@@ -10,7 +10,7 @@ import { buildServer } from "../src/server.js"
 import { OpencodeClient } from "../src/opencode-client.js"
 import { ModelRegistry } from "../src/model-registry.js"
 import { EventBus } from "../src/event-bus.js"
-import { authHeaders, startMockProvider, startOpencodeWithMock } from "./helpers.mjs"
+import { authHeaders, mark, startMockProvider, startOpencodeWithMock } from "./helpers.mjs"
 
 let mock
 let oc
@@ -26,7 +26,9 @@ test.before(async () => {
       }),
     }),
   })
+  mark("errors.test.mjs: starting the mock server")
   oc = await startOpencodeWithMock(mock)
+  mark("errors.test.mjs: mock server ready")
 
   const client = new OpencodeClient({ baseUrl: `http://127.0.0.1:${oc.port}` })
   const registry = new ModelRegistry()

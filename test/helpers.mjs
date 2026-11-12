@@ -112,6 +112,16 @@ function killTree(child) {
   } catch {}
 }
 
+/**
+ * Writes a progress marker to stderr.
+ *
+ * The test runner only reports a file-level timeout, so these markers make
+ * it possible to see how far a hanging test got.
+ */
+export function mark(step) {
+  if (process.env.TEST_TRACE) process.stderr.write(`[trace] ${step}\n`)
+}
+
 /** Reserves a free TCP port from the OS. */
 async function freePort() {
   const probe = http.createServer()
@@ -174,6 +184,7 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
 
   // Let the OS pick a free port so parallel test files never collide.
   const port = await freePort()
+  mark(`starting opencode on port ${port}`)
   // Use the real executable rather than the bin shim: the shim is a shell
   // script on POSIX and a .cmd on Windows, and the two behave differently.
   const bin = resolveOpencodeBinary()
@@ -234,6 +245,7 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
     await new Promise((r) => setTimeout(r, 300))
   }
 
+  mark("opencode is healthy")
   // Connect the mock provider so opencode treats it as an authorised account.
   const auth = await fetch(`http://127.0.0.1:${port}/auth/mock`, {
     method: "PUT",
@@ -244,6 +256,17 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
     killTree(child)
     throw new Error(`could not connect the mock provider: ${auth.status} ${await auth.text()}`)
   }
+
+  // The catalogue call is the first heavy request; it can be slow on a cold
+  // server, so it gets its own generous budget.
+  const catalogue = await fetch(`http://127.0.0.1:${port}/provider`, {
+    signal: AbortSignal.timeout(180000),
+  })
+  if (!catalogue.ok) {
+    killTree(child)
+    throw new Error(`could not read the provider catalogue: ${catalogue.status}`)
+  }
+  mark("provider catalogue loaded")
 
   return {
     port,

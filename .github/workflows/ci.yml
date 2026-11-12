@@ -66,6 +66,9 @@ jobs:
 
       - name: Run the test suite
         run: pnpm test
+        env:
+          # Prints progress markers so a hanging test file shows how far it got.
+          TEST_TRACE: "1"
 
   docker:
     name: Build the container image

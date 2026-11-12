@@ -15,7 +15,7 @@ import { buildServer } from "../src/server.js"
 import { OpencodeClient } from "../src/opencode-client.js"
 import { ModelRegistry } from "../src/model-registry.js"
 import { EventBus } from "../src/event-bus.js"
-import { authHeaders, startMockProvider, startOpencodeWithMock } from "./helpers.mjs"
+import { authHeaders, mark, startMockProvider, startOpencodeWithMock } from "./helpers.mjs"
 
 /**
  * Answers a structured-output request with a `StructuredOutput` tool call that
@@ -78,7 +78,9 @@ test.before(async () => {
       tool_calls: [{ name: "get_weather", arguments: { city: "Paris", unit: "c" } }],
     }),
   })
+  mark("tools.test.mjs: starting the mock server")
   oc = await startOpencodeWithMock(mock)
+  mark("tools.test.mjs: mock server ready")
 
   const client = new OpencodeClient({ baseUrl: `http://127.0.0.1:${oc.port}` })
   const registry = new ModelRegistry()

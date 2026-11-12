@@ -180,7 +180,15 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
     isWindows ? ["/c", bin, "serve", "--port", String(port), "--hostname", "127.0.0.1"] : ["serve", "--port", String(port), "--hostname", "127.0.0.1"],
     {
       cwd: dir,
-      env: { ...process.env, OPENCODE_DISABLE_AUTOUPDATE: "1" },
+      env: {
+        ...process.env,
+        OPENCODE_DISABLE_AUTOUPDATE: "1",
+        // Every server gets its own state directory. Otherwise they all share
+        // one SQLite database, and a lock held by one instance stalls the
+        // others.
+        XDG_DATA_HOME: path.join(dir, "data"),
+        XDG_CONFIG_HOME: path.join(dir, "config"),
+      },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       // On POSIX the child becomes a process-group leader, so the teardown can
@@ -222,7 +230,7 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
     body: JSON.stringify({ type: "api", key: "test-key" }),
   })
   if (!auth.ok) {
-    child.kill()
+    killTree(child)
     throw new Error(`could not connect the mock provider: ${auth.status} ${await auth.text()}`)
   }
 

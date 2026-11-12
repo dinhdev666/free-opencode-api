@@ -98,9 +98,14 @@ export class OpencodeClient {
     return this.request("/global/health", { timeout: 5000 })
   }
 
-  /** Returns { all: Provider[], default: {...}, connected: string[] } */
+  /**
+   * The provider catalogue.
+   *
+   * The first call on a cold server also builds the catalogue, which can take
+   * a while, so the timeout is generous.
+   */
   providers() {
-    return this.request("/provider", { timeout: 30000 })
+    return this.request("/provider", { timeout: 120000 })
   }
 
   /** Built-in tool ids known to the running opencode build. */

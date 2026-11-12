@@ -204,7 +204,9 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
   child.stdout.unref?.()
   child.stderr.unref?.()
 
-  const deadline = Date.now() + 60000
+  // A cold CI runner can take a while: the binary is large and the first
+  // start builds the provider catalogue.
+  const deadline = Date.now() + 180000
   let lastError = ""
   for (;;) {
     try {
@@ -222,7 +224,7 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
     if (Date.now() > deadline) {
       killTree(child)
       throw new Error(
-        `the mock opencode server did not start within 60s: ${lastError}\n${stderr.trim()}`,
+        `the mock opencode server did not start within 180s: ${lastError}\n${stderr.trim()}`,
       )
     }
     await new Promise((r) => setTimeout(r, 300))

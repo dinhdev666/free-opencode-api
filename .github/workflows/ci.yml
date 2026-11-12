@@ -49,7 +49,7 @@ jobs:
           # here points at the binary instead of at a test timeout.
           pnpm exec opencode serve --port 4099 --hostname 127.0.0.1 &
           OPENCODE_PID=$!
-          for i in $(seq 1 30); do
+          for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:4099/global/health > /dev/null; then
               echo "opencode server is up"
               kill "$OPENCODE_PID" || true

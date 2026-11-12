@@ -14,11 +14,24 @@ import { config, projectRoot } from "./config.js"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 
-/** Candidate locations for the locally installed opencode binary. */
+/**
+ * Resolves the opencode executable.
+ *
+ * The `node_modules/.bin/opencode` entry is a shell script on POSIX and a
+ * `.cmd` shim on Windows. The real executable lives in the package itself
+ * (`node_modules/opencode-ai/bin/opencode`), so it is preferred: it starts
+ * the same way everywhere and it does not need a command interpreter.
+ */
 export function resolveOpencodeBinary() {
   if (process.env.OPENCODE_BIN) return process.env.OPENCODE_BIN
 
   const isWindows = process.platform === "win32"
+
+  // The real executable, straight from the package.
+  const packageBinary = path.join(projectRoot, "node_modules", "opencode-ai", "bin", isWindows ? "opencode.exe" : "opencode")
+  if (existsSync(packageBinary)) return packageBinary
+
+  // Fall back to the bin shim.
   const names = isWindows ? ["opencode.cmd", "opencode.exe", "opencode"] : ["opencode"]
   const roots = [path.join(projectRoot, "node_modules", ".bin"), path.join(here, "..", "node_modules", ".bin")]
 

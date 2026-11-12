@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 
 import { config } from "../src/config.js"
+import { resolveOpencodeBinary } from "../src/opencode-server.js"
 
 const run = promisify(execFile)
 
@@ -173,7 +174,10 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
 
   // Let the OS pick a free port so parallel test files never collide.
   const port = await freePort()
-  const bin = path.join(projectRoot, "node_modules", ".bin", process.platform === "win32" ? "opencode.cmd" : "opencode")
+  // Use the real executable rather than the bin shim: the shim is a shell
+  // script on POSIX and a .cmd on Windows, and the two behave differently.
+  const bin = resolveOpencodeBinary()
+  if (!bin) throw new Error("the opencode binary could not be found")
   const isWindows = process.platform === "win32"
   const child = spawn(
     isWindows ? process.env.COMSPEC || "cmd.exe" : bin,

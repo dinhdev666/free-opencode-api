@@ -124,6 +124,14 @@ export const config = {
    */
   deleteSessions: bool("DELETE_SESSIONS", false),
 
+  /**
+   * Upper bound on the tokens the model may produce.
+   *
+   * opencode has no per-request token limit, so this is set on the server it
+   * spawns. It is the closest equivalent to the OpenAI `max_tokens` field.
+   */
+  maxOutputTokens: num("MAX_OUTPUT_TOKENS", 0),
+
   /** Advertised as the OpenAI organisation / owner for /v1/models. */
   owner: process.env.MODEL_OWNER || "opencode",
 

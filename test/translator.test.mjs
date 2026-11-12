@@ -7,10 +7,12 @@ import test from "node:test"
 import assert from "node:assert/strict"
 
 import {
+  buildResponseFormat,
   buildToolSchema,
   contentToText,
   flattenMessages,
   messagesToParts,
+  structuredToJsonMessage,
   structuredToResponse,
 } from "../src/translator.js"
 
@@ -168,4 +170,46 @@ test("structuredToResponse tolerates a missing structured payload", () => {
   const { content, toolCalls } = structuredToResponse(undefined)
   assert.equal(content, "")
   assert.deepEqual(toolCalls, [])
+})
+
+test("buildResponseFormat returns undefined without a response_format", () => {
+  assert.equal(buildResponseFormat(undefined), undefined)
+  assert.equal(buildResponseFormat(null), undefined)
+  assert.equal(buildResponseFormat({}), undefined)
+  assert.equal(buildResponseFormat({ type: "text" }), undefined)
+})
+
+test("buildResponseFormat maps json_object onto a JSON schema", () => {
+  const result = buildResponseFormat({ type: "json_object" })
+  assert.ok(result)
+  assert.equal(result.schema.type, "object")
+  assert.ok(result.schema.properties.content)
+})
+
+test("buildResponseFormat maps json_schema onto the given schema", () => {
+  const schema = { type: "object", properties: { city: { type: "string" } }, required: ["city"] }
+  const result = buildResponseFormat({ type: "json_schema", json_schema: { schema } })
+  assert.ok(result)
+  assert.equal(result.schema.type, "object")
+  assert.deepEqual(result.schema.properties.city, { type: "string" })
+  assert.deepEqual(result.schema.required, ["city"])
+})
+
+test("buildResponseFormat normalises a json_schema without a type", () => {
+  const result = buildResponseFormat({
+    type: "json_schema",
+    json_schema: { schema: { properties: { a: { type: "number" } } } },
+  })
+  assert.equal(result.schema.type, "object")
+  assert.ok(result.schema.properties.a)
+})
+
+test("structuredToJsonMessage unwraps the json_object envelope", () => {
+  assert.equal(structuredToJsonMessage({ content: "hello" }), "hello")
+  assert.equal(structuredToJsonMessage({ content: null }), "")
+})
+
+test("structuredToJsonMessage serialises a json_schema answer", () => {
+  assert.equal(structuredToJsonMessage({ city: "Paris" }), '{"city":"Paris"}')
+  assert.equal(structuredToJsonMessage("already json"), "already json")
 })

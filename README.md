@@ -120,6 +120,45 @@ OpenAI function calling on top of opencode's **structured output** support:
 `{"type":"function","function":{"name":"…"}}` restricts the schema to one
 function.
 
+### JSON mode (`response_format`)
+
+`response_format` is supported in both OpenAI shapes:
+
+```jsonc
+// JSON mode — the answer is valid JSON.
+{ "response_format": { "type": "json_object" } }
+
+// JSON schema — the answer matches the schema.
+{
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "capital",
+      "schema": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] }
+    }
+  }
+}
+```
+
+Both go through the same structured-output mechanism as function calling. The
+message body then contains the raw JSON, exactly as OpenAI does.
+
+### Fields the proxy accepts
+
+| Field | Effect |
+| ----- | ------ |
+| `model` | `provider/model`, a bare model id, or `provider/model#variant`. |
+| `messages` | The conversation. `system`/`developer` messages become the system prompt. |
+| `tools` / `tool_choice` | Function definitions, emulated through structured output. |
+| `response_format` | `json_object` or `json_schema`. |
+| `stream` | SSE streaming. |
+| `stream_options.include_usage` | Accepted; a usage block is always sent at the end. |
+
+`max_tokens` and `max_completion_tokens` are accepted but opencode has no
+per-request token limit — the cap is set server-wide with `MAX_OUTPUT_TOKENS`.
+`temperature`, `top_p` and `stop` are accepted and ignored: opencode picks
+those per model.
+
 ### Keeping requests cheap
 
 opencode is a coding agent, so a naive proxy would ship its whole agent
@@ -177,6 +216,7 @@ Environment variables always take precedence over the file.
 | `DEFAULT_AGENT` | `proxy` | opencode agent used for proxied requests. |
 | `REQUEST_TIMEOUT` | `300` | Seconds a single completion may take. |
 | `MAX_RETRY_ATTEMPTS` | `1` | Provider retries opencode may make before the proxy gives up. |
+| `MAX_OUTPUT_TOKENS` | `0` | Upper bound on the tokens the model may produce (0 = opencode's default). |
 | `DELETE_SESSIONS` | `false` | Delete each opencode session after the request. |
 | `LOG_LEVEL` | `silent` | pino log level. `silent` writes no log files. |
 | `MODEL_OWNER` | `opencode` | Owner string reported by `/v1/models`. |
@@ -274,6 +314,7 @@ test/
   helpers.mjs         mock provider + opencode server harness
   proxy.test.mjs      end-to-end: models, health, chat, streaming, completions
   tools.test.mjs      end-to-end: function-calling emulation
+  response-format.test.mjs end-to-end: json_object and json_schema
   errors.test.mjs     end-to-end: rate limits, unreachable servers
   registry.test.mjs   unit tests for the model registry
   translator.test.mjs unit tests for the OpenAI <-> opencode translation

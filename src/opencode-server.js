@@ -64,6 +64,11 @@ export async function startOpencodeServer(client, { log = console.log } = {}) {
   const env = { ...process.env, OPENCODE_DISABLE_AUTOUPDATE: "1" }
   if (config.opencodePassword) env.OPENCODE_SERVER_PASSWORD = config.opencodePassword
   if (config.opencodeUsername) env.OPENCODE_SERVER_USERNAME = config.opencodeUsername
+  // opencode has no per-request token limit, so the OpenAI `max_tokens` field
+  // is mapped onto this server-wide cap.
+  if (config.maxOutputTokens > 0) {
+    env.OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX = String(config.maxOutputTokens)
+  }
 
   // On Windows the shim is a `.cmd` file, which cannot be spawned directly —
   // it has to be run through the command interpreter.

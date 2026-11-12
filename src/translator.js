@@ -197,6 +197,60 @@ export function buildToolSchema(tools, toolChoice) {
   return schema
 }
 
+/**
+ * Builds the opencode `format` for an OpenAI `response_format`.
+ *
+ * OpenAI offers two shapes:
+ *  - `{ type: "json_object" }` — the answer must be valid JSON.
+ *  - `{ type: "json_schema", json_schema: { schema } }` — the answer must
+ *    match a schema.
+ *
+ * opencode implements both through the same structured-output mechanism: the
+ * answer is captured in `info.structured`.
+ *
+ * @param {any} responseFormat
+ * @returns {{schema: object}|undefined}
+ */
+export function buildResponseFormat(responseFormat) {
+  if (!responseFormat || typeof responseFormat !== "object") return undefined
+
+  if (responseFormat.type === "json_schema") {
+    const schema = responseFormat.json_schema?.schema
+    if (!schema || typeof schema !== "object") return undefined
+    return { schema: normalizeSchema(schema) }
+  }
+
+  if (responseFormat.type === "json_object") {
+    // JSON mode: any JSON value is acceptable.
+    return {
+      schema: {
+        type: "object",
+        properties: { content: { type: ["string", "null"] } },
+        required: ["content"],
+        additionalProperties: false,
+      },
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * Converts the structured answer into the message body of a response_format
+ * request. The answer is the raw JSON the model produced.
+ */
+export function structuredToJsonMessage(structured) {
+  if (structured === undefined || structured === null) return ""
+  if (typeof structured === "string") return structured
+
+  // A json_object response is wrapped in `{ content }`, so the payload is the
+  // inner value. A json_schema response is the object itself.
+  if (structured.content !== undefined && Object.keys(structured).length === 1) {
+    return structured.content === null ? "" : String(structured.content)
+  }
+  return JSON.stringify(structured)
+}
+
 function forcedFunctionName(toolChoice) {
   if (!toolChoice || typeof toolChoice !== "object") return undefined
   if (toolChoice.type === "function" && toolChoice.function?.name) return toolChoice.function.name

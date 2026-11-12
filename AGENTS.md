@@ -83,24 +83,31 @@ These were established empirically and are easy to get wrong.
    the caller's functions become a JSON Schema, sent as
    `format: { type: "json_schema", schema }`. opencode then advertises an
    internal `StructuredOutput` tool and the answer is converted back into
-   OpenAI `tool_calls`.
+   OpenAI `tool_calls`. The same mechanism carries OpenAI's `response_format`
+   (`json_object` and `json_schema`). Only one schema can be active per
+   request — tools win, because a tool call carries the answer.
 
-3. **Deny-all breaks structured output.** `permission: { "*": "deny" }` removes
+3. **No per-request sampling parameters.** opencode picks `temperature`,
+   `top_p` and `top_k` per model, and has no request field for them. The
+   token limit is a server-wide flag
+   (`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`), exposed as `MAX_OUTPUT_TOKENS`.
+
+4. **Deny-all breaks structured output.** `permission: { "*": "deny" }` removes
    *every* tool schema — including the internal `StructuredOutput` tool — so
    function calling stops working. Disable the built-in tools by name
    instead: `tools: { bash: false, read: false, … }`.
 
-4. **The title agent costs an extra LLM call.** opencode spends a second
+5. **The title agent costs an extra LLM call.** opencode spends a second
    provider call generating a session title unless the agent is disabled
    (`agent: { title: { disable: true } }`) or the session is created with an
    explicit title. The proxy does both.
 
-5. **Retries are not configurable.** opencode retries a failing provider 5
+6. **Retries are not configurable.** opencode retries a failing provider 5
    times with a 2 s → 30 s backoff (~90 s total). The proxy watches the
    `session.status` event with `type: "retry"` and aborts the turn, so a
    rate-limited provider answers with HTTP 429 in about a second.
 
-6. **The provider request.** With the `proxy` agent, the upstream request
+7. **The provider request.** With the `proxy` agent, the upstream request
    carries no tool schemas and a short system prompt. Every proxy request must
    cost exactly **one** provider request — `test/proxy.test.mjs` asserts it.
 

@@ -196,8 +196,12 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
       detached: !isWindows,
     },
   )
+  let stderr = ""
   child.stdout.on("data", () => {})
-  child.stderr.on("data", () => {})
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString()
+    if (stderr.length > 4000) stderr = stderr.slice(-4000)
+  })
   // The pipes must not keep the event loop alive on their own; the teardown
   // ends the process explicitly.
   child.stdout.unref?.()
@@ -214,11 +218,15 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
       lastError = err?.message ?? String(err)
     }
     if (child.exitCode !== null) {
-      throw new Error(`the mock opencode server exited with code ${child.exitCode}: ${lastError}`)
+      throw new Error(
+        `the mock opencode server exited with code ${child.exitCode}: ${lastError}\n${stderr.trim()}`,
+      )
     }
     if (Date.now() > deadline) {
       killTree(child)
-      throw new Error(`the mock opencode server did not start within 60s: ${lastError}`)
+      throw new Error(
+        `the mock opencode server did not start within 60s: ${lastError}\n${stderr.trim()}`,
+      )
     }
     await new Promise((r) => setTimeout(r, 300))
   }

@@ -3,6 +3,7 @@ node_modules
 .gitignore
 .env
 test
+scripts
 *.log
 proxy.log
 proxy.err
@@ -13,3 +14,4 @@ LICENSE
 docker-compose.yml
 Dockerfile
 .dockerignore
+.github

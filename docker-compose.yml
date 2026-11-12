@@ -2,6 +2,7 @@ services:
   proxy:
     build: .
     image: free-opencode-api
+    container_name: free-opencode-api
     restart: unless-stopped
     ports:
       - "20128:20128"

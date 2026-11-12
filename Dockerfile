@@ -15,6 +15,11 @@ RUN corepack enable && pnpm install --frozen-lockfile --prod
 
 FROM node:22-bookworm-slim AS runtime
 
+LABEL org.opencontainers.image.title="Free OpenCode API" \
+      org.opencontainers.image.description="OpenAI-compatible REST API proxy that reuses the AI models authenticated in the opencode CLI" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="https://github.com/dinhdev666/free-opencode-api"
+
 # `curl` is only used by the health check, `tini` reaps the opencode child
 # process.
 RUN apt-get update \

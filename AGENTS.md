@@ -37,9 +37,20 @@ asked.
 pnpm install        # install dependencies (also fetches the opencode binary)
 pnpm start          # run the proxy (spawns `opencode serve` itself)
 pnpm dev            # run with --watch
+pnpm lint           # syntax + style checks (no dependencies)
 pnpm test           # run the test suite (no network, no provider quota needed)
+pnpm check          # lint + test
 docker compose up -d   # run in a container
 ```
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request to `main`:
+
+- **test** — `pnpm lint` + `pnpm test` on Node.js 20, 22 and 24
+- **docker** — builds the image and smoke-tests the container
+
+Keep the matrix green: the code has to run on Node 20 as well.
 
 ## Architecture
 

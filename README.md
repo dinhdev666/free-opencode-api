@@ -1,5 +1,8 @@
 # Free OpenCode API
 
+[![CI](https://github.com/dinhdev666/free-opencode-api/actions/workflows/ci.yml/badge.svg)](https://github.com/dinhdev666/free-opencode-api/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An **OpenAI-compatible REST API** that reuses the AI models you are already
 signed in to with the [opencode](https://opencode.ai) CLI.
 
@@ -258,7 +261,9 @@ base URL to `http://127.0.0.1:20128/v1`.
 ```bash
 pnpm install
 pnpm dev     # node --watch src/index.js
+pnpm lint    # syntax + style checks, no dependencies
 pnpm test    # node --test
+pnpm check   # lint + test
 ```
 
 The test suite boots a real opencode server against a **mock OpenAI-compatible
@@ -266,12 +271,20 @@ provider**, so it needs no network access and burns no provider quota.
 
 ```
 test/
-  helpers.mjs        mock provider + opencode server harness
-  proxy.test.mjs     end-to-end: models, health, chat, streaming, completions
-  tools.test.mjs     end-to-end: function-calling emulation
-  errors.test.mjs    end-to-end: rate limits, unreachable servers
+  helpers.mjs         mock provider + opencode server harness
+  proxy.test.mjs      end-to-end: models, health, chat, streaming, completions
+  tools.test.mjs      end-to-end: function-calling emulation
+  errors.test.mjs     end-to-end: rate limits, unreachable servers
+  registry.test.mjs   unit tests for the model registry
   translator.test.mjs unit tests for the OpenAI <-> opencode translation
 ```
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+- **test** — the suite on Node.js 20, 22 and 24
+- **docker** — builds the image and smoke-tests the container
 
 See [AGENTS.md](AGENTS.md) for the architecture notes and the opencode API
 gotchas that are easy to get wrong.
@@ -291,7 +304,11 @@ src/
   event-bus.js        multiplexes opencode's global SSE stream
   model-registry.js   opencode catalogue -> OpenAI model list
   config.js           environment configuration + .env loader
+scripts/
+  lint.js             dependency-free syntax and style checks
 opencode.json         the tool-less `proxy` agent
+.github/workflows/
+  ci.yml              tests + container build
 Dockerfile            container image
 docker-compose.yml    local container setup
 railway.json          Railway deployment

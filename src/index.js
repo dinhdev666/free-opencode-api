@@ -67,6 +67,8 @@ process.on("SIGINT", () => shutdown("SIGINT"))
 process.on("SIGTERM", () => shutdown("SIGTERM"))
 
 boot().catch((err) => {
+  // A failed boot has to be visible even when logging is off.
+  // lint-ignore
   console.error(err)
   process.exit(1)
 })

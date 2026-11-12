@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run of the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test on Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20", "22", "24"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify the opencode binary
+        run: pnpm exec opencode --version
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Run the test suite
+        run: pnpm test
+
+  docker:
+    name: Build the container image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: free-opencode-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the container
+        run: |
+          docker run -d --name proxy \
+            -e API_KEY=sk-dummy \
+            -p 20128:20128 \
+            free-opencode-api:ci
+
+          # Wait for the proxy to report a healthy opencode server.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:20128/health > /dev/null; then
+              echo "proxy is up"
+              break
+            fi
+            sleep 2
+          done
+
+          curl -fsS http://127.0.0.1:20128/health
+          curl -fsS -H 'authorization: Bearer sk-dummy' http://127.0.0.1:20128/v1/models \
+            | head -c 200
+          echo
+
+          docker logs proxy
+          docker rm -f proxy

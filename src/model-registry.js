@@ -26,9 +26,11 @@ export class ModelRegistry {
    * @param {{all: any[], default?: Record<string,string>, connected?: string[]}} payload
    */
   update(payload) {
-    this.providers.clear()
-    this.bareIndex.clear()
-    this.modelCount = 0
+    // Build into fresh maps and swap them in, so a reader never sees the
+    // registry half-rebuilt.
+    const providers = new Map()
+    const bareIndex = new Map()
+    let modelCount = 0
 
     const connected = new Set(payload.connected ?? [])
 
@@ -37,20 +39,23 @@ export class ModelRegistry {
       const models = Object.keys(provider.models ?? {})
       if (!models.length) continue
 
-      this.providers.set(providerID, {
+      providers.set(providerID, {
         name: provider.name ?? providerID,
         connected: connected.has(providerID),
         models,
       })
-      this.modelCount += models.length
+      modelCount += models.length
 
       for (const modelID of models) {
         // First provider wins for a bare model id; connected providers are
         // preferred by #lookup().
-        if (!this.bareIndex.has(modelID)) this.bareIndex.set(modelID, `${providerID}/${modelID}`)
+        if (!bareIndex.has(modelID)) bareIndex.set(modelID, `${providerID}/${modelID}`)
       }
     }
 
+    this.providers = providers
+    this.bareIndex = bareIndex
+    this.modelCount = modelCount
     this.loadedAt = Date.now()
   }
 

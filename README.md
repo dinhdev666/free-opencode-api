@@ -326,6 +326,7 @@ test/
   proxy.test.mjs      end-to-end: models, health, chat, streaming, completions
   tools.test.mjs      end-to-end: function-calling emulation
   response-format.test.mjs end-to-end: json_object and json_schema
+  conversation.test.mjs end-to-end: multi-turn tool chats, concurrency
   openai-sdk.test.mjs compatibility with the real OpenAI SDK
   errors.test.mjs     end-to-end: rate limits, unreachable servers
   registry.test.mjs   unit tests for the model registry

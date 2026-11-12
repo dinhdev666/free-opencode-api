@@ -14,6 +14,7 @@ import {
   messagesToParts,
   structuredToJsonMessage,
   structuredToResponse,
+  toFinishReason,
 } from "../src/translator.js"
 
 test("contentToText handles strings, arrays and missing values", () => {
@@ -237,4 +238,14 @@ test("structuredToJsonMessage serialises a json_schema answer", () => {
 
 test("structuredToJsonMessage keeps the whole object without unwrapping", () => {
   assert.equal(structuredToJsonMessage({ content: "hello" }), '{"content":"hello"}')
+})
+
+test("toFinishReason maps opencode's reasons onto the OpenAI values", () => {
+  assert.equal(toFinishReason("stop"), "stop")
+  assert.equal(toFinishReason("length"), "length")
+  assert.equal(toFinishReason("max-tokens"), "length")
+  assert.equal(toFinishReason("content-filter"), "content_filter")
+  assert.equal(toFinishReason("tool-calls"), "tool_calls")
+  assert.equal(toFinishReason("error"), "stop")
+  assert.equal(toFinishReason(undefined), "stop")
 })

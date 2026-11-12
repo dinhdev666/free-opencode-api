@@ -22,8 +22,9 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "lint": "node scripts/lint.js",
+    "check:dockerfile": "node scripts/check-dockerfile.mjs",
     "test": "node --test --test-concurrency=1 --test-timeout=300000 test/*.test.mjs",
-    "check": "pnpm lint && pnpm test"
+    "check": "pnpm lint && pnpm check:dockerfile && pnpm test"
   },
   "dependencies": {
     "@fastify/cors": "^11.4.1",

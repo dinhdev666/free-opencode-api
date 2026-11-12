@@ -38,17 +38,27 @@ pnpm install        # install dependencies (also fetches the opencode binary)
 pnpm start          # run the proxy (spawns `opencode serve` itself)
 pnpm dev            # run with --watch
 pnpm lint           # syntax + style checks (no dependencies)
+pnpm check:dockerfile # check the Dockerfile against Railway's rules
 pnpm test           # run the test suite (no network, no provider quota needed)
-pnpm check          # lint + test
+pnpm check          # lint + deployment checks + tests
 docker compose up -d   # run in a container
 ```
+
+## Deployment rules
+
+**Railway rejects a Dockerfile that contains a `VOLUME` instruction** — the
+build stops during validation with "The Dockerfile failed validation". The
+volume has to be attached in the Railway dashboard, mounted on `/data`.
+
+`scripts/check-dockerfile.mjs` and `test/deployment.test.mjs` guard this. Do
+not add a `VOLUME` instruction back.
 
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every push and pull request to `main`:
 
-- **test** — `pnpm lint` + `pnpm test` on Node.js 20, 22 and 24
-- **docker** — builds the image and smoke-tests the container
+- **test** — `pnpm lint` + `pnpm check:dockerfile` + `pnpm test` on Node.js 20, 22 and 24
+- **docker** — checks the Dockerfile against Railway's rules, builds the image and smoke-tests the container
 
 Keep the matrix green: the code has to run on Node 20 as well.
 

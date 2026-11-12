@@ -65,6 +65,9 @@ jobs:
         with:
           context: .
           push: false
+          # The buildx driver keeps the image in its own cache, so it has to be
+          # loaded into the Docker daemon for the smoke test to run it.
+          load: true
           tags: free-opencode-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max

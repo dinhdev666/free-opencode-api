@@ -89,16 +89,26 @@ export async function startMockProvider({ reply = "Hello from mock", onRequest }
   }
 }
 
-/** Kills a process tree (Windows) or a single process (POSIX). */
+/**
+ * Kills a process and everything it spawned.
+ *
+ * The opencode binary is a wrapper that starts the real server as a child
+ * process. Killing only the wrapper leaves the server alive, holding the
+ * stdio pipes open, which keeps the test runner from exiting.
+ */
 function killTree(child) {
   if (!child?.pid) return
   if (process.platform === "win32") {
     spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
-  } else {
-    try {
-      child.kill("SIGKILL")
-    } catch {}
+    return
   }
+  try {
+    // Kill the whole process group: the negative pid reaches the children.
+    process.kill(-child.pid, "SIGKILL")
+  } catch {}
+  try {
+    child.kill("SIGKILL")
+  } catch {}
 }
 
 /** Reserves a free TCP port from the OS. */
@@ -168,20 +178,39 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
   const child = spawn(
     isWindows ? process.env.COMSPEC || "cmd.exe" : bin,
     isWindows ? ["/c", bin, "serve", "--port", String(port), "--hostname", "127.0.0.1"] : ["serve", "--port", String(port), "--hostname", "127.0.0.1"],
-    { cwd: dir, env: { ...process.env, OPENCODE_DISABLE_AUTOUPDATE: "1" }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+    {
+      cwd: dir,
+      env: { ...process.env, OPENCODE_DISABLE_AUTOUPDATE: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      // On POSIX the child becomes a process-group leader, so the teardown can
+      // kill the opencode server it starts as well.
+      detached: !isWindows,
+    },
   )
   child.stdout.on("data", () => {})
   child.stderr.on("data", () => {})
+  // The pipes must not keep the event loop alive on their own; the teardown
+  // ends the process explicitly.
+  child.stdout.unref?.()
+  child.stderr.unref?.()
 
   const deadline = Date.now() + 60000
+  let lastError = ""
   for (;;) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/global/health`)
       if (res.ok) break
-    } catch {}
+      lastError = `health returned ${res.status}`
+    } catch (err) {
+      lastError = err?.message ?? String(err)
+    }
+    if (child.exitCode !== null) {
+      throw new Error(`the mock opencode server exited with code ${child.exitCode}: ${lastError}`)
+    }
     if (Date.now() > deadline) {
-      child.kill()
-      throw new Error("mock opencode server did not start")
+      killTree(child)
+      throw new Error(`the mock opencode server did not start within 60s: ${lastError}`)
     }
     await new Promise((r) => setTimeout(r, 300))
   }
@@ -202,7 +231,12 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
     dir,
     close: async () => {
       killTree(child)
-      await new Promise((r) => setTimeout(r, 500))
+      // Wait for the process to disappear so its stdio pipes are released.
+      await new Promise((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) return resolve()
+        child.once("exit", resolve)
+        setTimeout(resolve, 3000).unref?.()
+      })
       try {
         fs.rmSync(dir, { recursive: true, force: true })
       } catch {}

@@ -64,6 +64,9 @@ jobs:
       - name: Lint
         run: pnpm lint
 
+      - name: Check the deployment files
+        run: pnpm check:dockerfile
+
       - name: Run the test suite
         run: pnpm test
         env:
@@ -77,6 +80,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Check the Dockerfile against Railway's rules
+        run: |
+          # Railway rejects a Dockerfile that contains a VOLUME instruction:
+          # "The Dockerfile failed validation." The volume has to be attached
+          # in the Railway dashboard instead.
+          if grep -nE '^\s*VOLUME\b' Dockerfile; then
+            echo "::error::The Dockerfile must not contain a VOLUME instruction; Railway rejects it."
+            exit 1
+          fi
+          echo "no VOLUME instruction"
+          node scripts/check-dockerfile.mjs
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4

@@ -42,12 +42,15 @@ COPY src ./src
 
 # The opencode CLI writes its state (sessions, credentials, logs) under
 # $XDG_DATA_HOME/opencode and its configuration under $XDG_CONFIG_HOME/opencode.
-# Mounting /data keeps the provider credentials across restarts.
+# Mount a volume on /data to keep the provider credentials across restarts.
+#
+# NOTE: there is deliberately no VOLUME instruction here. Railway rejects a
+# Dockerfile that contains VOLUME ("The Dockerfile failed validation"); the
+# volume has to be attached in the Railway dashboard instead.
 ENV XDG_DATA_HOME=/data \
     XDG_CONFIG_HOME=/data/config \
     OPENCODE_DISABLE_AUTOUPDATE=1
 RUN mkdir -p /data && chown -R node:node /data /app
-VOLUME ["/data"]
 
 USER node
 EXPOSE 20128

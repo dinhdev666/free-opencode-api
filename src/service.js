@@ -4,7 +4,7 @@
  */
 
 import { config } from "./config.js"
-import { buildResponseFormat, buildToolSchema, contentToText, flattenMessages, messagesToParts, structuredToJsonMessage, structuredToResponse } from "./translator.js"
+import { buildResponseFormat, buildToolSchema, contentToText, flattenMessages, messagesToParts, structuredToJsonMessage, structuredToResponse, toFinishReason } from "./translator.js"
 
 export class ProxyService {
   constructor({ client, registry, eventBus }) {
@@ -107,6 +107,7 @@ export class ProxyService {
       const structured = result?.info?.structured
       const responseFormat = buildResponseFormat(body.response_format)
       const wantsJson = Boolean(responseFormat) && !body.tools?.length
+      const finishReason = toFinishReason(result?.info?.finish)
 
       if (structured !== undefined && structured !== null) {
         // A response_format request wants the raw JSON as the message body.
@@ -144,7 +145,7 @@ export class ProxyService {
                 ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
               },
               logprobs: null,
-              finish_reason: toolCalls.length ? "tool_calls" : "stop",
+              finish_reason: toolCalls.length ? "tool_calls" : finishReason,
             },
           ],
           usage,
@@ -170,7 +171,7 @@ export class ProxyService {
               ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
             },
             logprobs: null,
-            finish_reason: toolCalls.length ? "tool_calls" : "stop",
+            finish_reason: toolCalls.length ? "tool_calls" : finishReason,
           },
         ],
         usage,
@@ -303,7 +304,7 @@ export class ProxyService {
         if (part?.type === "step-finish") {
           const stepUsage = usageFrom(part.tokens)
           if (stepUsage.total_tokens > 0) usage = stepUsage
-          finishReason = part.reason === "tool-calls" ? "tool_calls" : (part.reason ?? "stop")
+          finishReason = toFinishReason(part.reason)
         }
 
         if (part?.type === "tool" && part.tool === "StructuredOutput" && !structuredEmitted) {
@@ -366,6 +367,7 @@ export class ProxyService {
         }
         // The assistant message carries `finish` once the turn is over.
         if (info?.role === "assistant" && info?.finish) {
+          finishReason = toFinishReason(info.finish)
           resolveDone?.()
         }
       }

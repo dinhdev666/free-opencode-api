@@ -33,8 +33,9 @@ const RULES = [
     name: "no-console",
     pattern: /^\s*console\.(log|debug|info|warn|error)\(/,
     message: "console output left in the source; the proxy stays silent by default",
-    // The lint script itself has to report its findings.
-    skip: (file) => file === "scripts/lint.js",
+    // The lint script and the Dockerfile check report their findings on the
+    // console, that is their whole job.
+    skip: (file) => file.startsWith("scripts/"),
   },
   {
     name: "no-debugger",
@@ -46,7 +47,7 @@ const RULES = [
     pattern: /\b(TODO|FIXME|XXX|HACK)\b/,
     message: "unresolved marker",
     // The rule definition mentions the markers it looks for.
-    skip: (file) => file === "scripts/lint.js",
+    skip: (file) => file.startsWith("scripts/"),
   },
   {
     name: "no-tabs",

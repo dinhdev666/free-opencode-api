@@ -283,6 +283,33 @@ function forcedFunctionName(toolChoice) {
 }
 
 /**
+ * Maps an opencode stop reason onto an OpenAI `finish_reason`.
+ *
+ * opencode reports the AI SDK's reasons: `stop`, `length`,
+ * `content-filter`, `tool-calls`, `error`, `unknown`. OpenAI uses
+ * `stop`, `length`, `content_filter`, `tool_calls`, `function_call`.
+ *
+ * @param {string|undefined} reason
+ * @returns {"stop"|"length"|"content_filter"|"tool_calls"}
+ */
+export function toFinishReason(reason) {
+  switch (reason) {
+    case "length":
+    case "max-tokens":
+      return "length"
+    case "content-filter":
+    case "content_filter":
+      return "content_filter"
+    case "tool-calls":
+    case "tool_calls":
+      return "tool_calls"
+    default:
+      // `stop`, `error`, `unknown` and anything else end the turn normally.
+      return "stop"
+  }
+}
+
+/**
  * JSON Schema for tool arguments. OpenAI clients often send a schema without
  * `type: "object"`; opencode's structured output wants a well-formed object.
  */

@@ -243,9 +243,9 @@ docker compose up -d
 curl http://127.0.0.1:20128/health
 ```
 
-The image is a slim `node:22-alpine` build with a `tini` init and a
+The image is a slim `node:22-bookworm-slim` build with a `tini` init and a
 `HEALTHCHECK`. The opencode state (sessions, provider credentials) lives in
-the `/data` volume, so it survives restarts.
+`/data`, so it survives restarts when a volume is mounted on that path.
 
 To authenticate a provider inside the container:
 
@@ -273,9 +273,24 @@ the port. The container listens on `0.0.0.0` so Railway can reach it.
 curl https://<your-domain>/v1/models -H "authorization: Bearer $API_KEY"
 ```
 
-> The opencode credentials live in the container filesystem (`/data`). On
-> Railway the filesystem is ephemeral, so run `opencode auth login` once per
-> deployment, or mount a volume if your plan supports it.
+### Keeping the opencode credentials
+
+The opencode credentials live in `/data`. On Railway the container filesystem
+is ephemeral, so a restart would lose them. Attach a **Volume** mounted on
+`/data` in the Railway dashboard to keep them:
+
+- **Service → Settings → Volumes → Add Volume**, mount path `/data`.
+
+> **Note** — the Dockerfile deliberately contains **no `VOLUME` instruction**.
+> Railway rejects an image whose Dockerfile has one ("The Dockerfile failed
+> validation"), so the volume is attached in the dashboard instead. The CI
+> workflow checks for this so the instruction cannot come back by accident.
+
+Without a volume you have to authenticate again after every redeploy:
+
+```bash
+railway run opencode auth login
+```
 
 ---
 
@@ -313,8 +328,8 @@ base URL to `http://127.0.0.1:20128/v1`.
 pnpm install
 pnpm dev     # node --watch src/index.js
 pnpm lint    # syntax + style checks, no dependencies
-pnpm test    # node --test
-pnpm check   # lint + test
+pnpm test    # the test suite
+pnpm check   # lint + deployment checks + tests
 ```
 
 The test suite boots a real opencode server against a **mock OpenAI-compatible
@@ -329,6 +344,7 @@ test/
   conversation.test.mjs end-to-end: multi-turn tool chats, concurrency
   openai-sdk.test.mjs compatibility with the real OpenAI SDK
   errors.test.mjs     end-to-end: rate limits, unreachable servers
+  deployment.test.mjs the Dockerfile and railway.json follow Railway's rules
   registry.test.mjs   unit tests for the model registry
   translator.test.mjs unit tests for the OpenAI <-> opencode translation
 ```
@@ -361,6 +377,7 @@ src/
   config.js           environment configuration + .env loader
 scripts/
   lint.js             dependency-free syntax and style checks
+  check-dockerfile.mjs checks the Dockerfile against Railway's rules
 opencode.json         the tool-less `proxy` agent
 .github/workflows/
   ci.yml              tests + container build

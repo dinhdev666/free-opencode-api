@@ -122,13 +122,22 @@ export function mark(step) {
   if (process.env.TEST_TRACE) process.stderr.write(`[trace] ${step}\n`)
 }
 
-/** Reserves a free TCP port from the OS. */
+/**
+ * Picks a free TCP port from a high range.
+ *
+ * The port is released before opencode binds it, so there is a small window
+ * in which something else could take it. The range is far away from the
+ * ports the rest of the system uses, which makes a collision unlikely.
+ */
 async function freePort() {
-  const probe = http.createServer()
-  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve))
-  const { port } = probe.address()
-  await new Promise((resolve) => probe.close(resolve))
-  return port
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const probe = http.createServer()
+    await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve))
+    const { port } = probe.address()
+    await new Promise((resolve) => probe.close(resolve))
+    if (port > 20000) return port
+  }
+  throw new Error("could not find a free port")
 }
 
 /**
@@ -182,7 +191,9 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
     ),
   )
 
-  // Let the OS pick a free port so parallel test files never collide.
+  // Pick a port from a high range that nothing else uses. `opencode serve
+  // --port 0` would prefer 4096, and a leftover server on that port would
+  // break the next one.
   const port = await freePort()
   mark(`starting opencode on port ${port}`)
   // Use the real executable rather than the bin shim: the shim is a shell
@@ -209,7 +220,11 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
     },
   )
   let stderr = ""
-  child.stdout.on("data", () => {})
+  let stdout = ""
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk.toString()
+    if (stdout.length > 4000) stdout = stdout.slice(-4000)
+  })
   child.stderr.on("data", (chunk) => {
     stderr += chunk.toString()
     if (stderr.length > 4000) stderr = stderr.slice(-4000)
@@ -244,8 +259,7 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
     }
     await new Promise((r) => setTimeout(r, 300))
   }
-
-  mark("opencode is healthy")
+  mark(`opencode is listening on port ${port}`)
   // Connect the mock provider so opencode treats it as an authorised account.
   const auth = await fetch(`http://127.0.0.1:${port}/auth/mock`, {
     method: "PUT",
@@ -283,10 +297,30 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
       // is still holding the port, the next test would talk to it instead of
       // to a fresh server.
       await killPortOwner(port)
+      // Wait until the port is free again, so the next server can bind it.
+      await waitForFreePort(port)
       try {
         fs.rmSync(dir, { recursive: true, force: true })
       } catch {}
     },
+  }
+}
+
+/**
+ * Waits until nothing answers on a TCP port.
+ */
+async function waitForFreePort(port) {
+  const deadline = Date.now() + 10000
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/global/health`, {
+        signal: AbortSignal.timeout(1000),
+      })
+      await res.arrayBuffer()
+    } catch {
+      return
+    }
+    await new Promise((r) => setTimeout(r, 200))
   }
 }
 

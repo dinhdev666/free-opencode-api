@@ -66,3 +66,13 @@ test("railway.json does not force a mount path", () => {
 test("the container runs as a non-root user", () => {
   assert.match(dockerfile, /^USER\s+node\b/m)
 })
+
+test("the image keeps the opencode workdir on the volume", () => {
+  // opencode snapshots its workdir, so it has to live on the volume rather
+  // than in the read-only image layer.
+  assert.match(dockerfile, /OPENCODE_WORKDIR=\/data/)
+})
+
+test("the image gives the node user its own data directory", () => {
+  assert.match(dockerfile, /mkdir -p \/data && chown -R node:node \/data \/app/)
+})

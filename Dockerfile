@@ -49,7 +49,8 @@ COPY src ./src
 # volume has to be attached in the Railway dashboard instead.
 ENV XDG_DATA_HOME=/data \
     XDG_CONFIG_HOME=/data/config \
-    OPENCODE_DISABLE_AUTOUPDATE=1
+    OPENCODE_DISABLE_AUTOUPDATE=1 \
+    OPENCODE_WORKDIR=/data
 RUN mkdir -p /data && chown -R node:node /data /app
 
 USER node

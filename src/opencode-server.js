@@ -19,8 +19,11 @@ const here = path.dirname(fileURLToPath(import.meta.url))
  *
  * The `node_modules/.bin/opencode` entry is a shell script on POSIX and a
  * `.cmd` shim on Windows. The real executable lives in the package itself
- * (`node_modules/opencode-ai/bin/opencode`), so it is preferred: it starts
+ * (`node_modules/opencode-ai/bin/opencode.exe`), so it is preferred: it starts
  * the same way everywhere and it does not need a command interpreter.
+ *
+ * The `.exe` suffix is not a Windows thing: opencode's postinstall copies the
+ * platform binary to `bin/opencode.exe` on every platform.
  */
 export function resolveOpencodeBinary() {
   if (process.env.OPENCODE_BIN) return process.env.OPENCODE_BIN
@@ -28,8 +31,11 @@ export function resolveOpencodeBinary() {
   const isWindows = process.platform === "win32"
 
   // The real executable, straight from the package.
-  const packageBinary = path.join(projectRoot, "node_modules", "opencode-ai", "bin", isWindows ? "opencode.exe" : "opencode")
-  if (existsSync(packageBinary)) return packageBinary
+  const packageRoot = path.join(projectRoot, "node_modules", "opencode-ai", "bin")
+  for (const name of ["opencode.exe", "opencode"]) {
+    const candidate = path.join(packageRoot, name)
+    if (existsSync(candidate)) return candidate
+  }
 
   // Fall back to the bin shim.
   const names = isWindows ? ["opencode.cmd", "opencode.exe", "opencode"] : ["opencode"]

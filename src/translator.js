@@ -168,6 +168,7 @@ export function buildToolSchema(tools, toolChoice) {
 
   const forced = forcedFunctionName(toolChoice)
   const disabled = toolChoice === "none"
+  const required = toolChoice === "required"
 
   const variants = list
     .filter((tool) => !forced || tool.function.name === forced)
@@ -194,6 +195,15 @@ export function buildToolSchema(tools, toolChoice) {
     schema.properties.tool_calls = { type: "array", items: { anyOf: variants } }
   }
 
+  // `tool_choice: "required"` means the model has to call a tool. The
+  // schema makes `tool_calls` mandatory and forbids a plain answer.
+  if (required && variants.length) {
+    schema.required = ["tool_calls"]
+    schema.properties.content = { type: "null" }
+    delete schema.properties.tool_calls.minItems
+    schema.properties.tool_calls.minItems = 1
+  }
+
   return schema
 }
 
@@ -209,7 +219,7 @@ export function buildToolSchema(tools, toolChoice) {
  * answer is captured in `info.structured`.
  *
  * @param {any} responseFormat
- * @returns {{schema: object}|undefined}
+ * @returns {{schema: object, unwrapContent: boolean}|undefined}
  */
 export function buildResponseFormat(responseFormat) {
   if (!responseFormat || typeof responseFormat !== "object") return undefined
@@ -217,11 +227,12 @@ export function buildResponseFormat(responseFormat) {
   if (responseFormat.type === "json_schema") {
     const schema = responseFormat.json_schema?.schema
     if (!schema || typeof schema !== "object") return undefined
-    return { schema: normalizeSchema(schema) }
+    return { schema: normalizeSchema(schema), unwrapContent: false }
   }
 
   if (responseFormat.type === "json_object") {
-    // JSON mode: any JSON value is acceptable.
+    // JSON mode: any JSON value is acceptable. The answer is wrapped in a
+    // `content` field, which is unwrapped again on the way out.
     return {
       schema: {
         type: "object",
@@ -229,6 +240,7 @@ export function buildResponseFormat(responseFormat) {
         required: ["content"],
         additionalProperties: false,
       },
+      unwrapContent: true,
     }
   }
 
@@ -238,14 +250,17 @@ export function buildResponseFormat(responseFormat) {
 /**
  * Converts the structured answer into the message body of a response_format
  * request. The answer is the raw JSON the model produced.
+ *
+ * @param {unknown} structured
+ * @param {{unwrapContent?: boolean}} options
  */
-export function structuredToJsonMessage(structured) {
+export function structuredToJsonMessage(structured, { unwrapContent = false } = {}) {
   if (structured === undefined || structured === null) return ""
   if (typeof structured === "string") return structured
 
-  // A json_object response is wrapped in `{ content }`, so the payload is the
-  // inner value. A json_schema response is the object itself.
-  if (structured.content !== undefined && Object.keys(structured).length === 1) {
+  // A json_object answer is wrapped in `{ content }`; the payload is the
+  // inner value. A json_schema answer is the object itself.
+  if (unwrapContent && structured.content !== undefined) {
     return structured.content === null ? "" : String(structured.content)
   }
   return JSON.stringify(structured)

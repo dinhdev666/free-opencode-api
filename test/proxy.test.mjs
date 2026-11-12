@@ -145,6 +145,69 @@ test("POST /v1/chat/completions streams SSE chunks", async () => {
   assert.equal(typeof usageChunk.usage.total_tokens, "number")
 })
 
+test("the stream opens with a role-only chunk", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: "mock/mock-model",
+      messages: [{ role: "user", content: "Hello" }],
+      stream: true,
+    }),
+  })
+
+  const text = await res.text()
+  const chunks = text
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
+    .map((line) => JSON.parse(line.slice(6)))
+
+  assert.equal(chunks[0].choices[0].delta.role, "assistant")
+  assert.equal(chunks[0].choices[0].delta.content, undefined)
+  assert.equal(chunks[0].choices[0].finish_reason, null)
+})
+
+test("the stream ends with exactly one [DONE]", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: "mock/mock-model",
+      messages: [{ role: "user", content: "Hello" }],
+      stream: true,
+    }),
+  })
+
+  const text = await res.text()
+  const done = text.split("\n").filter((line) => line.trim() === "data: [DONE]")
+  assert.equal(done.length, 1)
+  assert.ok(text.trimEnd().endsWith("data: [DONE]"), "[DONE] must be the last thing sent")
+})
+
+test("stream_options.include_usage false omits the usage chunk", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: "mock/mock-model",
+      messages: [{ role: "user", content: "Hello" }],
+      stream: true,
+      stream_options: { include_usage: false },
+    }),
+  })
+
+  const text = await res.text()
+  const chunks = text
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
+    .map((line) => JSON.parse(line.slice(6)))
+
+  assert.equal(chunks.find((c) => c.usage), undefined, "expected no usage chunk")
+  // The stream still has to finish properly.
+  const final = chunks.filter((c) => c.choices?.some((choice) => choice.finish_reason)).at(-1)
+  assert.equal(final.choices[0].finish_reason, "stop")
+})
+
 test("POST /v1/completions returns a text completion", async () => {
   const { status, body } = await post("/v1/completions", {
     model: "mock/mock-model",
@@ -205,8 +268,7 @@ test("the system message reaches the model", async () => {
   assert.ok(roles.includes("system"), "expected a system message in the provider request")
 })
 
-test("the streaming content does not echo the user's prompt", async () => {
-  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+test("the streaming content does not echo the user's prompt", async () => {  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({

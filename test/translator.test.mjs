@@ -134,6 +134,25 @@ test("buildToolSchema with tool_choice none omits tool calls", () => {
   assert.ok(schema.properties.content)
 })
 
+test("buildToolSchema with tool_choice required demands a tool call", () => {
+  const schema = buildToolSchema(
+    [{ type: "function", function: { name: "a", parameters: { type: "object" } } }],
+    "required",
+  )
+  assert.deepEqual(schema.required, ["tool_calls"])
+  assert.equal(schema.properties.content.type, "null")
+  assert.equal(schema.properties.tool_calls.minItems, 1)
+})
+
+test("buildToolSchema ignores a tool_choice for an unknown function", () => {
+  const schema = buildToolSchema(
+    [{ type: "function", function: { name: "a", parameters: { type: "object" } } }],
+    { type: "function", function: { name: "missing" } },
+  )
+  // No variant matches, so no tool call can be produced.
+  assert.equal(schema.properties.tool_calls, undefined)
+})
+
 test("buildToolSchema normalises a schema without an object type", () => {
   const schema = buildToolSchema(
     [{ type: "function", function: { name: "a", parameters: { properties: { x: { type: "string" } } } } }],
@@ -184,6 +203,7 @@ test("buildResponseFormat maps json_object onto a JSON schema", () => {
   assert.ok(result)
   assert.equal(result.schema.type, "object")
   assert.ok(result.schema.properties.content)
+  assert.equal(result.unwrapContent, true)
 })
 
 test("buildResponseFormat maps json_schema onto the given schema", () => {
@@ -193,6 +213,7 @@ test("buildResponseFormat maps json_schema onto the given schema", () => {
   assert.equal(result.schema.type, "object")
   assert.deepEqual(result.schema.properties.city, { type: "string" })
   assert.deepEqual(result.schema.required, ["city"])
+  assert.equal(result.unwrapContent, false)
 })
 
 test("buildResponseFormat normalises a json_schema without a type", () => {
@@ -205,11 +226,15 @@ test("buildResponseFormat normalises a json_schema without a type", () => {
 })
 
 test("structuredToJsonMessage unwraps the json_object envelope", () => {
-  assert.equal(structuredToJsonMessage({ content: "hello" }), "hello")
-  assert.equal(structuredToJsonMessage({ content: null }), "")
+  assert.equal(structuredToJsonMessage({ content: "hello" }, { unwrapContent: true }), "hello")
+  assert.equal(structuredToJsonMessage({ content: null }, { unwrapContent: true }), "")
 })
 
 test("structuredToJsonMessage serialises a json_schema answer", () => {
   assert.equal(structuredToJsonMessage({ city: "Paris" }), '{"city":"Paris"}')
   assert.equal(structuredToJsonMessage("already json"), "already json")
+})
+
+test("structuredToJsonMessage keeps the whole object without unwrapping", () => {
+  assert.equal(structuredToJsonMessage({ content: "hello" }), '{"content":"hello"}')
 })

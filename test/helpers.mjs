@@ -57,10 +57,11 @@ export async function startMockProvider({ reply = "Hello from mock", onRequest }
       if (parsed?.stream) {
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" })
         const base = { id: "chatcmpl-mock", object: "chat.completion.chunk", created: 1700000000, model: parsed.model }
+        const usage = { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 }
         for (const piece of String(reply).split(/(?<= )/)) {
           res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] })}\n\n`)
         }
-        res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`)
+        res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage })}\n\n`)
         res.write("data: [DONE]\n\n")
         res.end()
         return

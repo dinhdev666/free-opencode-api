@@ -149,15 +149,26 @@ message body then contains the raw JSON, exactly as OpenAI does.
 | ----- | ------ |
 | `model` | `provider/model`, a bare model id, or `provider/model#variant`. |
 | `messages` | The conversation. `system`/`developer` messages become the system prompt. |
-| `tools` / `tool_choice` | Function definitions, emulated through structured output. |
+| `tools` / `tool_choice` | Function definitions, emulated through structured output. `tool_choice` accepts `"auto"`, `"none"`, `"required"` and `{"type":"function","function":{"name":…}}`. |
 | `response_format` | `json_object` or `json_schema`. |
 | `stream` | SSE streaming. |
-| `stream_options.include_usage` | Accepted; a usage block is always sent at the end. |
+| `stream_options.include_usage` | Defaults to on; set it to `false` to omit the usage chunk. |
 
 `max_tokens` and `max_completion_tokens` are accepted but opencode has no
 per-request token limit — the cap is set server-wide with `MAX_OUTPUT_TOKENS`.
-`temperature`, `top_p` and `stop` are accepted and ignored: opencode picks
-those per model.
+`temperature`, `top_p`, `stop`, `seed`, `n`, `user` and the penalty fields are
+accepted and ignored: opencode picks the sampling parameters per model.
+
+### OpenAI SDK compatibility
+
+The proxy is exercised against the real [OpenAI Node SDK](https://github.com/openai/openai-node)
+in `test/openai-sdk.test.mjs`. The SDK validates the response shape and throws
+on anything it does not understand, so it is the strictest available check.
+
+```bash
+pnpm add -D openai   # only needed to run that test file
+pnpm test
+```
 
 ### Keeping requests cheap
 
@@ -315,6 +326,7 @@ test/
   proxy.test.mjs      end-to-end: models, health, chat, streaming, completions
   tools.test.mjs      end-to-end: function-calling emulation
   response-format.test.mjs end-to-end: json_object and json_schema
+  openai-sdk.test.mjs compatibility with the real OpenAI SDK
   errors.test.mjs     end-to-end: rate limits, unreachable servers
   registry.test.mjs   unit tests for the model registry
   translator.test.mjs unit tests for the OpenAI <-> opencode translation

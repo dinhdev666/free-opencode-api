@@ -46,7 +46,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
     const token = header.startsWith("Bearer ") ? header.slice(7).trim() : request.headers["x-api-key"]
     if (token !== config.apiKey) {
       return reply.code(401).send({
-        error: { message: "Invalid API key", type: "invalid_request_error", code: "invalid_api_key" },
+        error: { message: "Invalid API key", type: "invalid_request_error", param: null, code: "invalid_api_key" },
       })
     }
   })
@@ -63,7 +63,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ServiceError) {
       return reply.code(error.status).send({
-        error: { message: error.message, type: "proxy_error", code: error.code },
+        error: { message: error.message, type: "proxy_error", param: error.param ?? null, code: error.code },
       })
     }
     // An opencode request that ran out of time.
@@ -74,23 +74,24 @@ export function buildServer({ client, registry, eventBus } = {}) {
             error.message ??
             "The upstream provider did not answer in time. opencode retries slow providers automatically; raise REQUEST_TIMEOUT or try another model.",
           type: "proxy_error",
+          param: null,
           code: "timeout",
         },
       })
     }
     if (error?.code === "unavailable") {
       return reply.code(503).send({
-        error: { message: error.message, type: "proxy_error", code: "opencode_unavailable" },
+        error: { message: error.message, type: "proxy_error", param: null, code: "opencode_unavailable" },
       })
     }
     if (error.validation) {
       return reply.code(400).send({
-        error: { message: error.message, type: "invalid_request_error", code: "invalid_request" },
+        error: { message: error.message, type: "invalid_request_error", param: null, code: "invalid_request" },
       })
     }
     request.log?.error({ err: error }, "request failed")
     return reply.code(error.statusCode ?? 500).send({
-      error: { message: error.message ?? "internal error", type: "proxy_error", code: "internal_error" },
+      error: { message: error.message ?? "internal error", type: "proxy_error", param: null, code: "internal_error" },
     })
   })
 
@@ -125,7 +126,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
     const entry = modelRegistry.resolve(request.params.id)
     if (!entry) {
       return reply.code(404).send({
-        error: { message: `Model '${request.params.id}' not found`, type: "invalid_request_error", code: "model_not_found" },
+        error: { message: `Model '${request.params.id}' not found`, type: "invalid_request_error", param: "model", code: "model_not_found" },
       })
     }
     return reply.send({
@@ -142,7 +143,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
     const body = request.body ?? {}
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       return reply.code(400).send({
-        error: { message: "'messages' is required and must be a non-empty array", type: "invalid_request_error", code: "invalid_request" },
+        error: { message: "'messages' is required and must be a non-empty array", type: "invalid_request_error", param: "messages", code: "invalid_request" },
       })
     }
 
@@ -164,7 +165,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
       } catch (err) {
         app.log.error({ err }, "stream failed")
         reply.raw.write(
-          `data: ${JSON.stringify({ error: { message: err.message, type: "proxy_error", code: err.code ?? "internal_error" } })}\n\n`,
+          `data: ${JSON.stringify({ error: { message: err.message, type: "proxy_error", param: err.param ?? null, code: err.code ?? "internal_error" } })}\n\n`,
         )
         reply.raw.write("data: [DONE]\n\n")
       } finally {
@@ -184,7 +185,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
     const prompt = body.prompt
     if (prompt === undefined || prompt === null) {
       return reply.code(400).send({
-        error: { message: "'prompt' is required", type: "invalid_request_error", code: "invalid_request" },
+        error: { message: "'prompt' is required", type: "invalid_request_error", param: "prompt", code: "invalid_request" },
       })
     }
 
@@ -246,7 +247,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
       } catch (err) {
         app.log.error({ err }, "stream failed")
         reply.raw.write(
-          `data: ${JSON.stringify({ error: { message: err.message, type: "proxy_error", code: err.code ?? "internal_error" } })}\n\n`,
+          `data: ${JSON.stringify({ error: { message: err.message, type: "proxy_error", param: err.param ?? null, code: err.code ?? "internal_error" } })}\n\n`,
         )
         reply.raw.write("data: [DONE]\n\n")
       } finally {

@@ -345,6 +345,7 @@ test/
   openai-sdk.test.mjs compatibility with the real OpenAI SDK
   errors.test.mjs     end-to-end: rate limits, unreachable servers
   deployment.test.mjs the Dockerfile and railway.json follow Railway's rules
+  binary.test.mjs     the opencode binary is found and executable
   registry.test.mjs   unit tests for the model registry
   translator.test.mjs unit tests for the OpenAI <-> opencode translation
 ```

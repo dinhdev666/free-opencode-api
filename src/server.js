@@ -275,16 +275,30 @@ export function buildServer({ client, registry, eventBus } = {}) {
     })
   })
 
-  /** Refreshes the model catalogue from opencode when it is stale. */
+  /**
+   * Refreshes the model catalogue from opencode when it is stale.
+   *
+   * The refresh is shared: concurrent requests wait for the one in flight
+   * instead of each pulling the ~7 MB catalogue on its own.
+   */
+  let refresh = null
   async function ensureModels() {
     if (!modelRegistry.isStale() && modelRegistry.size) return
-    try {
-      const payload = await ocClient.providers()
-      modelRegistry.update(payload)
-    } catch (err) {
-      if (!modelRegistry.size) throw err
-      app.log.warn({ err }, "could not refresh opencode model catalogue")
-    }
+    if (refresh) return refresh
+
+    refresh = (async () => {
+      try {
+        const payload = await ocClient.providers()
+        modelRegistry.update(payload)
+      } catch (err) {
+        if (!modelRegistry.size) throw err
+        app.log.warn({ err }, "could not refresh opencode model catalogue")
+      }
+    })().finally(() => {
+      refresh = null
+    })
+
+    return refresh
   }
 
   return app

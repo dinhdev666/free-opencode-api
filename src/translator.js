@@ -91,11 +91,21 @@ export function contentToText(content) {
 export function messagesToParts(messages) {
   const parts = []
 
+  // Map the tool call id to the function name, so a tool result can name the
+  // function it belongs to even when the client did not send `name`.
+  const callNames = new Map()
+  for (const message of messages ?? []) {
+    for (const call of message?.tool_calls ?? []) {
+      if (call?.id && call?.function?.name) callNames.set(call.id, call.function.name)
+    }
+  }
+
   for (const message of messages ?? []) {
     if (!message || typeof message !== "object") continue
     const role = message.role ?? "user"
     if (role === "tool" || role === "function") {
-      const name = message.name ?? message.tool_call_id ?? "tool"
+      const id = message.tool_call_id ?? message.id
+      const name = message.name ?? (id ? callNames.get(id) : undefined) ?? "tool"
       parts.push({ type: "text", text: `[Tool result: ${name}]\n${contentToText(message.content)}` })
       continue
     }

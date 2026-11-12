@@ -1,0 +1,22 @@
+services:
+  proxy:
+    build: .
+    image: free-opencode-api
+    restart: unless-stopped
+    ports:
+      - "20128:20128"
+    environment:
+      PORT: "20128"
+      HOST: "0.0.0.0"
+      LOG_LEVEL: "silent"
+      SPAWN_OPENCODE: "true"
+      # Change this before exposing the proxy to anyone.
+      API_KEY: "sk-dummy"
+      # Optional: the model used when a request does not specify one.
+      # DEFAULT_MODEL: "opencode/glm-5.3-flash-free"
+    volumes:
+      # Keeps the opencode session history and the provider credentials.
+      - opencode-data:/data
+
+volumes:
+  opencode-data:

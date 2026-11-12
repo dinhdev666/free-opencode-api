@@ -1,0 +1,323 @@
+# Free OpenCode API
+
+An **OpenAI-compatible REST API** that reuses the AI models you are already
+signed in to with the [opencode](https://opencode.ai) CLI.
+
+Point any OpenAI-compatible tool at it and it talks to opencode instead of
+`api.openai.com`:
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:20128/v1
+export OPENAI_API_KEY=sk-dummy
+```
+
+- **Server:** Fastify (Node.js, ESM)
+- **Package manager:** pnpm
+- **opencode:** installed as a project dependency — never globally
+- **Default port:** `20128` · **Default API key:** `sk-dummy`
+- **Lightweight by design:** no log files, no build step, 3 runtime dependencies
+
+---
+
+## Quick start
+
+```bash
+pnpm install          # installs fastify, @fastify/cors and opencode-ai
+pnpm start            # spawns `opencode serve` and starts the proxy
+```
+
+The proxy listens on `http://127.0.0.1:20128` by default.
+
+```bash
+# list the models opencode can reach
+curl http://127.0.0.1:20128/v1/models -H 'authorization: Bearer sk-dummy'
+
+# chat
+curl http://127.0.0.1:20128/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer sk-dummy' \
+  -d '{
+    "model": "opencode/glm-5.3-flash-free",
+    "messages": [{"role": "user", "content": "Say hello"}]
+  }'
+```
+
+> **Note** — the opencode CLI must already be authenticated for the providers
+> you want to use (`opencode auth login`, or `/connect` in the TUI). The proxy
+> reuses those credentials; it never stores its own.
+
+---
+
+## Endpoints
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| `GET`  | `/v1/models` | Every model the connected opencode providers expose. |
+| `GET`  | `/v1/models/:id` | A single model. |
+| `POST` | `/v1/chat/completions` | Chat completions, streaming and non-streaming. |
+| `POST` | `/v1/completions` | Legacy text completions (prompt → text), streaming and non-streaming. |
+| `GET`  | `/health` | Proxy + opencode health, also at `/v1/health`. |
+
+Every endpoint except `/health` requires `Authorization: Bearer <API_KEY>`.
+
+### Model ids
+
+Both forms are accepted and resolve to the same model:
+
+- `opencode/glm-5.3-flash-free` — fully qualified, unambiguous
+- `glm-5.3-flash-free` — bare model id; resolves to the first provider that
+  offers it, preferring a connected provider
+
+opencode's own variant syntax works too: `provider/model#high`.
+
+The model list is **never hard-coded** — `/v1/models` reflects whatever the
+connected opencode catalogue contains at that moment.
+
+### Streaming
+
+`"stream": true` returns a standard OpenAI SSE stream:
+
+```
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"}}]}
+…
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"choices":[],"usage":{"prompt_tokens":…,"completion_tokens":…,"total_tokens":…}}
+data: [DONE]
+```
+
+Reasoning models also receive their thinking under `delta.reasoning_content`,
+so it never contaminates the assistant message.
+
+---
+
+## How it works
+
+```
+OpenAI client ──HTTP──▶ Fastify proxy ──HTTP──▶ opencode serve ──▶ provider
+```
+
+The proxy does not reimplement an LLM client. It speaks opencode's own HTTP
+API (`opencode serve`), which exposes an OpenAPI 3.1 spec at `/doc`:
+
+1. `POST /session` creates a session.
+2. `POST /session/{id}/prompt_async` starts the turn.
+3. `GET /event` (SSE) streams `message.part.delta` events while it runs.
+
+### Function calling
+
+opencode has no per-request "here are my functions" hook. The proxy emulates
+OpenAI function calling on top of opencode's **structured output** support:
+
+- the caller's function definitions are compiled into a JSON Schema,
+- that schema is sent as opencode's `format: { type: "json_schema", … }`,
+- opencode asks the model to call its internal `StructuredOutput` tool,
+- the structured answer is converted back into OpenAI `tool_calls`.
+
+`tool_choice` is honoured: `"none"` suppresses tool calls, and
+`{"type":"function","function":{"name":"…"}}` restricts the schema to one
+function.
+
+### Keeping requests cheap
+
+opencode is a coding agent, so a naive proxy would ship its whole agent
+context with every request. The `proxy` agent in `opencode.json` removes that
+overhead:
+
+| Setting | Effect |
+| ------- | ------ |
+| `tools: { …: false }` | Drops every built-in tool schema from the request. |
+| `prompt: "You are a helpful assistant."` | Replaces opencode's ~2 kB base prompt. |
+| `title: { disable: true }` | Stops the extra LLM call opencode spends on a session title. |
+| `compaction: { auto: false }` | Stops the automatic compaction LLM call. |
+
+Measured effect on one request: **≈ 8 000 → ≈ 5 900 prompt tokens**, and the
+provider is hit **once** instead of twice.
+
+The proxy additionally creates every session with an explicit title, which is
+a second, request-level way to skip opencode's title generation.
+
+### Failing providers fail fast
+
+opencode retries a failing provider internally — 5 retries with a 2 s → 30 s
+backoff, so a request would hang for ~90 seconds. The proxy watches opencode's
+`session.status` events and aborts the turn as soon as a retry shows up, so a
+rate-limited provider returns **HTTP 429 in under a second** instead of
+blocking the request.
+
+The number of tolerated retries is configurable via `MAX_RETRY_ATTEMPTS`
+(default `1`, i.e. give up at the first retry).
+
+| Provider problem | HTTP status | `error.code` |
+| ---------------- | ----------- | ------------ |
+| Free tier / rate limit | `429` | `provider_rate_limited` |
+| Missing or invalid credentials | `401` | `provider_unauthorized` |
+| Context window exceeded | `413` | `context_too_long` |
+| Anything else | `502` | `provider_error` |
+| opencode unreachable | `503` | `opencode_unavailable` |
+| No answer in time | `504` | `timeout` |
+
+---
+
+## Configuration
+
+Configuration lives in `.env` (already included, with the defaults below).
+Environment variables always take precedence over the file.
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `PORT` | `20128` | Port the proxy listens on. |
+| `HOST` | `0.0.0.0` | Interface the proxy binds to. |
+| `API_KEY` | `sk-dummy` | Clients must send `Authorization: Bearer <key>`. |
+| `SPAWN_OPENCODE` | `true` | Spawn `opencode serve` from `node_modules/.bin`. |
+| `OPENCODE_HOST` / `OPENCODE_PORT` | `127.0.0.1` / `4096` | Where the opencode server is. |
+| `DEFAULT_MODEL` | *(empty)* | Model used when the client does not send one. |
+| `DEFAULT_AGENT` | `proxy` | opencode agent used for proxied requests. |
+| `REQUEST_TIMEOUT` | `300` | Seconds a single completion may take. |
+| `MAX_RETRY_ATTEMPTS` | `1` | Provider retries opencode may make before the proxy gives up. |
+| `DELETE_SESSIONS` | `false` | Delete each opencode session after the request. |
+| `LOG_LEVEL` | `silent` | pino log level. `silent` writes no log files. |
+| `MODEL_OWNER` | `opencode` | Owner string reported by `/v1/models`. |
+
+See `.env.example` for the annotated list.
+
+---
+
+## Docker
+
+```bash
+docker compose up -d
+curl http://127.0.0.1:20128/health
+```
+
+The image is a slim `node:22-alpine` build with a `tini` init and a
+`HEALTHCHECK`. The opencode state (sessions, provider credentials) lives in
+the `/data` volume, so it survives restarts.
+
+To authenticate a provider inside the container:
+
+```bash
+docker compose exec proxy opencode auth login
+```
+
+---
+
+## Deploying on Railway
+
+The repository is Railway-ready out of the box — `railway.json` builds the
+Dockerfile and points the health check at `/health`.
+
+1. Push the repository to GitHub.
+2. **New Project → Deploy from GitHub repo**.
+3. Railway detects the Dockerfile and builds it.
+4. In **Variables**, set at least `API_KEY` (and optionally `DEFAULT_MODEL`).
+5. Railway injects `PORT`; the proxy honours it.
+
+Railway injects `PORT` at runtime, so no further configuration is needed for
+the port. The container listens on `0.0.0.0` so Railway can reach it.
+
+```bash
+curl https://<your-domain>/v1/models -H "authorization: Bearer $API_KEY"
+```
+
+> The opencode credentials live in the container filesystem (`/data`). On
+> Railway the filesystem is ephemeral, so run `opencode auth login` once per
+> deployment, or mount a volume if your plan supports it.
+
+---
+
+## Using it with other tools
+
+**Any OpenAI SDK**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:20128/v1", api_key="sk-dummy")
+print(client.chat.completions.create(
+    model="opencode/glm-5.3-flash-free",
+    messages=[{"role": "user", "content": "Say hello"}],
+).choices[0].message.content)
+```
+
+```ts
+import OpenAI from "openai"
+
+const client = new OpenAI({ baseURL: "http://127.0.0.1:20128/v1", apiKey: "sk-dummy" })
+```
+
+**Cursor / Continue / Cline / Aider** — set the provider's *OpenAI-compatible*
+base URL to `http://127.0.0.1:20128/v1`.
+
+**Local tool that wants `/v1` paths only** — the proxy also answers
+`/health` and `/v1/health` without an API key.
+
+---
+
+## Development
+
+```bash
+pnpm install
+pnpm dev     # node --watch src/index.js
+pnpm test    # node --test
+```
+
+The test suite boots a real opencode server against a **mock OpenAI-compatible
+provider**, so it needs no network access and burns no provider quota.
+
+```
+test/
+  helpers.mjs        mock provider + opencode server harness
+  proxy.test.mjs     end-to-end: models, health, chat, streaming, completions
+  tools.test.mjs     end-to-end: function-calling emulation
+  errors.test.mjs    end-to-end: rate limits, unreachable servers
+  translator.test.mjs unit tests for the OpenAI <-> opencode translation
+```
+
+See [AGENTS.md](AGENTS.md) for the architecture notes and the opencode API
+gotchas that are easy to get wrong.
+
+---
+
+## Layout
+
+```
+src/
+  index.js            entry point: boots opencode + the proxy
+  server.js           Fastify routes
+  service.js          orchestration: opencode session -> OpenAI response
+  translator.js       OpenAI messages/tools <-> opencode parts/schema
+  opencode-client.js  HTTP client for the opencode server
+  opencode-server.js  spawns and supervises `opencode serve`
+  event-bus.js        multiplexes opencode's global SSE stream
+  model-registry.js   opencode catalogue -> OpenAI model list
+  config.js           environment configuration + .env loader
+opencode.json         the tool-less `proxy` agent
+Dockerfile            container image
+docker-compose.yml    local container setup
+railway.json          Railway deployment
+```
+
+---
+
+## Troubleshooting
+
+**`opencode binary not found in node_modules/.bin`** — run `pnpm install`.
+
+**`Free usage limit reached`** — the upstream provider's free tier is
+exhausted. The proxy surfaces this as HTTP `429` with code
+`provider_rate_limited`. Wait, or connect a paid provider in opencode.
+
+**`Model 'x' is not available`** — the model is not in the opencode catalogue
+yet. Check `GET /v1/models` and make sure the provider is connected.
+
+**`Invalid API key`** — clients must send `Authorization: Bearer <API_KEY>`.
+The default key is `sk-dummy`.
+
+**No output / hangs** — check `~/.local/share/opencode/log/opencode.log`
+(`/data/log/opencode.log` in Docker).
+
+---
+
+## License
+
+MIT © Phạm Văn Định

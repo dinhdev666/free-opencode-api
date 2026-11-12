@@ -1,0 +1,9 @@
+node_modules/
+*.log
+proxy.log
+proxy.err
+oc-serve*.log
+oc-serve*.err
+oc-spec.json
+test-out.txt
+t.txt

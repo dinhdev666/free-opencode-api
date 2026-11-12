@@ -1,0 +1,21 @@
+# Keep the line endings consistent across platforms.
+* text=auto eol=lf
+
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.json text eol=lf
+*.jsonc text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+Procfile text eol=lf
+*.sh   text eol=lf
+
+# The lockfile and the opencode config are generated as-is.
+pnpm-lock.yaml text eol=lf
+opencode.json text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.ico  binary

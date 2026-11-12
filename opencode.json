@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "proxy": {
+      "mode": "primary",
+      "prompt": "You are a helpful assistant.",
+      "tools": {
+        "bash": false,
+        "read": false,
+        "glob": false,
+        "grep": false,
+        "edit": false,
+        "write": false,
+        "task": false,
+        "webfetch": false,
+        "todowrite": false,
+        "websearch": false,
+        "skill": false,
+        "apply_patch": false,
+        "invalid": false,
+        "question": false
+      }
+    },
+    "title": { "disable": true }
+  },
+  "compaction": { "auto": false }
+}

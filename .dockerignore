@@ -1,0 +1,15 @@
+node_modules
+.git
+.gitignore
+.env
+test
+*.log
+proxy.log
+proxy.err
+oc-spec.json
+README.md
+AGENTS.md
+LICENSE
+docker-compose.yml
+Dockerfile
+.dockerignore

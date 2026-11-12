@@ -19,7 +19,13 @@ export class ProxyService {
   resolveModel(requested) {
     const wanted = requested || config.defaultModel
     if (!wanted) {
-      throw new ServiceError("No model specified and DEFAULT_MODEL is not configured", 400, "model_required")
+      throw new ServiceError(
+        "No model specified and DEFAULT_MODEL is not configured",
+        400,
+        "model_required",
+        undefined,
+        "model",
+      )
     }
 
     const entry = this.registry.resolve(wanted)
@@ -28,6 +34,8 @@ export class ProxyService {
         `Model '${wanted}' is not available. Call GET /v1/models for the list of available models.`,
         404,
         "model_not_found",
+        undefined,
+        "model",
       )
     }
     return entry
@@ -97,12 +105,13 @@ export class ProxyService {
 
       const usage = usageFrom(result?.info?.tokens)
       const structured = result?.info?.structured
-      const wantsJson = Boolean(buildResponseFormat(body.response_format))
+      const responseFormat = buildResponseFormat(body.response_format)
+      const wantsJson = Boolean(responseFormat) && !body.tools?.length
 
       if (structured !== undefined && structured !== null) {
         // A response_format request wants the raw JSON as the message body.
-        if (wantsJson && !body.tools?.length) {
-          const content = structuredToJsonMessage(structured)
+        if (wantsJson) {
+          const content = structuredToJsonMessage(structured, responseFormat)
           return {
             id: completionId(),
             object: "chat.completion",
@@ -194,6 +203,10 @@ export class ProxyService {
       emit(`data: ${JSON.stringify(payload)}\n\n`)
     }
 
+    // The OpenAI streaming protocol opens with a chunk that only carries the
+    // role, before any content arrives.
+    send({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })
+
     // Track streamed text so we can emit a final usage block.
     let streamedText = ""
     let finalText = ""
@@ -205,7 +218,8 @@ export class ProxyService {
     const messageRoles = new Map()
     let structuredEmitted = false
     /** The client asked for a JSON answer through `response_format`. */
-    const wantsJson = Boolean(buildResponseFormat(body.response_format)) && !body.tools?.length
+    const responseFormat = buildResponseFormat(body.response_format)
+    const wantsJson = Boolean(responseFormat) && !body.tools?.length
 
     // Structured output arrives as a `StructuredOutput` tool part, which
     // opencode publishes *after* the prompt call resolves. Resolve this
@@ -219,6 +233,13 @@ export class ProxyService {
     let resolveDone
     const done = new Promise((resolve) => {
       resolveDone = resolve
+    })
+
+    // The token counts arrive in their own event, which can land a moment
+    // after the turn is over.
+    let resolveUsage
+    const usageReady = new Promise((resolve) => {
+      resolveUsage = resolve
     })
 
     /** True while we are handling an assistant message (not the user's echo). */
@@ -292,8 +313,8 @@ export class ProxyService {
             structuredEmitted = true
 
             // A response_format request wants the raw JSON as the content.
-            if (wantsJson && !body.tools?.length) {
-              const json = structuredToJsonMessage(state.input)
+            if (wantsJson) {
+              const json = structuredToJsonMessage(state.input, responseFormat)
               if (json) {
                 send({ ...base, choices: [{ index: 0, delta: { content: json }, finish_reason: null }] })
               }
@@ -328,7 +349,10 @@ export class ProxyService {
         const info = props.info
         if (info?.role === "assistant" && info.tokens) {
           const messageUsage = usageFrom(info.tokens)
-          if (messageUsage.total_tokens > 0) usage = messageUsage
+          if (messageUsage.total_tokens > 0) {
+            usage = messageUsage
+            resolveUsage?.()
+          }
         }
         if (info?.role === "assistant" && info.error) {
           // opencode keeps retrying the provider internally. Abort the request
@@ -366,6 +390,13 @@ export class ProxyService {
       await Promise.race([done, timeout])
       timeout.cancel?.()
 
+      // The token counts can arrive just after the turn ended.
+      if (!usage) {
+        const usageTimeout = timeoutAfter(1000)
+        await Promise.race([usageReady, usageTimeout])
+        usageTimeout.cancel?.()
+      }
+
       if (providerFailure) {
         throw new ServiceError(providerFailure.message, providerFailure.status, providerFailure.code)
       }
@@ -384,7 +415,10 @@ export class ProxyService {
       }
 
       send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })
-      send({ ...base, choices: [], usage: usage ?? usageFrom(null) })
+      // OpenAI only appends the usage chunk when the client asked for it.
+      if (body.stream_options?.include_usage !== false) {
+        send({ ...base, choices: [], usage: usage ?? usageFrom(null) })
+      }
       emit("data: [DONE]\n\n")
     } catch (err) {
       if (providerFailure) {
@@ -448,12 +482,14 @@ export class ProxyService {
 }
 
 export class ServiceError extends Error {
-  constructor(message, status = 500, code = "error", details) {
+  constructor(message, status = 500, code = "error", details, param = null) {
     super(message)
     this.name = "ServiceError"
     this.status = status
     this.code = code
     this.details = details
+    /** The request field the error refers to, like the OpenAI error shape. */
+    this.param = param
   }
 }
 

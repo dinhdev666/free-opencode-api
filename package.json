@@ -29,5 +29,8 @@
     "@fastify/cors": "^11.4.1",
     "fastify": "^5.12.8",
     "opencode-ai": "1.19.5"
+  },
+  "devDependencies": {
+    "openai": "^7.55.0"
   }
 }

@@ -240,7 +240,12 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
   let lastError = ""
   for (;;) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/global/health`)
+      // The health check needs its own timeout: a busy server accepts the
+      // connection but does not answer, and an unanswered fetch would hang
+      // the whole test file.
+      const res = await fetch(`http://127.0.0.1:${port}/global/health`, {
+        signal: AbortSignal.timeout(10000),
+      })
       if (res.ok) break
       lastError = `health returned ${res.status}`
     } catch (err) {
@@ -265,6 +270,7 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ type: "api", key: "test-key" }),
+    signal: AbortSignal.timeout(30000),
   })
   if (!auth.ok) {
     killTree(child)
@@ -327,33 +333,78 @@ async function waitForFreePort(port) {
 /**
  * Kills whatever process is still listening on a TCP port.
  *
- * Uses `lsof` on macOS and `fuser`/`ss` on Linux. A failure is ignored: the
- * port is released when the process exits anyway.
+ * On Linux the owner is found by reading `/proc`, which needs no extra tool.
+ * On macOS `lsof` does the job. A failure is ignored: the port is released
+ * when the process exits anyway.
  */
 async function killPortOwner(port) {
-  const commands =
-    process.platform === "darwin"
-      ? [["lsof", ["-ti", `tcp:${port}`], "kill"]]
-      : [
-          ["fuser", ["-k", `${port}/tcp`], null],
-          ["ss", ["-lptn", `sport = :${port}`], null],
-        ]
-
-  for (const [command, args] of commands) {
+  const pids = await portOwners(port)
+  for (const pid of pids) {
     try {
-      const { stdout } = await run(command, args, { timeout: 5000 })
-      if (command === "lsof" && stdout.trim()) {
-        for (const pid of stdout.trim().split(/\s+/)) {
-          if (/^\d+$/.test(pid)) {
-            try {
-              process.kill(Number(pid), "SIGKILL")
-            } catch {}
-          }
-        }
-        return
+      process.kill(pid, "SIGKILL")
+    } catch {}
+  }
+}
+
+/** Finds the process ids listening on a TCP port. */
+async function portOwners(port) {
+  if (process.platform === "linux") {
+    const pids = new Set()
+    // Every socket shows up as an inode in /proc/net/tcp.
+    const inodes = new Set()
+    for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+      let content
+      try {
+        content = await fs.promises.readFile(file, "utf8")
+      } catch {
+        continue
       }
+      for (const line of content.split("\n").slice(1)) {
+        const columns = line.trim().split(/\s+/)
+        if (columns.length < 10) continue
+        const local = columns[1]
+        const state = columns[3]
+        if (state !== "0A") continue // LISTEN
+        if (Number(local.split(":")[1], 16) !== port) continue
+        inodes.add(columns[9])
+      }
+    }
+    if (!inodes.size) return []
+
+    for (const entry of await fs.promises.readdir("/proc")) {
+      if (!/^\d+$/.test(entry)) continue
+      let fds
+      try {
+        fds = await fs.promises.readdir(`/proc/${entry}/fd`)
+      } catch {
+        continue
+      }
+      for (const fd of fds) {
+        try {
+          const link = await fs.promises.readlink(`/proc/${entry}/fd/${fd}`)
+          const match = /^socket:\[(\d+)\]$/.exec(link)
+          if (match && inodes.has(match[1])) {
+            pids.add(Number(entry))
+            break
+          }
+        } catch {}
+      }
+    }
+    return [...pids]
+  }
+
+  if (process.platform === "darwin") {
+    try {
+      const { stdout } = await run("lsof", ["-ti", `tcp:${port}`], { timeout: 5000 })
+      return stdout
+        .trim()
+        .split(/\s+/)
+        .filter((pid) => /^\d+$/.test(pid))
+        .map(Number)
     } catch {
-      // The tool may not exist; try the next one.
+      return []
     }
   }
+
+  return []
 }

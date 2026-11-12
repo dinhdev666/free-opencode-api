@@ -127,3 +127,16 @@ When adding behaviour, add a test. The two properties that must never regress:
 - Comments explain *why*, not *what*.
 - Prefer the platform API over a dependency: `fetch`, `AbortController`,
   `node:test` — all built in.
+
+## Commits
+
+The project uses Conventional Commits. The full standard, with examples, is
+in [CONTRIBUTING.md](CONTRIBUTING.md). In short:
+
+```
+<type>(<scope>): <subject>
+```
+
+with `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci` or
+`chore` as the type. The subject is imperative, in the present tense, under 72
+characters, without a trailing period. One commit does one thing.

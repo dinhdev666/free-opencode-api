@@ -287,7 +287,8 @@ test/
 - **docker** — builds the image and smoke-tests the container
 
 See [AGENTS.md](AGENTS.md) for the architecture notes and the opencode API
-gotchas that are easy to get wrong.
+gotchas that are easy to get wrong. Contributions are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the commit message standard.
 
 ---
 

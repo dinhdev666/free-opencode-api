@@ -4,7 +4,7 @@
  */
 
 import { config } from "./config.js"
-import { buildToolSchema, contentToText, flattenMessages, messagesToParts, structuredToResponse } from "./translator.js"
+import { buildResponseFormat, buildToolSchema, contentToText, flattenMessages, messagesToParts, structuredToJsonMessage, structuredToResponse } from "./translator.js"
 
 export class ProxyService {
   constructor({ client, registry, eventBus }) {
@@ -97,8 +97,29 @@ export class ProxyService {
 
       const usage = usageFrom(result?.info?.tokens)
       const structured = result?.info?.structured
+      const wantsJson = Boolean(buildResponseFormat(body.response_format))
 
       if (structured !== undefined && structured !== null) {
+        // A response_format request wants the raw JSON as the message body.
+        if (wantsJson && !body.tools?.length) {
+          const content = structuredToJsonMessage(structured)
+          return {
+            id: completionId(),
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: model.id,
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: content || null },
+                logprobs: null,
+                finish_reason: "stop",
+              },
+            ],
+            usage,
+          }
+        }
+
         const { content, toolCalls } = structuredToResponse(structured)
         return {
           id: completionId(),
@@ -183,6 +204,8 @@ export class ProxyService {
     /** messageID -> role */
     const messageRoles = new Map()
     let structuredEmitted = false
+    /** The client asked for a JSON answer through `response_format`. */
+    const wantsJson = Boolean(buildResponseFormat(body.response_format)) && !body.tools?.length
 
     // Structured output arrives as a `StructuredOutput` tool part, which
     // opencode publishes *after* the prompt call resolves. Resolve this
@@ -267,6 +290,17 @@ export class ProxyService {
           if (state.status === "running" || state.status === "completed") {
             if (!state.input) return
             structuredEmitted = true
+
+            // A response_format request wants the raw JSON as the content.
+            if (wantsJson && !body.tools?.length) {
+              const json = structuredToJsonMessage(state.input)
+              if (json) {
+                send({ ...base, choices: [{ index: 0, delta: { content: json }, finish_reason: null }] })
+              }
+              resolveStructured?.(true)
+              return
+            }
+
             const { content, toolCalls } = structuredToResponse(state.input)
             if (content) {
               send({ ...base, choices: [{ index: 0, delta: { content }, finish_reason: null }] })
@@ -398,8 +432,16 @@ export class ProxyService {
     const system = extractSystemPrompt(body.messages)
     if (system) payload.system = system
 
-    const schema = buildToolSchema(body.tools, body.tool_choice)
-    if (schema) payload.format = { type: "json_schema", schema }
+    // Function calling and response_format both use opencode's structured
+    // output, so only one schema can be active at a time. Tools win, because
+    // a tool call carries the answer.
+    const toolSchema = buildToolSchema(body.tools, body.tool_choice)
+    if (toolSchema) {
+      payload.format = { type: "json_schema", schema: toolSchema }
+    } else {
+      const responseFormat = buildResponseFormat(body.response_format)
+      if (responseFormat) payload.format = { type: "json_schema", schema: responseFormat.schema }
+    }
 
     return payload
   }

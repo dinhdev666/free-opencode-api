@@ -7,13 +7,17 @@
  */
 
 import { spawn } from "node:child_process"
+import { execFile } from "node:child_process"
 import http from "node:http"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { promisify } from "node:util"
 
 import { config } from "../src/config.js"
+
+const run = promisify(execFile)
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 export const projectRoot = path.resolve(here, "..")
@@ -103,10 +107,6 @@ function killTree(child) {
     return
   }
   try {
-    // Kill the whole process group: the negative pid reaches the children.
-    process.kill(-child.pid, "SIGKILL")
-  } catch {}
-  try {
     child.kill("SIGKILL")
   } catch {}
 }
@@ -191,9 +191,6 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
       },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
-      // On POSIX the child becomes a process-group leader, so the teardown can
-      // kill the opencode server it starts as well.
-      detached: !isWindows,
     },
   )
   let stderr = ""
@@ -253,9 +250,47 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
         child.once("exit", resolve)
         setTimeout(resolve, 3000).unref?.()
       })
+      // The opencode binary starts the real server as a child process. If it
+      // is still holding the port, the next test would talk to it instead of
+      // to a fresh server.
+      await killPortOwner(port)
       try {
         fs.rmSync(dir, { recursive: true, force: true })
       } catch {}
     },
+  }
+}
+
+/**
+ * Kills whatever process is still listening on a TCP port.
+ *
+ * Uses `lsof` on macOS and `fuser`/`ss` on Linux. A failure is ignored: the
+ * port is released when the process exits anyway.
+ */
+async function killPortOwner(port) {
+  const commands =
+    process.platform === "darwin"
+      ? [["lsof", ["-ti", `tcp:${port}`], "kill"]]
+      : [
+          ["fuser", ["-k", `${port}/tcp`], null],
+          ["ss", ["-lptn", `sport = :${port}`], null],
+        ]
+
+  for (const [command, args] of commands) {
+    try {
+      const { stdout } = await run(command, args, { timeout: 5000 })
+      if (command === "lsof" && stdout.trim()) {
+        for (const pid of stdout.trim().split(/\s+/)) {
+          if (/^\d+$/.test(pid)) {
+            try {
+              process.kill(Number(pid), "SIGKILL")
+            } catch {}
+          }
+        }
+        return
+      }
+    } catch {
+      // The tool may not exist; try the next one.
+    }
   }
 }

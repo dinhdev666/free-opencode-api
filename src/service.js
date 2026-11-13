@@ -60,8 +60,9 @@ export class ProxyService {
         const attempt = props.status.attempt ?? 1
         if (attempt >= (config.maxRetryAttempts ?? 1)) {
           providerFailure = providerErrorStatus(props.status.message ?? "the provider is retrying")
+          // Abort the request to opencode. The session itself is left alone:
+          // aborting it makes opencode answer the next request with 499.
           abortController.abort()
-          this.client.abortSession(session.id).catch(() => {})
         }
         return
       }
@@ -92,6 +93,9 @@ export class ProxyService {
         if (providerFailure) {
           throw new ServiceError(providerFailure.message, providerFailure.status, providerFailure.code)
         }
+        // The client left before the answer was ready. There is nobody left
+        // to answer, so this is not an error anyone has to see.
+        if (signal?.aborted) return undefined
         // opencode answers a failing provider with an HTTP error of its own.
         throw toServiceError(err)
       }
@@ -186,7 +190,16 @@ export class ProxyService {
       }
     } finally {
       unsubscribe()
-      if (config.deleteSessions) await this.client.deleteSession(session.id)
+      // A client that disconnected leaves the session half-finished, so it has
+      // to go. A completed session is left alone unless asked otherwise.
+      if (config.deleteSessions || signal?.aborted) {
+        await this.client.deleteSession(session.id)
+        // The abort poisoned the opencode instance of this project: every
+        // later request to it would answer with an empty 499. Disposing the
+        // instance clears that.
+        // See https://github.com/anomalyco/opencode/issues/58942
+        if (signal?.aborted) await this.client.disposeInstance()
+      }
     }
   }
 
@@ -456,7 +469,16 @@ export class ProxyService {
     } finally {
       closed = true
       unsubscribe()
-      if (config.deleteSessions) await this.client.deleteSession(session.id)
+      // A client that disconnected leaves the session half-finished, so it has
+      // to go. A completed session is left alone unless asked otherwise.
+      if (config.deleteSessions || signal?.aborted) {
+        await this.client.deleteSession(session.id)
+        // The abort poisoned the opencode instance of this project: every
+        // later request to it would answer with an empty 499. Disposing the
+        // instance clears that.
+        // See https://github.com/anomalyco/opencode/issues/58942
+        if (signal?.aborted) await this.client.disposeInstance()
+      }
     }
   }
 

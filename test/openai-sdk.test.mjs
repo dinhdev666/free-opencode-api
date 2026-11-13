@@ -78,7 +78,7 @@ test.before(async () => {
   })
   oc = await startOpencodeWithMock(mock)
 
-  const client = new OpencodeClient({ baseUrl: `http://127.0.0.1:${oc.port}` })
+  const client = oc.client()
   const registry = new ModelRegistry()
   registry.update(await client.providers())
 

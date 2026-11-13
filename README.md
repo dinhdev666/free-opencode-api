@@ -219,6 +219,10 @@ per-request token limit — the cap is set server-wide with `MAX_OUTPUT_TOKENS`.
 `temperature`, `top_p`, `stop`, `seed`, `user` and the penalty fields are
 accepted and ignored: opencode picks the sampling parameters per model.
 
+`logprobs` is accepted as well, but the answer always carries
+`logprobs: null`: opencode does not ask the provider for token
+probabilities, so there is nothing to report.
+
 ### OpenAI SDK compatibility
 
 The proxy is exercised against the real [OpenAI Node SDK](https://github.com/openai/openai-node)

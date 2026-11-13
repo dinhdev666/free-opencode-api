@@ -146,11 +146,14 @@ export class OpencodeClient {
    * Sessions are disposable, but deleting every one of them costs an extra
    * request per completion. The proxy therefore only deletes them when asked
    * to; opencode keeps them until it prunes its own history.
+   *
+   * The timeout is short on purpose: this runs while the request is already
+   * over, and a slow cleanup would hold the client waiting for nothing.
    */
   deleteSession(id) {
     return this.request(`/session/${id}${this.workspaceQuery}`, {
       method: "DELETE",
-      timeout: 15000,
+      timeout: 5000,
     }).catch(() => false)
   }
 
@@ -175,7 +178,7 @@ export class OpencodeClient {
     try {
       await this.request(`/instance/dispose${this.workspaceQuery}`, {
         method: "POST",
-        timeout: 15000,
+        timeout: 10000,
       })
       return true
     } catch {

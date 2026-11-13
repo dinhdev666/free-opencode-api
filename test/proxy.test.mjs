@@ -484,6 +484,20 @@ test("a streaming request with n produces several choices", async () => {
   }
 })
 
+test("a request with logprobs answers with null logprobs", async () => {
+  // opencode does not ask the provider for token probabilities, so there is
+  // nothing to report.
+  const { status, body } = await post("/v1/chat/completions", {
+    model: "mock/mock-model",
+    messages: [{ role: "user", content: "Hello" }],
+    logprobs: true,
+    top_logprobs: 5,
+  })
+
+  assert.equal(status, 200)
+  assert.equal(body.choices[0].logprobs, null)
+})
+
 test("one proxy request costs exactly one provider request", async () => {
   mock.requests.length = 0
   await post("/v1/chat/completions", {

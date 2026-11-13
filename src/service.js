@@ -126,7 +126,18 @@ export class ProxyService {
   /** Runs a single chat completion. */
   async #completeOnce(body, { signal } = {}) {
     const model = this.resolveModel(body.model)
-    const session = await this.client.createSession(this.#sessionTitle(body))
+
+    // Creating the session can also meet the broken instance, so it is part
+    // of the recovery.
+    let session
+    try {
+      session = await this.client.createSession(this.#sessionTitle(body))
+    } catch (err) {
+      const failure = toServiceError(err)
+      if (failure.code !== "opencode_instance_broken") throw failure
+      await this.#disposeInstance()
+      session = await this.client.createSession(this.#sessionTitle(body))
+    }
 
     // opencode retries a failing provider internally (5 retries, 2s -> 30s
     // backoff, ~90s in total) and publishes a `retry` status for each
@@ -343,7 +354,18 @@ export class ProxyService {
   /** Runs a single streaming chat completion. */
   async #streamOnce(body, emit, { signal, choiceIndex = 0 } = {}) {
     const model = this.resolveModel(body.model)
-    const session = await this.client.createSession(this.#sessionTitle(body))
+
+    // Creating the session can also meet the broken instance, so it is part
+    // of the recovery.
+    let session
+    try {
+      session = await this.client.createSession(this.#sessionTitle(body))
+    } catch (err) {
+      const failure = toServiceError(err)
+      if (failure.code !== "opencode_instance_broken") throw failure
+      await this.#disposeInstance()
+      session = await this.client.createSession(this.#sessionTitle(body))
+    }
     const completionID = completionId()
     const created = Math.floor(Date.now() / 1000)
     const base = { id: completionID, object: "chat.completion.chunk", created, model: model.id }

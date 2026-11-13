@@ -28,6 +28,18 @@ export class ProxyService {
       )
     }
 
+    // A model id is a string. Anything else is a malformed request, not a
+    // model that could not be found.
+    if (typeof wanted !== "string") {
+      throw new ServiceError(
+        "'model' must be a string",
+        400,
+        "invalid_request",
+        undefined,
+        "model",
+      )
+    }
+
     const entry = this.registry.resolve(wanted)
     if (!entry) {
       throw new ServiceError(

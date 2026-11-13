@@ -125,6 +125,31 @@ export function buildServer({ client, registry, eventBus } = {}) {
         error: { message: error.message, type: "invalid_request_error", param: null, code: "invalid_request" },
       })
     }
+
+    // A body the proxy could not read is the client's mistake, not a proxy
+    // failure: Fastify reports a broken JSON body and a missing content type
+    // with their own status codes.
+    if (error.code === "FST_ERR_CTP_INVALID_MEDIA_TYPE") {
+      return reply.code(415).send({
+        error: {
+          message: "The request body must be sent as application/json.",
+          type: "invalid_request_error",
+          param: null,
+          code: "invalid_request",
+        },
+      })
+    }
+    if (error.code === "FST_ERR_CTP_EMPTY_JSON_BODY" || error.code === "FST_ERR_CTP_INVALID_JSON_BODY") {
+      return reply.code(400).send({
+        error: {
+          message: error.message ?? "The request body is not valid JSON.",
+          type: "invalid_request_error",
+          param: null,
+          code: "invalid_request",
+        },
+      })
+    }
+
     request.log?.error({ err: error }, "request failed")
     return reply.code(error.statusCode ?? 500).send({
       error: { message: error.message ?? "internal error", type: "proxy_error", param: null, code: "internal_error" },
@@ -185,6 +210,11 @@ export function buildServer({ client, registry, eventBus } = {}) {
         error: { message: "'messages' is required and must be a non-empty array", type: "invalid_request_error", param: "messages", code: "invalid_request" },
       })
     }
+    if (body.model !== undefined && typeof body.model !== "string") {
+      return reply.code(400).send({
+        error: { message: "'model' must be a string", type: "invalid_request_error", param: "model", code: "invalid_request" },
+      })
+    }
 
     await ensureModels()
 
@@ -227,6 +257,11 @@ export function buildServer({ client, registry, eventBus } = {}) {
     if (prompt === undefined || prompt === null) {
       return reply.code(400).send({
         error: { message: "'prompt' is required", type: "invalid_request_error", param: "prompt", code: "invalid_request" },
+      })
+    }
+    if (body.model !== undefined && typeof body.model !== "string") {
+      return reply.code(400).send({
+        error: { message: "'model' must be a string", type: "invalid_request_error", param: "model", code: "invalid_request" },
       })
     }
 

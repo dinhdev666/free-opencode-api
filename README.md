@@ -275,6 +275,10 @@ its reference on: `Unexpected server error. Check server logs for details.
 (opencode reference: err_6719a53a)`. Look that reference up in the opencode
 log to find the cause.
 
+A request the proxy could not read — a broken JSON body, a content type it
+does not accept, a `model` that is not a string — is the client's mistake and
+answers with `invalid_request_error`, never with an internal error.
+
 ---
 
 ## Configuration
@@ -289,7 +293,11 @@ Environment variables always take precedence over the file.
 | `API_KEY` | `sk-dummy` | Clients must send `Authorization: Bearer <key>`. |
 | `SPAWN_OPENCODE` | `true` | Spawn `opencode serve` from `node_modules/.bin`. |
 | `OPENCODE_HOST` / `OPENCODE_PORT` | `127.0.0.1` / `4096` | Where the opencode server is. |
+| `OPENCODE_WORKDIR` | *(the project root)* | Directory opencode treats as the project. |
+| `OPENCODE_STARTUP_TIMEOUT` | `30` | Seconds to wait for the spawned opencode server. |
+| `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | `opencode` / *(empty)* | Basic auth for the opencode server. |
 | `DEFAULT_MODEL` | *(empty)* | Model used when the client does not send one. |
+| `DEFAULT_PROVIDER` | `opencode` | Provider used when the client does not send a full model id. |
 | `DEFAULT_AGENT` | `proxy` | opencode agent used for proxied requests. |
 | `REQUEST_TIMEOUT` | `300` | Seconds a single completion may take. |
 | `MAX_RETRY_ATTEMPTS` | `1` | Provider retries opencode may make before the proxy gives up. |

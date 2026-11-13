@@ -117,6 +117,59 @@ test("an unreachable opencode server surfaces as HTTP 503", async () => {
   }
 })
 
+test("a request with a broken JSON body is a client error", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { ...authHeaders(), "content-type": "application/json" },
+    body: "{not json",
+  })
+
+  assert.equal(res.status, 400)
+  const body = await res.json()
+  assert.equal(body.error.type, "invalid_request_error")
+  assert.equal(body.error.code, "invalid_request")
+})
+
+test("a request with an unsupported content type is a client error", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { ...authHeaders(), "content-type": "text/xml" },
+    body: "<request/>",
+  })
+
+  assert.equal(res.status, 415)
+  const body = await res.json()
+  assert.equal(body.error.type, "invalid_request_error")
+  assert.equal(body.error.code, "invalid_request")
+})
+
+test("a model that is not a string is a client error", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ model: 123, messages: [{ role: "user", content: "Hi" }] }),
+  })
+
+  assert.equal(res.status, 400)
+  const body = await res.json()
+  assert.equal(body.error.type, "invalid_request_error")
+  assert.equal(body.error.code, "invalid_request")
+  assert.equal(body.error.param, "model")
+})
+
+test("a model that is not a string is a client error on the completions endpoint", async () => {
+  const res = await fetch(`${baseUrl}/v1/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ model: 123, prompt: "Hi" }),
+  })
+
+  assert.equal(res.status, 400)
+  const body = await res.json()
+  assert.equal(body.error.type, "invalid_request_error")
+  assert.equal(body.error.code, "invalid_request")
+})
+
 test("a model opencode does not know surfaces as HTTP 404", async () => {
   // opencode answers an unknown model with an HTTP 404 of its own.
   const client = new OpencodeClient({ baseUrl: "http://127.0.0.1:1" })

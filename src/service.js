@@ -92,7 +92,8 @@ export class ProxyService {
         if (providerFailure) {
           throw new ServiceError(providerFailure.message, providerFailure.status, providerFailure.code)
         }
-        throw err
+        // opencode answers a failing provider with an HTTP error of its own.
+        throw toServiceError(err)
       }
 
       if (providerFailure) {
@@ -385,7 +386,7 @@ export class ProxyService {
         if (providerFailure) {
           throw new ServiceError(providerFailure.message, providerFailure.status, providerFailure.code)
         }
-        throw err
+        throw toServiceError(err)
       }
 
       const timeout = timeoutAfter(config.requestTimeout)
@@ -601,10 +602,49 @@ function providerErrorStatus(error) {
   if (/not connected|unauthorized|invalid.*key|authentication|\b401\b/i.test(message)) {
     return { status: 401, code: "provider_unauthorized", message }
   }
+  if (/model not found|no such model|unknown model/i.test(message)) {
+    return { status: 404, code: "model_not_found", message }
+  }
   if (/context (length|window)|too long|maximum.*tokens/i.test(message)) {
     return { status: 413, code: "context_too_long", message }
   }
   return { status: 502, code: "provider_error", message }
+}
+
+/**
+ * Turns an error from the opencode client into a well-shaped service error.
+ *
+ * opencode reports a failing provider as an HTTP error of its own, so the
+ * status and the message have to be classified here instead of turning into
+ * a generic 500.
+ */
+function toServiceError(err) {
+  if (err instanceof ServiceError) return err
+
+  const message = err?.message ?? "the opencode server returned an error"
+  const failure = providerErrorStatus(message)
+
+  // The message is more precise than the status: opencode reports a missing
+  // model with a 500 even though it is a client error.
+  if (failure.status !== 502) {
+    return new ServiceError(message, failure.status, failure.code)
+  }
+
+  // Otherwise the HTTP status decides.
+  if (err?.status === 404) return new ServiceError(message, 404, "model_not_found", undefined, "model")
+  if (err?.status === 401 || err?.status === 403) {
+    return new ServiceError(message, 401, "provider_unauthorized")
+  }
+  if (err?.status === 429) return new ServiceError(message, 429, "provider_rate_limited")
+  if (err?.code === "timeout") return new ServiceError(message, 504, "timeout")
+  if (err?.code === "unavailable") return new ServiceError(message, 503, "opencode_unavailable")
+
+  // opencode hides the real cause behind a generic message and points at its
+  // own log with a reference. Pass the reference on so the cause can be
+  // found.
+  const ref = err?.body?.data?.ref
+  const detail = ref ? `${message} (opencode reference: ${ref})` : message
+  return new ServiceError(detail, failure.status, failure.code)
 }
 
 function errorChunk(err) {

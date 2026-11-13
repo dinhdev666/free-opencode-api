@@ -22,7 +22,11 @@ export function buildServer({ client, registry, eventBus } = {}) {
     // The logger is off by default: the proxy writes no log files and keeps
     // stdout quiet, which is what a container or a small VPS wants.
     logger: config.logLevel !== "silent" ? { level: config.logLevel } : false,
-    bodyLimit: 32 * 1024 * 1024,
+    // A JSON body costs far more memory than its size: the raw bytes, the
+    // parsed object and the copies the proxy makes of it. A 19 MB body
+    // measured 340 MB of resident memory, so the limit is well below what
+    // any real chat request needs.
+    bodyLimit: config.maxBodySize * 1024 * 1024,
   })
 
   app.decorate("opencode", { client: ocClient, registry: modelRegistry, eventBus: bus, service })
@@ -96,6 +100,25 @@ export function buildServer({ client, registry, eventBus } = {}) {
     request.clientSignal = requestSignal(request, reply)
   })
 
+  // Fastify drops the connection when the body is over the limit, so the
+  // client never sees the error. Checking the announced length up front
+  // answers with a proper 413 instead.
+  app.addHook("preParsing", async (request, reply, payload) => {
+    const length = Number(request.headers["content-length"])
+    if (Number.isFinite(length) && length > config.maxBodySize * 1024 * 1024) {
+      reply.code(413).send({
+        error: {
+          message: `The request body is larger than the ${config.maxBodySize} MB limit.`,
+          type: "invalid_request_error",
+          param: null,
+          code: "invalid_request",
+        },
+      })
+      return payload
+    }
+    return payload
+  })
+
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ServiceError) {
       return reply.code(error.status).send({
@@ -129,6 +152,16 @@ export function buildServer({ client, registry, eventBus } = {}) {
     // A body the proxy could not read is the client's mistake, not a proxy
     // failure: Fastify reports a broken JSON body and a missing content type
     // with their own status codes.
+    if (error.code === "FST_ERR_CTP_BODY_TOO_LARGE") {
+      return reply.code(413).send({
+        error: {
+          message: `The request body is larger than the ${config.maxBodySize} MB limit.`,
+          type: "invalid_request_error",
+          param: null,
+          code: "invalid_request",
+        },
+      })
+    }
     if (error.code === "FST_ERR_CTP_INVALID_MEDIA_TYPE") {
       return reply.code(415).send({
         error: {

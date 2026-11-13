@@ -170,6 +170,22 @@ test("a model that is not a string is a client error on the completions endpoint
   assert.equal(body.error.code, "invalid_request")
 })
 
+test("a request body over the limit is a client error", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: "mock/mock-model",
+      messages: [{ role: "user", content: "x".repeat(5 * 1024 * 1024) }],
+    }),
+  })
+
+  assert.equal(res.status, 413)
+  const body = await res.json()
+  assert.equal(body.error.type, "invalid_request_error")
+  assert.equal(body.error.code, "invalid_request")
+})
+
 test("a model opencode does not know surfaces as HTTP 404", async () => {
   // opencode answers an unknown model with an HTTP 404 of its own.
   const client = new OpencodeClient({ baseUrl: "http://127.0.0.1:1" })

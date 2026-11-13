@@ -60,6 +60,10 @@ not add a `VOLUME` instruction back.
 - **test** — `pnpm lint` + `pnpm check:dockerfile` + `pnpm test` on Node.js 20, 22 and 24
 - **docker** — checks the Dockerfile against Railway's rules, builds the image and smoke-tests the container
 
+The smoke test runs the container with a 512 MB memory limit, so a proxy that
+needs more is killed by the kernel and the health check fails. It also fails
+when the container writes anything to stdout. Keep both true.
+
 Keep the matrix green: the code has to run on Node 20 as well.
 
 ## Architecture
@@ -133,6 +137,26 @@ These were established empirically and are easy to get wrong.
    server's own directory when the request does not say. The client therefore
    sends `?directory=…` with every session route and the event stream.
 
+10. **The token counts are split differently.** opencode's `input` is the raw
+    input **minus** the cached tokens, and its `output` is the raw output
+    **minus** the reasoning tokens. OpenAI counts the other way round, so the
+    proxy has to add `cache.read`, `cache.write` and `reasoning` back. Getting
+    this wrong undercounts every request that uses the prompt cache or a
+    reasoning model.
+
+11. **A client disconnect has to be detected on the response.** The request
+    stream emits `close` as soon as the body was received, long before the
+    answer is sent, so it cannot be used to spot a disconnect. The response's
+    `close` event can: it fires when the connection goes away, and
+    `writableEnded` tells a disconnect from an answer that was written.
+    Fastify also drops the connection when the body is over the limit, so the
+    length has to be checked in a `preParsing` hook to answer with a 413.
+
+12. **A JSON body costs far more memory than its size.** A 19 MB body measured
+    340 MB of resident memory — the raw bytes, the parsed object and the
+    copies the proxy makes of it. `MAX_BODY_SIZE` (4 MB) refuses a body
+    before it is read.
+
 ## Testing
 
 The suite boots a real opencode server against a mock OpenAI-compatible
@@ -147,6 +171,11 @@ When adding behaviour, add a test. The two properties that must never regress:
 
 - one proxy request → exactly one provider request
 - a failing provider → a fast, well-shaped error (not a 90 s timeout)
+
+Two more worth keeping:
+
+- a request that arrives while another one is running → the answers do not mix
+- a client that disconnects → the session and the opencode instance are cleaned up
 
 ## Style
 

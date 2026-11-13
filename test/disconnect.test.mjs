@@ -39,9 +39,18 @@ test.after(async () => {
   await mock?.close()
 })
 
-/** The number of sessions opencode is holding. */
+/**
+ * The number of sessions opencode is holding.
+ *
+ * The route is project-scoped, so the directory has to be passed — otherwise
+ * the answer belongs to a different project. An empty body means the server
+ * is busy rebuilding the instance, which counts as no sessions.
+ */
 async function sessionCount() {
-  const list = await (await fetch(`http://127.0.0.1:${oc.port}/session`)).json()
+  const response = await fetch(`http://127.0.0.1:${oc.port}/session?directory=${encodeURIComponent(oc.dir)}`)
+  const text = await response.text()
+  if (!text) return 0
+  const list = JSON.parse(text)
   return Array.isArray(list) ? list.length : 0
 }
 
@@ -80,7 +89,11 @@ test("a client that disconnects leaves no session behind", async () => {
 async function waitForSessions(target, timeout = 30000) {
   const deadline = Date.now() + timeout
   while (Date.now() < deadline) {
-    if ((await sessionCount()) <= target) return
+    try {
+      if ((await sessionCount()) <= target) return
+    } catch {
+      // The server is busy rebuilding the instance; try again.
+    }
     await new Promise((resolve) => setTimeout(resolve, 250))
   }
 }

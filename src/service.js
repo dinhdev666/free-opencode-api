@@ -284,12 +284,16 @@ export class ProxyService {
       // A client that disconnected leaves the session half-finished, so it has
       // to go. A completed session is left alone unless asked otherwise.
       if (config.deleteSessions || signal?.aborted) {
-        await this.client.deleteSession(session.id)
         // The abort poisoned the opencode instance of this project: every
         // later request to it would answer with an empty 499. Disposing the
         // instance clears that.
         // See https://github.com/anomalyco/opencode/issues/58942
+        //
+        // The instance has to be disposed *before* the session is deleted: a
+        // delete that meets the broken instance fails, and the session stays
+        // behind forever.
         if (signal?.aborted) await this.#disposeInstance()
+        await this.client.deleteSession(session.id)
       }
     }
   }
@@ -626,12 +630,11 @@ export class ProxyService {
       // A client that disconnected leaves the session half-finished, so it has
       // to go. A completed session is left alone unless asked otherwise.
       if (config.deleteSessions || signal?.aborted) {
-        await this.client.deleteSession(session.id)
-        // The abort poisoned the opencode instance of this project: every
-        // later request to it would answer with an empty 499. Disposing the
-        // instance clears that.
-        // See https://github.com/anomalyco/opencode/issues/58942
+        // The instance has to be disposed *before* the session is deleted: a
+        // delete that meets the broken instance fails, and the session stays
+        // behind forever.
         if (signal?.aborted) await this.#disposeInstance()
+        await this.client.deleteSession(session.id)
       }
     }
   }

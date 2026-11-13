@@ -51,12 +51,28 @@ export function buildServer({ client, registry, eventBus } = {}) {
     }
   })
 
-  /** Builds an AbortSignal that fires when the client disconnects. */
-  function requestSignal(request) {
+  /**
+   * Builds an AbortSignal that fires when the client disconnects.
+   *
+   * The request stream cannot be used: its `close` event fires as soon as the
+   * body was received, long before the answer is sent. The response can: its
+   * `close` event fires when the connection goes away, and `writableEnded`
+   * tells a disconnect from a response that was written successfully.
+   */
+  function requestSignal(request, reply) {
     const controller = new AbortController()
-    request.raw.on("close", () => {
-      if (!request.raw.readableEnded) controller.abort()
+    const response = reply.raw
+
+    const abort = () => {
+      if (!controller.signal.aborted) controller.abort()
+    }
+
+    request.raw.on("aborted", abort)
+    response.on("close", () => {
+      // The connection went away before the answer was written.
+      if (!response.writableEnded) abort()
     })
+
     return controller.signal
   }
 
@@ -177,7 +193,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
       return reply
     }
 
-    const result = await service.complete(body, { signal: requestSignal(request) })
+    const result = await service.complete(body, { signal: requestSignal(request, reply) })
     return reply.send(result)
   })
 
@@ -259,7 +275,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
       return reply
     }
 
-    const result = await service.complete(chatBody, { signal: requestSignal(request) })
+    const result = await service.complete(chatBody, { signal: requestSignal(request, reply) })
     const choice = result.choices[0]
     return reply.send({
       id: result.id,

@@ -101,15 +101,17 @@ equivalent. Those answer with HTTP 404 and the usual OpenAI error body:
 `"stream": true` returns a standard OpenAI SSE stream:
 
 ```
-data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"}}]}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
 …
-data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
-data: {"choices":[],"usage":{"prompt_tokens":…,"completion_tokens":…,"total_tokens":…}}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":…,"completion_tokens":…,"total_tokens":…}}
 data: [DONE]
 ```
 
-Reasoning models also receive their thinking under `delta.reasoning_content`,
-so it never contaminates the assistant message.
+The stream opens with a chunk that only carries the role, exactly as the
+OpenAI API does. Reasoning models also receive their thinking under
+`delta.reasoning_content`, so it never contaminates the assistant message.
 
 ---
 
@@ -223,6 +225,16 @@ blocking the request.
 
 The number of tolerated retries is configurable via `MAX_RETRY_ATTEMPTS`
 (default `1`, i.e. give up at the first retry).
+
+### Abandoned requests are cleaned up
+
+opencode keeps a session for every turn. A client that disconnects mid-request
+would leave that session half-finished, so the proxy watches the connection
+and deletes the session when the client goes away. Ten dropped connections
+leave at most one session behind instead of ten.
+
+Set `DELETE_SESSIONS=true` to delete the session after every request, not
+just the abandoned ones.
 
 | Provider problem | HTTP status | `error.code` |
 | ---------------- | ----------- | ------------ |

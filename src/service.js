@@ -186,7 +186,11 @@ export class ProxyService {
       }
     } finally {
       unsubscribe()
-      if (config.deleteSessions) await this.client.deleteSession(session.id)
+      // A client that disconnected leaves the session half-finished, so it has
+      // to go. A completed session is left alone unless asked otherwise.
+      if (config.deleteSessions || signal?.aborted) {
+        await this.client.deleteSession(session.id)
+      }
     }
   }
 
@@ -456,7 +460,11 @@ export class ProxyService {
     } finally {
       closed = true
       unsubscribe()
-      if (config.deleteSessions) await this.client.deleteSession(session.id)
+      // A client that disconnected leaves the session half-finished, so it has
+      // to go. A completed session is left alone unless asked otherwise.
+      if (config.deleteSessions || signal?.aborted) {
+        await this.client.deleteSession(session.id)
+      }
     }
   }
 

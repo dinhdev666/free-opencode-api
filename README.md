@@ -114,6 +114,21 @@ equivalent. Those answer with HTTP 404 and the usual OpenAI error body:
 }
 ```
 
+### Token usage
+
+opencode counts the tokens differently from OpenAI: its `input` is the raw
+input minus the cached tokens, and its `output` is the raw output minus the
+reasoning tokens. The proxy puts them back where OpenAI expects them:
+
+| OpenAI | opencode |
+| ------ | -------- |
+| `prompt_tokens` | `input` + `cache.read` + `cache.write` |
+| `completion_tokens` | `output` + `reasoning` |
+| `total_tokens` | `total` |
+
+The breakdown follows in `prompt_tokens_details.cached_tokens` and
+`completion_tokens_details.reasoning_tokens`.
+
 ### Streaming
 
 `"stream": true` returns a standard OpenAI SSE stream:

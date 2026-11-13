@@ -43,8 +43,35 @@ export class ProxyService {
 
   /**
    * Runs a chat completion without streaming.
+   *
+   * The OpenAI `n` field asks for several answers. opencode returns one per
+   * session, so the request is run that many times and the answers are merged
+   * into one completion.
    */
   async complete(body, { signal } = {}) {
+    const count = choiceCount(body.n)
+    if (count === 1) return this.#completeOnce(body, { signal })
+
+    const results = await Promise.all(
+      Array.from({ length: count }, () => this.#completeOnce(body, { signal })),
+    )
+    const choices = results.flatMap((result, index) =>
+      result.choices.map((choice) => ({ ...choice, index })),
+    )
+    const usage = results.reduce(
+      (total, result) => ({
+        prompt_tokens: total.prompt_tokens + result.usage.prompt_tokens,
+        completion_tokens: total.completion_tokens + result.usage.completion_tokens,
+        total_tokens: total.total_tokens + result.usage.total_tokens,
+      }),
+      { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    )
+
+    return { ...results[0], choices, usage }
+  }
+
+  /** Runs a single chat completion. */
+  async #completeOnce(body, { signal } = {}) {
     const model = this.resolveModel(body.model)
     const session = await this.client.createSession(this.#sessionTitle(body))
 
@@ -652,6 +679,18 @@ function providerErrorStatus(error) {
 }
 
 /**
+ * How many answers the client asked for.
+ *
+ * The OpenAI spec allows `n` between 1 and 128. Anything outside that is
+ * treated as a single answer.
+ */
+function choiceCount(n) {
+  const count = Number(n)
+  if (!Number.isInteger(count) || count < 1) return 1
+  return Math.min(count, 128)
+}
+
+/**
  * Turns an error from the opencode client into a well-shaped service error.
  *
  * opencode reports a failing provider as an HTTP error of its own, so the
@@ -663,6 +702,18 @@ function toServiceError(err) {
 
   const message = err?.message ?? "the opencode server returned an error"
   const failure = providerErrorStatus(message)
+
+  // An empty 499 means opencode's instance of the project is broken. The
+  // proxy disposes the instance after an abort, so this only happens when the
+  // instance was poisoned some other way.
+  if (err?.status === 499) {
+    return new ServiceError(
+      "The opencode instance of this project is in a broken state. Set DELETE_SESSIONS=true " +
+        "or restart the proxy to clear it.",
+      503,
+      "opencode_instance_broken",
+    )
+  }
 
   // The message is more precise than the status: opencode reports a missing
   // model with a 500 even though it is a client error.

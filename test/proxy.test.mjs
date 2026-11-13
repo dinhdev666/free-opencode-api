@@ -343,6 +343,36 @@ test("an unknown endpoint answers with the OpenAI error shape", async () => {
   assert.equal(body.error.code, "unknown_endpoint")
 })
 
+test("the n parameter asks for several answers", async () => {
+  const { status, body } = await post("/v1/chat/completions", {
+    model: "mock/mock-model",
+    messages: [{ role: "user", content: "Hello" }],
+    n: 3,
+  })
+
+  assert.equal(status, 200)
+  assert.equal(body.choices.length, 3)
+  assert.deepEqual(
+    body.choices.map((choice) => choice.index),
+    [0, 1, 2],
+  )
+  for (const choice of body.choices) {
+    assert.equal(choice.message.content, "Hello from mock")
+  }
+  // The usage adds up over the answers.
+  assert.equal(body.usage.total_tokens, body.usage.prompt_tokens + body.usage.completion_tokens)
+})
+
+test("an out-of-range n falls back to a single answer", async () => {
+  const { status, body } = await post("/v1/chat/completions", {
+    model: "mock/mock-model",
+    messages: [{ role: "user", content: "Hello" }],
+    n: 0,
+  })
+  assert.equal(status, 200)
+  assert.equal(body.choices.length, 1)
+})
+
 test("one proxy request costs exactly one provider request", async () => {
   mock.requests.length = 0
   await post("/v1/chat/completions", {

@@ -329,6 +329,20 @@ test("POST /v1/chat/completions rejects a request without an API key", async () 
   assert.equal(res.status, 401)
 })
 
+test("an unknown endpoint answers with the OpenAI error shape", async () => {
+  const res = await fetch(`${baseUrl}/v1/embeddings`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ model: "mock/mock-model", input: "x" }),
+  })
+  assert.equal(res.status, 404)
+  const body = await res.json()
+  assert.equal(typeof body.error.message, "string")
+  assert.equal(body.error.type, "invalid_request_error")
+  assert.ok("param" in body.error)
+  assert.equal(body.error.code, "unknown_endpoint")
+})
+
 test("one proxy request costs exactly one provider request", async () => {
   mock.requests.length = 0
   await post("/v1/chat/completions", {

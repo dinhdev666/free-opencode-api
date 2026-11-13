@@ -304,5 +304,18 @@ export function buildServer({ client, registry, eventBus } = {}) {
     return refresh
   }
 
+  // An unknown route answers like the OpenAI API does, so a client that
+  // probes an endpoint the proxy does not implement still gets a usable error.
+  app.setNotFoundHandler((request, reply) => {
+    reply.code(404).send({
+      error: {
+        message: `Unknown endpoint: ${request.method} ${request.url}`,
+        type: "invalid_request_error",
+        param: null,
+        code: "unknown_endpoint",
+      },
+    })
+  })
+
   return app
 }

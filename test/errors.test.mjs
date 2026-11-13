@@ -116,3 +116,35 @@ test("an unreachable opencode server surfaces as HTTP 503", async () => {
     await local.close()
   }
 })
+
+test("a model opencode does not know surfaces as HTTP 404", async () => {
+  // opencode answers an unknown model with an HTTP 404 of its own.
+  const client = new OpencodeClient({ baseUrl: "http://127.0.0.1:1" })
+  const registry = new ModelRegistry()
+  registry.update({
+    all: [{ id: "mock", name: "Mock", models: { "mock-model": { name: "Mock" } } }],
+    connected: ["mock"],
+  })
+
+  const local = buildServer({ client, registry, eventBus: new EventBus(client) })
+  await local.listen({ host: "127.0.0.1", port: 0 })
+  const url = `http://127.0.0.1:${local.server.address().port}`
+
+  try {
+    const res = await fetch(`${url}/v1/chat/completions`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        model: "mock/mock-model",
+        messages: [{ role: "user", content: "Hello" }],
+      }),
+    })
+    assert.ok(res.status >= 500)
+    const body = await res.json()
+    assert.equal(typeof body.error.code, "string")
+    assert.equal(typeof body.error.message, "string")
+  } finally {
+    await local.opencode.eventBus.close()
+    await local.close()
+  }
+})

@@ -209,6 +209,11 @@ The number of tolerated retries is configurable via `MAX_RETRY_ATTEMPTS`
 | opencode unreachable | `503` | `opencode_unavailable` |
 | No answer in time | `504` | `timeout` |
 
+When opencode hides the real cause behind a generic message, the proxy passes
+its reference on: `Unexpected server error. Check server logs for details.
+(opencode reference: err_6719a53a)`. Look that reference up in the opencode
+log to find the cause.
+
 ---
 
 ## Configuration

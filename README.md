@@ -225,6 +225,16 @@ The proxy is exercised against the real [OpenAI Node SDK](https://github.com/ope
 in `test/openai-sdk.test.mjs`. The SDK validates the response shape and throws
 on anything it does not understand, so it is the strictest available check.
 
+That includes the SDK's own helpers:
+
+| SDK call | Works |
+| -------- | ----- |
+| `openai.models.list()` / `models.retrieve()` | ✓ |
+| `openai.chat.completions.create()` | ✓ |
+| `openai.chat.completions.create({ stream: true })` | ✓ |
+| `openai.chat.completions.parse()` | ✓ — `message.parsed` holds the object |
+| `openai.completions.create()` | ✓ |
+
 ```bash
 pnpm add -D openai   # only needed to run that test file
 pnpm test

@@ -15,11 +15,31 @@ import { ModelRegistry } from "../src/model-registry.js"
 import { EventBus } from "../src/event-bus.js"
 import { authHeaders, startMockProvider, startOpencodeWithMock } from "./helpers.mjs"
 
-/** Answers a structured-output request with a StructuredOutput tool call. */
+/**
+ * Answers a structured-output request with a StructuredOutput tool call.
+ *
+ * The payload has to match what the request asked for: a `json_object`
+ * wants the answer wrapped in `content`, a `json_schema` wants the object
+ * itself, and a tool call wants it in `tool_calls`.
+ */
 function structuredResponder(payload) {
   return (request) => {
     const tool = (request.body?.tools ?? []).find((t) => t.function?.name === "StructuredOutput")
     if (!tool) return null
+
+    // The schema of the request says where the answer belongs.
+    const schema = tool.function.parameters ?? {}
+    const properties = schema.properties ?? {}
+    let answer
+    if (properties.tool_calls) {
+      answer = { tool_calls: payload.tool_calls }
+    } else if (properties.content) {
+      // The json_object envelope.
+      answer = { content: payload.content }
+    } else {
+      // A json_schema: the object itself.
+      answer = JSON.parse(payload.content)
+    }
 
     const base = {
       id: "chatcmpl-mock",
@@ -38,7 +58,7 @@ function structuredResponder(payload) {
                 index: 0,
                 id: "call_structured_1",
                 type: "function",
-                function: { name: "StructuredOutput", arguments: JSON.stringify(payload) },
+                function: { name: "StructuredOutput", arguments: JSON.stringify(answer) },
               },
             ],
           },
@@ -96,6 +116,31 @@ test.after(async () => {
   await app?.close()
   await oc?.close()
   await mock?.close()
+})
+
+test("the OpenAI SDK can parse a structured completion", async () => {
+  // `parse()` is the SDK's structured-output helper: it sends a
+  // `json_schema` response format and parses the answer back.
+  const res = await openai.chat.completions.parse({
+    model: "mock/mock-model",
+    messages: [{ role: "user", content: "Hello" }],
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "answer",
+        strict: true,
+        schema: {
+          type: "object",
+          properties: { answer: { type: "string" } },
+          required: ["answer"],
+          additionalProperties: false,
+        },
+      },
+    },
+  })
+
+  assert.deepEqual(res.choices[0].message.parsed, { answer: "Hello from mock" })
+  assert.equal(res.choices[0].finish_reason, "stop")
 })
 
 test("the OpenAI SDK can list the models", async () => {

@@ -85,8 +85,13 @@ test("a client that disconnects leaves no session behind", async () => {
   )
 })
 
-/** Waits until the session count drops to at most `target`. */
-async function waitForSessions(target, timeout = 30000) {
+/**
+ * Waits until the session count drops to at most `target`.
+ *
+ * The cleanup is a network round trip to opencode, so a loaded runner needs
+ * more than a moment.
+ */
+async function waitForSessions(target, timeout = 60000) {
   const deadline = Date.now() + timeout
   while (Date.now() < deadline) {
     try {

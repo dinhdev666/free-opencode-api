@@ -121,6 +121,18 @@ These were established empirically and are easy to get wrong.
    carries no tool schemas and a short system prompt. Every proxy request must
    cost exactly **one** provider request — `test/proxy.test.mjs` asserts it.
 
+8. **An aborted request poisons the instance.** When the proxy aborts a request
+   to opencode, the interrupt leaves opencode's cached per-directory instance
+   broken: every later request to that directory answers with an empty **499**.
+   The proxy disposes the instance (`POST /instance/dispose?directory=…`)
+   after an abort. See
+   [opencode#58942](https://github.com/anomalyco/opencode/issues/58942).
+
+9. **The project directory has to be passed.** opencode routes a request to
+   the project of the working directory it came from and falls back to the
+   server's own directory when the request does not say. The client therefore
+   sends `?directory=…` with every session route and the event stream.
+
 ## Testing
 
 The suite boots a real opencode server against a mock OpenAI-compatible

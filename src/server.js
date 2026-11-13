@@ -58,6 +58,10 @@ export function buildServer({ client, registry, eventBus } = {}) {
    * body was received, long before the answer is sent. The response can: its
    * `close` event fires when the connection goes away, and `writableEnded`
    * tells a disconnect from a response that was written successfully.
+   *
+   * The listener is removed once the response is done, so a keep-alive
+   * connection does not leave a stale handler behind that would abort the
+   * next request.
    */
   function requestSignal(request, reply) {
     const controller = new AbortController()
@@ -67,14 +71,30 @@ export function buildServer({ client, registry, eventBus } = {}) {
       if (!controller.signal.aborted) controller.abort()
     }
 
-    request.raw.on("aborted", abort)
-    response.on("close", () => {
+    const onClose = () => {
       // The connection went away before the answer was written.
       if (!response.writableEnded) abort()
-    })
+    }
+
+    request.raw.on("aborted", abort)
+    response.on("close", onClose)
+
+    // The listener belongs to this request alone. A keep-alive connection
+    // reuses the socket, so a listener that stayed behind could abort a later
+    // request.
+    const detach = () => response.off("close", onClose)
+    response.on("finish", detach)
+    response.on("close", detach)
 
     return controller.signal
   }
+
+  // The signal has to exist before the route runs: a client can disconnect
+  // while the request is still being read, and the route has to see that.
+  app.decorateRequest("clientSignal", null)
+  app.addHook("onRequest", async (request, reply) => {
+    request.clientSignal = requestSignal(request, reply)
+  })
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ServiceError) {
@@ -193,7 +213,9 @@ export function buildServer({ client, registry, eventBus } = {}) {
       return reply
     }
 
-    const result = await service.complete(body, { signal: requestSignal(request, reply) })
+    const result = await service.complete(body, { signal: request.clientSignal })
+    // The client disconnected before the answer was ready.
+    if (!result) return reply
     return reply.send(result)
   })
 
@@ -275,7 +297,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
       return reply
     }
 
-    const result = await service.complete(chatBody, { signal: requestSignal(request, reply) })
+    const result = await service.complete(chatBody, { signal: request.clientSignal })
     const choice = result.choices[0]
     return reply.send({
       id: result.id,

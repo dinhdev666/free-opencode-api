@@ -26,9 +26,22 @@ function authHeader() {
 }
 
 export class OpencodeClient {
-  constructor({ baseUrl = opencodeBaseUrl } = {}) {
+  constructor({ baseUrl = opencodeBaseUrl, directory = config.workdir } = {}) {
     this.baseUrl = baseUrl.replace(/\/+$/, "")
     this.token = authHeader()
+    /**
+     * The opencode project directory.
+     *
+     * opencode routes a request to the project of the working directory the
+     * request came from. Without this the server falls back to its own
+     * working directory, which is not necessarily the same project.
+     */
+    this.directory = directory
+  }
+
+  /** The workspace query opencode uses to pick the project. */
+  get workspaceQuery() {
+    return this.directory ? `?directory=${encodeURIComponent(this.directory)}` : ""
   }
 
   async request(path, { method = "GET", body, signal, timeout } = {}) {
@@ -120,7 +133,7 @@ export class OpencodeClient {
    * would otherwise trigger a second, completely wasted LLM call.
    */
   createSession(title) {
-    return this.request("/session", {
+    return this.request(`/session${this.workspaceQuery}`, {
       method: "POST",
       body: title ? { title } : {},
       timeout: 30000,
@@ -135,11 +148,39 @@ export class OpencodeClient {
    * to; opencode keeps them until it prunes its own history.
    */
   deleteSession(id) {
-    return this.request(`/session/${id}`, { method: "DELETE", timeout: 15000 }).catch(() => false)
+    return this.request(`/session/${id}${this.workspaceQuery}`, {
+      method: "DELETE",
+      timeout: 15000,
+    }).catch(() => false)
   }
 
   abortSession(id) {
-    return this.request(`/session/${id}/abort`, { method: "POST", timeout: 10000 }).catch(() => false)
+    return this.request(`/session/${id}/abort${this.workspaceQuery}`, {
+      method: "POST",
+      timeout: 10000,
+    }).catch(() => false)
+  }
+
+  /**
+   * Disposes the opencode instance of the project.
+   *
+   * When a request to opencode is aborted, the interrupt it leaves behind
+   * poisons the cached instance of that project: every later request to the
+   * same directory answers with an empty 499. Disposing the instance clears
+   * the state, and opencode builds it again on the next request.
+   *
+   * See https://github.com/anomalyco/opencode/issues/58942
+   */
+  async disposeInstance() {
+    try {
+      await this.request(`/instance/dispose${this.workspaceQuery}`, {
+        method: "POST",
+        timeout: 15000,
+      })
+      return true
+    } catch {
+      return false
+    }
   }
 
   /**
@@ -147,7 +188,7 @@ export class OpencodeClient {
    * Returns `{ info, parts }`.
    */
   prompt(sessionID, payload, { signal } = {}) {
-    return this.request(`/session/${sessionID}/message`, {
+    return this.request(`/session/${sessionID}/message${this.workspaceQuery}`, {
       method: "POST",
       body: payload,
       signal,
@@ -162,7 +203,7 @@ export class OpencodeClient {
    * a failing provider as soon as opencode reports it.
    */
   async promptAsync(sessionID, payload, { signal } = {}) {
-    await this.request(`/session/${sessionID}/prompt_async`, {
+    await this.request(`/session/${sessionID}/prompt_async${this.workspaceQuery}`, {
       method: "POST",
       body: payload,
       signal,
@@ -177,7 +218,7 @@ export class OpencodeClient {
    * explicitly — otherwise the proxy's own directory is used and the sessions
    * it created are invisible.
    */
-  async sessionStatus(directory = config.workdir) {
+  async sessionStatus(directory = this.directory) {
     const query = directory ? `?directory=${encodeURIComponent(directory)}` : ""
     const payload = await this.request(`/session/status${query}`, { timeout: 10000 }).catch(() => ({}))
     return payload ?? {}
@@ -186,12 +227,16 @@ export class OpencodeClient {
   /**
    * Opens the opencode server-sent event stream.
    * Returns `{ response, reader }` — the caller owns `reader.cancel()`.
+   *
+   * The directory matters here as well: opencode filters the events it
+   * publishes by the project they belong to, so the stream has to point at
+   * the same project the requests use.
    */
   async events({ signal } = {}) {
     const headers = { accept: "text/event-stream" }
     if (this.token) headers.authorization = this.token
 
-    const response = await fetch(`${this.baseUrl}/event`, { headers, signal })
+    const response = await fetch(`${this.baseUrl}/event${this.workspaceQuery}`, { headers, signal })
     if (!response.ok || !response.body) {
       throw new OpencodeError(`cannot subscribe to opencode events (HTTP ${response.status})`, {
         status: 502,

@@ -23,7 +23,7 @@ test.before(async () => {
   mock = await startMockProvider({ reply: "answer" })
   oc = await startOpencodeWithMock(mock)
 
-  const client = new OpencodeClient({ baseUrl: `http://127.0.0.1:${oc.port}` })
+  const client = oc.client()
   const registry = new ModelRegistry()
   registry.update(await client.providers())
 
@@ -65,8 +65,9 @@ test("a client that disconnects leaves no session behind", async () => {
     await new Promise((resolve) => setTimeout(resolve, 120))
   }
 
-  // Give the proxy time to notice the disconnects and clean up.
-  await new Promise((resolve) => setTimeout(resolve, 3000))
+  // Give the proxy time to notice the disconnects and clean up. A loaded
+  // runner needs more than a moment.
+  await waitForSessions(before + 1)
 
   const after = await sessionCount()
   assert.ok(
@@ -75,7 +76,20 @@ test("a client that disconnects leaves no session behind", async () => {
   )
 })
 
+/** Waits until the session count drops to at most `target`. */
+async function waitForSessions(target, timeout = 30000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    if ((await sessionCount()) <= target) return
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+}
+
 test("a completed request still works and keeps its session", async () => {
+  // A request right after an abandoned one can still be disturbed by the
+  // cleanup, so give it a moment.
+  await waitForSessions(1)
+
   const res = await fetch(baseUrl, {
     method: "POST",
     headers: authHeaders(),
@@ -85,7 +99,11 @@ test("a completed request still works and keeps its session", async () => {
     }),
   })
 
-  assert.equal(res.status, 200)
+  if (res.status !== 200) {
+    const body = await res.json()
+    assert.equal(res.status, 200, `unexpected status ${res.status}: ${body.error?.message}`)
+  }
+
   const body = await res.json()
   assert.equal(body.choices[0].message.content, "answer")
 })

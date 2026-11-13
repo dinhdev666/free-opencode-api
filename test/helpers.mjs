@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 
 import { config } from "../src/config.js"
+import { OpencodeClient } from "../src/opencode-client.js"
 import { resolveOpencodeBinary } from "../src/opencode-server.js"
 
 const run = promisify(execFile)
@@ -292,6 +293,14 @@ export async function startOpencodeWithMock(mock, { extraConfig = {} } = {}) {
   return {
     port,
     dir,
+    /**
+     * A client that talks to this server.
+     *
+     * The directory matters: opencode routes a request to the project of the
+     * working directory it came from, and falls back to the server's own
+     * directory when the request does not say which project it means.
+     */
+    client: () => new OpencodeClient({ baseUrl: `http://127.0.0.1:${port}`, directory: dir }),
     close: async () => {
       killTree(child)
       // Wait for the process to disappear so its stdio pipes are released.

@@ -236,6 +236,11 @@ leave at most one session behind instead of ten.
 Set `DELETE_SESSIONS=true` to delete the session after every request, not
 just the abandoned ones.
 
+Aborting a request also poisons opencode's cached instance of the project:
+every later request to that directory answers with an empty **499**. The proxy
+disposes the instance after an abort to clear that — see
+[opencode#58942](https://github.com/anomalyco/opencode/issues/58942).
+
 | Provider problem | HTTP status | `error.code` |
 | ---------------- | ----------- | ------------ |
 | Free tier / rate limit | `429` | `provider_rate_limited` |

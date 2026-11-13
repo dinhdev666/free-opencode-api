@@ -177,7 +177,7 @@ message actually carries.
 | `messages` | The conversation. `system`/`developer` messages become the system prompt. |
 | `tools` / `tool_choice` | Function definitions, emulated through structured output. `tool_choice` accepts `"auto"`, `"none"`, `"required"` and `{"type":"function","function":{"name":…}}`. |
 | `response_format` | `json_object` or `json_schema`. |
-| `n` | How many answers to return. opencode answers once per session, so the request is run that many times. |
+| `n` | How many answers to return. opencode answers once per session, so the request is run that many times. In a stream the answers arrive with their own choice index. |
 | `stream` | SSE streaming. |
 | `stream_options.include_usage` | Defaults to on; set it to `false` to omit the usage chunk. |
 

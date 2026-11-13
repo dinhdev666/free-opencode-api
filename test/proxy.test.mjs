@@ -373,6 +373,37 @@ test("an out-of-range n falls back to a single answer", async () => {
   assert.equal(body.choices.length, 1)
 })
 
+test("a streaming request with n produces several choices", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: "mock/mock-model",
+      messages: [{ role: "user", content: "Hello" }],
+      n: 3,
+      stream: true,
+    }),
+  })
+
+  assert.equal(res.status, 200)
+  const text = await res.text()
+  const chunks = text
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
+    .map((line) => JSON.parse(line.slice(6)))
+
+  const indexes = [...new Set(chunks.flatMap((chunk) => (chunk.choices ?? []).map((choice) => choice.index)))]
+  assert.deepEqual(indexes.sort(), [0, 1, 2])
+
+  // Every answer has to reach its own finish reason.
+  for (const index of [0, 1, 2]) {
+    const final = chunks
+      .filter((chunk) => chunk.choices?.some((choice) => choice.index === index && choice.finish_reason))
+      .at(-1)
+    assert.ok(final, `choice ${index} has no finish reason`)
+  }
+})
+
 test("one proxy request costs exactly one provider request", async () => {
   mock.requests.length = 0
   await post("/v1/chat/completions", {

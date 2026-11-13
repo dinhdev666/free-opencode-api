@@ -104,6 +104,15 @@ test("POST /v1/chat/completions rejects an unknown model", async () => {
   assert.equal(body.error.code, "model_not_found")
 })
 
+test("POST /v1/chat/completions needs a model when none is configured", async () => {
+  const { status, body } = await post("/v1/chat/completions", {
+    messages: [{ role: "user", content: "Hello" }],
+  })
+  assert.equal(status, 400)
+  assert.equal(body.error.code, "model_required")
+  assert.equal(body.error.param, "model")
+})
+
 test("POST /v1/chat/completions streams SSE chunks", async () => {
   const res = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: "POST",

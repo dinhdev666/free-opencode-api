@@ -520,9 +520,10 @@ railway.json          Railway deployment
 
 **`opencode binary not found in node_modules/.bin`** — run `pnpm install`.
 
-**`Free usage limit reached`** — the upstream provider's free tier is
-exhausted. The proxy surfaces this as HTTP `429` with code
-`provider_rate_limited`. Wait, or connect a paid provider in opencode.
+**`Free usage exceeded`** — the upstream provider's free tier is exhausted.
+The proxy surfaces this as HTTP `429` with code `provider_rate_limited`, in
+about a second instead of the ~90 s opencode would spend retrying. Wait for
+the quota to refill, or connect a paid provider in opencode.
 
 **`Model 'x' is not available`** — the model is not in the opencode catalogue
 yet. Check `GET /v1/models` and make sure the provider is connected.

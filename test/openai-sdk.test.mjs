@@ -104,6 +104,16 @@ test("the OpenAI SDK can list the models", async () => {
   assert.ok(list.data.some((m) => m.id === "mock/mock-model"))
 })
 
+test("the OpenAI SDK can retrieve a single model", async () => {
+  // A model id contains a slash, so the route has to accept the whole path.
+  const qualified = await openai.models.retrieve("mock/mock-model")
+  assert.equal(qualified.id, "mock/mock-model")
+  assert.equal(qualified.object, "model")
+
+  const bare = await openai.models.retrieve("mock-model")
+  assert.equal(bare.id, "mock/mock-model")
+})
+
 test("the OpenAI SDK can run a chat completion", async () => {
   const res = await openai.chat.completions.create({
     model: "mock/mock-model",

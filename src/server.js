@@ -121,12 +121,15 @@ export function buildServer({ client, registry, eventBus } = {}) {
     return reply.send(modelRegistry.list(config.owner))
   })
 
-  app.get("/v1/models/:id", async (request, reply) => {
+  // A model id contains a slash (`provider/model`), so the route has to accept
+  // the rest of the path.
+  app.get("/v1/models/*", async (request, reply) => {
     await ensureModels()
-    const entry = modelRegistry.resolve(request.params.id)
+    const id = decodeURIComponent(request.params["*"] ?? "")
+    const entry = modelRegistry.resolve(id)
     if (!entry) {
       return reply.code(404).send({
-        error: { message: `Model '${request.params.id}' not found`, type: "invalid_request_error", param: "model", code: "model_not_found" },
+        error: { message: `Model '${id}' not found`, type: "invalid_request_error", param: "model", code: "model_not_found" },
       })
     }
     return reply.send({

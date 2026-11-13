@@ -291,6 +291,44 @@ test("the streaming content does not echo the user's prompt", async () => {  con
   assert.match(content, /Hello from mock/)
 })
 
+test("GET /v1/models/:id returns a single model", async () => {
+  const res = await fetch(`${baseUrl}/v1/models/mock/mock-model`, { headers: authHeaders() })
+  assert.equal(res.status, 200)
+  const body = await res.json()
+  assert.equal(body.id, "mock/mock-model")
+  assert.equal(body.object, "model")
+  assert.equal(typeof body.created, "number")
+  assert.equal(typeof body.owned_by, "string")
+})
+
+test("GET /v1/models/:id accepts a bare model id", async () => {
+  const res = await fetch(`${baseUrl}/v1/models/mock-model`, { headers: authHeaders() })
+  assert.equal(res.status, 200)
+  const body = await res.json()
+  assert.equal(body.id, "mock/mock-model")
+})
+
+test("GET /v1/models/:id rejects an unknown model", async () => {
+  const res = await fetch(`${baseUrl}/v1/models/does/not/exist`, { headers: authHeaders() })
+  assert.equal(res.status, 404)
+  const body = await res.json()
+  assert.equal(body.error.code, "model_not_found")
+})
+
+test("GET /health does not require an API key", async () => {
+  const res = await fetch(`${baseUrl}/health`)
+  assert.equal(res.status, 200)
+})
+
+test("POST /v1/chat/completions rejects a request without an API key", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock/mock-model", messages: [{ role: "user", content: "Hello" }] }),
+  })
+  assert.equal(res.status, 401)
+})
+
 test("one proxy request costs exactly one provider request", async () => {
   mock.requests.length = 0
   await post("/v1/chat/completions", {

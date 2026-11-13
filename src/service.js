@@ -232,11 +232,45 @@ export class ProxyService {
 
   /**
    * Runs a chat completion with SSE streaming.
+   *
+   * The OpenAI `n` field asks for several answers. opencode answers once per
+   * session, so the streams are run that many times and their chunks are
+   * interleaved with distinct choice indexes.
+   *
    * @param {any} body OpenAI request body
    * @param {(chunk: string) => void} emit writes a raw SSE chunk
    * @param {{signal?: AbortSignal}} options
    */
   async stream(body, emit, { signal } = {}) {
+    const count = choiceCount(body.n)
+    if (count === 1) return this.#streamOnce(body, emit, { signal, choiceIndex: 0 })
+
+    // Each answer gets its own buffer. A chunk is written as soon as it
+    // arrives, so the client sees the answers as they come in.
+    const buffers = Array.from({ length: count }, () => [])
+
+    const flush = () => {
+      for (const buffer of buffers) {
+        for (const chunk of buffer.splice(0)) emit(chunk)
+      }
+    }
+
+    const runs = Array.from({ length: count }, (_, index) =>
+      this.#streamOnce(
+        body,
+        (chunk) => {
+          buffers[index].push(chunk)
+          flush()
+        },
+        { signal, choiceIndex: index },
+      ),
+    )
+
+    await Promise.all(runs)
+  }
+
+  /** Runs a single streaming chat completion. */
+  async #streamOnce(body, emit, { signal, choiceIndex = 0 } = {}) {
     const model = this.resolveModel(body.model)
     const session = await this.client.createSession(this.#sessionTitle(body))
     const completionID = completionId()
@@ -254,7 +288,7 @@ export class ProxyService {
 
     // The OpenAI streaming protocol opens with a chunk that only carries the
     // role, before any content arrives.
-    send({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })
+    send({ ...base, choices: [{ index: choiceIndex, delta: { role: "assistant" }, finish_reason: null }] })
 
     // Track streamed text so we can emit a final usage block.
     let streamedText = ""
@@ -335,14 +369,14 @@ export class ProxyService {
         // Reasoning deltas are surfaced separately so they never pollute the
         // assistant message content.
         if (kind === "reasoning") {
-          send({ ...base, choices: [{ index: 0, delta: { reasoning_content: props.delta ?? "" }, finish_reason: null }] })
+          send({ ...base, choices: [{ index: choiceIndex, delta: { reasoning_content: props.delta ?? "" }, finish_reason: null }] })
           return
         }
         // The user's own prompt is echoed back as a message part; it must not
         // be streamed as assistant content.
         if (messageRoles.get(props.messageID) === "user") return
         streamedText += props.delta ?? ""
-        send({ ...base, choices: [{ index: 0, delta: { content: props.delta ?? "" }, finish_reason: null }] })
+        send({ ...base, choices: [{ index: choiceIndex, delta: { content: props.delta ?? "" }, finish_reason: null }] })
         return
       }
 
@@ -367,7 +401,7 @@ export class ProxyService {
             if (wantsJson) {
               const json = structuredToJsonMessage(state.input, responseFormat)
               if (json) {
-                send({ ...base, choices: [{ index: 0, delta: { content: json }, finish_reason: null }] })
+                send({ ...base, choices: [{ index: choiceIndex, delta: { content: json }, finish_reason: null }] })
               }
               resolveStructured?.(true)
               return
@@ -379,7 +413,7 @@ export class ProxyService {
               // JSON answer.
               const json = wantsJson ? structuredToJsonMessage(state.input, responseFormat) : content
               if (json) {
-                send({ ...base, choices: [{ index: 0, delta: { content: json }, finish_reason: null }] })
+                send({ ...base, choices: [{ index: choiceIndex, delta: { content: json }, finish_reason: null }] })
               }
             }
             for (const call of toolCalls) {
@@ -471,10 +505,10 @@ export class ProxyService {
       // If nothing was streamed (e.g. a short answer that arrived before the
       // subscription was live), fall back to the text the events reported.
       if (!streamedText && !structuredEmitted && finalText) {
-        send({ ...base, choices: [{ index: 0, delta: { content: finalText }, finish_reason: null }] })
+        send({ ...base, choices: [{ index: choiceIndex, delta: { content: finalText }, finish_reason: null }] })
       }
 
-      send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })
+      send({ ...base, choices: [{ index: choiceIndex, delta: {}, finish_reason: finishReason }] })
       // OpenAI only appends the usage chunk when the client asked for it.
       if (body.stream_options?.include_usage !== false) {
         send({ ...base, choices: [], usage: usage ?? usageFrom(null) })

@@ -67,9 +67,8 @@ export class ProxyService {
     const results = await Promise.all(
       Array.from({ length: count }, () => this.#completeOnce(body, { signal })),
     )
-    const choices = results.flatMap((result, index) =>
-      result.choices.map((choice) => ({ ...choice, index })),
-    )
+    // Each answer becomes one choice, numbered from zero.
+    const choices = results.flatMap((result) => result.choices).map((choice, index) => ({ ...choice, index }))
     const usage = results.reduce(
       (total, result) => ({
         prompt_tokens: total.prompt_tokens + result.usage.prompt_tokens,
@@ -433,7 +432,7 @@ export class ProxyService {
                 ...base,
                 choices: [
                   {
-                    index: 0,
+                    index: choiceIndex,
                     delta: { tool_calls: [{ index: 0, id: call.id, type: "function", function: call.function }] },
                     finish_reason: null,
                   },

@@ -221,3 +221,58 @@ test("a streaming tool-calling request emits tool_call deltas", async () => {
   const final = chunks.filter((c) => c.choices?.some((choice) => choice.finish_reason)).at(-1)
   assert.equal(final.choices[0].finish_reason, "tool_calls")
 })
+
+test("a tool-calling request with n produces one tool call per answer", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: "mock/mock-model",
+      messages: [{ role: "user", content: "Weather in Paris?" }],
+      tools: [WEATHER_TOOL],
+      n: 2,
+    }),
+  })
+
+  assert.equal(res.status, 200)
+  const body = await res.json()
+  assert.equal(body.choices.length, 2)
+  assert.deepEqual(body.choices.map((choice) => choice.index), [0, 1])
+
+  for (const choice of body.choices) {
+    assert.equal(choice.finish_reason, "tool_calls")
+    assert.equal(choice.message.tool_calls.length, 1)
+    assert.equal(choice.message.tool_calls[0].function.name, "get_weather")
+  }
+})
+
+test("a streaming tool-calling request with n carries the right choice index", async () => {  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: "mock/mock-model",
+      messages: [{ role: "user", content: "Weather in Paris?" }],
+      stream: true,
+      n: 2,
+      tools: [WEATHER_TOOL],
+    }),
+  })
+
+  assert.equal(res.status, 200)
+  const text = await res.text()
+  const chunks = text
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
+    .map((line) => JSON.parse(line.slice(6)))
+
+  const toolDeltas = chunks.flatMap((c) => c.choices ?? []).filter((choice) => choice.delta?.tool_calls)
+  assert.ok(toolDeltas.length > 0, "expected tool_call deltas in the stream")
+
+  // Every answer carries its own choice index, and the tool call keeps its
+  // own index inside that choice.
+  assert.deepEqual([...new Set(toolDeltas.map((choice) => choice.index))].sort(), [0, 1])
+  for (const choice of toolDeltas) {
+    assert.equal(choice.delta.tool_calls[0].index, 0)
+    assert.equal(choice.delta.tool_calls[0].function.name, "get_weather")
+  }
+})

@@ -163,6 +163,10 @@ function.
 Both go through the same structured-output mechanism as function calling. The
 message body then contains the raw JSON, exactly as OpenAI does.
 
+`response_format` can also be combined with `tools`. The model then answers
+either with JSON or with a tool call, and the `finish_reason` follows what the
+message actually carries.
+
 ### Fields the proxy accepts
 
 | Field | Effect |

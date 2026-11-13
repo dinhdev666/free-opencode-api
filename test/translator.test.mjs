@@ -154,6 +154,19 @@ test("buildToolSchema ignores a tool_choice for an unknown function", () => {
   assert.equal(schema.properties.tool_calls, undefined)
 })
 
+test("buildToolSchema applies a response_format to the content", () => {
+  const schema = buildToolSchema(
+    [{ type: "function", function: { name: "a", parameters: { type: "object" } } }],
+    "auto",
+    { schema: { type: "object", properties: { city: { type: "string" } } } },
+  )
+  // The answer may be JSON, so the content is an object now.
+  assert.equal(schema.properties.content.type, "object")
+  assert.deepEqual(schema.properties.content.properties.city, { type: "string" })
+  // The tools stay available.
+  assert.ok(schema.properties.tool_calls)
+})
+
 test("buildToolSchema normalises a schema without an object type", () => {
   const schema = buildToolSchema(
     [{ type: "function", function: { name: "a", parameters: { properties: { x: { type: "string" } } } } }],

@@ -107,13 +107,16 @@ export class ProxyService {
       const usage = usageFrom(result?.info?.tokens)
       const structured = result?.info?.structured
       const responseFormat = buildResponseFormat(body.response_format)
-      const wantsJson = Boolean(responseFormat) && !body.tools?.length
+      const hasTools = (body.tools ?? []).some((tool) => tool?.type === "function")
+      const wantsJson = Boolean(responseFormat) && !hasTools
       const finishReason = toFinishReason(result?.info?.finish)
 
       if (structured !== undefined && structured !== null) {
+        const { content, toolCalls } = structuredToResponse(structured)
+
         // A response_format request wants the raw JSON as the message body.
         if (wantsJson) {
-          const content = structuredToJsonMessage(structured, responseFormat)
+          const json = structuredToJsonMessage(structured, responseFormat)
           return {
             id: completionId(),
             object: "chat.completion",
@@ -122,7 +125,7 @@ export class ProxyService {
             choices: [
               {
                 index: 0,
-                message: { role: "assistant", content: content || null },
+                message: { role: "assistant", content: json || null },
                 logprobs: null,
                 finish_reason: "stop",
               },
@@ -131,7 +134,11 @@ export class ProxyService {
           }
         }
 
-        const { content, toolCalls } = structuredToResponse(structured)
+        // Tools and a response_format together: the model either calls a tool
+        // or answers with JSON. Which one it did shows up in the answer, so
+        // the finish reason has to follow it.
+        const jsonAnswer = responseFormat ? structuredToJsonMessage(structured, responseFormat) : ""
+
         return {
           id: completionId(),
           object: "chat.completion",
@@ -142,11 +149,11 @@ export class ProxyService {
               index: 0,
               message: {
                 role: "assistant",
-                content: content || null,
+                content: toolCalls.length ? content || null : jsonAnswer || content || null,
                 ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
               },
               logprobs: null,
-              finish_reason: toolCalls.length ? "tool_calls" : finishReason,
+              finish_reason: toolCalls.length ? "tool_calls" : "stop",
             },
           ],
           usage,
@@ -221,7 +228,9 @@ export class ProxyService {
     let structuredEmitted = false
     /** The client asked for a JSON answer through `response_format`. */
     const responseFormat = buildResponseFormat(body.response_format)
-    const wantsJson = Boolean(responseFormat) && !body.tools?.length
+    const wantsJson =
+      Boolean(responseFormat) &&
+      !(body.tools ?? []).some((tool) => tool?.type === "function")
 
     // Structured output arrives as a `StructuredOutput` tool part, which
     // opencode publishes *after* the prompt call resolves. Resolve this
@@ -326,7 +335,12 @@ export class ProxyService {
 
             const { content, toolCalls } = structuredToResponse(state.input)
             if (content) {
-              send({ ...base, choices: [{ index: 0, delta: { content }, finish_reason: null }] })
+              // With a response_format alongside the tools, the content is the
+              // JSON answer.
+              const json = wantsJson ? structuredToJsonMessage(state.input, responseFormat) : content
+              if (json) {
+                send({ ...base, choices: [{ index: 0, delta: { content: json }, finish_reason: null }] })
+              }
             }
             for (const call of toolCalls) {
               send({
@@ -340,7 +354,10 @@ export class ProxyService {
                 ],
               })
             }
+            // A tool call and a JSON answer are different outcomes, so the
+            // finish reason has to match what the stream actually carries.
             if (toolCalls.length) finishReason = "tool_calls"
+            else if (wantsJson) finishReason = "stop"
             resolveStructured?.(true)
           }
         }
@@ -471,13 +488,14 @@ export class ProxyService {
 
     // Function calling and response_format both use opencode's structured
     // output, so only one schema can be active at a time. Tools win, because
-    // a tool call carries the answer.
-    const toolSchema = buildToolSchema(body.tools, body.tool_choice)
+    // a tool call carries the answer — but a response_format alongside the
+    // tools still constrains the answer.
+    const responseFormat = buildResponseFormat(body.response_format)
+    const toolSchema = buildToolSchema(body.tools, body.tool_choice, responseFormat ?? {})
     if (toolSchema) {
       payload.format = { type: "json_schema", schema: toolSchema }
-    } else {
-      const responseFormat = buildResponseFormat(body.response_format)
-      if (responseFormat) payload.format = { type: "json_schema", schema: responseFormat.schema }
+    } else if (responseFormat) {
+      payload.format = { type: "json_schema", schema: responseFormat.schema }
     }
 
     return payload

@@ -253,6 +253,52 @@ test("POST /v1/completions streams text_completion chunks", async () => {
   assert.match(content, /Hello from mock/)
 })
 
+test("POST /v1/completions sends the usage chunk in a stream", async () => {
+  const res = await fetch(`${baseUrl}/v1/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: "mock/mock-model",
+      prompt: "Hello",
+      stream: true,
+      stream_options: { include_usage: true },
+    }),
+  })
+
+  assert.equal(res.status, 200)
+  const chunks = (await res.text())
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
+    .map((line) => JSON.parse(line.slice(6)))
+
+  const usage = chunks.find((chunk) => chunk.usage)
+  assert.ok(usage, "expected a usage chunk")
+  assert.equal(usage.object, "text_completion")
+  assert.deepEqual(usage.choices, [])
+  assert.equal(typeof usage.usage.total_tokens, "number")
+})
+
+test("POST /v1/completions omits the usage chunk when asked to", async () => {
+  const res = await fetch(`${baseUrl}/v1/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: "mock/mock-model",
+      prompt: "Hello",
+      stream: true,
+      stream_options: { include_usage: false },
+    }),
+  })
+
+  assert.equal(res.status, 200)
+  const chunks = (await res.text())
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
+    .map((line) => JSON.parse(line.slice(6)))
+
+  assert.equal(chunks.find((chunk) => chunk.usage), undefined, "expected no usage chunk")
+})
+
 test("a model id with a #variant suffix resolves", async () => {
   const { status, body } = await post("/v1/chat/completions", {
     model: "mock/mock-model#high",

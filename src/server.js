@@ -304,6 +304,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
       messages: [{ role: "user", content: text }],
       ...(body.stop ? { stop: body.stop } : {}),
       ...(body.n !== undefined ? { n: body.n } : {}),
+      ...(body.stream_options ? { stream_options: body.stream_options } : {}),
     }
 
     await ensureModels()
@@ -340,8 +341,26 @@ export function buildServer({ client, registry, eventBus } = {}) {
             return
           }
           if (payload.model) model = payload.model
-          const choice = payload.choices?.[0]
-          if (!choice) return
+
+          // The usage chunk carries no choices, so it has to be handled before
+          // the choice is looked at.
+          if (!payload.choices?.length) {
+            if (payload.usage) {
+              reply.raw.write(
+                `data: ${JSON.stringify({
+                  id,
+                  object: "text_completion",
+                  created,
+                  model,
+                  choices: [],
+                  usage: payload.usage,
+                })}\n\n`,
+              )
+            }
+            return
+          }
+
+          const choice = payload.choices[0]
           const text = choice.delta?.content ?? ""
           reply.raw.write(
             `data: ${JSON.stringify({
@@ -350,7 +369,6 @@ export function buildServer({ client, registry, eventBus } = {}) {
               created,
               model,
               choices: [{ index: 0, text, logprobs: null, finish_reason: choice.finish_reason ?? null }],
-              ...(payload.usage ? { usage: payload.usage } : {}),
             })}\n\n`,
           )
         }, { signal: abort.signal })

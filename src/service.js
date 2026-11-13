@@ -13,6 +13,29 @@ export class ProxyService {
     this.eventBus = eventBus
     /** Reusable opencode agent for chat requests. */
     this.agent = config.defaultAgent
+    /**
+     * The pending instance disposal.
+     *
+     * Several requests can be aborted at the same time, and each of them
+     * poisons the opencode instance. Disposing it twice at once races: the
+     * second dispose can pull the instance down while another request is
+     * using it, which poisons it again. The disposal is therefore shared.
+     */
+    this.disposal = null
+  }
+
+  /**
+   * Disposes the opencode instance of the project, once for all callers.
+   *
+   * @see https://github.com/anomalyco/opencode/issues/58942
+   */
+  async #disposeInstance() {
+    if (!this.disposal) {
+      this.disposal = this.client.disposeInstance().finally(() => {
+        this.disposal = null
+      })
+    }
+    return this.disposal
   }
 
   /** Resolves the requested model to an opencode provider/model pair. */
@@ -62,10 +85,10 @@ export class ProxyService {
    */
   async complete(body, { signal } = {}) {
     const count = choiceCount(body.n)
-    if (count === 1) return this.#completeOnce(body, { signal })
+    if (count === 1) return this.#completeWithRecovery(body, { signal })
 
     const results = await Promise.all(
-      Array.from({ length: count }, () => this.#completeOnce(body, { signal })),
+      Array.from({ length: count }, () => this.#completeWithRecovery(body, { signal })),
     )
     // Each answer becomes one choice, numbered from zero.
     const choices = results.flatMap((result) => result.choices).map((choice, index) => ({ ...choice, index }))
@@ -79,6 +102,25 @@ export class ProxyService {
     )
 
     return { ...results[0], choices, usage }
+  }
+
+  /**
+   * Runs a completion and recovers from a poisoned opencode instance.
+   *
+   * An aborted request can leave opencode's instance of the project in a
+   * broken state, and every later request to it answers with an empty 499.
+   * The instance is disposed and the request is tried once more.
+   */
+  async #completeWithRecovery(body, { signal } = {}) {
+    try {
+      return await this.#completeOnce(body, { signal })
+    } catch (err) {
+      // The error is turned into a ServiceError, so the broken instance shows
+      // up as its own code.
+      if (err?.code !== "opencode_instance_broken") throw err
+      await this.#disposeInstance()
+      return this.#completeOnce(body, { signal })
+    }
   }
 
   /** Runs a single chat completion. */
@@ -236,7 +278,7 @@ export class ProxyService {
         // later request to it would answer with an empty 499. Disposing the
         // instance clears that.
         // See https://github.com/anomalyco/opencode/issues/58942
-        if (signal?.aborted) await this.client.disposeInstance()
+        if (signal?.aborted) await this.#disposeInstance()
       }
     }
   }
@@ -254,7 +296,7 @@ export class ProxyService {
    */
   async stream(body, emit, { signal } = {}) {
     const count = choiceCount(body.n)
-    if (count === 1) return this.#streamOnce(body, emit, { signal, choiceIndex: 0 })
+    if (count === 1) return this.#streamWithRecovery(body, emit, { signal, choiceIndex: 0 })
 
     // Each answer gets its own buffer. A chunk is written as soon as it
     // arrives, so the client sees the answers as they come in.
@@ -267,7 +309,7 @@ export class ProxyService {
     }
 
     const runs = Array.from({ length: count }, (_, index) =>
-      this.#streamOnce(
+      this.#streamWithRecovery(
         body,
         (chunk) => {
           buffers[index].push(chunk)
@@ -278,6 +320,24 @@ export class ProxyService {
     )
 
     await Promise.all(runs)
+  }
+
+  /**
+   * Runs a streaming completion and recovers from a poisoned instance.
+   *
+   * A stream cannot be restarted once a chunk went out, so the broken
+   * instance is disposed *before* the second attempt. The instance is
+   * poisoned by an aborted request, which means the first attempt produced
+   * nothing worth keeping.
+   */
+  async #streamWithRecovery(body, emit, { signal, choiceIndex = 0 } = {}) {
+    try {
+      return await this.#streamOnce(body, emit, { signal, choiceIndex })
+    } catch (err) {
+      if (err?.code !== "opencode_instance_broken") throw err
+      await this.#disposeInstance()
+      return this.#streamOnce(body, emit, { signal, choiceIndex })
+    }
   }
 
   /** Runs a single streaming chat completion. */
@@ -549,7 +609,7 @@ export class ProxyService {
         // later request to it would answer with an empty 499. Disposing the
         // instance clears that.
         // See https://github.com/anomalyco/opencode/issues/58942
-        if (signal?.aborted) await this.client.disposeInstance()
+        if (signal?.aborted) await this.#disposeInstance()
       }
     }
   }

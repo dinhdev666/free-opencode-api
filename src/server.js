@@ -235,6 +235,7 @@ export function buildServer({ client, registry, eventBus } = {}) {
       model: body.model,
       messages: [{ role: "user", content: text }],
       ...(body.stop ? { stop: body.stop } : {}),
+      ...(body.n !== undefined ? { n: body.n } : {}),
     }
 
     await ensureModels()
@@ -298,20 +299,17 @@ export function buildServer({ client, registry, eventBus } = {}) {
     }
 
     const result = await service.complete(chatBody, { signal: request.clientSignal })
-    const choice = result.choices[0]
     return reply.send({
       id: result.id,
       object: "text_completion",
       created: result.created,
       model: result.model,
-      choices: [
-        {
-          index: 0,
-          text: choice.message.content ?? "",
-          logprobs: null,
-          finish_reason: choice.finish_reason,
-        },
-      ],
+      choices: result.choices.map((choice) => ({
+        index: choice.index,
+        text: choice.message.content ?? "",
+        logprobs: null,
+        finish_reason: choice.finish_reason,
+      })),
       usage: result.usage,
     })
   })

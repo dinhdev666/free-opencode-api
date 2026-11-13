@@ -68,3 +68,32 @@ test("the proxy recovers from a poisoned opencode instance", async () => {
     client.createSession = originalCreate
   }
 })
+
+test("a poisoned instance that stays broken answers with a proper error", async () => {
+  // The instance cannot be repaired, so the client has to get a readable
+  // error instead of an internal error.
+  const client = app.opencode.client
+  const originalCreate = client.createSession.bind(client)
+
+  client.createSession = async () => {
+    throw new OpencodeError("HTTP 499", { status: 499, code: "opencode_error" })
+  }
+
+  try {
+    const res = await fetch(baseUrl, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        model: "mock/mock-model",
+        messages: [{ role: "user", content: "Hello" }],
+      }),
+    })
+
+    assert.equal(res.status, 503)
+    const body = await res.json()
+    assert.equal(body.error.code, "opencode_instance_broken")
+    assert.equal(typeof body.error.message, "string")
+  } finally {
+    client.createSession = originalCreate
+  }
+})

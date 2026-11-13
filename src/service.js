@@ -119,7 +119,34 @@ export class ProxyService {
       // up as its own code.
       if (err?.code !== "opencode_instance_broken") throw err
       await this.#disposeInstance()
-      return this.#completeOnce(body, { signal })
+      try {
+        return await this.#completeOnce(body, { signal })
+      } catch (retry) {
+        // The second attempt has to answer with a proper error, not with the
+        // raw error of the opencode client.
+        throw toServiceError(retry)
+      }
+    }
+  }
+
+  /**
+   * Creates an opencode session, recovering from a broken instance.
+   *
+   * Creating the session is part of the recovery: the broken instance answers
+   * the session request with an empty 499 as well.
+   */
+  async #createSession(title) {
+    try {
+      return await this.client.createSession(title)
+    } catch (err) {
+      const failure = toServiceError(err)
+      if (failure.code !== "opencode_instance_broken") throw failure
+      await this.#disposeInstance()
+      try {
+        return await this.client.createSession(title)
+      } catch (retry) {
+        throw toServiceError(retry)
+      }
     }
   }
 
@@ -129,15 +156,7 @@ export class ProxyService {
 
     // Creating the session can also meet the broken instance, so it is part
     // of the recovery.
-    let session
-    try {
-      session = await this.client.createSession(this.#sessionTitle(body))
-    } catch (err) {
-      const failure = toServiceError(err)
-      if (failure.code !== "opencode_instance_broken") throw failure
-      await this.#disposeInstance()
-      session = await this.client.createSession(this.#sessionTitle(body))
-    }
+    const session = await this.#createSession(this.#sessionTitle(body))
 
     // opencode retries a failing provider internally (5 retries, 2s -> 30s
     // backoff, ~90s in total) and publishes a `retry` status for each
@@ -284,12 +303,16 @@ export class ProxyService {
       // A client that disconnected leaves the session half-finished, so it has
       // to go. A completed session is left alone unless asked otherwise.
       if (config.deleteSessions || signal?.aborted) {
-        await this.client.deleteSession(session.id)
         // The abort poisoned the opencode instance of this project: every
         // later request to it would answer with an empty 499. Disposing the
         // instance clears that.
         // See https://github.com/anomalyco/opencode/issues/58942
+        //
+        // The instance has to be disposed *before* the session is deleted: a
+        // delete that meets the broken instance fails, and the session stays
+        // behind forever.
         if (signal?.aborted) await this.#disposeInstance()
+        await this.client.deleteSession(session.id)
       }
     }
   }
@@ -347,7 +370,13 @@ export class ProxyService {
     } catch (err) {
       if (err?.code !== "opencode_instance_broken") throw err
       await this.#disposeInstance()
-      return this.#streamOnce(body, emit, { signal, choiceIndex })
+      try {
+        return await this.#streamOnce(body, emit, { signal, choiceIndex })
+      } catch (retry) {
+        // The second attempt has to answer with a proper error, not with the
+        // raw error of the opencode client.
+        throw toServiceError(retry)
+      }
     }
   }
 
@@ -357,15 +386,7 @@ export class ProxyService {
 
     // Creating the session can also meet the broken instance, so it is part
     // of the recovery.
-    let session
-    try {
-      session = await this.client.createSession(this.#sessionTitle(body))
-    } catch (err) {
-      const failure = toServiceError(err)
-      if (failure.code !== "opencode_instance_broken") throw failure
-      await this.#disposeInstance()
-      session = await this.client.createSession(this.#sessionTitle(body))
-    }
+    const session = await this.#createSession(this.#sessionTitle(body))
     const completionID = completionId()
     const created = Math.floor(Date.now() / 1000)
     const base = { id: completionID, object: "chat.completion.chunk", created, model: model.id }
@@ -626,12 +647,11 @@ export class ProxyService {
       // A client that disconnected leaves the session half-finished, so it has
       // to go. A completed session is left alone unless asked otherwise.
       if (config.deleteSessions || signal?.aborted) {
-        await this.client.deleteSession(session.id)
-        // The abort poisoned the opencode instance of this project: every
-        // later request to it would answer with an empty 499. Disposing the
-        // instance clears that.
-        // See https://github.com/anomalyco/opencode/issues/58942
+        // The instance has to be disposed *before* the session is deleted: a
+        // delete that meets the broken instance fails, and the session stays
+        // behind forever.
         if (signal?.aborted) await this.#disposeInstance()
+        await this.client.deleteSession(session.id)
       }
     }
   }

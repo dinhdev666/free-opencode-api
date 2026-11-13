@@ -110,24 +110,52 @@ jobs:
 
       - name: Smoke-test the container
         run: |
+          # The memory limit is the budget check: a container that needs more
+          # than 512 MB is killed by the kernel, and the health check below
+          # then fails. No parsing of `docker stats` needed.
           docker run -d --name proxy \
+            --memory 512m \
+            --memory-swap 512m \
             -e API_KEY=sk-dummy \
             -p 20128:20128 \
             free-opencode-api:ci
 
           # Wait for the proxy to report a healthy opencode server.
+          UP=0
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:20128/health > /dev/null; then
               echo "proxy is up"
+              UP=1
               break
+            fi
+            if ! docker ps --filter name=proxy --filter status=running -q | grep -q .; then
+              echo "::error::The container stopped. It probably ran out of memory."
+              docker logs proxy || true
+              exit 1
             fi
             sleep 2
           done
+          if [ "$UP" -ne 1 ]; then
+            echo "::error::The proxy did not become healthy."
+            docker logs proxy || true
+            exit 1
+          fi
 
           curl -fsS http://127.0.0.1:20128/health
           curl -fsS -H 'authorization: Bearer sk-dummy' http://127.0.0.1:20128/v1/models \
             | head -c 200
           echo
 
-          docker logs proxy
+          echo "the container uses this much memory:"
+          docker stats --no-stream --format '{{.MemUsage}}' proxy
+
+          # The proxy writes no log files and keeps stdout quiet.
+          LOG_BYTES=$(docker logs proxy 2>&1 | wc -c)
+          echo "the container wrote $LOG_BYTES bytes to stdout"
+          if [ "$LOG_BYTES" -ne 0 ]; then
+            echo "::error::The proxy is supposed to stay silent at the default log level."
+            docker logs proxy
+            exit 1
+          fi
+
           docker rm -f proxy

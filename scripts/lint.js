@@ -117,6 +117,33 @@ for (const file of files) {
   }
 }
 
+// Scratch files must never end up in the repository.
+const KEEP_AT_ROOT = new Set([
+  ".dockerignore",
+  ".env",
+  ".env.example",
+  ".gitattributes",
+  ".gitignore",
+  "AGENTS.md",
+  "CONTRIBUTING.md",
+  "Dockerfile",
+  "LICENSE",
+  "Procfile",
+  "README.md",
+  "docker-compose.yml",
+  "opencode.json",
+  "package.json",
+  "pnpm-lock.yaml",
+  "railway.json",
+])
+
+for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+  if (entry.isDirectory()) continue
+  if (KEEP_AT_ROOT.has(entry.name)) continue
+  if (entry.name.startsWith(".")) continue
+  problems.push(`${entry.name}: unexpected file in the project root`)
+}
+
 if (problems.length) {
   console.error(`lint failed with ${problems.length} problem(s):\n`)
   for (const problem of problems) console.error(`  ${problem}`)

@@ -678,17 +678,36 @@ function extractToolParts(parts) {
   return { toolCalls }
 }
 
-function usageFrom(tokens) {
+/**
+ * Maps opencode's token counts onto the OpenAI usage fields.
+ *
+ * opencode splits the counts differently: its `input` is the raw input minus
+ * the cached tokens, and its `output` is the raw output minus the reasoning
+ * tokens. OpenAI counts the other way round — the prompt tokens include
+ * everything that was sent, and the completion tokens include the reasoning.
+ */
+export function usageFrom(tokens) {
   if (!tokens) {
     return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
   }
-  const prompt = (tokens.input ?? 0) + (tokens.cache?.read ?? 0)
-  const completion = tokens.output ?? 0
+
+  const prompt = (tokens.input ?? 0) + (tokens.cache?.read ?? 0) + (tokens.cache?.write ?? 0)
+  const completion = (tokens.output ?? 0) + (tokens.reasoning ?? 0)
+  const total = tokens.total ?? prompt + completion
+
   return {
     prompt_tokens: prompt,
     completion_tokens: completion,
-    total_tokens: prompt + completion,
+    total_tokens: total,
     ...(tokens.reasoning ? { completion_tokens_details: { reasoning_tokens: tokens.reasoning } } : {}),
+    ...(tokens.cache?.read || tokens.cache?.write
+      ? {
+          prompt_tokens_details: {
+            cached_tokens: tokens.cache?.read ?? 0,
+            ...(tokens.cache?.write ? { cache_write_tokens: tokens.cache.write } : {}),
+          },
+        }
+      : {}),
   }
 }
 

@@ -86,7 +86,10 @@ export function contentToText(content) {
 
 /**
  * Splits OpenAI message content into opencode parts.
- * Images become `file` parts so multimodal models can consume them.
+ *
+ * Images become `file` parts so multimodal models can consume them. The
+ * system and developer messages are left out — they travel as the system
+ * prompt, not as part of the conversation.
  */
 export function messagesToParts(messages) {
   const parts = []
@@ -103,6 +106,11 @@ export function messagesToParts(messages) {
   for (const message of messages ?? []) {
     if (!message || typeof message !== "object") continue
     const role = message.role ?? "user"
+
+    // The system prompt is sent separately, so repeating it in the transcript
+    // would tell the model the same thing twice.
+    if (role === "system" || role === "developer") continue
+
     if (role === "tool" || role === "function") {
       const id = message.tool_call_id ?? message.id
       const name = message.name ?? (id ? callNames.get(id) : undefined) ?? "tool"

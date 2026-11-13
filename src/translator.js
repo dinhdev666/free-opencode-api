@@ -169,10 +169,15 @@ function mimeFromUrl(url) {
  *  - `{ content, tool_calls }` — the model may answer directly or call tools.
  *  - `{ content }` — tool calling is disabled (tool_choice "none").
  *
+ * When the client also asked for a `response_format`, the schema is extended
+ * so the answer satisfies both: the tool arguments follow the response
+ * format's schema.
+ *
  * @param {any[]} tools OpenAI tool definitions
  * @param {any} toolChoice
+ * @param {{schema?: object}} responseFormat
  */
-export function buildToolSchema(tools, toolChoice) {
+export function buildToolSchema(tools, toolChoice, responseFormat = {}) {
   const list = (tools ?? []).filter((tool) => tool && tool.type === "function" && tool.function)
   if (!list.length) return undefined
 
@@ -212,6 +217,14 @@ export function buildToolSchema(tools, toolChoice) {
     schema.properties.content = { type: "null" }
     delete schema.properties.tool_calls.minItems
     schema.properties.tool_calls.minItems = 1
+  }
+
+  // A response_format alongside the tools constrains the answer. The model
+  // may answer directly with JSON, or call a tool whose arguments follow the
+  // same schema.
+  if (responseFormat?.schema) {
+    schema.properties.content = { ...responseFormat.schema }
+    schema.required = ["content"]
   }
 
   return schema

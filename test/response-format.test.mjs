@@ -153,3 +153,33 @@ test("a response_format request wins over nothing else", async () => {
   const tool = (request.body?.tools ?? []).find((t) => t.function?.name === "StructuredOutput")
   assert.equal(tool, undefined, "a plain chat request must not use structured output")
 })
+
+test("tools and response_format together return the JSON answer", async () => {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({
+      model: "mock/mock-model",
+      messages: [{ role: "user", content: "Weather in Paris?" }],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "get_weather",
+            parameters: { type: "object", properties: { city: { type: "string" } } },
+          },
+        },
+      ],
+      response_format: { type: "json_object" },
+    }),
+  })
+
+  assert.equal(res.status, 200)
+  const body = await res.json()
+  const choice = body.choices[0]
+
+  // The answer is JSON, so the finish reason must not claim a tool call.
+  assert.equal(choice.finish_reason, "stop")
+  assert.equal(choice.message.tool_calls, undefined)
+  assert.doesNotThrow(() => JSON.parse(choice.message.content))
+})

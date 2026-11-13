@@ -234,6 +234,22 @@ provider is hit **once** instead of twice.
 The proxy additionally creates every session with an explicit title, which is
 a second, request-level way to skip opencode's title generation.
 
+### What it costs
+
+Measured on the machine this was written on:
+
+| | |
+| --- | --- |
+| Resident memory | **≈ 92 MB** (proxy + opencode, idle) |
+| Idle CPU | **≈ 1.4 %** of one core |
+| CPU per request | **≈ 2.8 %** of one core for the proxy; the rest is opencode's own work |
+| Runtime dependencies | **3** — `fastify`, `@fastify/cors`, `opencode-ai` |
+| Log files | none; stdout stays empty at the default log level |
+
+The opencode catalogue holds ~9 100 models in ~7 MB of JSON. The proxy keeps a
+compact projection of it — plain strings instead of full model objects — and
+resolves a model id in under a millisecond.
+
 ### Failing providers fail fast
 
 opencode retries a failing provider internally — 5 retries with a 2 s → 30 s

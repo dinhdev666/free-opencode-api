@@ -76,6 +76,26 @@ opencode's own variant syntax works too: `provider/model#high`.
 The model list is **never hard-coded** — `/v1/models` reflects whatever the
 connected opencode catalogue contains at that moment.
 
+`GET /v1/models/opencode/glm-5.3-flash-free` returns a single model, and
+`GET /v1/models/glm-5.3-flash-free` works with the bare id as well.
+
+### Endpoints the proxy does not implement
+
+The proxy speaks the OpenAI chat-completions standard only. There is no
+`/v1/embeddings`, no `/v1/audio`, no `/v1/images` — opencode has no
+equivalent. Those answer with HTTP 404 and the usual OpenAI error body:
+
+```json
+{
+  "error": {
+    "message": "Unknown endpoint: POST /v1/embeddings",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "unknown_endpoint"
+  }
+}
+```
+
 ### Streaming
 
 `"stream": true` returns a standard OpenAI SSE stream:

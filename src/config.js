@@ -110,6 +110,15 @@ export const config = {
 
   /** How long (ms) a single chat completion may take. */
   requestTimeout: num("REQUEST_TIMEOUT", 300) * 1000,
+
+  /**
+   * Largest request body the proxy accepts, in megabytes.
+   *
+   * A JSON body costs far more memory than its size: the raw bytes, the
+   * parsed object and the copies the proxy makes of it. A 19 MB body measured
+   * 340 MB of resident memory, so an exposed proxy needs a bound.
+   */
+  maxBodySize: num("MAX_BODY_SIZE", 4),
   /**
    * How many provider retries opencode may make before the proxy gives up and
    * reports the failure. opencode's own default is 5 retries with a 2s -> 30s

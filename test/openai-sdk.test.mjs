@@ -305,6 +305,18 @@ test("a request without an API key is rejected", async () => {
   assert.ok("param" in body.error)
 })
 
+test("the key has to come as a bearer token", async () => {
+  // The OpenAI standard sends the key in the Authorization header. Other
+  // schemes are not accepted.
+  const res = await fetch(`${baseUrl}/v1/models`, {
+    headers: { "x-api-key": "sk-dummy" },
+  })
+
+  assert.equal(res.status, 401)
+  const body = await res.json()
+  assert.equal(body.error.code, "invalid_api_key")
+})
+
 test("an error body matches the OpenAI error shape", async () => {
   const res = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: "POST",

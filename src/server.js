@@ -46,8 +46,9 @@ export function buildServer({ client, registry, eventBus } = {}) {
     if (!config.apiKey) return
     if (request.url === "/health" || request.url === "/v1/health") return
 
+    // The OpenAI standard sends the key as a bearer token.
     const header = request.headers.authorization ?? ""
-    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : request.headers["x-api-key"]
+    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : ""
     if (token !== config.apiKey) {
       return reply.code(401).send({
         error: { message: "Invalid API key", type: "invalid_request_error", param: null, code: "invalid_api_key" },

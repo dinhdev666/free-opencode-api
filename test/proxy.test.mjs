@@ -268,6 +268,31 @@ test("the system message reaches the model", async () => {
   assert.ok(roles.includes("system"), "expected a system message in the provider request")
 })
 
+test("the system message is not repeated in the conversation", async () => {
+  mock.requests.length = 0
+  await post("/v1/chat/completions", {
+    model: "mock/mock-model",
+    messages: [
+      { role: "system", content: "You are a pirate." },
+      { role: "developer", content: "Answer in one word." },
+      { role: "user", content: "Hello" },
+    ],
+  })
+
+  const request = mock.requests.at(-1)
+  const messages = request.body?.messages ?? []
+
+  // The system prompt carries both, once.
+  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n")
+  assert.match(system, /You are a pirate\./)
+  assert.match(system, /Answer in one word\./)
+
+  // The conversation itself must not repeat them.
+  const user = messages.filter((m) => m.role === "user").map((m) => m.content).join("\n")
+  assert.doesNotMatch(user, /You are a pirate\./)
+  assert.doesNotMatch(user, /Answer in one word\./)
+})
+
 test("the streaming content does not echo the user's prompt", async () => {  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: "POST",
     headers: authHeaders(),

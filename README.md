@@ -79,6 +79,24 @@ connected opencode catalogue contains at that moment.
 `GET /v1/models/opencode/glm-5.3-flash-free` returns a single model, and
 `GET /v1/models/glm-5.3-flash-free` works with the bare id as well.
 
+### Images
+
+A message can carry an image the OpenAI way:
+
+```jsonc
+{
+  "role": "user",
+  "content": [
+    { "type": "text", "text": "What is this?" },
+    { "type": "image_url", "image_url": { "url": "data:image/png;base64,…" } }
+  ]
+}
+```
+
+The proxy turns it into an opencode `file` part. Whether the model can look
+at it depends on the model — opencode reports that itself when the model
+does not support images.
+
 ### Endpoints the proxy does not implement
 
 The proxy speaks the OpenAI chat-completions standard only. There is no
@@ -183,7 +201,7 @@ message actually carries.
 
 `max_tokens` and `max_completion_tokens` are accepted but opencode has no
 per-request token limit — the cap is set server-wide with `MAX_OUTPUT_TOKENS`.
-`temperature`, `top_p`, `stop`, `seed`, `n`, `user` and the penalty fields are
+`temperature`, `top_p`, `stop`, `seed`, `user` and the penalty fields are
 accepted and ignored: opencode picks the sampling parameters per model.
 
 ### OpenAI SDK compatibility

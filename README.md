@@ -62,6 +62,8 @@ curl http://127.0.0.1:20128/v1/chat/completions \
 | `GET`  | `/health` | Proxy + opencode health, also at `/v1/health`. |
 
 Every endpoint except `/health` requires `Authorization: Bearer <API_KEY>`.
+That is the only scheme the proxy accepts — the key has to come as a bearer
+token, the way the OpenAI standard sends it.
 
 ### Model ids
 

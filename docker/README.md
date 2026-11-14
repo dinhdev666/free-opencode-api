@@ -26,20 +26,26 @@ The image bundles Node.js 22, the project source, and the OpenCode CLI (npm pack
 
 | Tag | Description |
 | --- | --- |
-| `dinhdev666/free-opencode-api:latest` | OpenAI-compatible API gateway for the OpenCode CLI |
+| `dinhdev666/free-opencode-api:latest` | Newest published release — OpenAI-compatible API gateway for the OpenCode CLI |
+| `dinhdev666/free-opencode-api:1.0.0` | Pinned release tag |
+
+Both tags are multi-architecture images (`linux/amd64` and `linux/arm64`); Docker pulls the variant that matches the
+host, so no `--platform` flag is needed on Intel servers or Apple Silicon machines.
 
 ---
 
 ## Quick Start
 
 ```bash
+docker pull dinhdev666/free-opencode-api:1.0.0
+
 docker run -d \
   --restart=always \
   --network common-all \
   --name free-opencode-api \
   --privileged \
   -p 8083:8083 \
-  dinhdev666/free-opencode-api
+  dinhdev666/free-opencode-api:1.0.0
 ```
 
 The service is then reachable at `http://<your-ip>:8083`.
@@ -214,6 +220,30 @@ Two OpenCode 1.19.5 compatibility issues are fixed directly in [`src/proxy.js`](
 **Fix 1 — tool hang.** With opencode ≥ 1.19 and a free zen model (e.g. `opencode/deepseek-v4.1-flash-free`), `DISABLE_TOOLS=true` (the image default) disables every OpenCode tool, and as soon as either `read` or `glob` is disabled the prompt request hangs forever — the gateway never returns content. The fix keeps the two read-only tools `read` and `glob` enabled while still disabling every other tool (bash/edit/write/task/webfetch/question/grep/skill…). Both are read-only with no write or execution capability, and `stripFunctionCalls` output filtering plus the `TOOL_GUARD_MESSAGE` system prompt act as a second line of defense.
 
 **Fix 2 — streaming SSE compatibility.** In opencode ≥ 1.19, SSE `message.part.updated` events carry no `properties.delta`, and `part.text` holds the part's **current full text**. Reading the increment via `const { part, delta } = event.properties` therefore always yielded `undefined`, so streams carried no content and only a finish chunk; worse, a fast assistant finish delivers `message.updated(finish=stop)` before the 4s first-chunk timer, resolving the collector early with empty content — a path the existing noData/idleTimeout fallbacks never covered (non-streaming responses were unaffected). The fix prefers `properties.delta` when present (older versions) and otherwise derives the increment by diffing `part.text` against what has already been accumulated (`startsWith` check followed by `slice`); when nothing has been streamed at all, it polls `pollForAssistantResponse` once for the full reply (filtered through `stripFunctionCalls`), and emits no delta if polling is also empty.
+
+---
+
+## Publishing a Release
+
+The image is published by `.github/workflows/docker-publish.yml`. Pushing a version tag builds
+`linux/amd64` + `linux/arm64` and pushes the version tag, the minor tag and `latest`:
+
+```bash
+# package.json version and the tag must match; the workflow fails otherwise
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+The workflow needs two repository secrets (Settings → Secrets and variables → Actions):
+`DOCKERHUB_USERNAME` (the Docker Hub account) and `DOCKERHUB_TOKEN` (an access token with Read & Write scope, not the
+account password). Builds run on GitHub-hosted runners, so no local Docker installation is required.
+
+To publish from this machine instead:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile -t dinhdev666/free-opencode-api:1.0.0 --push .
+```
 
 ---
 

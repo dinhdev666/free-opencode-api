@@ -1,0 +1,1433 @@
+import Fastify from 'fastify';
+import { spawn } from 'child_process';
+import { createOpencodeClient } from '@opencode-ai/sdk';
+import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { fileURLToPath } from 'url';
+import { logger, maskHeaders } from './logger.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// --- Mutex Logic with Timeout ---
+const queue = [];
+
+const STARTUP_WAIT_ITERATIONS = 60;
+const STARTUP_WAIT_INTERVAL_MS = 2000;
+const STARTING_WAIT_ITERATIONS = 120;
+const STARTING_WAIT_INTERVAL_MS = 1000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
+const DEFAULT_POLL_INTERVAL_MS = 500;
+const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
+const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
+
+// Authentication is mandatory by design: when API_KEY is missing or blank the gateway falls back to this
+// built-in key instead of running without authentication.
+export const DEFAULT_API_KEY = 'sk-dummy-123';
+
+export const resolveApiKey = (value) => {
+    const key = value === undefined || value === null ? '' : String(value).trim();
+    return key || DEFAULT_API_KEY;
+};
+
+const OPENCODE_BASENAME = 'opencode';
+
+function splitPathEnv() {
+    const raw = process.env.PATH || '';
+    return raw.split(path.delimiter).filter(Boolean);
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function pushDir(list, dir) {
+    if (!dir) return;
+    if (!list.includes(dir)) list.push(dir);
+}
+
+function pushExistingDir(list, dir) {
+    if (!dir) return;
+    if (!fs.existsSync(dir)) return;
+    if (!list.includes(dir)) list.push(dir);
+}
+
+function addVersionedDirs(list, baseDir, subpath) {
+    if (!baseDir || !fs.existsSync(baseDir)) return;
+    let entries = [];
+    try {
+        entries = fs.readdirSync(baseDir, { withFileTypes: true });
+    } catch (e) {
+        return;
+    }
+    entries.forEach((entry) => {
+        if (!entry.isDirectory()) return;
+        const full = path.join(baseDir, entry.name, subpath || '');
+        pushExistingDir(list, full);
+    });
+}
+
+function prefixToBin(prefix) {
+    if (!prefix) return null;
+    return process.platform === 'win32' ? prefix : path.join(prefix, 'bin');
+}
+
+function getOpencodeCandidateNames() {
+    if (process.platform === 'win32') {
+        return [`${OPENCODE_BASENAME}.cmd`, `${OPENCODE_BASENAME}.exe`, `${OPENCODE_BASENAME}.bat`, OPENCODE_BASENAME];
+    }
+    return [OPENCODE_BASENAME];
+}
+
+function findExecutableInDirs(dirs, names) {
+    for (const dir of dirs) {
+        for (const name of names) {
+            const full = path.join(dir, name);
+            if (fs.existsSync(full)) {
+                return full;
+            }
+        }
+    }
+    return null;
+}
+
+function resolveOpencodePath(requestedPath) {
+    const input = (requestedPath || '').trim();
+    const names = getOpencodeCandidateNames();
+
+    if (input) {
+        const looksLikePath = path.isAbsolute(input) || input.includes('/') || input.includes('\\');
+        if (looksLikePath) {
+            if (fs.existsSync(input)) return { path: input, source: 'config' };
+            const resolved = path.resolve(process.cwd(), input);
+            if (fs.existsSync(resolved)) return { path: resolved, source: 'config' };
+        }
+    }
+
+    const pathDirs = splitPathEnv();
+    const fromPath = findExecutableInDirs(pathDirs, names);
+    if (fromPath) return { path: fromPath, source: 'PATH' };
+
+    const extraDirs = [];
+    if (process.env.OPENCODE_HOME) {
+        pushDir(extraDirs, path.join(process.env.OPENCODE_HOME, 'bin'));
+    }
+    if (process.env.OPENCODE_DIR) {
+        pushDir(extraDirs, path.join(process.env.OPENCODE_DIR, 'bin'));
+    }
+    pushDir(extraDirs, prefixToBin(process.env.npm_config_prefix || process.env.NPM_CONFIG_PREFIX));
+    pushDir(extraDirs, process.env.PNPM_HOME);
+    if (process.env.YARN_GLOBAL_FOLDER) {
+        pushDir(extraDirs, path.join(process.env.YARN_GLOBAL_FOLDER, 'bin'));
+    }
+    if (process.env.VOLTA_HOME) {
+        pushDir(extraDirs, path.join(process.env.VOLTA_HOME, 'bin'));
+    }
+    pushDir(extraDirs, process.env.NVM_BIN);
+    pushDir(extraDirs, path.dirname(process.execPath));
+
+    const home = os.homedir();
+    if (home) {
+        pushDir(extraDirs, path.join(home, '.opencode', 'bin'));
+        pushDir(extraDirs, path.join(home, '.local', 'bin'));
+        pushDir(extraDirs, path.join(home, '.npm-global', 'bin'));
+        pushDir(extraDirs, path.join(home, '.npm', 'bin'));
+        pushDir(extraDirs, path.join(home, '.pnpm-global', 'bin'));
+        pushDir(extraDirs, path.join(home, '.local', 'share', 'pnpm'));
+        pushDir(extraDirs, path.join(home, '.fnm', 'node-versions', 'v1', 'installations'));
+        pushDir(extraDirs, path.join(home, '.asdf', 'shims'));
+    }
+
+    if (process.platform === 'win32') {
+        pushDir(extraDirs, process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : null);
+        pushDir(extraDirs, process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'pnpm') : null);
+        pushDir(extraDirs, process.env.NVM_HOME);
+        pushDir(extraDirs, process.env.NVM_SYMLINK);
+        pushDir(extraDirs, process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'nodejs') : null);
+        pushDir(extraDirs, process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], 'nodejs') : null);
+    } else {
+        pushDir(extraDirs, '/usr/local/bin');
+        pushDir(extraDirs, '/usr/bin');
+        pushDir(extraDirs, '/bin');
+        pushDir(extraDirs, '/opt/homebrew/bin');
+        pushDir(extraDirs, '/snap/bin');
+    }
+
+    // nvm (unix) versions
+    const nvmDir = process.env.NVM_DIR || (home ? path.join(home, '.nvm') : null);
+    if (nvmDir) {
+        addVersionedDirs(extraDirs, path.join(nvmDir, 'versions', 'node'), 'bin');
+    }
+
+    // asdf nodejs installs
+    const asdfDir = process.env.ASDF_DATA_DIR || (home ? path.join(home, '.asdf') : null);
+    if (asdfDir) {
+        addVersionedDirs(extraDirs, path.join(asdfDir, 'installs', 'nodejs'), 'bin');
+    }
+
+    // fnm installs
+    if (home) {
+        addVersionedDirs(extraDirs, path.join(home, '.fnm', 'node-versions', 'v1'), 'installation' + path.sep + 'bin');
+    }
+
+    const fromExtras = findExecutableInDirs(extraDirs, names);
+    if (fromExtras) return { path: fromExtras, source: 'known-locations' };
+
+    return { path: null, source: 'not-found' };
+}
+
+// How many chat completions may run at the same time. 1 (the default) preserves the historical behaviour of
+// serializing every completions request; raise it to let independent OpenCode sessions run in parallel.
+const MAX_CONCURRENCY = (() => {
+    const raw = Number(process.env.OPENCODE_PROXY_MAX_CONCURRENCY);
+    if (!Number.isFinite(raw) || raw < 1) return 1;
+    return Math.min(Math.floor(raw), 32);
+})();
+
+let activeTasks = 0;
+
+function runQueuedTask() {
+    const { task, timeout, resolve, reject } = queue.shift();
+    activeTasks += 1;
+    let settled = false;
+    const timeoutMs = timeout || 120000;
+    const timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`Request timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    Promise.resolve()
+        .then(() => task())
+        .then((result) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeoutId);
+            resolve(result);
+        })
+        .catch((err) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeoutId);
+            reject(err);
+        })
+        .finally(() => {
+            activeTasks -= 1;
+            // Drain the queue on the next tick instead of waiting a fixed 100 ms between requests
+            setImmediate(processQueue);
+        });
+}
+
+function processQueue() {
+    while (activeTasks < MAX_CONCURRENCY && queue.length > 0) {
+        runQueuedTask();
+    }
+}
+
+function lock(task, timeout = 120000) {
+    return new Promise((resolve, reject) => {
+        queue.push({ task, timeout, resolve, reject });
+        processQueue();
+    });
+}
+
+// Keep-alive socket for backend health probes: a fresh connection per chat request is measurable overhead
+const healthAgent = new http.Agent({ keepAlive: true, maxSockets: 4 });
+
+/**
+ * Robust Health Check Helper
+ */
+function checkHealth(serverUrl) {
+    return new Promise((resolve, reject) => {
+        const req = http.get(`${serverUrl}/health`, { agent: healthAgent }, (res) => {
+            // Drain the body so the socket goes back to the keep-alive pool
+            res.resume();
+            if (res.statusCode === 200) resolve(true);
+            else reject(new Error(`Status ${res.statusCode}`));
+        });
+        req.on('error', (e) => reject(e));
+        req.setTimeout(2000, () => {
+            req.destroy();
+            reject(new Error('Timeout'));
+        });
+    });
+}
+
+// How long a successful health probe is trusted before the next one (0 disables the cache)
+const BACKEND_HEALTH_CACHE_MS = Number(process.env.OPENCODE_PROXY_HEALTH_CACHE_MS ?? 2000);
+
+// After a failed start attempt (missing binary, backend never became healthy) requests fail fast for this long
+// instead of repeating a multi-minute startup wait on every single request
+const BACKEND_START_RETRY_COOLDOWN_MS = Number(process.env.OPENCODE_PROXY_START_RETRY_MS ?? 15000);
+
+const isConnectionError = (error) => {
+    const message = String(error?.message || '');
+    return message.includes('fetch failed') ||
+        message.includes('ECONNREFUSED') ||
+        message.includes('socket hang up') ||
+        error?.cause?.code === 'ECONNREFUSED';
+};
+
+/**
+ * Cleanup temporary directories
+ */
+function cleanupTempDirs() {
+    // Only cleanup jail directories on non-Windows platforms
+    // On Windows, we don't use isolated jail to avoid path issues
+    if (process.platform === 'win32') return;
+
+    const jailRoot = path.join(os.tmpdir(), 'opencode-proxy-jail');
+    try {
+        if (fs.existsSync(jailRoot)) {
+            fs.rmSync(jailRoot, { recursive: true, force: true });
+        }
+    } catch (e) {
+        logger.error('[Cleanup] Failed to remove temp dirs:', { error: e.message });
+    }
+}
+
+// Register cleanup on exit
+process.on('exit', cleanupTempDirs);
+
+// Handle signals - Unix-like systems
+if (process.platform !== 'win32') {
+    process.on('SIGINT', () => {
+        logger.info('[Shutdown] Received SIGINT, cleaning up...');
+        cleanupTempDirs();
+        process.exit(0);
+    });
+    process.on('SIGTERM', () => {
+        logger.info('[Shutdown] Received SIGTERM, cleaning up...');
+        cleanupTempDirs();
+        process.exit(0);
+    });
+}
+// Note: Windows signal handling is limited, cleanup is handled via process.on('exit')
+
+/**
+ * Best-effort extraction of the status code and error-body summary from an upstream (opencode serve) call error.
+ * The SDK error shape may change between versions; common fields are supported:
+ * response.{status,data} / status / statusCode / responseBody / data / body
+ */
+function extractUpstreamError(error) {
+    const status = error?.response?.status ?? error?.status ?? error?.statusCode ?? null;
+    const body = error?.response?.data ?? error?.responseBody ?? error?.data ?? error?.body ?? null;
+    let bodySummary = null;
+    if (typeof body === 'string') {
+        bodySummary = body.slice(0, 500) || null;
+    } else if (body !== null && body !== undefined) {
+        try {
+            bodySummary = JSON.stringify(body).slice(0, 500);
+        } catch (e) {
+            // Never fail silently on serialization: record the reason in the summary
+            bodySummary = `[unserializable: ${e?.message || 'unknown error'}]`;
+        }
+    }
+    return { status, bodySummary };
+}
+
+const HEALTH_SCHEMA = {
+    type: 'object',
+    properties: {
+        status: { type: 'string' },
+        backend: { type: 'string' }
+    }
+};
+
+const MODELS_SCHEMA = {
+    type: 'object',
+    properties: {
+        object: { type: 'string' },
+        data: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string' },
+                    name: { type: 'string' },
+                    object: { type: 'string' },
+                    owned_by: { type: 'string' }
+                }
+            }
+        }
+    }
+};
+
+/**
+ * Create the Fastify application.
+ */
+function createApp(config) {
+    // DEBUG no longer controls output directly (startProxy maps it onto the debug log level), so it is not destructured here
+    const { API_KEY, OPENCODE_SERVER_URL, REQUEST_TIMEOUT_MS, DISABLE_TOOLS } = config;
+
+    // Performance-oriented setup: no built-in logger (we log ourselves), no automatic request logging,
+    // 50 MB JSON body limit (unchanged), and trailing-slash tolerance matching the previous behavior.
+    const app = Fastify({
+        logger: false,
+        disableRequestLogging: true,
+        bodyLimit: 50 * 1024 * 1024,
+        ignoreTrailingSlash: true,
+        useSemicolonDelimiter: false,
+        trustProxy: false,
+        maxRequestsPerSocket: 0
+    });
+
+    // Request bookkeeping + one-line-per-request logging. The summary is emitted from the raw response's
+    // 'finish' event so hijacked SSE streams (which bypass the normal reply lifecycle) are covered too.
+    app.addHook('onRequest', (request, reply, done) => {
+        const startedAt = Date.now();
+        const path = request.url.split('?')[0];
+        const meta = { reqId: `gw-${startedAt.toString(36)}${Math.random().toString(36).slice(2, 6)}`, startedAt, path };
+        request.gatewayLog = meta;
+        let logged = false;
+        const logSummary = () => {
+            if (logged) return;
+            logged = true;
+            const model = meta.model || '-';
+            const streamText = typeof meta.stream === 'boolean' ? String(meta.stream) : '-';
+            const line = `${request.method} ${request.url} -> ${reply.raw.statusCode} ${Date.now() - startedAt}ms [${meta.reqId}] model=${model} stream=${streamText}`;
+            if (path.startsWith('/v1/')) logger.info(line);
+            else logger.debug(line);
+        };
+        reply.raw.once('finish', logSummary);
+        reply.raw.once('close', logSummary);
+        done();
+    });
+
+    // CORS headers are written on the raw response so they are present for streamed (hijacked) replies as well
+    app.addHook('onRequest', (request, reply, done) => {
+        reply.raw.setHeader('Access-Control-Allow-Origin', '*');
+        reply.raw.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        reply.raw.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        done();
+    });
+
+    // Preflight for every path
+    app.options('/*', (request, reply) => reply.code(204).send());
+
+    const client = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL });
+
+    // Precomputed once: comparing against a ready-made string avoids rebuilding it on every request.
+    // resolveApiKey() guarantees a non-empty key, so authentication can never be switched off.
+    const bearerToken = `Bearer ${resolveApiKey(API_KEY)}`;
+
+    // Auth hook: /health and / stay open; every other route always requires the bearer token
+    app.addHook('onRequest', (request, reply, done) => {
+        if (request.method === 'OPTIONS') return done();
+        const path = request.gatewayLog ? request.gatewayLog.path : request.url.split('?')[0];
+        if (path === '/health' || path === '/') return done();
+        if (request.headers.authorization !== bearerToken) {
+            reply.code(401).send({ error: { message: 'Unauthorized' } });
+            return;
+        }
+        done();
+    });
+
+    // Models endpoint. The provider list changes rarely, so a short TTL cache avoids hitting the backend
+    // on every client startup/probe; failures are never cached so a recovering backend is picked up immediately.
+    const MODELS_CACHE_TTL_MS = 5000;
+    let modelsCache = null;
+    let modelsCacheAt = 0;
+
+    app.get('/v1/models', { schema: { response: { 200: MODELS_SCHEMA } } }, async (request, reply) => {
+        const now = Date.now();
+        if (modelsCache && now - modelsCacheAt < MODELS_CACHE_TTL_MS) {
+            return modelsCache;
+        }
+        try {
+            const providersRes = await client.config.providers();
+            const providersRaw = providersRes.data?.providers || [];
+            const models = [];
+            const list = Array.isArray(providersRaw)
+                ? providersRaw
+                : Object.entries(providersRaw).map(([id, info]) => ({ ...info, id }));
+
+            list.forEach((p) => {
+                if (p.models) {
+                    Object.entries(p.models).forEach(([mId, mData]) => {
+                        models.push({
+                            id: `${p.id}/${mId}`,
+                            name: mData.name || mId,
+                            object: 'model',
+                            owned_by: p.id
+                        });
+                    });
+                }
+            });
+            modelsCache = { object: 'list', data: models };
+            modelsCacheAt = now;
+            return modelsCache;
+        } catch (error) {
+            logger.error('[Proxy] Model Fetch Error:', { error: error.message, status: error.status, body: error.response?.data || error.responseBody || null });
+            return { object: 'list', data: [{ id: 'opencode/kimi-k2.5-free', object: 'model' }] };
+        }
+    });
+
+    // Debug logs all go through the logger (visible with LOG_LEVEL=debug; the legacy DEBUG switch is still
+    // honoured, startProxy maps DEBUG=true onto the debug level)
+    const logDebug = (...args) => logger.debug(...args);
+
+    const TOOL_GUARD_MESSAGE = 'Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge. If external or real-time data is required, say so and ask the user to enable tools.';
+    const applyToolGuard = (systemMsg) => {
+        if (!DISABLE_TOOLS) return systemMsg || undefined;
+        if (systemMsg && systemMsg.trim()) {
+            return `${systemMsg}\n\n${TOOL_GUARD_MESSAGE}`;
+        }
+        return TOOL_GUARD_MESSAGE;
+    };
+
+    const stripFunctionCalls = (text, trim = true) => {
+        if (!DISABLE_TOOLS || !text) return text;
+        const cleaned = text
+            .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
+            .replace(/<\/?function_calls>/g, '');
+        return trim ? cleaned.trim() : cleaned;
+    };
+
+    const createToolCallFilter = () => {
+        if (!DISABLE_TOOLS) return (chunk) => chunk;
+        let inBlock = false;
+        return (chunk) => {
+            if (!chunk) return chunk;
+            let output = '';
+            let remaining = chunk;
+            while (remaining.length) {
+                if (inBlock) {
+                    const endIdx = remaining.indexOf('</function_calls>');
+                    if (endIdx === -1) {
+                        return output;
+                    }
+                    remaining = remaining.slice(endIdx + '</function_calls>'.length);
+                    inBlock = false;
+                    continue;
+                }
+                const startIdx = remaining.indexOf('<function_calls>');
+                if (startIdx === -1) {
+                    output += remaining;
+                    return output;
+                }
+                output += remaining.slice(0, startIdx);
+                remaining = remaining.slice(startIdx + '<function_calls>'.length);
+                inBlock = true;
+            }
+            return output;
+        };
+    };
+
+    const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
+    let cachedToolOverrides = null;
+    let cachedToolAt = 0;
+
+    const getToolOverrides = async () => {
+        if (!DISABLE_TOOLS) return null;
+        if (cachedToolOverrides && Date.now() - cachedToolAt < TOOL_IDS_CACHE_MS) {
+            return cachedToolOverrides;
+        }
+        try {
+            const idsRes = await client.tool.ids();
+            const ids = Array.isArray(idsRes?.data)
+                ? idsRes.data
+                : Array.isArray(idsRes)
+                    ? idsRes
+                    : [];
+            const overrides = {};
+            ids.forEach((id) => {
+                /* With opencode>=1.19 + a free zen model, disabling either read or glob makes the prompt request hang forever, so these two read-only tools stay enabled while all other tools remain disabled */
+                overrides[id] = ["read","glob"].includes(String(id).toLowerCase()) ? true : false;
+            });
+            cachedToolOverrides = overrides;
+            cachedToolAt = Date.now();
+            logDebug('Tool overrides loaded', { count: ids.length });
+            return overrides;
+        } catch (e) {
+            logDebug('Tool override fetch failed', { error: e.message });
+            return null;
+        }
+    };
+
+    async function promptWithTimeout(promptParams, timeoutMs) {
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
+        });
+        return Promise.race([client.session.prompt(promptParams), timeoutPromise]);
+    }
+
+    class NoEventDataError extends Error {
+        constructor(message) {
+            super(message);
+            this.name = 'NoEventDataError';
+        }
+    }
+
+    function extractFromParts(parts) {
+        if (!Array.isArray(parts)) return { content: '', reasoning: '' };
+        const content = parts.filter(p => p.type === 'text').map(p => p.text).join('');
+        const reasoning = parts.filter(p => p.type === 'reasoning').map(p => p.text).join('');
+        return { content, reasoning };
+    }
+
+    async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS) {
+        const pollStart = Date.now();
+        const startedAt = Date.now();
+        while (Date.now() - startedAt < timeoutMs) {
+            const messagesRes = await client.session.messages({ path: { id: sessionId } });
+            const messages = messagesRes?.data || messagesRes || [];
+            if (Array.isArray(messages) && messages.length) {
+                for (let i = messages.length - 1; i >= 0; i -= 1) {
+                    const entry = messages[i];
+                    const info = entry?.info;
+                    if (info?.role !== 'assistant') continue;
+                    const { content, reasoning } = extractFromParts(entry?.parts || []);
+                    const error = info?.error || null;
+                    const done = Boolean(info.finish || info.time?.completed || error);
+                    if (done || content || reasoning) {
+                        if (error) {
+                            logger.error('[Proxy] OpenCode assistant error:', { sessionId, error });
+                        }
+                        logDebug('Polling completed', {
+                            sessionId,
+                            ms: Date.now() - pollStart,
+                            done,
+                            contentLen: content.length,
+                            reasoningLen: reasoning.length,
+                            error: error ? error.name : null
+                        });
+                        return { content, reasoning, error };
+                    }
+                }
+            }
+            await sleep(intervalMs);
+        }
+        logDebug('Polling timeout', { sessionId, ms: Date.now() - pollStart });
+        throw new Error(`Request timeout after ${timeoutMs}ms`);
+    }
+
+    /**
+     * Subscribes to the OpenCode event stream and forwards streamed deltas.
+     * Returns the completion promise plus controls, so the caller can cut the first-delta wait short once the
+     * prompt call itself has returned: at that point the full answer is available through polling anyway.
+     */
+    async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs) {
+        const controller = new AbortController();
+        const eventStreamResult = await client.event.subscribe({ signal: controller.signal });
+        const eventStream = eventStreamResult.stream;
+        let finished = false;
+        let content = '';
+        let reasoning = '';
+        let receivedDelta = false;
+        let deltaChars = 0;
+        let firstDeltaAt = null;
+        let firstDeltaTimer = null;
+        let idleTimer = null;
+        let timeoutId = null;
+        let resolvePromise = null;
+        const startedAt = Date.now();
+
+        const settle = (value) => {
+            if (finished) return;
+            finished = true;
+            if (timeoutId) clearTimeout(timeoutId);
+            if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+            if (idleTimer) clearTimeout(idleTimer);
+            controller.abort();
+            resolvePromise(value);
+        };
+
+        const scheduleFirstDeltaTimer = (ms) => {
+            if (!ms) return;
+            if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+            firstDeltaTimer = setTimeout(() => {
+                if (finished || receivedDelta) return;
+                logDebug('No event data received', { sessionId, ms: Date.now() - startedAt });
+                settle({ content: '', reasoning: '', noData: true });
+            }, ms);
+        };
+
+        const scheduleIdleTimer = () => {
+            if (!idleTimeoutMs) return;
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => {
+                if (finished) return;
+                logDebug('Event idle timeout', {
+                    sessionId,
+                    ms: Date.now() - startedAt,
+                    deltaChars
+                });
+                settle({
+                    content,
+                    reasoning,
+                    idleTimeout: true,
+                    receivedDelta
+                });
+            }, idleTimeoutMs);
+        };
+
+        const promise = new Promise((resolve, reject) => {
+            resolvePromise = resolve;
+            timeoutId = setTimeout(() => {
+                if (finished) return;
+                finished = true;
+                controller.abort();
+                reject(new Error(`Request timeout after ${timeoutMs}ms`));
+            }, timeoutMs);
+
+            scheduleFirstDeltaTimer(firstDeltaTimeoutMs);
+
+            (async () => {
+                try {
+                    for await (const event of eventStream) {
+                        if (event.type === 'message.part.updated' && ((event.properties.part && event.properties.part.sessionID) || event.properties.sessionID) === sessionId) {
+                            const { part } = event.properties;
+                            /* opencode>=1.19 events carry no delta field: part.text is the part's current full text, so derive the increment by diffing against what has already been accumulated */
+                            let delta = event.properties.delta;
+                            if (!delta && (part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
+                                const acc = part.type === 'reasoning' ? reasoning : content;
+                                delta = part.text.startsWith(acc) ? part.text.slice(acc.length) : part.text;
+                            }
+                            if (delta) {
+                                receivedDelta = true;
+                                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+                                scheduleIdleTimer();
+                                if (!firstDeltaAt) {
+                                    firstDeltaAt = Date.now();
+                                    logDebug('SSE first delta', {
+                                        sessionId,
+                                        ms: firstDeltaAt - startedAt,
+                                        type: part.type
+                                    });
+                                }
+                                if (part.type === 'reasoning') {
+                                    reasoning += delta;
+                                    if (onDelta) onDelta(delta, true);
+                                } else {
+                                    content += delta;
+                                    if (onDelta) onDelta(delta, false);
+                                }
+                                deltaChars += delta.length;
+                            }
+                        }
+                        if (event.type === 'message.updated' &&
+                            event.properties.info.sessionID === sessionId &&
+                            event.properties.info.finish === 'stop') {
+                            logDebug('SSE completed', {
+                                sessionId,
+                                ms: Date.now() - startedAt,
+                                deltaChars
+                            });
+                            settle({ content, reasoning });
+                            break;
+                        }
+                    }
+                } catch (e) {
+                    if (!finished) {
+                        finished = true;
+                        if (timeoutId) clearTimeout(timeoutId);
+                        if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+                        if (idleTimer) clearTimeout(idleTimer);
+                        reject(e);
+                    }
+                }
+            })();
+        });
+
+        return {
+            promise: promise.finally(() => controller.abort()),
+            /**
+             * Called as soon as the prompt request returns. If this stream has not produced a single delta by
+             * then, the event subscription is not delivering (seen intermittently with opencode >= 1.19), so the
+             * wait is shortened to a small grace period instead of the full first-delta timeout (4 s by default).
+             * Polling then supplies the answer immediately.
+             */
+            endFirstDeltaWait: (graceMs = 50) => {
+                if (finished || receivedDelta) return;
+                scheduleFirstDeltaTimer(graceMs);
+            }
+        };
+    }
+
+    // Chat completions endpoint
+    app.post('/v1/chat/completions', async (request, reply) => {
+        let hijacked = false;
+        // Declared here (not inside the try) so the error paths can log the request id even when the body
+        // handling itself throws
+        let reqId = null;
+        try {
+            await lock(async () => {
+                let sessionId = null;
+                let eventStream = null;
+
+                try {
+                    reqId = request.gatewayLog?.reqId || null;
+                    // Header masking allocates a fresh object; only build it when debug logging is actually on
+                    if (logger.isEnabled('debug')) {
+                        logger.debug('Incoming OpenAI request', {
+                            reqId,
+                            method: request.method,
+                            path: request.url,
+                            headers: maskHeaders(request.headers),
+                            body: request.body
+                        });
+                    }
+                    const { messages, model, stream } = request.body;
+                    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+                        return reply.code(400).send({ error: { message: 'messages array is required' } });
+                    }
+
+                    let [pID, mID] = (model || 'opencode/kimi-k2.5-free').split('/');
+                    if (!mID) { mID = pID; pID = 'opencode'; }
+                    if (request.gatewayLog) {
+                        request.gatewayLog.model = `${pID}/${mID}`;
+                        request.gatewayLog.stream = Boolean(stream);
+                    }
+
+                    const normalizeMessageContent = (content) => {
+                        if (typeof content === 'string') return content;
+                        if (Array.isArray(content)) {
+                            return content.map((part) => {
+                                if (typeof part === 'string') return part;
+                                if (part && typeof part.text === 'string') return part.text;
+                                return '';
+                            }).join('');
+                        }
+                        if (content && typeof content.text === 'string') return content.text;
+                        if (content === null || content === undefined) return '';
+                        if (typeof content === 'number' || typeof content === 'boolean') return String(content);
+                        return '';
+                    };
+
+                    const buildPromptParts = (rawMessages) => {
+                        const parts = [];
+                        const systemChunks = [];
+                        const userContents = [];
+                        rawMessages.forEach((m) => {
+                            const role = (m?.role || 'user').toLowerCase();
+                            const content = normalizeMessageContent(m?.content);
+                            if (role === 'system') {
+                                if (content) systemChunks.push(content);
+                                return;
+                            }
+                            if (!content) return;
+                            if (role === 'user') userContents.push(content);
+                            const roleLabel = role.toUpperCase();
+                            const nameSuffix = m?.name ? `(${m.name})` : '';
+                            parts.push({
+                                type: 'text',
+                                text: `${roleLabel}${nameSuffix}: ${content}`
+                            });
+                        });
+                        return {
+                            parts,
+                            system: systemChunks.join('\n\n'),
+                            lastUserMsg: userContents[userContents.length - 1] || ''
+                        };
+                    };
+
+                    const { parts, system: systemMsg, lastUserMsg } = buildPromptParts(messages);
+                    const systemWithGuard = applyToolGuard(systemMsg);
+                    if (!parts.length) {
+                        return reply.code(400).send({ error: { message: 'messages must include at least one non-system text message' } });
+                    }
+                    logDebug('Request start', {
+                        model: `${pID}/${mID}`,
+                        stream: Boolean(stream),
+                        userMessages: messages.length,
+                        system: Boolean(systemMsg),
+                        lastUserLength: lastUserMsg.length,
+                        parts: parts.length,
+                        disableTools: DISABLE_TOOLS
+                    });
+
+                    // Ensure backend is running
+                    await ensureBackend(config);
+
+                    // Create session
+                    const sessionRes = await client.session.create();
+                    sessionId = sessionRes.data?.id;
+                    if (!sessionId) throw new Error('Failed to create OpenCode session');
+                    logDebug('Session created', { sessionId });
+
+                    const promptParams = {
+                        path: { id: sessionId },
+                        body: {
+                            model: { providerID: pID, modelID: mID },
+                            system: systemWithGuard,
+                            parts: parts
+                        }
+                    };
+                    const toolOverrides = await getToolOverrides();
+                    if (toolOverrides && Object.keys(toolOverrides).length > 0) {
+                        promptParams.body.tools = toolOverrides;
+                    }
+                    logger.debug('Upstream payload (final request body to opencode serve)', {
+                        reqId,
+                        sessionId,
+                        model: `${pID}/${mID}`,
+                        payload: promptParams
+                    });
+
+                    if (stream) {
+                        // Take over the raw socket: Fastify must not send its own reply for SSE
+                        reply.hijack();
+                        hijacked = true;
+                        const raw = reply.raw;
+                        raw.setHeader('Content-Type', 'text/event-stream');
+                        raw.setHeader('Cache-Control', 'no-cache');
+                        raw.setHeader('X-Accel-Buffering', 'no');
+                        const id = `chatcmpl-${Date.now()}`;
+                        const filterContentDelta = createToolCallFilter();
+                        const filterReasoningDelta = createToolCallFilter();
+                        let streamedContent = '';
+                        let streamedReasoning = '';
+                        let sseChunkCount = 0;
+
+                        // The envelope fields are identical for every chunk of this stream, so they are serialized
+                        // once up front; per delta only the escaped text is stringified and appended.
+                        const createdAt = Math.floor(Date.now() / 1000);
+                        const chunkHead = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${JSON.stringify(`${pID}/${mID}`)},"choices":[{"index":0,"delta":{"`;
+                        // Closes the delta object and the chunk envelope: `"<field>":<value>},"finish_reason":null}]}`
+                        const chunkTail = '},"finish_reason":null}]}\n\n';
+                        const stopFrame = `data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`;
+
+                        const sendDelta = (delta, isReasoning = false) => {
+                            if (!delta) return;
+                            const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+                            if (!filtered) return;
+                            if (isReasoning) {
+                                streamedReasoning += filtered;
+                            } else {
+                                streamedContent += filtered;
+                            }
+                            raw.write(`${chunkHead}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(filtered)}${chunkTail}`);
+                            sseChunkCount++;
+                        };
+
+                        let collected = null;
+                        try {
+                            const collectDeferred = collectFromEvents(
+                                sessionId,
+                                REQUEST_TIMEOUT_MS,
+                                sendDelta,
+                                DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+                                DEFAULT_EVENT_IDLE_TIMEOUT_MS
+                            );
+                            const safeCollect = collectDeferred
+                                .then((collector) => collector.promise)
+                                .catch((err) => ({ __error: err }));
+                            const promptStart = Date.now();
+                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
+                            // The prompt has returned: if the stream never delivered a delta, stop waiting for one
+                            const collector = await collectDeferred.catch(() => null);
+                            if (collector) collector.endFirstDeltaWait();
+                            collected = await safeCollect;
+                        } catch (e) {
+                            throw e;
+                        }
+
+                        if (collected && collected.__error) {
+                            logDebug('SSE collect error, falling back to polling', {
+                                sessionId,
+                                error: collected.__error?.message
+                            });
+                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            if (error && !content && !reasoning) {
+                                sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
+                            } else {
+                                const safeReasoning = stripFunctionCalls(reasoning, false);
+                                const safeContent = stripFunctionCalls(content, false);
+                                if (safeReasoning) sendDelta(safeReasoning, true);
+                                if (safeContent) sendDelta(safeContent, false);
+                            }
+                        } else if (collected && collected.noData) {
+                            logDebug('Fallback to polling (stream)', { sessionId });
+                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            if (error && !content && !reasoning) {
+                                sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
+                            } else {
+                                const safeReasoning = stripFunctionCalls(reasoning, false);
+                                const safeContent = stripFunctionCalls(content, false);
+                                if (safeReasoning) sendDelta(safeReasoning, true);
+                                if (safeContent) sendDelta(safeContent, false);
+                            }
+                        } else if (collected && collected.idleTimeout) {
+                            logDebug('SSE idle timeout, polling for completion', { sessionId });
+                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            if (error && !content && !reasoning) {
+                                sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
+                            } else {
+                                const safeReasoning = stripFunctionCalls(reasoning, false);
+                                const safeContent = stripFunctionCalls(content, false);
+                                const remainingReasoning = safeReasoning && safeReasoning.startsWith(streamedReasoning)
+                                    ? safeReasoning.slice(streamedReasoning.length)
+                                    : safeReasoning;
+                                const remainingContent = safeContent && safeContent.startsWith(streamedContent)
+                                    ? safeContent.slice(streamedContent.length)
+                                    : safeContent;
+                                if (remainingReasoning) sendDelta(remainingReasoning, true);
+                                if (remainingContent) sendDelta(remainingContent, false);
+                            }
+                        }
+
+                        /* When opencode>=1.19 SSE deltas are missing, a fast assistant finish resolves early with empty content; fall back to polling once for the full reply before emitting, and emit no delta if polling is also empty */
+                        if (collected && !streamedContent && !streamedReasoning) {
+                            const { content: polledContent, reasoning: polledReasoning } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const safePolledReasoning = stripFunctionCalls(polledReasoning, false);
+                            const safePolledContent = stripFunctionCalls(polledContent, false);
+                            if (safePolledReasoning) sendDelta(safePolledReasoning, true);
+                            if (safePolledContent) sendDelta(safePolledContent, false);
+                        }
+
+                        raw.write(stopFrame);
+                        sseChunkCount++;
+                        raw.write('data: [DONE]\n\n');
+                        raw.end();
+                        logger.debug('SSE stream summary', {
+                            reqId,
+                            sessionId,
+                            model: `${pID}/${mID}`,
+                            chunks: sseChunkCount,
+                            contentChars: streamedContent.length,
+                            reasoningChars: streamedReasoning.length,
+                            finishReason: 'stop'
+                        });
+                    } else {
+                        const promptStart = Date.now();
+                        await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                        logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
+                        const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                        if (error && !content && !reasoning) {
+                            return reply.code(502).send({
+                                error: {
+                                    message: error.data?.message || error.message || 'OpenCode provider error',
+                                    type: error.name || 'OpenCodeError'
+                                }
+                            });
+                        }
+                        const safeContent = stripFunctionCalls(content);
+                        const safeReasoning = stripFunctionCalls(reasoning);
+
+                        const responsePayload = {
+                            id: `chatcmpl-${Date.now()}`,
+                            object: 'chat.completion',
+                            created: Math.floor(Date.now() / 1000),
+                            model: `${pID}/${mID}`,
+                            choices: [{
+                                index: 0,
+                                message: { role: 'assistant', content: safeContent, reasoning_content: safeReasoning || null },
+                                finish_reason: 'stop'
+                            }],
+                            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                        };
+                        logger.debug('Upstream response (non-stream full JSON)', {
+                            reqId,
+                            sessionId,
+                            response: responsePayload
+                        });
+                        return reply.send(responsePayload);
+                    }
+                } catch (error) {
+                    // Upstream (opencode serve) call chain failed: always emitted at error level with status code and
+                    // error-body summary; the full error object goes to debug level
+                    const upstream = extractUpstreamError(error);
+                    logger.error('[Proxy] API Error (upstream call failed)', {
+                        reqId,
+                        sessionId,
+                        message: error.message,
+                        status: upstream.status,
+                        bodySummary: upstream.bodySummary
+                    });
+                    logger.debug('[Proxy] Error details', { reqId, sessionId, error });
+
+                    // A dead/unreachable backend must not stay cached as healthy: drop the timestamp so the next
+                    // request performs a real probe (and restarts the backend if needed)
+                    if (isConnectionError(error)) {
+                        const backend = backendState.get(OPENCODE_SERVER_URL);
+                        if (backend) backend.healthyAt = 0;
+                    }
+
+                    if (!reply.raw.headersSent) {
+                        let errorMessage = error.message;
+                        let statusCode = 500;
+                        if (error.message && error.message.includes('Request timeout')) {
+                            statusCode = 504;
+                        }
+                        if (error.message && error.message.includes('ENOENT')) {
+                            errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
+                        }
+                        const payload = { error: { message: errorMessage, type: error.constructor.name } };
+                        if (hijacked) {
+                            reply.raw.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+                            reply.raw.end(JSON.stringify(payload));
+                        } else {
+                            reply.code(statusCode).send(payload);
+                        }
+                    }
+                    if (sessionId) {
+                        try {
+                            await client.session.delete({ path: { id: sessionId } });
+                        } catch (e) {
+                            logger.warn('[Proxy] Failed to cleanup session on error:', { sessionId, error: e.message });
+                        }
+                    }
+                } finally {
+                    if (eventStream && eventStream.close) {
+                        eventStream.close();
+                    }
+                }
+            }, REQUEST_TIMEOUT_MS + 20000);
+        } catch (error) {
+            logger.error('[Proxy] Request Handler Error:', { message: error.message, stack: error.stack });
+            if (!reply.raw.headersSent) {
+                const payload = { error: { message: error.message, type: error.constructor.name } };
+                if (hijacked) {
+                    reply.raw.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+                    reply.raw.end(JSON.stringify(payload));
+                } else {
+                    reply.code(500).send(payload);
+                }
+            }
+        }
+        return reply;
+    });
+
+    // Health check
+    app.get('/health', { schema: { response: { 200: HEALTH_SCHEMA } } }, async () => ({
+        status: 'ok',
+        backend: OPENCODE_SERVER_URL
+    }));
+
+    // Uniform OpenAI-style error envelope for anything Fastify itself rejects (invalid JSON, body too large,
+    // unknown route, ...) instead of the framework's default { statusCode, code, error, message } shape
+    app.setErrorHandler((error, request, reply) => {
+        const statusCode = error.statusCode && error.statusCode >= 400 ? error.statusCode : 500;
+        const detail = {
+            method: request.method,
+            path: request.url,
+            message: error.message,
+            code: error.code || error.name
+        };
+        if (statusCode >= 500) logger.error('[Proxy] Unhandled request error:', detail);
+        else logger.warn('[Proxy] Rejected request:', detail);
+        if (reply.raw.headersSent) {
+            if (!reply.raw.writableEnded) reply.raw.end();
+            return;
+        }
+        reply.code(statusCode).send({
+            error: {
+                message: error.message,
+                type: error.code || error.name || 'Error'
+            }
+        });
+    });
+
+    // Unknown routes use the same OpenAI-style envelope
+    app.setNotFoundHandler((request, reply) => {
+        reply.code(404).send({
+            error: {
+                message: `Route ${request.method} ${request.url.split('?')[0]} not found`,
+                type: 'not_found'
+            }
+        });
+    });
+
+    return { app, client };
+}
+
+// Backend management state (per-instance)
+const backendState = new Map();
+
+/**
+ * Backend Lifecycle Management
+ */
+async function ensureBackend(config, options = {}) {
+    const { OPENCODE_SERVER_URL, OPENCODE_PATH, OPENCODE_BIND_HOST, USE_ISOLATED_HOME } = config;
+    const stateKey = OPENCODE_SERVER_URL;
+
+    if (!backendState.has(stateKey)) {
+        backendState.set(stateKey, {
+            isStarting: false,
+            process: null,
+            jailRoot: null,
+            healthyAt: 0,
+            lastStartError: null,
+            lastStartFailureAt: 0
+        });
+    }
+
+    const state = backendState.get(stateKey);
+
+    // A recent successful probe is trusted for BACKEND_HEALTH_CACHE_MS so a burst of chat requests shares one
+    // health round trip instead of one per request; connection failures reset the timestamp (see chat error path)
+    if (options.force !== true && BACKEND_HEALTH_CACHE_MS > 0 && state.healthyAt && Date.now() - state.healthyAt < BACKEND_HEALTH_CACHE_MS) {
+        return;
+    }
+
+    if (state.isStarting) {
+        // Wait for startup to complete
+        for (let i = 0; i < STARTING_WAIT_ITERATIONS; i++) {
+            await new Promise(r => setTimeout(r, STARTING_WAIT_INTERVAL_MS));
+            try {
+                await checkHealth(OPENCODE_SERVER_URL);
+                state.healthyAt = Date.now();
+                return;
+            } catch (e) { }
+        }
+        throw new Error('Backend startup timeout');
+    }
+
+    try {
+        await checkHealth(OPENCODE_SERVER_URL);
+        state.healthyAt = Date.now();
+        state.lastStartFailureAt = 0;
+    } catch (err) {
+        // Recent start attempt already failed: answer immediately instead of retrying the whole startup wait
+        if (state.lastStartFailureAt && Date.now() - state.lastStartFailureAt < BACKEND_START_RETRY_COOLDOWN_MS) {
+            throw new Error(`OpenCode backend unavailable (last start attempt failed: ${state.lastStartError || 'unknown error'})`);
+        }
+        state.isStarting = true;
+        logger.info(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
+
+        // Kill existing process if any
+        if (state.process) {
+            try {
+                state.process.kill();
+            } catch (e) { }
+        }
+
+        // Cleanup old temp dir
+        if (state.jailRoot && fs.existsSync(state.jailRoot)) {
+            try {
+                fs.rmSync(state.jailRoot, { recursive: true, force: true });
+            } catch (e) { }
+        }
+
+        const isWindows = process.platform === 'win32';
+        const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
+            ? USE_ISOLATED_HOME
+            : String(process.env.OPENCODE_USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
+            process.env.OPENCODE_USE_ISOLATED_HOME === '1';
+
+        // On Windows, don't use isolated fake-home to avoid path issues
+        // On Unix-like systems, use jail for isolation
+        const salt = Math.random().toString(36).substring(7);
+        const jailRoot = path.join(os.tmpdir(), 'opencode-proxy-jail', salt);
+        state.jailRoot = jailRoot;
+        const workspace = path.join(jailRoot, 'empty-workspace');
+
+        let envVars;
+        let cwd;
+
+        if (isWindows) {
+            // Windows: use normal user home to avoid opencode storage path issues
+            fs.mkdirSync(workspace, { recursive: true });
+            cwd = workspace;
+            envVars = {
+                ...process.env,
+                OPENCODE_PROJECT_DIR: workspace
+            };
+            logger.info('[Proxy] Running on Windows, using standard user home directory');
+        } else {
+            fs.mkdirSync(workspace, { recursive: true });
+            cwd = workspace;
+
+            if (useIsolatedHome) {
+                // Unix-like: use isolated fake-home
+                const fakeHome = path.join(jailRoot, 'fake-home');
+
+                // Create necessary opencode directories
+                const opencodeDir = path.join(fakeHome, '.local', 'share', 'opencode');
+                const storageDir = path.join(opencodeDir, 'storage');
+                const messageDir = path.join(storageDir, 'message');
+                const sessionDir = path.join(storageDir, 'session');
+
+                [fakeHome, opencodeDir, storageDir, messageDir, sessionDir].forEach(d => {
+                    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+                });
+
+                envVars = {
+                    ...process.env,
+                    HOME: fakeHome,
+                    USERPROFILE: fakeHome,
+                    OPENCODE_PROJECT_DIR: workspace
+                };
+                logger.info('[Proxy] Using isolated home for OpenCode');
+            } else {
+                envVars = {
+                    ...process.env,
+                    OPENCODE_PROJECT_DIR: workspace
+                };
+                logger.info('[Proxy] Using real HOME for OpenCode (isolation disabled)');
+            }
+        }
+
+        const [, , portStr] = OPENCODE_SERVER_URL.split(':');
+        const port = portStr ? portStr.split('/')[0] : '4097';
+        const resolved = resolveOpencodePath(OPENCODE_PATH);
+        const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;
+        if (resolved.path) {
+            logger.info(`[Proxy] Using OpenCode binary: ${opencodeBin} (source: ${resolved.source})`);
+        } else {
+            logger.warn(`[Proxy] Unable to resolve OpenCode binary for '${OPENCODE_PATH}'. Using as-is.`);
+        }
+
+        // Cross-platform spawn options
+        const useShell = process.platform === 'win32' || !resolved.path ||
+            opencodeBin.endsWith('.cmd') || opencodeBin.endsWith('.bat');
+        const spawnOptions = {
+            stdio: 'inherit',
+            cwd: cwd,
+            env: envVars,
+            shell: useShell  // Use shell only when needed (e.g., Windows .cmd or unresolved PATH)
+        };
+
+        // Backend listen address: OPENCODE_BIND_HOST (default 127.0.0.1; set to 0.0.0.0 inside Docker so port 4097
+        // can be exposed)
+        const bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
+        logger.info(`[Proxy] Starting OpenCode backend: --port ${port} --hostname ${bindHost}`);
+        state.process = spawn(opencodeBin, ['serve', '--port', port, '--hostname', bindHost], spawnOptions);
+
+        // Handle spawn errors
+        let spawnError = null;
+        state.process.on('error', (err) => {
+            spawnError = err;
+            logger.error(`[Proxy] Failed to spawn OpenCode: ${err.message}`);
+            if (err.code === 'ENOENT') {
+                logger.error(`[Proxy] Command '${OPENCODE_PATH}' not found. Please ensure OpenCode is installed and in your PATH.`);
+                logger.error(`[Proxy] You can specify the full path in config.json using 'OPENCODE_PATH'`);
+            }
+        });
+
+        // Wait for backend to be ready (a spawn failure aborts the wait right away instead of burning
+        // the full startup budget)
+        let started = false;
+        for (let i = 0; i < STARTUP_WAIT_ITERATIONS; i++) {
+            await new Promise(r => setTimeout(r, STARTUP_WAIT_INTERVAL_MS));
+            if (spawnError) break;
+            // Spawned through a shell (missing/unresolved binary) the process exits with a code instead of
+            // emitting 'error'; stop waiting as soon as that happens
+            if (state.process.exitCode !== null) {
+                spawnError = new Error(`OpenCode backend exited during startup (code ${state.process.exitCode})`);
+                break;
+            }
+            try {
+                await checkHealth(OPENCODE_SERVER_URL);
+                logger.info('[Proxy] OpenCode backend ready.');
+                started = true;
+                break;
+            } catch (e) { }
+        }
+
+        state.isStarting = false;
+
+        if (spawnError) {
+            state.lastStartError = spawnError.message;
+            state.lastStartFailureAt = Date.now();
+            throw new Error(`Failed to start OpenCode backend: ${spawnError.message}`);
+        }
+
+        if (!started) {
+            logger.warn('[Proxy] Backend start timed out.');
+            state.lastStartError = 'Backend start timeout';
+            state.lastStartFailureAt = Date.now();
+            throw new Error('Backend start timeout');
+        }
+    }
+}
+
+/**
+ * Starts the OpenCode-to-OpenAI Proxy server.
+ */
+export function startProxy(options) {
+    const normalizeBool = (value) => {
+        if (typeof value === 'boolean') return value;
+        if (typeof value === 'number') return value === 1;
+        if (typeof value === 'string') {
+            const v = value.trim().toLowerCase();
+            if (['1', 'true', 'yes', 'y', 'on'].includes(v)) return true;
+            if (['0', 'false', 'no', 'n', 'off'].includes(v)) return false;
+        }
+        return undefined;
+    };
+
+    const disableTools =
+        normalizeBool(options.DISABLE_TOOLS) ??
+        normalizeBool(options.disableTools) ??
+        normalizeBool(process.env.OPENCODE_DISABLE_TOOLS) ??
+        false;
+
+    const config = {
+        PORT: options.PORT || 8083,
+        // Empty/blank values fall back to DEFAULT_API_KEY: authentication is always on
+        API_KEY: resolveApiKey(options.API_KEY),
+        OPENCODE_SERVER_URL: options.OPENCODE_SERVER_URL || 'http://127.0.0.1:4097',
+        OPENCODE_BIND_HOST: options.OPENCODE_BIND_HOST || options.openCodeBindHost || process.env.OPENCODE_BIND_HOST || '127.0.0.1',
+        OPENCODE_PATH: options.OPENCODE_PATH || 'opencode',
+        BIND_HOST: options.BIND_HOST || options.bindHost || process.env.OPENCODE_PROXY_BIND_HOST || '127.0.0.1',
+        // Raw LOG_LEVEL value: index.js already merged it as "env > config.json" and passes it in; when startProxy is
+        // called directly, fall back to reading the environment variable
+        LOG_LEVEL: options.LOG_LEVEL ?? options.logLevel ?? process.env.LOG_LEVEL ?? null,
+        USE_ISOLATED_HOME: typeof options.USE_ISOLATED_HOME === 'boolean'
+            ? options.USE_ISOLATED_HOME
+            : String(options.USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
+            options.USE_ISOLATED_HOME === '1' ||
+            String(process.env.OPENCODE_USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
+            process.env.OPENCODE_USE_ISOLATED_HOME === '1',
+        REQUEST_TIMEOUT_MS: Number(options.REQUEST_TIMEOUT_MS || process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS || DEFAULT_REQUEST_TIMEOUT_MS),
+        DISABLE_TOOLS: disableTools,
+        DEBUG: String(options.DEBUG || '').toLowerCase() === 'true' ||
+            options.DEBUG === '1' ||
+            String(process.env.OPENCODE_PROXY_DEBUG || '').toLowerCase() === 'true' ||
+            process.env.OPENCODE_PROXY_DEBUG === '1'
+    };
+
+    // Log level resolution (calibrated at startup; all later log output follows this level):
+    // 1) LOG_LEVEL (options/env, case-insensitive) 2) when not explicitly set but the legacy DEBUG switch is on,
+    // promote to debug (backward compatible) 3) default info; invalid values fall back to info with a warning
+    let levelResolution = logger.setLevel(config.LOG_LEVEL);
+    if (!levelResolution.valid) {
+        logger.warn(`Invalid LOG_LEVEL '${levelResolution.requested}', fallback to 'info' (valid values: error/warn/info/debug)`);
+    } else if (!levelResolution.explicit && config.DEBUG) {
+        levelResolution = logger.setLevel('debug');
+    }
+    config.LOG_LEVEL = logger.level;
+    const levelSource = !levelResolution.explicit
+        ? (config.DEBUG ? 'legacy DEBUG flag' : 'default')
+        : 'LOG_LEVEL';
+
+    const { app } = createApp(config);
+
+    // Fastify resolves listen() once the server is bound; log and warm the backend from the continuation.
+    // No await here so startProxy stays synchronous for callers that need the server handle immediately.
+    app.listen({ port: config.PORT, host: config.BIND_HOST })
+        .then(async () => {
+            logger.info(`Log level: ${logger.level} (source: ${levelSource})`);
+            logger.info(`[Proxy] Active at http://${config.BIND_HOST}:${config.PORT}`);
+            try {
+                await ensureBackend(config, { force: true });
+            } catch (error) {
+                logger.error('[Proxy] Backend warmup failed:', { error: error.message });
+            }
+        })
+        .catch((error) => {
+            logger.error('[Fatal] Failed to start HTTP server:', { error: error.message, stack: error.stack });
+            process.exit(1);
+        });
+
+    // Expose the Fastify instance as `server`: it implements close(cb), which index.js uses for shutdown
+    return {
+        server: app,
+        killBackend: () => {
+            const state = backendState.get(config.OPENCODE_SERVER_URL);
+            if (state && state.process) {
+                state.process.kill();
+            }
+            // Cleanup temp dir (only on non-Windows where we use jail)
+            if (state && state.jailRoot && process.platform !== 'win32') {
+                try {
+                    fs.rmSync(state.jailRoot, { recursive: true, force: true });
+                } catch (e) { }
+            }
+        }
+    };
+}

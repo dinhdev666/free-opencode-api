@@ -1,0 +1,346 @@
+# Free OpenCode API
+
+[![CI](https://github.com/dinhdev666/free-deepseek-api/actions/workflows/ci.yml/badge.svg)](https://github.com/dinhdev666/free-deepseek-api/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
+[![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI%20compatible-412991.svg)]()
+
+**Free OpenCode API** turns the [OpenCode](https://opencode.ai) CLI into a standard, OpenAI-compatible REST API. It runs as a small Node.js gateway in front of `opencode serve`, so any client that understands the OpenAI protocol — Cursor, Claude Code, the official OpenAI SDKs, or your own scripts — can use free models such as **Kimi k2.5**, **GLM 4.7**, and **MiniMax m2.1** without a paid API key.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [How It Works](#how-it-works)
+- [Performance](#performance)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [API Reference](#api-reference)
+- [Client Examples](#client-examples)
+- [Logging](#logging)
+- [Docker](#docker)
+- [Project Structure](#project-structure)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+---
+
+## Features
+
+- **OpenAI-compatible surface** — `/v1/models`, `/v1/chat/completions`, streaming and non-streaming responses.
+- **Zero extra infrastructure** — one Node.js process; the OpenCode backend is launched and supervised automatically.
+- **Mandatory authentication** — every request needs `Authorization: Bearer <key>`. The default key is `sk-dummy-123`, and authentication cannot be disabled: a blank `API_KEY` simply falls back to that default.
+- **Tool guard** — `DISABLE_TOOLS=true` keeps models from running commands or touching files on the host.
+- **Structured logging** — `error` / `warn` / `info` / `debug` levels, one-line request summaries, secrets masked.
+- **Production friendly** — configurable bind host, request timeouts, graceful shutdown, Docker image available.
+- **Fast HTTP stack** — built on Fastify 5 with precompiled response schemas and no per-request middleware chain.
+
+---
+
+## How It Works
+
+```text
+OpenAI client  ──HTTP──▶  Free OpenCode API (default :8083)  ──▶  opencode serve (default :4097)  ──▶  model providers
+```
+
+The gateway accepts OpenAI-shaped requests, translates them into OpenCode sessions and prompts, streams the results back as standard SSE chunks or a single JSON body, and hides the lifecycle of the backend process (startup, health checks, teardown).
+
+---
+
+## Performance
+
+The HTTP layer is Fastify 5 with a deliberately thin lifecycle: three `onRequest` hooks (request id/logging,
+CORS, auth) and no plugin-level middleware chain. Additional choices that matter under load:
+
+- **Precompiled response schemas** — `/health` and `/v1/models` are serialized through `fast-json-stringify`
+  schemas compiled at startup instead of the generic `JSON.stringify` path.
+- **Short model-list cache** — `/v1/models` results are cached for 5 s, so client startup probes do not hit the
+  backend every time (failures are never cached).
+- **No hidden allocations on the hot path** — header masking for debug logs is only built when `LOG_LEVEL=debug`,
+  the bearer token string is precomputed once, and request paths are parsed once per request.
+- **SSE written straight to the socket** — streaming replies hijack the response and write `data:` frames directly
+  to the raw connection: no buffering layer, no extra copies, `X-Accel-Buffering: no` for proxy friendliness.
+- **Logging without a framework logger** — Fastify's built-in request logging is disabled; summaries are emitted
+  from the raw response `finish` event, which also covers hijacked streams.
+- **Pre-serialized SSE envelopes** — the `chat.completion.chunk` wrapper (id, model, created, choices) is built once
+  per stream, so each delta only escapes its text and appends it to a prepared prefix.
+- **No 4-second stall when the event stream is silent** — the gateway subscribes to OpenCode events and, as soon as
+  the prompt call returns without a single delta, it shortens the first-delta wait to ~50 ms and falls back to
+  polling (the answer is already available at that point).
+- **Backend health probes are cached and keep-alive** — one probe is shared across a burst of requests
+  (`OPENCODE_PROXY_HEALTH_CACHE_MS`, default 2000 ms) over a reused socket; a connection failure invalidates the
+  cache immediately.
+- **Startup failures fail fast** — if the OpenCode process exits during startup (missing binary, bad path) the
+  readiness wait is aborted instead of burning the full budget, and requests answer in milliseconds for the retry
+  cooldown window (`OPENCODE_PROXY_START_RETRY_MS`, default 15000 ms).
+- **Queue drains immediately** — the completion queue starts the next request on the next tick instead of after a
+  fixed 100 ms pause, and `OPENCODE_PROXY_MAX_CONCURRENCY` (default `1`, i.e. one completion at a time as before)
+  can be raised to run independent sessions in parallel.
+
+Local benchmarks, `autocannon`, same machine (Node.js 26, macOS, loopback), against a stub OpenCode backend so that
+the HTTP layer is what is being measured:
+
+| Scenario | Before | After |
+| --- | --- | --- |
+| `GET /health`, `-c 100 -d 10`, throughput | ~74,000 req/s (Express) | ~110,000 req/s (Fastify) |
+| `GET /health`, `-c 100 -d 10`, avg latency | 1.04 ms | 0.12 ms |
+| `POST /v1/chat/completions` non-stream, `-c 10 -d 8` | ~1,900 req/s, 4.7 ms avg | ~3,900 req/s, 2.2 ms avg |
+| `POST /v1/chat/completions` non-stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | — (serialized) | ~5,900 req/s, 1.3 ms avg |
+| `POST /v1/chat/completions` stream, `-c 10 -d 8` | 4,014 ms p50, ~0.4 req/s | 484 ms p50, ~21 req/s |
+
+Treat these as relative numbers — real throughput is bounded by the OpenCode backend and model latency, not by the
+HTTP layer.
+
+---
+
+## Requirements
+
+| Requirement | Details |
+| --- | --- |
+| **Node.js** | 20.0 or newer (required by Fastify 5) |
+| **pnpm** | 12.0 or newer (the project's package manager) |
+| **OpenCode CLI** | Installed and authenticated once (`opencode auth login`) |
+
+Install pnpm if you do not have it yet:
+
+```bash
+corepack enable pnpm
+# or
+npm install -g pnpm
+```
+
+Install the OpenCode CLI if you do not have it yet:
+
+```bash
+# Windows
+npm install -g opencode-ai
+
+# Linux / macOS
+curl -fsSL https://opencode.ai/install | bash
+```
+
+> npm appears above only for third-party CLI installation; the project's own dependencies are managed with pnpm.
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/dinhdev666/free-deepseek-api.git
+cd free-deepseek-api
+pnpm install
+cp config.json.example config.json   # optional: edit port, API key, paths
+pnpm start                           # or: node index.js
+```
+
+Verify the gateway is up (`/health` is the only unauthenticated route besides `/`):
+
+```bash
+curl http://127.0.0.1:8083/health
+curl -H "Authorization: Bearer sk-dummy-123" http://127.0.0.1:8083/v1/models
+```
+
+Send your first message:
+
+```bash
+curl -X POST http://127.0.0.1:8083/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-dummy-123" \
+  -d '{"model":"opencode/kimi-k2.5-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
+```
+
+> `sk-dummy-123` is the built-in default key. Change `API_KEY` (environment variable or `config.json`) for any real deployment; leaving it blank still enforces the default.
+
+---
+
+## Configuration
+
+Settings are resolved in this order: **environment variables → `config.json` → built-in defaults**.
+
+`config.json` (see [config.json.example](config.json.example)):
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `PORT` | `8083` | Gateway listen port |
+| `BIND_HOST` | `127.0.0.1` | Gateway bind address; use `0.0.0.0` to expose it on all interfaces |
+| `API_KEY` | `sk-dummy-123` | Bearer token clients must send. Authentication is always on — an empty or blank value falls back to `sk-dummy-123` |
+| `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway |
+| `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend |
+| `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
+| `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files |
+| `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (case-insensitive) |
+
+Environment variables:
+
+| Variable | Maps to |
+| --- | --- |
+| `PORT` | `PORT` |
+| `BIND_HOST` | `BIND_HOST` |
+| `API_KEY` | `API_KEY` |
+| `OPENCODE_SERVER_URL` | `OPENCODE_SERVER_URL` |
+| `OPENCODE_BIND_HOST` | `OPENCODE_BIND_HOST` |
+| `OPENCODE_PATH` | `OPENCODE_PATH` |
+| `OPENCODE_DISABLE_TOOLS` | `DISABLE_TOOLS` |
+| `LOG_LEVEL` | `LOG_LEVEL` |
+
+Advanced tuning (environment only):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `300000` | Upstream request timeout in milliseconds |
+| `OPENCODE_PROXY_HEALTH_CACHE_MS` | `2000` | How long a successful backend health probe is trusted before the next one (`0` probes on every request) |
+| `OPENCODE_PROXY_START_RETRY_MS` | `15000` | Cooldown after a failed backend start attempt; requests fail fast instead of retrying immediately |
+| `OPENCODE_PROXY_MAX_CONCURRENCY` | `1` | Number of chat completions processed in parallel (1..32). `1` keeps the historical serialized behaviour; raise it only if the backend/provider tolerates concurrent sessions |
+| `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` (legacy alias; prefer `LOG_LEVEL=debug`) |
+| `OPENCODE_USE_ISOLATED_HOME` | unset | Run the backend with an isolated HOME directory |
+| `OPENCODE_PROXY_BIND_HOST` | unset | Fallback bind address when `BIND_HOST` is not set |
+
+> `LOG_LEVEL` is read directly from the environment by the Node process, so it always wins over the `LOG_LEVEL` field in `config.json`.
+
+---
+
+## API Reference
+
+Base URL: `http://<host>:<port>/v1` (for example `http://127.0.0.1:8083/v1`). Every `/v1` request needs `Authorization: Bearer <API_KEY>`; the default key is `sk-dummy-123` and authentication cannot be turned off. Only `/health` and `/` are unauthenticated.
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/health` | GET | Liveness probe; returns gateway status and the configured backend URL |
+| `/v1/models` | GET | OpenAI-style model list |
+| `/v1/chat/completions` | POST | Chat completions; supports `stream: true` for SSE |
+
+**Chat completions** accepts the usual OpenAI fields; model IDs use the `opencode/<model>` form (for example `opencode/kimi-k2.5-free`).
+
+```bash
+curl -X POST http://127.0.0.1:8083/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-dummy-123" \
+  -d '{
+        "model": "opencode/kimi-k2.5-free",
+        "messages": [{"role": "user", "content": "Explain event loops in two sentences."}],
+        "stream": false
+      }'
+```
+
+Errors follow the OpenAI error envelope (`{"error": {"message": ...}}`) and upstream failures are reported with the upstream status code.
+
+---
+
+## Client Examples
+
+**Python (official OpenAI SDK)**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8083/v1", api_key="sk-dummy-123")
+response = client.chat.completions.create(
+    model="opencode/kimi-k2.5-free",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
+```
+
+**Node.js (official OpenAI SDK)**
+
+```js
+import OpenAI from 'openai';
+
+const client = new OpenAI({ baseURL: 'http://127.0.0.1:8083/v1', apiKey: 'sk-dummy-123' });
+const res = await client.chat.completions.create({
+    model: 'opencode/kimi-k2.5-free',
+    messages: [{ role: 'user', content: 'Hello!' }],
+});
+console.log(res.choices[0].message.content);
+```
+
+Any other OpenAI-compatible tool works the same way: point its base URL at `http://127.0.0.1:8083/v1` and set its API key to your `API_KEY` value (`sk-dummy-123` unless you changed it) — the key is never optional.
+
+---
+
+## Logging
+
+All output goes to stdout/stderr with a `[gateway]` prefix:
+
+```text
+[gateway] <ISO timestamp> [LEVEL] message {"detail":"json"}
+```
+
+| Level | Content |
+| --- | --- |
+| `error` | Upstream failures (with status code and error-body summary) and fatal startup problems. Always emitted, stderr. |
+| `warn` | Invalid configuration fallbacks and self-recoverable anomalies. stderr. |
+| `info` | Default. Startup information plus a one-line summary per request: method, path, model, streaming, status, latency, request id. stdout. |
+| `debug` | Inbound request headers (secrets masked), the final payload sent to the backend, and full responses. stdout. |
+
+Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked before they are logged.
+
+---
+
+## Docker
+
+A container image with the OpenCode CLI preinstalled is available; see [docker/README.md](docker/README.md) for image tags, environment variables, and port exposure.
+
+```bash
+docker run -d --restart=always -p 8083:8083 dinhdev666/free-opencode-api
+```
+
+---
+
+## Project Structure
+
+```text
+.
+├── index.js                  # Entry point: merges config and starts the gateway
+├── src/
+│   ├── proxy.js              # Fastify app, OpenAI routes, OpenCode backend management
+│   └── logger.js             # Zero-dependency leveled logger with secret masking
+├── config.json.example       # Sample configuration
+├── package.json              # Scripts, dependencies, packageManager pin (pnpm)
+├── pnpm-lock.yaml            # Locked dependency tree (pnpm)
+├── docker/                   # Dockerfile, entrypoint, container documentation
+├── test/
+│   ├── stub-opencode.mjs     # Minimal opencode serve stand-in used by the smoke suite
+│   └── smoke.mjs             # Contract checks: boot stub + gateway, assert OpenAI behaviour
+├── .github/workflows/ci.yml  # CI: syntax check, smoke suite (Node 20/22/24), Docker build
+├── AGENTS.md                 # Invariants, architecture map and verification rules for coding agents
+├── CONTRIBUTING.md           # Setup, coding conventions, commit message standard, PR checklist
+└── LICENSE
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause and fix |
+| --- | --- |
+| `Cannot verify OpenCode installation` | The `opencode` binary is not on `PATH`; install the CLI or set `OPENCODE_PATH` to its absolute path. |
+| `401 Unauthorized` | The request has a missing or mismatched `Authorization: Bearer …` header; send the configured `API_KEY` (default `sk-dummy-123`). |
+| Requests time out | The backend is slow or unavailable; check `/health`, verify `opencode auth login` was completed, and consider raising `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`. |
+| Empty streaming responses | Update the OpenCode CLI; the gateway already handles the SSE event changes in opencode ≥ 1.19. |
+| Port already in use | Change `PORT` in `config.json` or the environment. |
+
+---
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, coding conventions, the
+[Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) message standard used in this repository and
+the pull request checklist. [AGENTS.md](AGENTS.md) documents the invariants (mandatory authentication, OpenAI wire
+format) and the verification steps expected before a change is merged.
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).  
+Copyright (c) 2026 Phạm Văn Định.
+
+---
+
+## Related Links
+
+- Repository: [dinhdev666/free-deepseek-api](https://github.com/dinhdev666/free-deepseek-api)
+- OpenCode: [opencode.ai](https://opencode.ai)

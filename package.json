@@ -1,0 +1,37 @@
+{
+  "name": "free-opencode-api",
+  "version": "1.0.0",
+  "description": "Free OpenCode API — an OpenAI-compatible API gateway for the OpenCode CLI that exposes free models (Kimi, GLM, MiniMax) to any standard OpenAI client.",
+  "main": "index.js",
+  "type": "module",
+  "packageManager": "pnpm@12.18.0",
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js && node --check src/proxy.js && node --check src/logger.js && node --check test/smoke.mjs && node --check test/stub-opencode.mjs",
+    "test": "node test/smoke.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "openai",
+    "openai-compatible",
+    "api-gateway",
+    "llm-gateway",
+    "proxy",
+    "rest-api",
+    "kimi",
+    "glm",
+    "minimax",
+    "free-models",
+    "nodejs"
+  ],
+  "author": "Phạm Văn Định",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=12.0.0"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.1.51",
+    "fastify": "^5.12.8"
+  }
+}

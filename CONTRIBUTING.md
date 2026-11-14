@@ -218,6 +218,18 @@ Additional manual checks that CI cannot cover:
 - When touching the backend lifecycle, run with the CLI missing (`OPENCODE_PATH` pointing nowhere): requests must
   fail in milliseconds, not after a multi-minute startup wait.
 
+## Releasing
+
+1. Bump `version` in `package.json` (the workflow fails when it does not match the tag) and merge the change.
+2. Tag and push it: `git tag v1.0.1 && git push origin v1.0.1`.
+3. `.github/workflows/docker-publish.yml` builds `linux/amd64` + `linux/arm64` and pushes `<version>`, `<major>.<minor>`
+   and `latest` to `dinhdev666/free-opencode-api`.
+4. Confirm the result on [Docker Hub](https://hub.docker.com/r/dinhdev666/free-opencode-api/tags) and in the
+   workflow run.
+
+The publishing job needs the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (access token with Read &
+Write scope). Never commit these values.
+
 ## Security
 
 - Never weaken or bypass authentication, and never accept an empty `API_KEY` as "auth disabled".

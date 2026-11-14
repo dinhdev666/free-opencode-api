@@ -281,11 +281,16 @@ Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked 
 
 ## Docker
 
-A container image with the OpenCode CLI preinstalled is available; see [docker/README.md](docker/README.md) for image tags, environment variables, and port exposure.
+A container image with the OpenCode CLI preinstalled is published for `linux/amd64` and `linux/arm64`; see
+[docker/README.md](docker/README.md) for image tags, environment variables, and port exposure.
 
 ```bash
-docker run -d --restart=always -p 8083:8083 dinhdev666/free-opencode-api
+docker pull dinhdev666/free-opencode-api:1.0.0
+docker run -d --restart=always -p 8083:8083 -e API_KEY=sk-your-key dinhdev666/free-opencode-api:1.0.0
 ```
+
+Docker Hub selects the matching architecture automatically. A new image is published by
+`.github/workflows/docker-publish.yml` whenever a `v*.*.*` tag is pushed.
 
 ---
 

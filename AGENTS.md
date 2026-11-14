@@ -46,6 +46,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
 | `test/smoke.mjs` | End-to-end contract checks: boots the stub and the gateway, asserts status codes, envelopes, SSE frames and clean shutdown. |
 | `.github/workflows/ci.yml` | CI: `pnpm run check`, shell check, `pnpm test` on Node 20/22/24, plus a Docker build with a container health check. |
+| `.github/workflows/docker-publish.yml` | Publishes `linux/amd64` + `linux/arm64` images to Docker Hub when a `v*.*.*` tag is pushed (secrets `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`). |
 | `README.md` | User-facing documentation: features, configuration tables, API reference, client examples, performance, troubleshooting. |
 
 Request flow (short version): `index.js` → Fastify hooks → auth → route handler → queue (`lock()`) → validate and
@@ -66,6 +67,10 @@ sh -n docker/docker-entrypoint.sh
 port 8199 (override with `SMOKE_STUB_PORT` / `SMOKE_PORT`). CI runs `pnpm run check` and `pnpm test` on Node 20, 22
 and 24. There is still no linter or formatter, so style is a review concern. Do not claim checks passed if they were
 not run.
+
+Releases are published from tags, not from a laptop: bump `version` in `package.json`, then `git tag vX.Y.Z` and push
+the tag. `docker-publish.yml` refuses a tag that does not match `package.json`, builds both architectures and pushes to
+Docker Hub.
 
 ## Verifying without the OpenCode CLI
 

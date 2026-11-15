@@ -256,6 +256,11 @@ curl -X POST http://127.0.0.1:8083/v1/chat/completions \
       }'
 ```
 
+Every response carries `X-Request-Id`: the gateway's own `gw-…` id, or the value of an `X-Request-Id` header you send
+(a short token of `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, `-`, up to 64 characters — anything else is replaced). The same id
+ends the request's log line, so a client report can be matched to a log entry, and it is exposed over CORS so browser
+clients can read it.
+
 Errors follow the OpenAI error envelope (`{"error": {"message": ..., "type": ...}}`): `400` for an invalid request
 (`type: "invalid_request_error"`, with Fastify's own `code` such as `FST_ERR_CTP_INVALID_JSON_BODY` when the body could
 not be parsed), `401` for a missing or wrong key (`type: "invalid_request_error"`, `code: "invalid_api_key"`), `404` for

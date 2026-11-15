@@ -1,4 +1,5 @@
 import { startProxy, DEFAULT_API_KEY, parseBoolean, resolveApiKey } from './src/proxy.js';
+import { readConfigFile } from './src/config.js';
 import { logger } from './src/logger.js';
 import fs from 'fs';
 import path from 'path';
@@ -22,18 +23,17 @@ const defaultConfig = {
     USE_ISOLATED_HOME: false
 };
 
-// Load config from file
+// Load config from file. A config.json that exists but cannot be used stops the gateway: continuing with defaults
+// would ignore the port and the API key the operator wrote there and serve traffic with the built-in dummy key.
 const configPath = path.join(__dirname, 'config.json');
-let fileConfig = {};
-
+const { config: fileConfig, error: configError } = readConfigFile(configPath);
+if (configError) {
+    logger.error(`[Config] config.json ${configError}`);
+    logger.error('[Config] Fix or remove the file, then start the gateway again.');
+    process.exit(1);
+}
 if (fs.existsSync(configPath)) {
-    try {
-        const content = fs.readFileSync(configPath, 'utf8');
-        fileConfig = JSON.parse(content);
-        logger.info('[Config] Loaded from config.json');
-    } catch (err) {
-        logger.error('[Config] Error parsing config.json:', { error: err.message });
-    }
+    logger.info('[Config] Loaded from config.json');
 }
 
 // Merge configs: env > file > default

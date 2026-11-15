@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 319 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 321 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -226,7 +226,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   media-type error, because a gateway that parses every type cannot tell a malformed client from an unsupported one. A
   body sent with a `Content-Encoding` other than `identity` is a `415` naming the header: the gateway does not
   decompress, so the compressed bytes reached the JSON parser and were reported as "body is not valid JSON", which
-  blames the one part of the request that was correct.
+  blames the one part of the request that was correct. A UTF-8 BOM in front of that text (PowerShell 5.1, Windows
+  editors) is stripped before the parse: `JSON.parse` refused it, so a good body was told it was not JSON.
 - A `415` names what it refused and what to send. `FST_ERR_CTP_INVALID_MEDIA_TYPE` used to arrive as Fastify's bare
   `Unsupported Media Type` for any type the gateway does not parse, including a **body with no `Content-Type` header**.
   The status and the code stay; the message becomes `unsupported content type "application/xml"; send

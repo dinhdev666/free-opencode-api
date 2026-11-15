@@ -1,5 +1,47 @@
 import fs from 'fs';
 
+// A config.json is a handful of scalars. Reading an arbitrarily large "config" into memory at startup is one
+// misplaced file away from an out-of-memory crash, and a FIFO blocks the read forever, so the file is bounded and has
+// to be a regular file.
+const MAX_CONFIG_BYTES = 1024 * 1024;
+
+// Keys the entry point reads. A value of the wrong type is refused instead of coerced: `resolveApiKey()` on a boolean
+// `true` turns the gateway's credential into the literal string "true" (guessable by every client, while the startup
+// summary still reports "custom - authentication always enforced"), and a nested object becomes "[object Object]".
+// So a mis-typed key has to stop the start, exactly like a file that is not valid JSON.
+const STRING_OR_NUMBER_KEYS = [
+    'API_KEY',
+    'PORT',
+    'BIND_HOST',
+    'OPENCODE_BIND_HOST',
+    'OPENCODE_SERVER_URL',
+    'OPENCODE_PATH',
+    'LOG_LEVEL',
+    'OPENCODE_PROXY_MAX_CONCURRENCY',
+    'OPENCODE_PROXY_MAX_QUEUE',
+    'OPENCODE_PROXY_MAX_BODY_MB',
+    'OPENCODE_PROXY_REQUEST_TIMEOUT_MS',
+    'OPENCODE_PROXY_HEALTH_CACHE_MS',
+    'OPENCODE_PROXY_START_RETRY_MS'
+];
+// Flags are parsed by parseBoolean(), which accepts booleans as well as their string/number spellings
+const FLAG_KEYS = ['DISABLE_TOOLS', 'USE_ISOLATED_HOME', 'DEBUG', 'OPENCODE_PROXY_DEBUG'];
+
+function describeType(value) {
+    if (value === null) return 'null';
+    if (Array.isArray(value)) return 'an array';
+    return `a ${typeof value}`;
+}
+
+function describeFileType(stat) {
+    if (stat.isDirectory()) return 'a directory';
+    if (stat.isFIFO()) return 'a FIFO';
+    if (stat.isSocket()) return 'a socket';
+    if (stat.isCharacterDevice()) return 'a character device';
+    if (stat.isBlockDevice()) return 'a block device';
+    return 'not a regular file';
+}
+
 /**
  * Reads a `config.json` file for the entry point.
  *
@@ -8,25 +50,48 @@ import fs from 'fs';
  * operator wrote, leaving the gateway running with the built-in dummy key instead of theirs.
  */
 export function readConfigFile(configPath) {
-    if (!fs.existsSync(configPath)) return { config: {}, error: null };
-
     let raw;
     try {
+        // statSync first, so a directory/FIFO/socket is named instead of surfacing as EISDIR or a read that never
+        // returns. A file removed between the stat and the read reports ENOENT from readFileSync below, which is the
+        // same "no config.json" answer as a missing file - not a startup failure.
+        const stat = fs.statSync(configPath);
+        if (!stat.isFile()) return { config: {}, error: `must be a regular file, found ${describeFileType(stat)}` };
+        if (stat.size > MAX_CONFIG_BYTES) {
+            return { config: {}, error: `is ${stat.size} bytes, the maximum is ${MAX_CONFIG_BYTES}` };
+        }
         raw = fs.readFileSync(configPath, 'utf8');
     } catch (e) {
+        if (e.code === 'ENOENT') return { config: {}, error: null };
         return { config: {}, error: `cannot be read: ${e.message}` };
     }
 
+    // A UTF-8 BOM is what a Windows editor or PowerShell 5.1 writes: JSON.parse rejects the first character of a file
+    // that is otherwise valid, and the reported error ("Unexpected token '﻿'") shows the operator nothing to fix.
+    const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+
     let parsed;
     try {
-        parsed = JSON.parse(raw);
+        parsed = JSON.parse(text);
     } catch (e) {
         return { config: {}, error: `is not valid JSON: ${e.message}` };
     }
 
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        const found = parsed === null ? 'null' : Array.isArray(parsed) ? 'an array' : `a ${typeof parsed}`;
-        return { config: {}, error: `must contain a JSON object, found ${found}` };
+        return { config: {}, error: `must contain a JSON object, found ${describeType(parsed)}` };
+    }
+
+    for (const key of STRING_OR_NUMBER_KEYS) {
+        if (!Object.prototype.hasOwnProperty.call(parsed, key)) continue;
+        const value = parsed[key];
+        if (typeof value === 'string' || typeof value === 'number') continue;
+        return { config: {}, error: `${key} must be a string or a number, found ${describeType(value)}` };
+    }
+    for (const key of FLAG_KEYS) {
+        if (!Object.prototype.hasOwnProperty.call(parsed, key)) continue;
+        const value = parsed[key];
+        if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') continue;
+        return { config: {}, error: `${key} must be a string, a number or a boolean, found ${describeType(value)}` };
     }
 
     return { config: parsed, error: null };

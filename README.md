@@ -218,6 +218,12 @@ directory** — next to `index.js` (in the container, `/app/config.json`) — no
 in; if a `config.json` sits in that working directory instead, startup says so:
 `[Config] config.json is read from …; the file at … is ignored`.
 
+The file must be a regular file of at most 1 MiB; a UTF-8 BOM (which a Windows editor writes) is tolerated. A key the
+gateway knows but whose value has the wrong type stops it with the key named
+(`[Config] config.json API_KEY must be a string or a number, found a boolean`) instead of being coerced: a boolean
+`API_KEY` would make the literal string `true` the gateway's credential, which every client can guess while the
+startup summary still reports a custom key.
+
 `config.json` (see [config.json.example](config.json.example)):
 
 | Key | Default | Description |
@@ -226,9 +232,10 @@ in; if a `config.json` sits in that working directory instead, startup says so:
 | `BIND_HOST` | `127.0.0.1` | Gateway bind address; use `0.0.0.0` to expose it on all interfaces |
 | `API_KEY` | `sk-dummy-123` | Bearer token clients must send. Authentication is always on — an empty or blank value falls back to `sk-dummy-123` |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway; a trailing slash is stripped and a missing scheme is read as `http://` (both are reported in the startup log) |
-| `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend |
+| `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend. Keep it on loopback: the backend has no authentication of its own, so publishing it bypasses the gateway's key |
+| `OPENCODE_PROXY_BIND_HOST` | unset | Read as the bind address only when `BIND_HOST` is not set |
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
-| `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files |
+| `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files. Booleans accept `true`/`false` (JSON) or `1`/`0`, `yes`/`no`, `y`/`n`, `on`/`off` (environment or string) |
 | `USE_ISOLATED_HOME` | `false` | Run the backend with a throwaway `HOME` instead of the real one, so it cannot pick up your machine's OpenCode state |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (case-insensitive) |
 

@@ -6,8 +6,8 @@ import https from 'https';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { timingSafeEqual } from 'crypto';
-import { logger, maskHeaders } from './logger.js';
+import { timingSafeEqual, randomBytes } from 'crypto';
+import { logger, maskHeaders, maskUrlQuery } from './logger.js';
 
 
 // --- Mutex Logic with Timeout ---
@@ -63,6 +63,15 @@ const MAX_LOGGED_URL_LENGTH = 512;
 const loggableModelId = (id) => {
     const clean = String(id).replace(CONTROL_CHARS_RE, '?');
     return clean.length > MAX_LOGGED_MODEL_LENGTH ? `${clean.slice(0, MAX_LOGGED_MODEL_LENGTH)}…` : clean;
+};
+// The same treatment for the request URL, which every log site used to copy raw: credential query values are masked
+// (`?api_key=…` is an OpenAI-compatible convention some clients still send) and an unbounded URL is cut, because the
+// URL is client input bounded only by the HTTP parser's header limit.
+const loggableUrl = (url) => {
+    const masked = maskUrlQuery(url);
+    return masked.length > MAX_LOGGED_URL_LENGTH
+        ? `${masked.slice(0, MAX_LOGGED_URL_LENGTH)}…[truncated ${masked.length - MAX_LOGGED_URL_LENGTH} chars]`
+        : masked;
 };
 
 // Authentication is mandatory by design: when API_KEY is missing or blank the gateway falls back to this
@@ -736,9 +745,10 @@ function createApp(config) {
             // is cut here, so neither can forge a second log line or turn one request into an arbitrarily large log
             // record. Both are logged, never echoed to the client, so truncation loses nothing a reader needs.
             const model = meta.model || '-';
-            const url = request.url.length > MAX_LOGGED_URL_LENGTH
-                ? `${request.url.slice(0, MAX_LOGGED_URL_LENGTH)}…[truncated ${request.url.length - MAX_LOGGED_URL_LENGTH} chars]`
-                : request.url;
+            // A credential sent in the query string (`?api_key=…`, a convention some OpenAI-compatible clients still
+            // use) used to be copied into the log verbatim at the default level; only the values whose name looks like
+            // a credential are masked
+            const url = loggableUrl(request.url);
             const streamText = typeof meta.stream === 'boolean' ? String(meta.stream) : '-';
             const line = `${request.method} ${url} -> ${reply.raw.statusCode} ${Date.now() - startedAt}ms [${meta.reqId}] model=${model} stream=${streamText}`;
             if (isApiPath) logger.info(line);
@@ -851,6 +861,16 @@ function createApp(config) {
     const fetchModels = async () => {
         try {
             const providersRes = await client.config.providers(backendDeadline(MODELS_TIMEOUT_MS));
+            // The SDK resolves a rejected call with `{ error, response }` instead of throwing, so reading `.data` alone
+            // made a refused provider call ("upstream answered 500", "the backend is gone") report itself as "the
+            // backend reported no models" - the one SDK call in the gateway whose error tuple was never inspected.
+            if (providersRes && providersRes.error) {
+                const { status, reason } = upstreamFailureReason(providersRes);
+                logger.warn(
+                    `[Proxy] The backend rejected the provider listing${status ? ` (status ${status})` : ''}${reason}, using the static fallback`
+                );
+                return STATIC_FALLBACK_MODELS;
+            }
             const providersRaw = providersRes.data?.providers || [];
             const models = [];
             const list = Array.isArray(providersRaw)
@@ -1463,6 +1483,22 @@ function createApp(config) {
                             break;
                         }
                     }
+                    // The stream ended without ever reporting a finish event: the backend restarted, a proxy in front
+                    // of it closed an idle connection, or the CLI tore the subscription down while it was still
+                    // writing. The answer is usually complete and pollable by then, so the caller takes over with the
+                    // recovery poll - waiting out the rest of the budget instead answered the client an in-band error
+                    // while the finished message was sitting in the backend (measured: a 6 s budget spent on a stream
+                    // closed after two deltas, then `data: {"error":…}` despite a complete stored answer).
+                    if (!finished) {
+                        if (logger.isEnabled('debug')) {
+                            logger.debug('SSE stream ended without a finish event', {
+                                sessionId,
+                                ms: Date.now() - startedAt,
+                                deltaChars
+                            });
+                        }
+                        settle({ content, reasoning, streamEnded: true, receivedDelta });
+                    }
                 } catch (e) {
                     if (!finished) {
                         finished = true;
@@ -1520,7 +1556,7 @@ function createApp(config) {
                 // Nothing to answer and no reason to run the completion: it would spend backend time (and tokens) for
                 // nobody while delaying the requests still waiting behind this one.
                 if (clientDisconnected) {
-                    logDebug('Abandoned while queued, skipping completion', { url: request.url });
+                    logDebug('Abandoned while queued, skipping completion', { url: loggableUrl(request.url) });
                     if (!reply.raw.writableEnded) reply.raw.end();
                     return reply;
                 }
@@ -1539,7 +1575,7 @@ function createApp(config) {
                         logger.debug('Incoming OpenAI request', {
                             reqId,
                             method: request.method,
-                            path: request.url,
+                            path: loggableUrl(request.url),
                             headers: maskHeaders(request.headers),
                             body: request.body
                         });
@@ -1997,16 +2033,22 @@ function createApp(config) {
                                 error: collected.__error?.message
                             });
                             polled = true;
-                            await emitPolled(false);
+                            // Text may already be on the wire: the poll then only contributes the part the client does
+                            // not have, because re-sending the whole answer duplicated it (the idle-timeout fallback
+                            // below has always been append-only for that reason).
+                            await emitPolled(Boolean(streamedContent || streamedReasoning));
                         } else if (collected && collected.noData) {
                             logDebug('Fallback to polling (stream)', { sessionId });
                             polled = true;
                             await emitPolled(false);
-                        } else if (collected && collected.idleTimeout) {
-                            logDebug('SSE idle timeout, polling for completion', { sessionId });
+                        } else if (collected && (collected.idleTimeout || collected.streamEnded)) {
+                            // Both cases mean the same thing: nothing more is coming from the event stream, and the
+                            // answer has to be read from the backend. A stream that ended early is polled with the same
+                            // tolerance as one that went silent - the collected text is a prefix of the real answer.
+                            logDebug(collected.streamEnded ? 'SSE stream ended early, polling for the answer' : 'SSE idle timeout, polling for completion', { sessionId });
                             polled = true;
-                            // The backend just went silent on us: give it another full idle window before deciding the
-                            // message will never be marked finished
+                            // The backend just went silent (or away) on us: give it another full idle window before
+                            // deciding the message will never be marked finished
                             await emitPolled(true, IDLE_RECOVERY_STALL_POLLS);
                         }
 
@@ -2300,7 +2342,9 @@ function createApp(config) {
         const statusCode = error.statusCode && error.statusCode >= 400 ? error.statusCode : 500;
         const detail = {
             method: request.method,
-            path: request.url,
+            // Client input: a credential in the query string is masked and a pathological URL is cut, the same way
+            // the request summary treats it
+            path: loggableUrl(request.url),
             message: error.message,
             code: error.code || error.name
         };
@@ -2329,7 +2373,8 @@ function createApp(config) {
     app.setNotFoundHandler((request, reply) => {
         reply.code(404).send({
             error: {
-                message: `Route ${request.method} ${request.url.split('?')[0]} not found`,
+                // The path is echoed back, so it is the client's own input: no query string, no control characters
+                message: `Route ${request.method} ${loggableUrl(request.url.split('?')[0])} not found`,
                 type: 'not_found'
             }
         });
@@ -2514,13 +2559,26 @@ async function ensureBackend(config, options = {}) {
 
             // On Windows, don't use isolated fake-home to avoid path issues
             // On Unix-like systems, use jail for isolation
-            const salt = Math.random().toString(36).substring(7);
+            // The salt is what keeps two gateway instances (or two respawns) out of each other's jail:
+            // `Math.random().toString(36).substring(7)` could yield an empty string (deleting the shared parent) or a
+            // one-character name (colliding with another instance, whose jail cleanup would then remove it).
+            const salt = randomBytes(8).toString('hex');
+            if (!salt) throw new Error('Could not generate a jail directory name');
             // 0700: this tree is the backend's working directory and, with USE_ISOLATED_HOME, its entire HOME. The
             // default mode (0755) let any other local user on a shared /tmp traverse and list it, which defeats the
             // isolation the option exists for. mkdir's mode is masked by the umask, so 0700 is the strictest that
             // survives.
             const jailParent = path.join(os.tmpdir(), 'opencode-proxy-jail');
+            // mkdirSync does not change the mode of a directory that already exists, so a parent created by an older
+            // build (0755) kept its permissions for the lifetime of the machine; re-assert them on every start.
             fs.mkdirSync(jailParent, { recursive: true, mode: 0o700 });
+            if (!isWindows) {
+                try {
+                    fs.chmodSync(jailParent, 0o700);
+                } catch (error) {
+                    logger.warn('[Proxy] Could not restrict the backend jail directory:', { path: jailParent, error: error.message });
+                }
+            }
             const jailRoot = path.join(jailParent, salt);
             state.jailRoot = jailRoot;
             ownedJailRoots.add(jailRoot);

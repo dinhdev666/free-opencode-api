@@ -19,6 +19,7 @@ The image bundles Node.js 22, the project source, and the OpenCode CLI (npm pack
 - [Logging](#logging)
 - [Exposing the 4097 Backend Port](#exposing-the-4097-backend-port)
 - [Known Issues and Compatibility Fixes](#known-issues-and-compatibility-fixes)
+- [Publishing a Release](#publishing-a-release)
 - [Related Links](#related-links)
 
 ---
@@ -44,7 +45,7 @@ docker run -d \
   --restart=always \
   --network common-all \
   --name free-opencode-api \
-  --privileged \
+  -e API_KEY=your-secret-key \
   -p 8083:8083 \
   dinhdev666/free-opencode-api:2.0.0
 ```
@@ -52,6 +53,11 @@ docker run -d \
 The service is then reachable at `http://<your-ip>:8083`.
 
 > The `--network common-all` flag is optional — it just attaches the container to an existing user-defined network. Drop it if you do not use one.
+
+> **Pass `-e API_KEY=…`.** Without it the gateway runs with the built-in key `sk-dummy-123`, which is public: anyone who
+> can reach the port can then drive your OpenCode installation. `--privileged` is **not** needed and is never used
+> here: the image needs no extra capability, and the backend runs model-directed tools, so keep those tools inside the
+> container's default isolation (with `DISABLE_TOOLS=true`, the image default, they are off entirely).
 
 ---
 
@@ -100,7 +106,7 @@ docker run -d \
   --restart=always \
   --network common-all \
   --name free-opencode-api \
-  --privileged \
+  -e API_KEY=your-secret-key \
   -p 8083:8083 \
   -v ~/.local/share/opencode:/home/node/.local/share/opencode \
   dinhdev666/free-opencode-api
@@ -156,17 +162,19 @@ working if it is later started without them.
 | `PORT` | `8083` | Gateway listen port |
 | `API_KEY` | `sk-dummy-123` | Gateway auth key; mandatory — an empty value falls back to the default key instead of disabling authentication |
 | `BIND_HOST` | `0.0.0.0` | Must listen on `0.0.0.0` inside the container for port mapping to work (the program default is `127.0.0.1`; the entrypoint overrides it) |
-| `DISABLE_TOOLS` | `true` | Disables OpenCode tool calls so the model cannot run commands or modify files in the container (`1`, `true`, `yes`, `on` turn it on; `0`, `false`, `no`, `off` turn it off) |
-| `OPENCODE_PATH` | empty (auto-detect) | Path to the `opencode` executable; when empty it is resolved through `PATH` (npm global install puts it at `/usr/local/bin/opencode`), and the program also probes `~/.opencode/bin` and the npm/pnpm global directories |
+| `DISABLE_TOOLS` (or `OPENCODE_DISABLE_TOOLS`) | `true` | Disables OpenCode tool calls so the model cannot run commands or modify files in the container (`1`, `true`, `yes`, `y`, `on` turn it on; `0`, `false`, `no`, `n`, `off` turn it off). The `OPENCODE_`-prefixed spelling wins when both are set |
+| `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; left as a bare name it is resolved through `PATH` (the npm global install puts it at `/usr/local/bin/opencode`), and the program also probes `~/.opencode/bin` and the npm/pnpm global directories. The CLI version is pinned at build time (`ARG OPENCODE_VERSION`), so the name resolves to the bundled 1.19.5 |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend the gateway launches internally; rarely needs changing (a trailing slash is stripped) |
 | `OPENCODE_USE_ISOLATED_HOME` (or `USE_ISOLATED_HOME`) | unset | Runs the backend with a throwaway `HOME` inside the container (the container is already isolated, so this is rarely needed) |
-| `OPENCODE_BIND_HOST` | `0.0.0.0` | Listen address of the OpenCode backend (4097), `0.0.0.0` by default inside the container; the program default is `127.0.0.1` (non-container behavior unchanged). See [Exposing the 4097 Backend Port](#exposing-the-4097-backend-port) |
-| `LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug` (case-insensitive; invalid values fall back to `info` with a warning). **Exception: never written into `config.json` — the Node process reads the environment directly, so it takes precedence over the `LOG_LEVEL` field there.** See [Logging](#logging) |
+| `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend (4097). Loopback by default, because the backend has no authentication of its own: publishing it would bypass the gateway's key. Set `0.0.0.0` to serve it outside the container — see [Exposing the 4097 Backend Port](#exposing-the-4097-backend-port) |
+| `OPENCODE_PROXY_BIND_HOST` | unset | Alias for `BIND_HOST`, read only when `BIND_HOST` is not set (the program's own default is `127.0.0.1`) |
+| `DEBUG` (or `OPENCODE_PROXY_DEBUG`) | unset | Legacy alias that turns on debug logging; `LOG_LEVEL=debug` is the documented way |
+| `LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug` (case-insensitive; invalid values fall back to `info` with a warning). **Exception: never written into `config.json` — it follows the usual precedence (environment first, then the `LOG_LEVEL` field in `config.json`, then `info`), but the entrypoint does not copy it into the generated file.** See [Logging](#logging) |
 
 Example with a custom API key (authentication is always on; omitting `API_KEY` uses `sk-dummy-123`):
 
 ```sh
-docker run -d --restart=always --network common-all --name free-opencode-api --privileged -p 8083:8083 \
+docker run -d --restart=always --network common-all --name free-opencode-api -p 8083:8083 \
   -e PORT=8083 -e API_KEY=your-key -e DISABLE_TOOLS=true \
   dinhdev666/free-opencode-api
 ```
@@ -184,9 +192,14 @@ docker run -d --restart=always --network common-all --name free-opencode-api --p
 - The entrypoint writes the `-e` values into `/app/config.json` **only when that file is missing**. On later starts the
   stored file is left untouched, so after changing `-e` values the file can disagree with the running gateway. Delete
   it (or drop the `-v` mount) and recreate the container if you want the stored copy to match again.
-- **`LOG_LEVEL` is the exception on the write path**: it is never written into `config.json`, so it can only come from
-  the environment (default `info`).
-- The first-boot line in `docker logs` shows the generated settings with the **API key masked** (`sup*** (22 chars)`):
+- **`LOG_LEVEL` is the exception on the write path**: the entrypoint never copies it into `config.json`. It still
+  follows the normal precedence (environment first, then the `LOG_LEVEL` field of an existing file, then `info`); the
+  image sets no `ENV LOG_LEVEL`, precisely so a value in the file remains reachable.
+- The file the entrypoint writes is created through a temporary file and an atomic `rename`, with mode `0600`: a
+  container killed mid-write cannot leave a truncated `config.json` behind (which made every later start exit with
+  "is not valid JSON" until a human deleted it).
+- The first-boot line in `docker logs` shows the generated settings with the **API key masked** (`sk-a***(22 chars)`,
+  nothing at all up to 16 characters — the same rule the in-process logger uses):
   the file it writes is `0600`, owned by the container user (`node`, uid 1000), and holds the real key, but container
   logs are usually collected and shipped, so the key must never be printed. The startup `[Security]` warning still
   tells you when the built-in `sk-dummy-123` is in use.
@@ -195,7 +208,11 @@ docker run -d --restart=always --network common-all --name free-opencode-api --p
 - A `config.json` that exists but is invalid stops the container with a clear error instead of silently falling back to
   the defaults — otherwise it would run with the built-in `sk-dummy-123` instead of your key.
 - The image's own defaults (used when generating `config.json`) differ from the program defaults for the container:
-  `BIND_HOST=0.0.0.0`, `OPENCODE_BIND_HOST=0.0.0.0` and `DISABLE_TOOLS=true`.
+  `BIND_HOST=0.0.0.0` and `DISABLE_TOOLS=true`. `OPENCODE_BIND_HOST` keeps the program default `127.0.0.1`.
+- A value of the wrong type for a known key (`"API_KEY": true`, an object where a string belongs) stops the container
+  with a message naming the key, instead of silently running with the stringified value (a boolean `API_KEY` would make
+  the literal word `true` the gateway's credential). A UTF-8 BOM is tolerated, and the file must be a regular file of at
+  most 1 MiB.
 
 ---
 
@@ -230,7 +247,7 @@ Example `docker logs` output per level:
 [gateway] 2026-11-06T12:00:12.789Z [INFO] POST /v1/chat/completions -> 200 4822ms [gw-n4def5y6] model=opencode/example-model-b stream=false
 
 # debug (additionally logs full request bodies and responses; sensitive headers masked)
-[gateway] 2026-11-06T12:00:05.010Z [DEBUG] Incoming OpenAI request {"reqId":"gw-m1abc2x3","headers":{"authorization":"Bear***c9Zw","content-type":"application/json"},"body":{"model":"opencode/example-model-a","messages":[...],"stream":true}}
+[gateway] 2026-11-06T12:00:05.010Z [DEBUG] Incoming OpenAI request {"reqId":"gw-m1abc2x3","headers":{"authorization":"Bear***(31 chars)","content-type":"application/json"},"body":{"model":"opencode/example-model-a","messages":[...],"stream":true}}
 [gateway] 2026-11-06T12:00:05.032Z [DEBUG] Upstream payload (final request body to opencode serve) {"reqId":"gw-m1abc2x3","sessionId":"ses_...","model":"opencode/example-model-a","payload":{"path":{"id":"ses_..."},"body":{"model":{...},"system":"...","parts":[...],"tools":{...}}}}
 [gateway] 2026-11-06T12:00:05.460Z [DEBUG] SSE stream summary {"reqId":"gw-m1abc2x3","chunks":12,"contentChars":866,"reasoningChars":0,"finishReason":"stop"}
 [gateway] 2026-11-06T12:00:12.780Z [DEBUG] Upstream response (non-stream full JSON) {"reqId":"gw-n4def5y6","response":{"id":"chatcmpl-...","choices":[{"message":{"content":"..."}}],"finish_reason":"stop"}}
@@ -246,16 +263,17 @@ Example `docker logs` output per level:
 
 ## Exposing the 4097 Backend Port
 
-When the gateway (8083) starts it launches the `opencode serve` backend (4097) inside the container. The backend listen address is controlled by `OPENCODE_BIND_HOST`: `0.0.0.0` by default when the entrypoint generates the config, while the program default is `127.0.0.1` (loopback only — unreachable from outside the container).
+When the gateway (8083) starts it launches the `opencode serve` backend (4097) inside the container. The backend listen address is controlled by `OPENCODE_BIND_HOST` and defaults to `127.0.0.1` — loopback only, unreachable from outside the container. That is deliberate: the backend has **no authentication of its own**, so anything that can reach 4097 can drive the model without the gateway's key.
 
-To reach 4097 directly from outside, add the port mapping `-p 4097:4097`:
+To reach 4097 directly from outside, set the address *and* publish the port:
 
 ```bash
 docker run -d \
   --restart=always \
   --network common-all \
   --name free-opencode-api \
-  --privileged \
+  -e API_KEY=your-secret-key \
+  -e OPENCODE_BIND_HOST=0.0.0.0 \
   -p 8083:8083 \
   -p 4097:4097 \
   dinhdev666/free-opencode-api
@@ -292,6 +310,9 @@ The image is published by `.github/workflows/docker-publish.yml`. Pushing a vers
 git tag v1.0.1
 git push origin v1.0.1
 ```
+
+The publish job itself is guarded by `if: startsWith(github.ref, 'refs/tags/v')`, so a run started from a branch (a
+manual dispatch) stops before it logs in to the registry: only a tag can move `latest`.
 
 The workflow needs two repository secrets (Settings → Secrets and variables → Actions):
 `DOCKERHUB_USERNAME` (the Docker Hub account) and `DOCKERHUB_TOKEN` (an access token with Read & Write scope, not the

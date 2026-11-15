@@ -2088,6 +2088,51 @@ async function run() {
     stop(bigErrorStub);
     await waitForExit(bigErrorStub);
 
+    // --- the debug body dump masks credential-shaped fields ----------------------------------------------
+    // The dump bounded the body but never masked it, and a body is as client-chosen as the headers: a wrapper that
+    // forwards `{"api_key": …}` put that value into `docker logs` at LOG_LEVEL=debug.
+    const debugPort = GATEWAY_PORT + 65;
+    let debugOutput = '';
+    const debugGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(debugPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'debug'
+        }
+    });
+    children.push(debugGateway);
+    debugGateway.stdout.on('data', (chunk) => { debugOutput += chunk; });
+    debugGateway.stderr.on('data', (chunk) => { debugOutput += chunk; });
+    const debugUrl = `http://127.0.0.1:${debugPort}`;
+    await waitForOk(`${debugUrl}/health`);
+    const DEBUG_SECRET = 'sk-must-not-appear-in-the-log';
+    const debugAnswer = await fetch(`${debugUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+            messages: [{ role: 'user', content: 'hi' }],
+            api_key: DEBUG_SECRET,
+            metadata: { authorization: `Bearer ${DEBUG_SECRET}`, note: 'kept' }
+        }),
+        signal: AbortSignal.timeout(15000)
+    }).then((r) => r.json().then((json) => ({ status: r.status, json })))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    await sleep(150);
+    const debugDump = debugOutput.split('\n').find((line) => line.includes('Incoming OpenAI request')) || '';
+    check('the debug body dump hides a credential-shaped field',
+        debugAnswer.status === 200 && debugDump.includes('Incoming OpenAI request') &&
+        !debugOutput.includes(DEBUG_SECRET),
+        `${debugAnswer.status} ${debugDump.slice(0, 200)}`);
+    check('the debug body dump keeps the field and the rest of the body',
+        /"api_key":"sk-[^"]*\*\*\*\(\d+ chars\)"/.test(debugDump) &&
+        /"note":"kept"/.test(debugDump) && /"content":"hi"/.test(debugDump),
+        debugDump.slice(0, 300));
+    stopGateway(debugGateway);
+    await waitForExit(debugGateway);
+
     // --- a backend that rejects the event stream ---------------------------------------------------------
     // A build whose SSE endpoint moved, or a proxy in front of it, answers /health and the session calls but refuses
     // GET /event. The SDK reports that as an error tuple with no stream, so the gateway must fall back to polling and

@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
-import { logger, maskBackendUrl, maskHeaders, maskUrlCredentials, maskUrlQuery, setOwnProperty } from './logger.js';
+import { logger, maskBackendUrl, maskDetail, maskHeaders, maskUrlCredentials, maskUrlQuery, setOwnProperty } from './logger.js';
 
 
 // --- Mutex Logic with Timeout ---
@@ -1906,7 +1906,10 @@ function createApp(config) {
                             method: request.method,
                             path: loggableUrl(request.url),
                             headers: maskHeaders(request.headers),
-                            body: request.body
+                            // The body is as client-chosen as the headers: a wrapper that forwards
+                            // `{"api_key": …}` or `{"metadata":{"authorization":…}}` wrote a credential into
+                            // `docker logs`, and bounding the dump never addressed that
+                            body: maskDetail(request.body)
                         });
                     }
                     // A body like `null` or `"text"` is valid JSON but not a completion request: answer 400 instead of

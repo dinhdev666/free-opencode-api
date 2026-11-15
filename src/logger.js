@@ -251,6 +251,36 @@ export function maskHeaders(headers) {
 }
 
 /**
+ * Copy a JSON payload and mask the values whose *key* names a credential, the way `maskHeaders()` does for headers.
+ * A request body is as client-chosen as the headers: a wrapper that forwards `{"api_key": …}` or
+ * `{"metadata":{"authorization":…}}` wrote a credential to `docker logs` at `LOG_LEVEL=debug`, because the debug
+ * dump bounded the body (`serializeDetail()`) but never masked it. The walk is bounded (depth, keys, items) and only
+ * runs when debug logging is on, so it costs nothing on the request path.
+ * @param {*} value any JSON value from a parsed request body
+ * @param {WeakSet} seen objects already visited, for circular payloads
+ * @param {number} depth nesting level
+ * @returns {*} masked copy (the original object is left untouched)
+ */
+export function maskDetail(value, seen = new WeakSet(), depth = 0) {
+    if (value === null || typeof value !== 'object') return value;
+    if (seen.has(value)) return '[Circular]';
+    if (depth >= 8) return '[MaxDepthExceeded]';
+    seen.add(value);
+    let out;
+    if (Array.isArray(value)) {
+        out = value.slice(0, 100).map((item) => maskDetail(item, seen, depth + 1));
+    } else {
+        out = {};
+        Object.keys(value).slice(0, 100).forEach((key) => {
+            const entry = value[key];
+            setOwnProperty(out, key, isSensitiveHeader(String(key).toLowerCase()) ? maskSecret(entry) : maskDetail(entry, seen, depth + 1));
+        });
+    }
+    seen.delete(value);
+    return out;
+}
+
+/**
  * Create a logger instance
  * @param {{level?: string, prefix?: string}} options
  */

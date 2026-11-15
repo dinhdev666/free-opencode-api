@@ -494,6 +494,15 @@ function createApp(config) {
 
     // Precomputed once: comparing against a ready-made buffer avoids rebuilding the token on every request.
     // resolveApiKey() guarantees a non-empty key, so authentication can never be switched off.
+    const CLIENT_REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+    // The incoming X-Request-Id, if it is usable as-is (see the note where it is used)
+    const requestId = (request) => {
+        const raw = request.headers['x-request-id'];
+        if (typeof raw !== 'string') return null;
+        const trimmed = raw.trim();
+        return CLIENT_REQUEST_ID_RE.test(trimmed) ? trimmed : null;
+    };
+
     const bearerToken = `Bearer ${resolveApiKey(API_KEY)}`;
     const bearerTokenBuffer = Buffer.from(bearerToken);
 
@@ -502,7 +511,10 @@ function createApp(config) {
     app.addHook('onRequest', (request, reply, done) => {
         const startedAt = Date.now();
         const path = request.url.split('?')[0];
-        const meta = { reqId: `gw-${startedAt.toString(36)}${Math.random().toString(36).slice(2, 6)}`, startedAt, path };
+        // A client that supplies its own trace id keeps it, so its logs and ours can be joined. Anything that is not a
+        // short, printable token is ignored instead of being echoed: a header value can carry newlines or control
+        // characters, and this string ends up in the log line and in a response header.
+        const meta = { reqId: requestId(request) || `gw-${startedAt.toString(36)}${Math.random().toString(36).slice(2, 6)}`, startedAt, path };
         request.gatewayLog = meta;
 
         // The summary is emitted from the raw response's events so hijacked SSE streams (which bypass the normal
@@ -528,6 +540,8 @@ function createApp(config) {
         reply.raw.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Api-Key, X-Requested-With');
         // Cache the preflight so a browser client does not pay a round trip before every request
         reply.raw.setHeader('Access-Control-Max-Age', '600');
+        // Without this a browser client cannot read the trace id back (CORS hides it from script)
+        reply.raw.setHeader('Access-Control-Expose-Headers', 'X-Request-Id');
         // The same id the request log carries, so a client-side report can be traced back to a log line
         reply.raw.setHeader('X-Request-Id', meta.reqId);
 

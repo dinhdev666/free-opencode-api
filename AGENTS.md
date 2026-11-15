@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 245 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 247 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -387,6 +387,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   stays the only parser (it is also used on request bodies, where a warning would be wrong); `readFlag()` only
   reports. The label repeats the name the operator used — an environment variable or `config.json DISABLE_TOOLS` —
   and the echoed value is stripped of control characters and cut at 64, because it lands in a log line.
+  `startProxy()` applies the same rule to its own fallbacks (`flagOption()`), for an embedder that calls it directly
+  with no entry point to resolve the option first: an option the caller passed is taken as given — `index.js` already
+  reported it, and a second line for one value reads like two different settings — while an option that is absent
+  reads the environment through `readFlag()`.
 - **Configuration** follows the precedence env > `config.json` > default, and every new key must be added to
   `config.json.example`, the README configuration table and — for container-relevant keys — `docker/docker-entrypoint.sh`.
   `config.json` is read from the **application directory** (`path.join(__dirname, 'config.json')`), not from the

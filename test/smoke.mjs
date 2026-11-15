@@ -280,6 +280,20 @@ async function run() {
     check('the defaults and ranges in the README tuning table are the ones the gateway resolves',
         tuningMismatches.length === 0, tuningMismatches.join('; '));
 
+    // `config.json.example` is not documentation an operator reads, it is configuration they copy: every value in it is
+    // written to their `config.json`, which wins over the default. A default changed in `src/proxy.js` while the
+    // template keeps the old number does not leave a stale table behind - it pins the old value in every install made
+    // from the template, and nothing at startup can report it, because the file is read and its values are valid.
+    const exampleConfig = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json.example'), 'utf8'));
+    const templateMismatches = [];
+    for (const [key, resolved] of tuningDefaults) {
+        if (exampleConfig[key] !== resolved.value) {
+            templateMismatches.push(`${key}: template ${JSON.stringify(exampleConfig[key])}, default ${resolved.value}`);
+        }
+    }
+    check('the values in config.json.example are the defaults the gateway resolves',
+        templateMismatches.length === 0, templateMismatches.join('; '));
+
     // The commit-message rules live in two places - the CONTRIBUTING.md tables and test/check-commit-messages.mjs -
     // and CI enforces the second over the commits a push adds. A scope added to the document alone would reject every
     // commit that uses it, and one added to the checker alone documents nothing, so the checker compares the two lists

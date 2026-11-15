@@ -37,9 +37,8 @@ These are product decisions, not implementation details. Do not "improve" them w
    copyright holder remains `Phạm Văn Định` (LICENSE, `package.json`, Docker image labels).
 5. **pnpm for project dependencies.** `package.json` pins `packageManager: pnpm@12.18.0`. `npm` appears only for
    installing the `opencode-ai` CLI, never for this project's dependency tree.
-6. **Two runtime dependencies.** `fastify` and `@opencode-ai/sdk`. Adding a dependency requires a clear, stated
-   reason; the project deliberately avoids helper packages (routing, CORS, logging, body parsing are all in-tree or
-   built into Fastify).
+6. **Two runtime dependencies.** `fastify` and `@opencode-ai/sdk`. Adding one requires a clear, stated reason; the
+   project deliberately avoids helper packages (routing, CORS, logging, body parsing are in-tree or built in).
 
 ## Repository map
 
@@ -70,7 +69,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 342 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 345 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -106,13 +105,12 @@ credential-bearing URL), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` 
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every creation after the n-th goes
 unanswered), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
-body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. Session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the
-session (its own backend round trip), so one read of `/__sessions` raced it and failed with `live: 1`; wait for
-`live: 0`. The suite refuses a taken port and SIGKILLs a stubborn child.
+body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. Session-cleanup
+assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the session (its own
+backend round trip), so one read of `/__sessions` raced it and failed with `live: 1`; wait for `live: 0`.
 
-For exploratory work, start the stub (or a throwaway one in `/tmp`) on a spare port - `STUB_PORT=4405
-node test/stub-opencode.mjs`, which reads `STUB_PORT` and ignores a positional argument - and point the gateway at
-it:
+For exploratory work, start a throwaway stub on a spare port (`STUB_PORT=4405 node test/stub-opencode.mjs`; it
+reads `STUB_PORT` and ignores a positional argument) and point the gateway at it:
 
 ```bash
 OPENCODE_SERVER_URL=http://127.0.0.1:4096 PORT=8080 LOG_LEVEL=debug node index.js
@@ -181,7 +179,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   **content type**, not by the value: `"hi"` under `application/json` decoded to a string, and reading it as unparsed
   text answered "not valid JSON" about a body that parses perfectly, while `42`, `true`, `[]` were answered `messages
   array is required` about a field never sent. All are `request body must be a JSON object, found …`; no body at all
-  keeps `messages array is required`.
+  keeps `messages array is required`, and an **empty** body (a retry that lost its payload) names the emptiness and
+  the fix (`request body is empty; send a JSON object with a messages array`, code kept) whatever the content type,
+  not Fastify's sentence about the header the client set correctly.
 - **A missing `messages` is not an unusable one.** Three client mistakes used to share a single message: a body with
   no `messages`, a `messages` that is not an array (`"hi"`, `{}`) and an empty array (`[]`) all answered
   `messages array is required`, which sends the reader looking for a field they did send. They are separated now:
@@ -212,9 +212,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **A message `name` is a label, not prompt text.** It is interpolated as `USER(name): …` only when it is a string,
   with control characters replaced and the value cut: a non-string reached the model as `USER([object Object]): …`.
 - **An announced request body has a deadline.** Fastify sets `requestTimeout: 0`, so nothing bounded the wait: a client
-  that sent `Content-Length: 4096` and four bytes held the socket as long as it liked, with no
-  credential needed, because the `401` is written from the headers while Node keeps the connection
-  alive to drain a body it will never read. `armBodyDeadline()` in the `onRequest` hook (armed before auth, only when
+  that sent `Content-Length: 4096` and four bytes held the socket as long as it liked without a credential, because
+  the `401` is written from the headers while Node keeps the connection alive to drain a body it will never read. `armBodyDeadline()` in the `onRequest` hook (armed before auth, only when
   the request announces a body, cleared on `end`/`close`/`error`) closes it after `min(30 s, REQUEST_TIMEOUT_MS)`,
   answering the `408` envelope when nothing has been sent. It closes the **request's** socket, not `reply.raw`: a
   keep-alive response is detached from the connection once it ends, so destroying that closed nothing.
@@ -425,8 +424,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   gateway listened on the default port with the built-in public key while the file named another port and a real
   secret. Keep every key on that rule.
   A **key nobody reads** is named at startup and ignored (`[Config] config.json has an unknown key 'APIKEY' (did you
-  mean 'API_KEY'?) - it is ignored`, via `findUnknownKeys()`): a misspelled key changed nothing at all in complete
-  silence, so the gateway ran the default while the operator was sure the value in the file was in force. A
+  mean 'API_KEY'?) - it is ignored`, via `findUnknownKeys()`): a misspelled key changed nothing at all, so the gateway
+  ran the default while the operator was sure the value in the file was in force. A
   suggestion is only made for a case/separator difference — a real misspelling (`…MAX_CONCURENCY`) cannot be guessed
   without sending the reader to the wrong key — the value is never printed (a mistyped `API_KEY` is still a
   credential), and nothing is merged generically, so an unknown key (including `__proto__`) cannot reach the running
@@ -461,8 +460,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   collector and the request parser: concatenating whatever arrived served a numeric part as answer text
   (`parts: [{text: 42}, {text: 'Alpha'}]` answered `"42Alpha"`). The
   first four polls use `min(intervalMs, POLL_BACKOFF_MS[i])`, an answer landing a few tens of milliseconds after
-  the prompt returned used to wait a whole interval, for a few cheap extra
-  `GET …/message` calls. Do not remove the backoff without keeping the time window: the two belong together.
+  the prompt returned used to wait a whole interval. Do not remove the backoff without keeping the time window: the two belong together.
 - **A completion has one budget, not one per phase.** The prompt, the event subscription and the polling fallback all
   take what is left of `REQUEST_TIMEOUT_MS` (`remainingBudget()` in the handler) instead of each starting a fresh
   copy: a streaming request whose event stream timed out spent a second full budget polling, so the client waited
@@ -475,8 +473,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   answer that was one poll away - the thrown case surfaced as `502 "fetch failed"`. Only `MAX_POLL_FAILURES` (5)
   consecutive failures give up, and they report an upstream error with the status and reason
   (`OpenCode backend failed while polling the answer (status 500): …`, or `… : the backend is not reachable
-  (fetch failed)` for a connection failure - the runtime's own wording names no cause) in ~2 s instead of burning the
-  whole request budget and answering `504`. An empty list is a normal "not written yet" poll, not a failure. A poll
+  (fetch failed)` for a connection failure) in ~2 s instead of burning the whole request budget and answering `504`. An empty list is a normal "not written yet" poll, not a failure. A poll
   that answers **2xx with something that is not a message list** (an envelope that moved, a proxy in front of the
   backend returning its own JSON) is reported by its shape - `… answered with a payload that is not a message list
   (status 200)` - not by the status, which reads like a gateway bug; the payload's type and top-level keys go to the
@@ -484,7 +481,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - **An idle stream is recovered, not ended.** When the event stream goes silent for `DEFAULT_EVENT_IDLE_TIMEOUT_MS`
   the gateway polls for the rest of the answer and appends only what the client does not have yet. That recovery poll
   tolerates a full idle window of further silence (`IDLE_RECOVERY_STALL_POLLS`) before accepting a message the backend
-  never marks finished: the default three intervals of no growth (~1.5 s, measured as time not as polls) is right after
+  never marks finished: the default three intervals of no growth (~1.5 s, time not polls) is right after
   a normal prompt, but applied to a stream already silent for 8 s it ended the response with `finish_reason: "stop"`
   on text that stopped mid-sentence.
 - **A stream that ends without a finish event is recovered, not timed out.** When the event stream is closed
@@ -512,8 +509,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `client.session.delete`, `client.session.prompt`, `client.config.providers` and `client.tool.ids` are all called
   with an `AbortSignal` (`backendDeadline()`), and an expired one answers `504` ("did not answer within …ms") instead
   of `500`. Node's `fetch` has no default timeout: a backend that answers `/health` but never `/session` left the
-  handler waiting forever, so the client got nothing and the slot was never released — at concurrency 1 that stops the
-  whole gateway. Session cleanup uses its own shorter budget
+  handler waiting forever, so the client got nothing and the slot was never released - at concurrency 1 that stops the
+  gateway. Session cleanup uses its own shorter budget
   (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client already has its answer, so it must not hold the slot for
   the full budget. The metadata calls (`/v1/models`, the tool list) are capped separately
   (`METADATA_TIMEOUT_CAP_MS`, never above `REQUEST_TIMEOUT_MS`), because they fall back — a client listing models must
@@ -644,9 +641,9 @@ Before reporting a change as complete:
 2. `pnpm test` passes; new behaviour that can be asserted belongs in `test/smoke.mjs`.
 3. `pnpm run check:commits <base>..HEAD` passes for the commits the change adds; a wrong subject must be fixed
    before it is published, because rewriting published history rewrites every commit after it.
-4. The gateway boots (`pnpm start` or `node index.js`) and `GET /health` returns `200`; with a real backend,
-   `/v1/models` with the key returns `200` and without it `401`, a chat completion works with and without
-   `stream: true`, and an invalid body returns `400`.
+4. The gateway boots (`pnpm start` or `node index.js`), `GET /health` returns `200`, `/v1/models` answers `200` with
+   the key and `401` without it, a chat completion works with and without `stream: true`, and an invalid body returns
+   `400`.
 5. Documentation that describes the changed behaviour is updated in the same change (README tables, Docker README,
    this file when invariants or commands change).
 6. Shutdown is clean (`SIGINT` logs `[Shutdown]` and exits) when backend lifecycle code was touched.
@@ -654,6 +651,6 @@ Before reporting a change as complete:
 
 ## Reporting
 
-Use the repository issue tracker for bugs and proposals: <https://github.com/dinhdev666/free-opencode-api/issues>.
-Security-sensitive reports (auth bypass, key leakage, command injection in backend spawning) should not be filed
-publicly; see `CONTRIBUTING.md`.
+Issues and proposals go to the repository tracker: <https://github.com/dinhdev666/free-opencode-api/issues>.
+Security-sensitive reports (auth bypass, key leakage, command injection in backend spawning) stay private; see
+`CONTRIBUTING.md`.

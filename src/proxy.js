@@ -735,6 +735,11 @@ const DEFAULT_MODEL = { id: 'opencode/big-pickle', name: 'Big Pickle', object: '
 
 const DEFAULT_MODEL_ID = DEFAULT_MODEL.id;
 
+// One sentence for one mistake on every path that can see it: a body that is not there at all is a payload that went
+// missing (a retry, a client that lost its buffer), and both the parser-level refusal and the text-body path name it,
+// so the same request cannot be told two different things depending on the Content-Type it was sent under.
+const EMPTY_BODY_MESSAGE = 'request body is empty; send a JSON object with a messages array';
+
 const MODELS_SCHEMA = {
     type: 'object',
     properties: {
@@ -2047,6 +2052,13 @@ function createApp(config) {
                         // exists for hand-written clients (`curl -d`, `text/plain`) was the one that failed.
                         // `config.json` tolerates the same prefix for the same reason.
                         const text = request.body.charCodeAt(0) === 0xfeff ? request.body.slice(1) : request.body;
+                        // A body handed over as text can be empty too, and `JSON.parse('')` answered it with a syntax
+                        // error about nothing at all.
+                        if (text.trim() === '') {
+                            return reply.code(400).send({
+                                error: { message: EMPTY_BODY_MESSAGE, type: 'invalid_request_error' }
+                            });
+                        }
                         try {
                             const parsed = JSON.parse(text);
                             if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -3043,6 +3055,13 @@ function createApp(config) {
             if (err.code === 'FST_ERR_CTP_INVALID_JSON_BODY') {
                 return 'request body is not valid JSON, or it carries a forbidden property name (__proto__, constructor); '
                     + 'send Content-Type: application/json';
+            }
+            // An empty body is what a retry whose payload went missing sends, and Fastify answered it with a sentence
+            // about the content type the client had just set correctly. The same request without that header reaches
+            // the handler and is answered "messages array is required", so the emptiness is named instead - and with
+            // it the fix.
+            if (err.code === 'FST_ERR_CTP_EMPTY_JSON_BODY') {
+                return EMPTY_BODY_MESSAGE;
             }
             if (err.code === 'FST_ERR_CTP_INVALID_MEDIA_TYPE') {
                 const rawType = request.headers['content-type'];

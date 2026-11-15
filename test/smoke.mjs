@@ -506,6 +506,20 @@ async function run() {
     check('the trailing-slash listing still answers', trailingSlash.response.status === 200 &&
         trailingSlash.json?.object === 'list', trailingSlash.text.slice(0, 120));
 
+    // A URL the router cannot decode (a percent escape that is not valid UTF-8) never reaches a hook, so Fastify's own
+    // handler answered `{"error":"Bad Request","code":"FST_ERR_BAD_URL",…}`: no `type`, no CORS headers, no request
+    // id. Every rejected request keeps the same envelope, whichever layer rejects it.
+    const badUrl = await fetch(`${BASE}/v1/models/%E0%A4%A`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then(async (r) => ({ status: r.status, headers: r.headers, json: await r.json().catch(() => null) }));
+    check('an undecodable URL keeps the OpenAI error envelope',
+        badUrl.status === 400 && badUrl.json?.error?.type === 'invalid_request_error' &&
+        badUrl.json?.error?.code === 'FST_ERR_BAD_URL' && typeof badUrl.json?.error?.message === 'string',
+        `status ${badUrl.status} ${JSON.stringify(badUrl.json)?.slice(0, 120)}`);
+    check('an undecodable URL still carries CORS headers and a request id',
+        badUrl.headers.get('access-control-allow-origin') === '*' &&
+        /^gw-[a-z0-9]+$/.test(badUrl.headers.get('x-request-id') || ''),
+        `${badUrl.headers.get('access-control-allow-origin')} ${badUrl.headers.get('x-request-id')}`);
+
     // --- validation -------------------------------------------------------------------------------------
     const invalid = await request('/v1/chat/completions', { method: 'POST', body: {} });
     check('missing messages array returns 400', invalid.response.status === 400, `status ${invalid.response.status}`);

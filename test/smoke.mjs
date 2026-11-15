@@ -380,6 +380,12 @@ async function run() {
         JSON.stringify(chunks[chunks.length - 1] || null));
     check('stream chunks carry the requested model',
         chunks.every((chunk) => !chunk?.model || chunk.model === 'opencode/kimi-k2.5-free'));
+    // Every frame is a chat.completion.chunk, the terminal one included: a client that validates the object type
+    // on each frame used to hit a bare {id, choices} envelope on the last one
+    const stopChunk = chunks.find((chunk) => chunk?.choices?.[0]?.finish_reason === 'stop');
+    check('the terminal frame carries the full chunk envelope',
+        stopChunk?.object === 'chat.completion.chunk' && typeof stopChunk?.created === 'number' &&
+        stopChunk?.model === 'opencode/kimi-k2.5-free', JSON.stringify(stopChunk));
 
     // A model id can contain more than one slash; only the first one separates provider from model
     const multiSlash = await request('/v1/chat/completions', {

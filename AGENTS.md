@@ -53,7 +53,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
 | `test/smoke.mjs` | End-to-end contract checks: boots stub and gateway, asserts status codes, envelopes, SSE frames and clean shutdown. |
-| `test/check-syntax.mjs` | Walks the repository and runs `node --check` on every `.js`/`.mjs` file, so a new source file is checked without editing a list. |
+| `test/check-syntax.mjs` | Walks the repository and runs `node --check` on every `.js`/`.mjs` file, so a new file is checked without editing a list. |
 | `test/check-commit-messages.mjs` | Applies the CONTRIBUTING.md rules to every commit in a range, and fails when its own type/scope lists and the document's tables disagree. |
 | `.github/workflows/ci.yml` | CI: `pnpm run check`, shell check, `pnpm test` on Node 20/22/24, plus a Docker build with a container health check. |
 | `.github/workflows/docker-publish.yml` | Publishes `linux/amd64` + `linux/arm64` to Docker Hub on a `v*.*.*` tag (secrets `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`). |
@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 325 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 330 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -79,9 +79,8 @@ port 8199 (override with `SMOKE_STUB_PORT` / `SMOKE_PORT`). CI runs `pnpm run ch
 and 24, plus `test/check-commit-messages.mjs` over the added commits. No linter or formatter exists: style is a review
 concern. Do not claim checks passed if they were not run.
 
-Releases come from tags, not from a laptop: bump `version` in `package.json`, then `git tag vX.Y.Z` and push the tag.
-`docker-publish.yml` refuses a tag that does not match `package.json`, builds both architectures and pushes to Docker
-Hub.
+Releases come from tags, not from a laptop: bump `version` in `package.json`, then push a `vX.Y.Z` tag.
+`docker-publish.yml` refuses a tag that does not match, builds both architectures and pushes to Docker Hub.
 
 ## Verifying without the OpenCode CLI
 
@@ -108,7 +107,7 @@ list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREAT
 unanswered), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
 body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. Session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the
-session (a backend round trip of its own), so one read of `/__sessions` raced it and failed with `live: 1`; wait for
+session (its own backend round trip), so one read of `/__sessions` raced it and failed with `live: 1`; wait for
 `live: 0` in a bounded window. The suite refuses a taken port and SIGKILLs a stubborn child.
 
 For exploratory work, start the stub (or a throwaway one in `/tmp`) on a spare port - `STUB_PORT=4405
@@ -217,7 +216,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   the backend only produced an opaque upstream error. An absent or blank `model` means `DEFAULT_MODEL`.
 - A completion body sent under a non-JSON content type (`curl -d '{…}'` without the header, `text/plain`) reaches the
   handler as an unparsed string; it is parsed there and served. Answering "messages array is required" blamed a body
-  that was perfectly valid for a missing header. A string that is not JSON answers `400` naming the content type.
+  valid for a missing header. A string that is not JSON answers `400` naming the content type.
   `curl -d` actually labels the body `application/x-www-form-urlencoded` (not `text/plain`), so that type is handed
   over as the same string by an explicit `addContentTypeParser` — Fastify answered it with a bare `415`, so the
   documented header-free path did not work for the most common hand-written client. Other content types keep the `415`
@@ -397,18 +396,19 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   `DISABLE_TOOLS` is read
   from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`.
 - **Boolean options go through `parseBoolean()`** (exported from `src/proxy.js`), the single parser used by
-  `index.js` and `startProxy()`. Two implementations of that rule drifted once already (`-e DISABLE_TOOLS=yes` meant
-  "off" inside the container); do not add a third. A value that is present but cannot be read is **named with the
+  `index.js` and `startProxy()`. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off"
+  in the container); do not add a third. A value that is present but cannot be read is **named with the
   value actually used** (`readFlag()` in `src/proxy.js`, used by `index.js` for `DISABLE_TOOLS`,
   `USE_ISOLATED_HOME` and `DEBUG`): `[Config] DISABLE_TOOLS='maybe' is not a boolean (use true/false, yes/no, on/off
   or 1/0), using false`. A silent fallback is the failure the numeric tuning keys were fixed for, and
-  for `DISABLE_TOOLS` it is the one the switch exists to prevent: a typo leaves the model's `<function_calls>` markup in
-  the answer while the operator believes it is filtered out. `parseBoolean()`
-  stays the only parser (it is also used on request bodies, where a warning would be wrong); `readFlag()` only
-  reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable); the value goes
+  for `DISABLE_TOOLS` a typo leaves the model's `<function_calls>` markup in the answer while the operator believes it
+  is filtered out. `parseBoolean()`
+  stays the only parser (it is also used on request bodies, where a warning would be wrong: an unreadable `stream` or
+  `stream_options.include_usage` there is a `400` naming the field, because a typo answered JSON to a client parsing
+  SSE, and `stream_options` must be an object); `readFlag()` only reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable); the value goes
   through `loggableConfigValue()` too, because it lands in a log line.
-  `startProxy()` applies the same rule to its own fallbacks (`flagOption()`), for an embedder that calls it directly
-  with no entry point to resolve the option first: an option the caller passed is taken as given — `index.js` already
+  `startProxy()` applies the same rule to its own fallbacks (`flagOption()`), for an embedder that calls it with no
+  entry point to resolve the option first: an option the caller passed is taken as given — `index.js` already
   reported it, and a second line for one value reads like two different settings — while an option that is absent
   reads the environment through `readFlag()`.
 - **Configuration** follows the precedence env > `config.json` > default, and every new key must be added to
@@ -417,7 +417,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   directory, because the container writes it next to the app; a `config.json` in the cwd is ignored, so startup warns
   `[Config] config.json is read from …; the file at … is ignored`.
   An environment variable that is present but **blank** counts as unset (`envOrFile()` in `src/config.js`): `PORT` and
-  `API_KEY` were read with `??`, where an empty string is a value: `API_KEY= PORT=` shadowed `config.json`, so the
+  `API_KEY` were read with `??`, where an empty string is a value, so `API_KEY= PORT=` shadowed `config.json` and the
   gateway listened on the default port with the built-in public key while the file named another port and a real
   secret. Keep every key on that rule.
   A **key nobody reads** is named at startup and ignored (`[Config] config.json has an unknown key 'APIKEY' (did you

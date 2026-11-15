@@ -2068,13 +2068,46 @@ function createApp(config) {
                     }
 
                     // `stream` arrives as a boolean from real SDKs, but hand-written clients (and template engines that
-                    // stringify booleans) also send "true"/"1"/"yes". Anything unrecognised keeps the historical
-                    // non-streaming default instead of guessing.
-                    const wantsStream = parseBoolean(stream, false) === true;
+                    // stringify booleans) also send "true"/"1"/"yes". A value that is *present* and unreadable used to
+                    // keep the historical non-streaming default: a typo answered `200 application/json` to a client
+                    // parsing SSE, which is the failure the string spellings exist to prevent, and the same class the
+                    // other body fields are refused for. It is refused by name now; absent, blank or `null` still means
+                    // "not streaming".
+                    const readableFlag = (value) =>
+                        value === undefined || value === null || parseBoolean(value, undefined) !== undefined;
+                    if (!readableFlag(stream)) {
+                        return reply.code(400).send({
+                            error: {
+                                message: `stream must be a boolean (or one of true/false, yes/no, on/off, 1/0), found ${jsonTypeName(stream)}`,
+                                type: 'invalid_request_error'
+                            }
+                        });
+                    }
                     // `stream_options: {include_usage: true}` asks for a final chunk that carries the token usage;
                     // without this the request is honoured only in the sense that nothing rejects it, and a client that
-                    // waits for its usage chunk (the OpenAI SDK does) gets no numbers at all.
-                    const includeUsage = wantsStream && parseBoolean(body.stream_options?.include_usage, false) === true;
+                    // waits for its usage chunk (the OpenAI SDK does) gets no numbers at all. A typo in the switch
+                    // dropped that chunk in silence, so it follows the rule above.
+                    const streamOptions = body.stream_options;
+                    if (streamOptions !== undefined && streamOptions !== null &&
+                        (typeof streamOptions !== 'object' || Array.isArray(streamOptions))) {
+                        return reply.code(400).send({
+                            error: {
+                                message: `stream_options must be an object, found ${jsonTypeName(streamOptions)}`,
+                                type: 'invalid_request_error'
+                            }
+                        });
+                    }
+                    if (!readableFlag(streamOptions?.include_usage)) {
+                        return reply.code(400).send({
+                            error: {
+                                message: `stream_options.include_usage must be a boolean ` +
+                                    `(or one of true/false, yes/no, on/off, 1/0), found ${jsonTypeName(streamOptions?.include_usage)}`,
+                                type: 'invalid_request_error'
+                            }
+                        });
+                    }
+                    const wantsStream = parseBoolean(stream, false) === true;
+                    const includeUsage = wantsStream && parseBoolean(streamOptions?.include_usage, false) === true;
 
                     // Split on the first slash only: a model id may itself contain slashes
                     // (`vendor/family/version`), and `split('/')` used to drop everything after the second one

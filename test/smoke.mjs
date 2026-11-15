@@ -1047,6 +1047,51 @@ async function run() {
         falseStream.json?.object === 'chat.completion' && !falseStream.text.includes('data: [DONE]'),
         JSON.stringify(falseStream.text).slice(0, 120));
 
+    // A `stream` value that is present but cannot be read used to keep the non-streaming default, so a typo answered
+    // `200 application/json` to a client that was parsing SSE - the failure the string spellings above exist to
+    // prevent. It is refused by name now (the way a non-string `model` is), and an absent or null value still means
+    // "not streaming".
+    const typoStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'hi' }], stream: 'ture' }
+    });
+    check('an unreadable stream value is refused instead of answered as JSON',
+        typoStream.response.status === 400 && /^stream must be a boolean/.test(typoStream.json?.error?.message || '') &&
+        /found a string$/.test(typoStream.json?.error?.message || ''),
+        `${typoStream.response.status} ${typoStream.json?.error?.message || typoStream.text.slice(0, 120)}`);
+    const objectStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'hi' }], stream: {} }
+    });
+    check('a non-scalar stream value is refused by its type',
+        objectStream.response.status === 400 && /found an object$/.test(objectStream.json?.error?.message || ''),
+        `${objectStream.response.status} ${objectStream.json?.error?.message || objectStream.text.slice(0, 120)}`);
+    const nullStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'hi' }], stream: null }
+    });
+    check('a null stream value still means not streaming',
+        nullStream.json?.object === 'chat.completion' && !nullStream.text.includes('data: [DONE]'),
+        JSON.stringify(nullStream.text).slice(0, 120));
+    const badOptions = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'hi' }], stream: true, stream_options: 'yes' }
+    });
+    check('stream_options must be an object',
+        badOptions.response.status === 400 && /^stream_options must be an object, found a string$/.test(badOptions.json?.error?.message || ''),
+        `${badOptions.response.status} ${badOptions.json?.error?.message || badOptions.text.slice(0, 120)}`);
+    const badUsage = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: {
+            messages: [{ role: 'user', content: 'hi' }],
+            stream: true,
+            stream_options: { include_usage: 'ture' }
+        }
+    });
+    check('an unreadable include_usage value is refused instead of dropping the usage chunk',
+        badUsage.response.status === 400 && /^stream_options\.include_usage must be a boolean/.test(badUsage.json?.error?.message || ''),
+        `${badUsage.response.status} ${badUsage.json?.error?.message || badUsage.text.slice(0, 120)}`);
+
     // A provider that ends its message without the literal finish reason "stop" must still end the stream: waiting
     // for the exact word would leave the client hanging until the 8 s idle timeout
     const endOnlyStart = Date.now();

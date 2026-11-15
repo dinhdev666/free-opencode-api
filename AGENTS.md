@@ -1,8 +1,7 @@
 # AGENTS.md
 
-Instructions for AI coding agents (and human contributors) working in this repository. Read this file before
-changing code; it records the invariants that the project's behaviour depends on and the checks expected before a
-change is considered done.
+Instructions for AI agents and human contributors: read this before changing code. It records the invariants the
+project's behaviour depends on and the checks expected before a change is done.
 
 ## What this project is
 
@@ -108,13 +107,15 @@ credential-bearing URL), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` 
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every session creation after the n-th is accepted and
 never answered), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
-body, for the summary bound). Extend that stub and `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is already taken (a stale process would answer
-with someone else's build) and SIGKILLs any child that ignores SIGTERM.
+body, for the summary bound). Extend that stub and `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is already taken, and SIGKILLs any child that ignores
+SIGTERM.
 The session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting
 the session (a backend round trip with nothing to do with the answer), so one read of `/__sessions` raced it and failed
 with `live: 1`; wait for `live: 0` in a bounded window.
 
-For exploratory work, start the stub (or a throwaway one in `/tmp`) on a spare port and point the gateway at it:
+For exploratory work, start the stub (or a throwaway one in `/tmp`) on a spare port - `STUB_PORT=4405
+node test/stub-opencode.mjs`, which reads `STUB_PORT` and ignores a positional argument - and point the gateway at
+it:
 
 ```bash
 OPENCODE_SERVER_URL=http://127.0.0.1:4096 PORT=8080 LOG_LEVEL=debug node index.js
@@ -206,8 +207,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **A message `name` is a label, not prompt text.** It is interpolated as `USER(name): …` only when it is a string,
   with control characters replaced and the value cut: a non-string reached the model as `USER([object Object]): …`.
 - **An announced request body has a deadline.** Fastify sets `requestTimeout: 0`, so nothing bounded the wait: a client
-  that sent `Content-Length: 4096` and four bytes held the socket for as long as it liked (measured 20 s with no
-  answer), with no credential needed, because the `401` is written from the headers while Node keeps the connection
+  that sent `Content-Length: 4096` and four bytes held the socket for as long as it liked, with no
+  credential needed, because the `401` is written from the headers while Node keeps the connection
   alive to drain a body it will never read. `armBodyDeadline()` in the `onRequest` hook (armed before auth, only when
   the request announces a body, cleared on `end`/`close`/`error`) closes it after `min(30 s, REQUEST_TIMEOUT_MS)`,
   answering the `408` envelope when nothing has been sent. It closes the **request's** socket, not `reply.raw`: a
@@ -443,20 +444,20 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   default, the failure the precedence rule above exists to prevent.
 - **Polling answers with the finished message.** `pollForAssistantResponse` is called with `requireDone: true` on
   every path that emits the final answer: the poll loop can start while the answer is still being written, and
-  returning the first non-empty message truncated it (`"Hello from t"` for a 41-character answer). A message whose
+  returning the first non-empty message truncated it. A message whose
   text stops growing for `stablePollsRequired * intervalMs` is accepted anyway, so a provider that never marks its
   message finished still gets an answer. That window is measured in **time, not in polls** (`stableWindowMs`): the
   first polls are much shorter than the interval (`POLL_BACKOFF_MS` = 25/50/100/200 ms), and counting polls would have shrunk the
   documented ~1.5 s of silence to ~75 ms and started serving half-written answers. It
   watches the whole visible answer, `content` **and** `reasoning`, and requires one of them to be non-empty: watching
   `content` alone left the window at 0 for a reasoning-only message, so a provider that never reports `finish` could
-  not be accepted and the completion answered `504` on its whole budget (measured 4.4 s of a 4 s budget) for an answer
+  not be accepted and the completion answered `504` on its whole budget for an answer
   the first poll already held. `extractFromParts()` reads a part's `text` only when it is a string, like the streaming
   collector and the request parser: concatenating whatever arrived served a numeric part as answer text
   (`parts: [{text: 42}, {text: 'Alpha'}]` answered `"42Alpha"`). The
   first four polls use `min(intervalMs, POLL_BACKOFF_MS[i])`, because an answer landing a few tens of milliseconds after
-  the prompt returned used to wait a whole interval (measured p50 507 ms → 90 ms, for a few cheap extra
-  `GET …/message` calls). Do not remove the backoff without keeping the time window: the two belong together.
+  the prompt returned used to wait a whole interval, for a few cheap extra
+  `GET …/message` calls. Do not remove the backoff without keeping the time window: the two belong together.
 - **A completion has one budget, not one per phase.** The prompt, the event subscription and the polling fallback all
   take what is left of `REQUEST_TIMEOUT_MS` (`remainingBudget()` in the handler) instead of each starting a fresh
   copy: a streaming request whose event stream timed out spent a second full budget polling, so the client waited
@@ -485,7 +486,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   mid-answer (backend restart, a proxy dropping idle SSE connections) the collector settles with
   `streamEnded: true` and the streaming path polls for the rest of the answer, appending only what the client does not
   have yet — exactly like the idle-timeout path. Before that it stayed silent until the whole budget ran out and then
-  wrote an in-band error (`5992 ms` of a `6000 ms` budget for an answer the backend had finished).
+  wrote an in-band error at the end of the budget, for an answer the backend had finished.
 - **A cumulative part snapshot is diffed against that part, not against the answer.** opencode ≥ 1.19 sends no
   `delta`: `part.text` is the part's current full text, so the gateway derives the increment. It belongs to the part
   it came from (`partTexts` in `collectFromEvents`): measuring it against the accumulated `content` never matched a

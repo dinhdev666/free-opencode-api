@@ -154,6 +154,9 @@ docker run -d --restart=always --network common-all --name free-opencode-api --p
   it (or drop the `-v` mount) and recreate the container if you want the stored copy to match again.
 - **`LOG_LEVEL` is the exception on the write path**: it is never written into `config.json`, so it can only come from
   the environment (default `info`).
+- The first-boot line in `docker logs` shows the generated settings with the **API key masked** (`sup*** (22 chars)`):
+  the file it writes is `0600` and holds the real key, but container logs are usually collected and shipped, so the key
+  must never be printed. The startup `[Security]` warning still tells you when the built-in `sk-dummy-123` is in use.
 - A `config.json` that exists but is invalid stops the container with a clear error instead of silently falling back to
   the defaults — otherwise it would run with the built-in `sk-dummy-123` instead of your key.
 - The image's own defaults (used when generating `config.json`) differ from the program defaults for the container:

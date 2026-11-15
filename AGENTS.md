@@ -67,7 +67,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 124 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 126 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -92,7 +92,8 @@ content, so a test can prove both modes report it as an error and the failure pa
 `ENDONLY` (an answer whose finish event carries only `time.completed`, so a test can prove the stream still ends
 without waiting for the idle timeout) and
 `GROW` (an answer that is still being written when the prompt returns, so a test can prove the polled answer is never
-truncated) and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
+truncated), `STUB_EMPTY_PROVIDERS=1` (a provider list with no models, so a test can prove the model listing falls back
+instead of serving an empty list) and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
 backend is killed or the gateway is shutting down) and `TAILTAG` (an answer whose last delta ends in a tag prefix that
 never becomes a tag, so a test can prove the held fragment is still delivered). Extend that stub and
 `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
@@ -121,7 +122,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - `GET /v1/models` → `200 {"object":"list","data":[{id,name,object,owned_by}, …]}`; 5 s cache, and a cold-cache burst
   shares one provider round trip (`modelsInFlight`) instead of one per request; failures — including a provider call
   that runs into its deadline, because a silent backend would otherwise never answer the listing at all — fall back to
-  a single static model and are not cached.
+  a single static model and are not cached. An **empty** provider list takes the same fallback: a payload the gateway
+  cannot read (a changed shape, a version that reports nothing) answers `200 {"providers":[]}`, and serving
+  `{"data":[]}` is as useless to a client as an error, because it leaves nothing to choose from.
 - `GET /v1/models/:modelId` and `GET /v1/models/<id with slashes>` → `200 {id,name,object,owned_by}` from the same
   cache; an id the provider list does not contain is described from the id itself (`provider` = text before `/`,
   default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either. The

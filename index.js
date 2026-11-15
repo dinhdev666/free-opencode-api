@@ -73,10 +73,11 @@ if (!finalConfig.OPENCODE_PATH) {
     process.exit(1);
 }
 
-// Check if opencode is available
+// Check if opencode is available. The timeout matters: a backend that waits for input (or a wrapper that never
+// returns) must not block the gateway from starting, and the probe result is a warning at most.
 import { execSync } from 'child_process';
 try {
-    execSync(`"${finalConfig.OPENCODE_PATH}" --version`, { stdio: 'ignore' });
+    execSync(`"${finalConfig.OPENCODE_PATH}" --version`, { stdio: 'ignore', timeout: 5000 });
 } catch (e) {
     logger.warn(`[Warning] Cannot verify OpenCode installation: ${finalConfig.OPENCODE_PATH}`);
     logger.warn('[Warning] Please ensure OpenCode is installed:');
@@ -99,25 +100,40 @@ logger.info(`  - Log Level (requested): ${finalConfig.LOG_LEVEL || 'info (defaul
 // Start the proxy
 try {
     const proxy = startProxy(finalConfig);
-    
-    // Handle graceful shutdown
-    process.on('SIGINT', () => {
-        logger.info('[Shutdown] Received SIGINT, shutting down gracefully...');
-        proxy.killBackend();
-        proxy.server.close(() => {
-            logger.info('[Shutdown] Server closed');
-            process.exit(0);
-        });
-    });
 
-    process.on('SIGTERM', () => {
-        logger.info('[Shutdown] Received SIGTERM, shutting down gracefully...');
+    // Graceful shutdown: stop accepting connections, stop the backend, then exit. Long-lived SSE streams can keep
+    // server.close() pending, so in-flight sockets get a short grace period before being dropped and a watchdog
+    // guarantees the process leaves even if a client never disconnects.
+    let shuttingDown = false;
+    const shutdown = (signal) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        logger.info(`[Shutdown] Received ${signal}, shutting down gracefully...`);
+
+        const watchdog = setTimeout(() => {
+            logger.warn('[Shutdown] Forcing exit, connections did not close in time');
+            process.exit(0);
+        }, 6000);
+        watchdog.unref();
+
         proxy.killBackend();
         proxy.server.close(() => {
+            clearTimeout(watchdog);
             logger.info('[Shutdown] Server closed');
             process.exit(0);
         });
-    });
+        // Give responses in flight a moment to finish, then drop whatever is still connected (open SSE streams)
+        setTimeout(() => {
+            try {
+                proxy.server.server?.closeAllConnections?.();
+            } catch (e) {
+                // best effort
+            }
+        }, 1500).unref();
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
 } catch (error) {
     logger.error('[Fatal] Failed to start proxy:', { error: error.message, stack: error.stack });
     process.exit(1);

@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 32 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 43 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -103,7 +103,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - `POST /v1/chat/completions` streaming → `text/event-stream`, frames `data: {…chat.completion.chunk…}\n\n`,
   a final frame with `"finish_reason":"stop"`, then `data: [DONE]\n\n`. Reasoning deltas use `reasoning_content`.
 - Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request), `401` (auth), `404` (unknown route),
-  `502` (upstream/provider error), `504` (timeout), `500` (anything else).
+  `502` (upstream/provider error), `503` (`type: "queue_full"`, the wait queue is full), `504` (timeout), `500`
+  (anything else).
+- A client that disconnects mid-stream releases its queue slot immediately: the event subscription is aborted and
+  the polling fallbacks are skipped (the backend keeps finishing on its own).
 - CORS headers are set on the raw response for every request, including hijacked streams.
 - Request log format: `METHOD url -> status Xms [reqId] model=… stream=…` (info for `/v1/*`, debug otherwise).
 
@@ -123,6 +126,11 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **Timeouts and fallbacks are behavioural contracts.** The polling fallback, the shortened first-delta wait, the
   health-probe cache and the backend start-failure cooldown exist because of real OpenCode protocol quirks
   (opencode ≥ 1.19 event payloads, free zen models). Do not remove them without replacing the behaviour they cover.
+- **Signals belong to the entry point.** `index.js` owns `SIGINT`/`SIGTERM`: it closes the HTTP server, kills the
+  backend and exits, with a watchdog so an open SSE stream cannot block shutdown. Do not register signal handlers
+  that call `process.exit()` from a module — they win the race and skip backend teardown.
+- **The wait queue is bounded** (`OPENCODE_PROXY_MAX_QUEUE`, default 64) because every waiting request pins its parsed
+  body; overflow answers `503 queue_full` instead of growing memory.
 - **Backend lifecycle changes** must keep these properties: `ensureBackend()` trusts a successful probe for
   `OPENCODE_PROXY_HEALTH_CACHE_MS`, connection failures clear that trust, a spawned process that exits during startup
   aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm.

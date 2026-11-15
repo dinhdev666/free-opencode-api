@@ -124,7 +124,12 @@ summary, CORS headers, bearer auth) and no plugin-level middleware chain. Additi
 
 Local benchmarks, `autocannon`, same machine (Node.js 26, macOS 27 on an Apple M4, loopback), against the
 smoke-test stub (`test/stub-opencode.mjs`). The stub answers in ~1 ms and streams its answer with deliberate 5 ms
-gaps, so these numbers measure this gateway plus the stub — never a model:
+gaps, so these numbers measure this gateway plus the stub — never a model. The request log is **off**
+(`LOG_LEVEL=error`): at the default `info` every `/v1/*` request writes a line, and on a redirected stdout (a file, as
+in a container) those writes are synchronous, so the log — not the handler — sets the ceiling. Measured on the same
+machine, `GET /v1/models` answers ~104,900 req/s at 0.08 ms with the log off and ~71,600 req/s at 1.02 ms with the
+default line; `/health` and `/` log at `debug` and are unaffected. Keep the log on in production and read the table as
+what the request path costs, not as a promise with stdout in the way:
 
 | Scenario | Throughput | Avg latency |
 | --- | --- | --- |
@@ -145,7 +150,7 @@ follows does not delay the next completion. Raise `OPENCODE_PROXY_MAX_CONCURRENC
 sessions. Numbers move with machine load; re-measure before drawing conclusions.
 
 For reference, the Express implementation this gateway replaced measured ~74,000 req/s on `/health` in the same
-harness at the time; the Fastify rewrite answers ~94,000 req/s on the same endpoint today.
+harness at the time; the Fastify rewrite answers ~110,000 req/s on the same endpoint today, as the table above says.
 
 ---
 

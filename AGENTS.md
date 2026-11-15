@@ -101,8 +101,8 @@ interleaved), `SHRINK` (a part whose snapshot gets shorter, because the backend 
 carrying both a `delta` and the part's cumulative text, then one closing update with neither),
 `CUTTOOL`/`OPENTOOL` (a tool-call answer whose stream is cut inside the closing/opening tag), `TOOLSPAM` (a tool-call
 block repeated by the answer), `BADPART` (a text part whose `text` is a number, next to a normal part), `REASONONLY`
-(a message carrying reasoning and no text that is never marked finished) and `LEAKYFAIL` (a provider error quoting a credential-bearing URL behind a long
-message) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
+(a message carrying reasoning and no text that is never marked finished) and `LEAKYFAIL` (a provider error quoting a
+credential-bearing URL behind a long message) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
 `POST /session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 502 whose message quotes a
 credential-bearing URL), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every session creation after the n-th is accepted and
@@ -351,8 +351,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **Logging** goes through `src/logger.js` (`logger.info`, `logger.warn`, `logger.error`, `logger.debug`). No
   `console.log` in `src/` or `index.js`. Never log an unmasked `authorization` header, and never print the API key:
   `docker/docker-entrypoint.sh` reports the key it generated as `sk-a***(22 chars)` — nothing but the length up to 16
-  characters — because `docker logs` is collected as often as not (`maskHeaders`/`maskSecret` in `src/logger.js` are
-  the in-process equivalents, deliberately identical). Header **names** are matched against
+  characters — because `docker logs` is collected as often as not (`maskHeaders`/`maskSecret` in `src/logger.js`). Header **names** are matched against
   `SENSITIVE_HEADER_PATTERN`, built from the exported `SENSITIVE_NAME_ALTERNATIVES` (`auth`, `authorization`,
   `authentication`, `api-key`/`apikey`, `token`, `secret`, `cookie`, `session`, `passw`, `key`, `code`, `sig`,
   `signature`, `credential`, `bearer` as whole name segments) rather than a fixed denylist: `x-goog-api-key`,
@@ -622,9 +621,11 @@ pnpm dlx autocannon -c 10 -d 8 -m POST -H "content-type: application/json" \
   http://127.0.0.1:8080/v1/chat/completions
 ```
 
-Report before/after instead of asserting an improvement, and update the README table only with numbers you actually
-measured on the machine you measured them on. Completion requests are serialised by default
-(`OPENCODE_PROXY_MAX_CONCURRENCY=1`); that default is intentional and must stay `1`.
+Measure with the request log off (`LOG_LEVEL=error`): at the default `info` every `/v1/*` request writes a line, and
+a redirected stdout is synchronous, so the log sets the ceiling (`GET /v1/models`: ~104,900 req/s at 0.08 ms quiet,
+~71,600 at 1.02 ms with the line - a before/after mixing log levels compares the logger). Report before/after instead
+of an improvement, and update the README table only with numbers you measured on that machine, naming the conditions.
+Completion requests are serialised by default (`OPENCODE_PROXY_MAX_CONCURRENCY=1`); that default stays `1`.
 
 ## Definition of done
 

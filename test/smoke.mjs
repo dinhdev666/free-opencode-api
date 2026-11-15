@@ -569,6 +569,19 @@ async function run() {
     check('400 uses the OpenAI error envelope', typeof invalid.json?.error?.message === 'string', invalid.text.slice(0, 120));
     check('400 carries the invalid_request_error type', invalid.json?.error?.type === 'invalid_request_error',
         invalid.text.slice(0, 120));
+    // Three different client mistakes, three different messages: "messages array is required" for a body that sent the
+    // field is a wrong diagnosis, and the reader goes looking for a missing key.
+    const notAnArray = await request('/v1/chat/completions', { method: 'POST', body: { messages: 'hi' } });
+    check('a messages field that is not an array is named by the type it arrived as',
+        notAnArray.response.status === 400 &&
+        /messages must be an array of message objects, found a string/.test(notAnArray.json?.error?.message || ''),
+        notAnArray.text.slice(0, 120));
+    const emptyMessages = await request('/v1/chat/completions', { method: 'POST', body: { messages: [] } });
+    check('an empty messages array is reported as empty, not as missing',
+        emptyMessages.response.status === 400 && emptyMessages.json?.error?.message === 'messages must contain at least one message',
+        emptyMessages.text.slice(0, 120));
+    check('a body with no messages at all still says the array is required',
+        /messages array is required/.test(invalid.json?.error?.message || ''), invalid.text.slice(0, 120));
 
     // A model id whose provider or model half is empty is not a model: `/v1/models` answers 404 for the same ids, and
     // sending one to the backend only produced an upstream error the client could not act on

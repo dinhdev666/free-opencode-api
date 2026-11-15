@@ -1,5 +1,5 @@
 import { startProxy, DEFAULT_API_KEY, parseBoolean, resolveApiKey, getQueueLimits } from './src/proxy.js';
-import { readConfigFile } from './src/config.js';
+import { readConfigFile, envOrFile } from './src/config.js';
 import { logger } from './src/logger.js';
 import fs from 'fs';
 import path from 'path';
@@ -37,18 +37,22 @@ const configPathLoaded = fs.existsSync(configPath);
 // Note: by design LOG_LEVEL takes env over the config.json logLevel field (same merge direction as the other keys
 // below, where env comes first)
 // A port must be digits only: parseInt('8083abc') is 8083, so a typo used to be accepted silently while the operator
-// believed the gateway listened where they asked
-const rawPort = String(process.env.PORT ?? fileConfig.PORT ?? '').trim();
+// believed the gateway listened where they asked. A blank environment value counts as unset (`envOrFile`), so a unit
+// file's `Environment=PORT=` no longer hides the port written in config.json.
+const rawPort = String(envOrFile(process.env, 'PORT', fileConfig.PORT) ?? '').trim();
 const portIsValid = /^\d{1,5}$/.test(rawPort) && Number(rawPort) > 0 && Number(rawPort) < 65536;
 const parsedPort = portIsValid ? Number(rawPort) : defaultConfig.PORT;
-if (!portIsValid && (process.env.PORT !== undefined || fileConfig.PORT !== undefined)) {
+// Warn only when a value was actually configured: a blank variable is "not configured", so there is nothing to report
+if (!portIsValid && rawPort !== '') {
     logger.warn(`[Config] PORT '${rawPort}' is not a valid TCP port (1-65535), falling back to ${defaultConfig.PORT}`);
 }
 
 const finalConfig = {
     PORT: portIsValid ? parsedPort : defaultConfig.PORT,
-    // Never empty: an unset/blank API_KEY falls back to the built-in default (authentication stays on)
-    API_KEY: resolveApiKey(process.env.API_KEY ?? fileConfig.API_KEY ?? defaultConfig.API_KEY),
+    // Never empty: an unset/blank API_KEY falls back to the built-in default (authentication stays on). A blank
+    // environment value counts as unset, so `-e API_KEY=` cannot replace a key written in config.json with the public
+    // default one
+    API_KEY: resolveApiKey(envOrFile(process.env, 'API_KEY', fileConfig.API_KEY) ?? defaultConfig.API_KEY),
     OPENCODE_SERVER_URL: process.env.OPENCODE_SERVER_URL || fileConfig.OPENCODE_SERVER_URL || defaultConfig.OPENCODE_SERVER_URL,
     OPENCODE_BIND_HOST: process.env.OPENCODE_BIND_HOST || fileConfig.OPENCODE_BIND_HOST || defaultConfig.OPENCODE_BIND_HOST,
     OPENCODE_PATH: process.env.OPENCODE_PATH || fileConfig.OPENCODE_PATH || defaultConfig.OPENCODE_PATH,

@@ -140,7 +140,8 @@ if (configPathLoaded) {
     // the shell's cwd is silently ignored, and the startup summary (port, key) is the only hint that it was not read.
     const cwdConfigPath = path.join(process.cwd(), 'config.json');
     if (path.resolve(cwdConfigPath) !== path.resolve(configPath) && fs.existsSync(cwdConfigPath)) {
-        logger.warn(`[Config] config.json is read from ${configPath}; the file at ${cwdConfigPath} is ignored`);
+        logger.warn(`[Config] config.json is read from ${loggableConfigValue(configPath)}; ` +
+            `the file at ${loggableConfigValue(cwdConfigPath)} is ignored`);
     }
 }
 
@@ -152,7 +153,7 @@ if (finalConfig.API_KEY === DEFAULT_API_KEY) {
     logger.warn(
         `[Security] API_KEY is not configured, using the built-in default '${DEFAULT_API_KEY}'. Set API_KEY for production use. ` +
         `The built-in key is public and the CORS headers allow any origin, so any web page can use this gateway; ` +
-        `it listens on ${finalConfig.BIND_HOST}:${finalConfig.PORT} - keep that on 127.0.0.1 or set a real key.`
+        `it listens on ${loggableConfigValue(finalConfig.BIND_HOST)}:${finalConfig.PORT} - keep that on 127.0.0.1 or set a real key.`
     );
 }
 

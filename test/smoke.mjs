@@ -367,6 +367,31 @@ async function run() {
         multiSlashModels.length > 0 && multiSlashModels.every((name) => name === 'vendor/family/version'),
         JSON.stringify(multiSlashModels[0]));
 
+    // A provider that ends its message without the literal finish reason "stop" must still end the stream: waiting
+    // for the exact word would leave the client hanging until the 8 s idle timeout
+    const endOnlyStart = Date.now();
+    const endOnly = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'ENDONLY' }], stream: true },
+        stream: true
+    });
+    const endOnlyElapsed = Date.now() - endOnlyStart;
+    const endOnlyContent = parseSseFrames(endOnly.text)
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        })
+        .filter((chunk) => chunk?.choices?.[0]?.delta?.content)
+        .map((chunk) => chunk.choices[0].delta.content)
+        .join('');
+    check('a finish signal other than "stop" still ends the stream quickly', endOnlyElapsed < 2000,
+        `${endOnlyElapsed} ms`);
+    check('the answer of a non-"stop" finish is complete', endOnlyContent === ANSWER, JSON.stringify(endOnlyContent));
+
     // --- no stalled stream requests ---------------------------------------------------------------------
     // Regression guard: a silent event stream used to cost a fixed 4 s wait on every other request
     const durations = [];

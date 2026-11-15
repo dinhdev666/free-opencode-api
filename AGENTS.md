@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 256 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 260 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -211,7 +211,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   forwards text only`). Dropping them instead answered a question the backend never received — a confidently wrong
   answer, which is the hardest kind to notice — and a request whose only part was an image was reported as
   `messages must include at least one non-system text message`, blaming a field the client had sent. The check runs
-  before the "no text at all" one for that reason.
+  before the "no text at all" one for that reason. Three causes, three messages: a part of a type the gateway cannot
+  forward (the message above), a `text` part whose `text` field is not a string
+  (`messages[0].content[1].text must be a string, found a number` — one message for all of them used to call a `text`
+  part unsupported, naming the only part type the gateway does forward), and a part that is not a part at all
+  (`messages[0].content[0] must be a string or an object with a text field, found a number`, for `42`, `null`, `true`,
+  which were dropped in silence and left the request failing the "no text at all" check).
 - **An announced request body has a deadline.** Fastify sets `requestTimeout: 0`, so nothing bounded the wait: a client
   that sent `Content-Length: 4096` and four bytes held the socket for as long as it liked (measured 20 s with no
   answer), with no credential needed, because the `401` is written from the headers while Node keeps the connection

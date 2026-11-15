@@ -53,6 +53,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
 | `test/smoke.mjs` | End-to-end contract checks: boots the stub and the gateway, asserts status codes, envelopes, SSE frames and clean shutdown. |
+| `test/check-syntax.mjs` | Walks the repository and runs `node --check` on every `.js`/`.mjs` file, so a new source file is checked without editing a list. |
 | `.github/workflows/ci.yml` | CI: `pnpm run check`, shell check, `pnpm test` on Node 20/22/24, plus a Docker build with a container health check. |
 | `.github/workflows/docker-publish.yml` | Publishes `linux/amd64` + `linux/arm64` images to Docker Hub when a `v*.*.*` tag is pushed (secrets `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`). |
 | `README.md` | User-facing documentation: features, configuration tables, API reference, client examples, performance, troubleshooting. |
@@ -66,7 +67,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 ```bash
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
-pnpm run check                   # node --check for every JavaScript source file
+pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
 pnpm test                        # smoke suite: stub backend + gateway, 136 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```

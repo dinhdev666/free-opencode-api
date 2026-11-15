@@ -517,10 +517,12 @@ by the configured backend URL
 (`http://user:secret@host:4097`, a proxy in front of the backend): the startup summary, the `[Config]` notes and
 `/health` show `http://***@host:4097` instead. An upstream reason that quotes the same credential back — a proxy in
 front of the backend reporting the `Authorization: Basic …` header it refused — is masked as `Basic ***` before it
-reaches a `502` body or a log line. The container's first-boot line prints the API key as its length and,
-above 16 characters, a 4-character prefix — `docker logs` is collected as often as not. Masking replaces the value of
-a header or key and never drops it: an odd name such as `__proto__` is still shown (masked like any other), because the
-debug dump is what you read to see what a client actually sent.
+reaches a `502` body or a log line. The same sentence is masked in a **stack trace** and in a debug dump of a request
+body: a stack's first line is the message it repeats, so a record that masked `message` and printed `stack` verbatim
+published the credential the masking had just removed. The container's first-boot line prints the API key as its
+length and, above 16 characters, a 4-character prefix — `docker logs` is collected as often as not. Masking replaces
+the value of a header or key and never drops it: an odd name such as `__proto__` is still shown (masked like any
+other), because the debug dump is what you read to see what a client actually sent.
 
 The startup summary prints the effective port, backend URL, tool filtering, log level and capacity
 (`Concurrency: … completion(s) processed in parallel`, `Wait queue: … waiting completion(s) before 503 queue_full`). The

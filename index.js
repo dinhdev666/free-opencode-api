@@ -8,7 +8,7 @@ import {
     readFlag
 } from './src/proxy.js';
 import { readConfigFile, envOrFile, findUnknownKeys } from './src/config.js';
-import { logger, maskBackendUrl } from './src/logger.js';
+import { logger, loggableError, maskBackendUrl } from './src/logger.js';
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
@@ -300,16 +300,13 @@ try {
     // A single failed request must not take the gateway down silently: a stray rejection is logged with its stack and
     // the process keeps serving, while an uncaught exception (state unknown) goes through the normal shutdown path.
     process.on('unhandledRejection', (reason) => {
-        logger.error('[Fatal] Unhandled promise rejection:', {
-            error: reason?.message || String(reason),
-            stack: reason?.stack
-        });
+        logger.error('[Fatal] Unhandled promise rejection:', loggableError(reason));
     });
     process.on('uncaughtException', (err) => {
-        logger.error('[Fatal] Uncaught exception:', { error: err.message, stack: err.stack });
+        logger.error('[Fatal] Uncaught exception:', loggableError(err));
         shutdown('uncaughtException');
     });
 } catch (error) {
-    logger.error('[Fatal] Failed to start proxy:', { error: error.message, stack: error.stack });
+    logger.error('[Fatal] Failed to start proxy:', loggableError(error));
     process.exit(1);
 }

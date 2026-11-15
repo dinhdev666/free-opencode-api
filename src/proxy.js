@@ -7,7 +7,10 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
-import { logger, maskBackendUrl, maskDetail, maskHeaders, maskQuotedCredentials, maskUrlCredentials, maskUrlQuery, setOwnProperty } from './logger.js';
+import {
+    logger, loggableError, maskBackendUrl, maskDetail, maskFreeText, maskHeaders, maskUrlQuery,
+    MAX_LOGGED_STACK_CHARS, setOwnProperty
+} from './logger.js';
 
 
 // --- Mutex Logic with Timeout ---
@@ -133,34 +136,13 @@ const urlPath = (url) => {
 // A backend (or a proxy in front of it) can quote a URL inside an error payload, and a configured backend URL may
 // carry a credential - Node's `fetch` answered `Request cannot be constructed from a URL that includes
 // credentials: http://user:secret@host:4097/session`, which reached the client-facing 502 body and this process's
-// log verbatim. The query string is masked for the same reason it is masked on a request URL, and the length is
-// bounded so a backend cannot answer a client with a reason the size of the request body limit.
-const MAX_UPSTREAM_TEXT_CHARS = 512;
-// Only the URL-shaped words of the text are masked. `maskUrlQuery()` is written for a URL: given a sentence it
-// read everything after the first `?` as that parameter's value, so `…?x=1: connection refused` answered
-// `…?x=***` and lost the half of the reason that explains the failure.
+// log verbatim. A proxy can also echo the `Authorization: Basic …` header it refused, which is the credential the
+// gateway lifted out of `OPENCODE_SERVER_URL` and sent as a header.
 //
-// The words are found by splitting on whitespace rather than with `/\S+:\/\/\S+/`, which backtracked over a
-// million-character token with no `://` in it one character at a time: a provider error of 1 MB parked the request
-// for longer than its whole budget. `includes('://')` decides per token, and a token is at most a word.
-const maskUrlsInText = (text) => {
-    const value = String(text);
-    if (!value.includes('://')) return value;
-    return value
-        .split(/(\s+)/)
-        .map((token) => (token.includes('://') ? maskUrlQuery(maskUrlCredentials(token)) : token))
-        .join('');
-};
-export const clientFacingText = (value) => {
-    if (typeof value !== 'string' || value === '') return '';
-    // A URL is not the only credential an upstream can quote: a proxy in front of the backend can echo the
-    // `Authorization: Basic …` header it refused, and that token is the credential the gateway lifted out of
-    // `OPENCODE_SERVER_URL`.
-    const masked = maskQuotedCredentials(maskUrlsInText(value));
-    return masked.length > MAX_UPSTREAM_TEXT_CHARS
-        ? `${masked.slice(0, MAX_UPSTREAM_TEXT_CHARS)}…[truncated ${masked.length - MAX_UPSTREAM_TEXT_CHARS} chars]`
-        : masked;
-};
+// The chain itself lives in `src/logger.js` (`maskFreeText()`), because the same sentence is written to a response
+// body *and* to a log line, and a second copy of it here is how the two drifted apart: the 500 body was masked while
+// the `stack` field of the same log record printed it verbatim.
+export const clientFacingText = (value) => (typeof value === 'string' && value !== '' ? maskFreeText(value) : '');
 
 /**
  * The sentence a failed completion shows a client and logs, read from whatever the route handler caught.
@@ -3016,7 +2998,7 @@ function createApp(config) {
             if (timedOut) {
                 logger.warn('[Proxy] Completion timed out:', { message: error.message });
             } else {
-                logger.error('[Proxy] Request Handler Error:', { message: handlerMessage, stack: error.stack });
+                logger.error('[Proxy] Request Handler Error:', { message: handlerMessage, stack: maskFreeText(error?.stack, MAX_LOGGED_STACK_CHARS) });
             }
             const payload = {
                 error: {
@@ -3674,11 +3656,11 @@ export function startProxy(options) {
             try {
                 await ensureBackend(config, { force: true });
             } catch (error) {
-                logger.error('[Proxy] Backend warmup failed:', { error: error.message });
+                logger.error('[Proxy] Backend warmup failed:', loggableError(error));
             }
         })
         .catch((error) => {
-            logger.error('[Fatal] Failed to start HTTP server:', { error: error.message, stack: error.stack });
+            logger.error('[Fatal] Failed to start HTTP server:', loggableError(error));
             process.exit(1);
         });
 

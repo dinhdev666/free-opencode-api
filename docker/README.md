@@ -143,7 +143,8 @@ docker run -d --restart=always --network common-all --name free-opencode-api --p
 ```
 
 > Advanced tuning variables (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_HEALTH_CACHE_MS`,
-> `OPENCODE_PROXY_START_RETRY_MS`, `OPENCODE_PROXY_MAX_CONCURRENCY`, `OPENCODE_PROXY_MAX_QUEUE`, `LOG_LEVEL`) are read
+> `OPENCODE_PROXY_START_RETRY_MS`, `OPENCODE_PROXY_MAX_CONCURRENCY`, `OPENCODE_PROXY_MAX_QUEUE`,
+> `OPENCODE_PROXY_MAX_BODY_MB`, `LOG_LEVEL`) are read
 > from the environment (or from `config.json`, which wins only when the environment does not set them) and documented
 > in the main [README](../README.md#configuration).
 

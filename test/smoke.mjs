@@ -1090,6 +1090,47 @@ async function run() {
         limitOutput.includes('OPENCODE_PROXY_MAX_CONCURRENCY=99 is above the maximum 32'),
         limitOutput.split('\n').filter((line) => line.includes('MAX_CONCURRENCY')).join(' | '));
 
+    // --- the accepted body size is configurable -----------------------------------------------------------
+    // Every waiting completion pins its parsed body, so the memory a burst can hold is the body limit times the queue
+    // length: the 50 MiB and 64-entry defaults allow 3.2 GiB. A gateway facing clients it does not trust lowers it, and
+    // a limit that is configured but not applied is worse than none.
+    stopGateway(limitGateway);
+    await waitForExit(limitGateway);
+    const bodyPort = GATEWAY_PORT + 7;
+    const bodyUrl = `http://127.0.0.1:${bodyPort}`;
+    const bodyGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(bodyPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'warn',
+            OPENCODE_PROXY_MAX_BODY_MB: '1'
+        }
+    });
+    children.push(bodyGateway);
+    bodyGateway.stdout.on('data', () => {});
+    bodyGateway.stderr.on('data', () => {});
+    await waitForOk(`${bodyUrl}/health`);
+    const oversized = await fetch(`${bodyUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'x'.repeat(2 * 1024 * 1024) }] })
+    });
+    const oversizedJson = await oversized.json().catch(() => null);
+    check('a body over the configured limit answers 413', oversized.status === 413, `status ${oversized.status}`);
+    check('the 413 keeps the OpenAI envelope', oversizedJson?.error?.type === 'invalid_request_error',
+        JSON.stringify(oversizedJson)?.slice(0, 160));
+    const withinLimit = await fetch(`${bodyUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+    });
+    check('a body under the configured limit is served', withinLimit.status === 200, `status ${withinLimit.status}`);
+    stopGateway(bodyGateway);
+    await waitForExit(bodyGateway);
+
     // --- a stalled stream still ends ---------------------------------------------------------------------
     // A backend that goes silent mid-answer used to leave the SSE connection open with no terminator: the client
     // waited for a stream that would never finish. The request timeout is shortened so the case stays fast.

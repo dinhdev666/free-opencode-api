@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 169 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 172 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -293,9 +293,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   the backend answers with 404 — the gateway then reported "backend exited during startup", which points nowhere near
   the real cause.
 - **Every tuning key follows the same precedence.** `OPENCODE_PROXY_MAX_CONCURRENCY`, `OPENCODE_PROXY_MAX_QUEUE`,
-  `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_HEALTH_CACHE_MS` and `OPENCODE_PROXY_START_RETRY_MS` are read
-  through `readLimit()` / `readMilliseconds()`, which take the `config.json` value as the fallback and let the
-  environment win. They used to be read from the environment alone, so the same keys in `config.json` were ignored in
+  `OPENCODE_PROXY_MAX_BODY_MB`, `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_HEALTH_CACHE_MS` and
+  `OPENCODE_PROXY_START_RETRY_MS` are read through `readLimit()` / `readMilliseconds()`, which take the `config.json`
+  value as the fallback and let the environment win. They used to be read from the environment alone, so the same keys in `config.json` were ignored in
   silence while the startup summary reported the default — the same class of failure as a `config.json` in the wrong
   directory. `startProxy()` applies the resolved queue limits and backend timings before the server listens, and
   `getQueueLimits()` takes the merged configuration so the summary cannot disagree with what the gateway uses.
@@ -345,8 +345,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   Every exit path stops the backend exactly once, so it can never outlive the gateway. Do not register signal handlers
   that call `process.exit()` from a module — they win the race and skip backend teardown.
 - **The wait queue is bounded** (`OPENCODE_PROXY_MAX_QUEUE`, default 64) because every waiting request pins its parsed
-  body; overflow answers `503 queue_full` instead of growing memory. The cap counts *waiting* requests, so it is only
-  reached while every slot is busy: `0` means "never queue", not "refuse every completion" (a lone request with a free
+  body; overflow answers `503 queue_full` instead of growing memory. The other half of that bound is
+  `OPENCODE_PROXY_MAX_BODY_MB` (default 50, the Fastify `bodyLimit`): the two defaults allow 3.2 GiB of pinned bodies,
+  which no small host plans for, so the limit is a documented knob rather than a constant. The queue cap counts
+  *waiting* requests, so it is only reached while every slot is busy: `0` means "never queue", not "refuse every completion" (a lone request with a free
   slot is served, which is what makes a `0` configuration safe to try). A slot is released when its response is
   complete (`release()` in `runQueuedTask`), not when the task promise settles: the session deletion after the answer
   is a backend round trip, and holding the slot through it made an immediate follow-up request look like a full

@@ -67,7 +67,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 122 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 124 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -119,8 +119,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   without a key in every form a probe uses it — HEAD, and a trailing slash (`ignoreTrailingSlash` routes `/health/`
   to the same handler, so the open-route test must match it too, otherwise a liveness probe answers 401).
 - `GET /v1/models` → `200 {"object":"list","data":[{id,name,object,owned_by}, …]}`; 5 s cache, and a cold-cache burst
-  shares one provider round trip (`modelsInFlight`) instead of one per request; failures fall back to a single static
-  model and are not cached.
+  shares one provider round trip (`modelsInFlight`) instead of one per request; failures — including a provider call
+  that runs into its deadline, because a silent backend would otherwise never answer the listing at all — fall back to
+  a single static model and are not cached.
 - `GET /v1/models/:modelId` and `GET /v1/models/<id with slashes>` → `200 {id,name,object,owned_by}` from the same
   cache; an id the provider list does not contain is described from the id itself (`provider` = text before `/`,
   default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either. The
@@ -205,12 +206,19 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.
 - **Every backend call carries a deadline.** `client.session.create`, `client.session.messages`,
-  `client.session.delete` and `client.session.prompt` are all called with an `AbortSignal` (`backendDeadline()`), and
-  an expired one answers `504` ("did not answer within …ms") instead of `500`. Node's `fetch` has no default timeout:
-  a wedged backend that still answers `/health` but never answers `/session` left the handler waiting forever, so the
-  client got no response at all and the queue slot was never released — at the default concurrency of 1 that stops the
-  whole gateway. Session cleanup uses its own shorter budget (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client
-  already has its answer, so it must not hold the slot for the full request budget.
+  `client.session.delete`, `client.session.prompt`, `client.config.providers` and `client.tool.ids` are all called
+  with an `AbortSignal` (`backendDeadline()`), and an expired one answers `504` ("did not answer within …ms") instead
+  of `500`. Node's `fetch` has no default timeout: a wedged backend that still answers `/health` but never answers
+  `/session` left the handler waiting forever, so the client got no response at all and the queue slot was never
+  released — at the default concurrency of 1 that stops the whole gateway. Session cleanup uses its own shorter budget
+  (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client already has its answer, so it must not hold the slot for
+  the full request budget. The metadata calls (`/v1/models`, the tool list) are capped separately
+  (`METADATA_TIMEOUT_CAP_MS`, and never above `REQUEST_TIMEOUT_MS`), because they fall back — a client listing models
+  must get the static fallback quickly instead of waiting a whole completion budget for a silent provider.
+- **A promise that loses a race needs a handler.** `promptWithTimeout` races the prompt against its own timer, and the
+  losing promise keeps running: a rejection that arrives afterwards (the backend dies, or the deadline aborts the
+  fetch) reached nothing and became an unhandled rejection, which terminates the process by default — one slow
+  completion could take the whole gateway down. Every raced promise gets a `.catch(() => {})` attached.
 - **Timeouts and fallbacks are behavioural contracts.** The polling fallback, the shortened first-delta wait, the
   health-probe cache and the backend start-failure cooldown exist because of real OpenCode protocol quirks
   (opencode ≥ 1.19 event payloads, free zen models). Do not remove them without replacing the behaviour they cover.

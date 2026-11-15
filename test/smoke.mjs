@@ -1115,6 +1115,21 @@ async function run() {
     check('the gateway keeps serving after an upstream timeout',
         wedgedAgain.status === 504 && Date.now() - wedgedStartedAt2 < 10000,
         `status ${wedgedAgain.status} after ${Date.now() - wedgedStartedAt2}ms ${wedgedAgain.body.slice(0, 140)}`);
+    // A metadata call has no completion to time out, so it needs its own deadline: the model list used to wait for the
+    // provider round trip forever, and a client listing models before chatting never got an answer at all
+    const wedgedModelsStartedAt = Date.now();
+    const wedgedModels = await fetch(`${wedgedUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${API_KEY}` },
+        signal: AbortSignal.timeout(15000)
+    }).then((r) => r.json().then((json) => ({ status: r.status, json })))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    check('the model list answers from its fallback when the backend is silent',
+        wedgedModels.status === 200 && wedgedModels.json?.object === 'list' && wedgedModels.json.data?.length === 1,
+        `status ${wedgedModels.status} after ${Date.now() - wedgedModelsStartedAt}ms ${JSON.stringify(wedgedModels.json).slice(0, 140)}`);
+    // A timeout must not leave a rejected promise behind: an unhandled rejection ends the process by default, so the
+    // gateway answering again is the assertion that the late rejection was handled
+    const wedgedAlive = await fetch(`${wedgedUrl}/health`).then((r) => r.status).catch(() => 0);
+    check('the gateway survives an upstream timeout', wedgedAlive === 200, `health ${wedgedAlive}`);
     stopGateway(wedgedGateway);
     await waitForExit(wedgedGateway);
     await new Promise((resolve) => wedgedBackend.close(resolve));

@@ -100,7 +100,12 @@ async function stallAfterTwoDeltas(sessionID) {
 // Wait (briefly) for the gateway to be subscribed before emitting, then replay the answer as incremental updates.
 // `pieces`/`delayMs` let a test ask for a deliberately slow answer (a prompt containing SLOW) so it can abort a
 // stream while the backend is still working.
-async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, delayMs = 5, chunks = null, finish = 'stop' } = {}) {
+async function streamAssistantReply(
+    sessionID,
+    text,
+    reasoning,
+    { pieces = 3, delayMs = 5, chunks = null, finish = 'stop', pauseAfterFirstMs = 0, onSnapshot = null } = {}
+) {
     const full = text;
     for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
 
@@ -128,6 +133,10 @@ async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, de
     }
     for (const snapshot of snapshots) {
         sendEvent(partUpdate(sessionID, { type: 'text', text: snapshot }));
+        if (onSnapshot) onSnapshot(snapshot);
+        // A backend that goes quiet for longer than the gateway's idle timeout before it carries on: the stored
+        // message stays partial and unfinished for the whole pause, exactly like a slow provider
+        if (pauseAfterFirstMs && snapshot === snapshots[0]) await sleep(pauseAfterFirstMs);
         // A message.updated for something the gateway does not care about, with no `info` at all
         sendEvent({ type: 'message.updated', properties: {} });
         // A part event that names the session but carries no part: same class of noise the gateway must skip
@@ -285,6 +294,29 @@ const server = http.createServer(async (req, res) => {
                     message.info.finish = 'stop';
                     message.info.time = { created: Date.now(), completed: Date.now() };
                 }, 400);
+                return;
+            }
+            if (session.promptText.includes('PAUSE')) {
+                // Silenced for longer than the SSE idle timeout and finished only afterwards: the gateway must recover
+                // through polling instead of ending the stream on the text it already had
+                const message = {
+                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
+                    parts: [{ type: 'text', text: '' }]
+                };
+                session.messages.push(message);
+                sendJson(res, 200, { info: message.info, parts: [] });
+                streamAssistantReply(id, ANSWER, REASONING, {
+                    delayMs: 2,
+                    pauseAfterFirstMs: 12500,
+                    onSnapshot: (text) => {
+                        message.parts[0].text = text;
+                    }
+                })
+                    .then(() => {
+                        message.info.finish = 'stop';
+                        message.info.time = { created: Date.now(), completed: Date.now() };
+                    })
+                    .catch(() => {});
                 return;
             }
             const toolTag = session.promptText.includes('TOOLTAG');

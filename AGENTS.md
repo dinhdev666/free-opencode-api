@@ -45,19 +45,19 @@ These are product decisions, not implementation details. Do not "improve" them w
 
 | Path | Responsibility |
 | --- | --- |
-| `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved concurrency/queue capacity and any clamp, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
+| `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved queue limits, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
-| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. `findUnknownKeys()` names a key nobody reads (with the key a typo probably meant). A BOM is tolerated. |
-| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`) plus `serializeDetail()` (bounded, truncate-before-stringify) used by debug logging. |
+| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. A BOM is tolerated. |
+| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`) plus `serializeDetail()` (truncate before stringify) for debug logging. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
 | `test/smoke.mjs` | End-to-end contract checks: boots stub and gateway, asserts status codes, envelopes, SSE frames and clean shutdown. |
 | `test/check-syntax.mjs` | Walks the repository and runs `node --check` on every `.js`/`.mjs` file, so a new source file is checked without editing a list. |
-| `test/check-commit-messages.mjs` | Applies the CONTRIBUTING.md rules to every commit in a range, and fails when its own type/scope lists and the document's tables disagree; CI runs it over a push's added commits, because a published subject cannot be corrected. |
+| `test/check-commit-messages.mjs` | Applies the CONTRIBUTING.md rules to every commit in a range, and fails when its own type/scope lists and the document's tables disagree. |
 | `.github/workflows/ci.yml` | CI: `pnpm run check`, shell check, `pnpm test` on Node 20/22/24, plus a Docker build with a container health check. |
 | `.github/workflows/docker-publish.yml` | Publishes `linux/amd64` + `linux/arm64` to Docker Hub on a `v*.*.*` tag (secrets `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`). |
-| `README.md` | User-facing documentation: features, configuration tables, API reference, client examples, performance, troubleshooting. |
+| `README.md` | User-facing documentation: features, configuration, API reference, client examples, performance, troubleshooting. |
 
 Request flow (short version): `index.js` → Fastify hooks → auth → route handler → queue (`lock()`) → validate and
 normalise messages → `ensureBackend()` → `client.session.create()` → prompt + event stream in parallel (streaming) or
@@ -76,8 +76,8 @@ sh -n docker/docker-entrypoint.sh
 
 `pnpm test` needs no OpenCode CLI and no network: it starts `test/stub-opencode.mjs` on port 4199 and the gateway on
 port 8199 (override with `SMOKE_STUB_PORT` / `SMOKE_PORT`). CI runs `pnpm run check` and `pnpm test` on Node 20, 22
-and 24, plus `test/check-commit-messages.mjs` over the added commits. There is still no linter or formatter, so style
-is a review concern. Do not claim checks passed if they were not run.
+and 24, plus `test/check-commit-messages.mjs` over the added commits. No linter or formatter exists: style is a review
+concern. Do not claim checks passed if they were not run.
 
 Releases come from tags, not from a laptop: bump `version` in `package.json`, then `git tag vX.Y.Z` and push the tag.
 `docker-publish.yml` refuses a tag that does not match `package.json`, builds both architectures and pushes to Docker
@@ -107,11 +107,9 @@ credential-bearing URL), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` 
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every session creation after the n-th goes
 unanswered), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
-body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses
-to start on a taken port and SIGKILLs a child that ignores SIGTERM.
-Session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the
+body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. Session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the
 session (a backend round trip of its own), so one read of `/__sessions` raced it and failed with `live: 1`; wait for
-`live: 0` in a bounded window.
+`live: 0` in a bounded window. The suite refuses a taken port and SIGKILLs a stubborn child.
 
 For exploratory work, start the stub (or a throwaway one in `/tmp`) on a spare port - `STUB_PORT=4405
 node test/stub-opencode.mjs`, which reads `STUB_PORT` and ignores a positional argument - and point the gateway at
@@ -375,8 +373,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   re-stringified into a 32 KB line (43 ms and +100 MB of heap per line).
   Masking replaces a value and never drops the key: the copy these helpers build is assigned to with
   `setOwnProperty()` (a `defineProperty` for exactly the name `__proto__`) because `copy[key] = value` runs the
-  `__proto__` setter, so a key of that name vanished from the masked header dump and the debug detail — the one place
-  an operator looks to see what arrived — and assigning a non-object through that setter is a silent no-op. A backend
+  `__proto__` setter, so a key of that name vanished from the masked header dump and the debug detail, and
+  assigning a non-object through that setter is a silent no-op. A backend
   payload reaches these helpers through plain `JSON.parse`, so a provider can put that key in a logged body; a request
   body cannot (Fastify's poisoning guard refuses it first) and Node's header parser drops it. Neither copy's prototype
   is touched either way (asserted).

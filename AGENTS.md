@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 241 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 243 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -392,10 +392,14 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   without sending the reader to the wrong key — the value is never printed (a mistyped `API_KEY` is still a
   credential), and nothing is merged generically, so an unknown key (including `__proto__`) cannot reach the running
   config.
-  `OPENCODE_SERVER_URL` is normalised at startup (`normalizeBackendUrl`): a trailing slash is stripped and a missing
-  scheme is read as `http://`, both with a `[Config]` warning. A trailing slash made every SDK path `//session`, which
-  the backend answers with 404 — the gateway then reported "backend exited during startup", which points nowhere near
-  the real cause.
+  `OPENCODE_SERVER_URL` is normalised at startup (`normalizeBackendUrl`): surrounding whitespace is trimmed, a
+  trailing slash is stripped and a missing scheme is read as `http://`, the last two with a `[Config]` warning. A
+  trailing slash made every SDK path `//session`, which the backend answers with 404 — the gateway then reported
+  "backend exited during startup", which points nowhere near the real cause. The entry point normalises the value
+  **before** it prints the summary and emits the notes there (the function is exported for that), because the summary
+  is where an operator copies the value from and it used to show the raw form — `http://host:4097/`, or a value with a
+  trailing space — while a note two lines later said it had been corrected. `startProxy()` normalises what it is handed
+  once more: a no-op for an already-normalised value, and still correct for an embedder that calls it directly.
 - **Every tuning key follows the same precedence.** `OPENCODE_PROXY_MAX_CONCURRENCY`, `OPENCODE_PROXY_MAX_QUEUE`,
   `OPENCODE_PROXY_MAX_BODY_MB`, `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_HEALTH_CACHE_MS` and
   `OPENCODE_PROXY_START_RETRY_MS` are read through `readLimit()` / `readMilliseconds()`, which take the `config.json`

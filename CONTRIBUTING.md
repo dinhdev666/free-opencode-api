@@ -110,6 +110,9 @@ messages are written in English, in the imperative mood, and describe the behavi
 `proxy` (routes/handlers), `stream` (SSE and event handling), `backend` (spawn, health, lifecycle), `auth`, `logger`,
 `config`, `docker`, `deps`, `docs`, `release`.
 
+Both lists live in two places — these tables and `test/check-commit-messages.mjs`, which CI runs — so a value
+added to one has to be added to the other; the check fails when they disagree.
+
 ### Examples
 
 ```

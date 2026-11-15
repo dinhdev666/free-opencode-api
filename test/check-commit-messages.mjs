@@ -17,9 +17,12 @@
  * wrote by hand (`gh pr merge <n> --merge --subject "<type>(<scope>): …"`).
  */
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 // Mirrors the tables in CONTRIBUTING.md. They are two copies of one rule - the document is what a contributor reads,
-// this is what CI enforces - so a type or scope added to one has to be added to the other.
+// this is what CI enforces - so a type or scope added to one has to be added to the other, and `assertMirrors()`
+// below fails the check when they disagree: a scope added to the document alone would reject every commit that uses
+// it, and one added here alone documents nothing.
 const TYPES = new Set(['feat', 'fix', 'perf', 'refactor', 'docs', 'build', 'ci', 'test', 'chore', 'revert']);
 const SCOPES = new Set([
     'proxy',
@@ -34,6 +37,63 @@ const SCOPES = new Set([
     'release',
 ]);
 const MAX_SUBJECT_LENGTH = 72;
+
+// Reads the two lists back out of the document instead of comparing against a third hand-written copy: the tables are
+// markdown, so the type names are the first cell of each row and the scopes are the backticked words of the "Scopes"
+// section. Both sections end at the next `### ` heading.
+const documentedLists = () => {
+    const text = readFileSync(new URL('../CONTRIBUTING.md', import.meta.url), 'utf8');
+    const section = (heading) => {
+        const start = text.indexOf(`### ${heading}`);
+        if (start === -1) return null;
+        const end = text.indexOf('\n### ', start + 1);
+        return text.slice(start, end === -1 ? undefined : end);
+    };
+    const typesSection = section('Types');
+    const scopesSection = section('Scopes');
+    if (typesSection === null || scopesSection === null) return null;
+    const types = new Set([...typesSection.matchAll(/^\|\s*`([a-z]+)`\s*\|/gm)].map((m) => m[1]));
+    const scopes = new Set([...scopesSection.matchAll(/`([a-z-]+)`/g)].map((m) => m[1]));
+    return { types, scopes };
+};
+
+// A list that drifted in either direction is a rule that disagrees with itself. This runs on every invocation,
+// including `--subject`, because the merge that publishes a subject is not the moment to discover it.
+const assertMirrors = () => {
+    let documented;
+    try {
+        documented = documentedLists();
+    } catch (error) {
+        // The script is also usable outside a checkout (`--subject` from a hook): a missing document is reported, not
+        // turned into a failure of the commit it was asked to judge
+        console.error(`[commits] cannot read CONTRIBUTING.md (${String(error.message).split('\n')[0]}); skipping the mirror check`);
+        return;
+    }
+    if (!documented) {
+        console.error('[commits] CONTRIBUTING.md has no "### Types" / "### Scopes" section; skipping the mirror check');
+        return;
+    }
+    const differences = [];
+    for (const [label, documentedSet, enforcedSet] of [
+        ['type', documented.types, TYPES],
+        ['scope', documented.scopes, SCOPES],
+    ]) {
+        for (const value of documentedSet) {
+            if (!enforcedSet.has(value)) differences.push(`the document lists the ${label} "${value}" and this check does not`);
+        }
+        for (const value of enforcedSet) {
+            if (!documentedSet.has(value)) differences.push(`this check enforces the ${label} "${value}" and the document does not list it`);
+        }
+    }
+    if (differences.length > 0) {
+        console.error('[commits] CONTRIBUTING.md and this script disagree:');
+        for (const difference of differences) console.error(`          - ${difference}`);
+        console.error('[commits] the two lists are one rule; add or remove the value in both places');
+        process.exit(1);
+    }
+};
+
+assertMirrors();
 
 const git = (args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 

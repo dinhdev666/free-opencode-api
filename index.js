@@ -18,7 +18,8 @@ const defaultConfig = {
     OPENCODE_BIND_HOST: '127.0.0.1',
     OPENCODE_PATH: 'opencode',
     BIND_HOST: '127.0.0.1',
-    DISABLE_TOOLS: false
+    DISABLE_TOOLS: false,
+    USE_ISOLATED_HOME: false
 };
 
 // Load config from file
@@ -61,6 +62,12 @@ const finalConfig = {
         process.env.OPENCODE_DISABLE_TOOLS ?? process.env.DISABLE_TOOLS,
         parseBoolean(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)
     ),
+    // Run the backend under an isolated HOME (a throwaway directory instead of the real one). The legacy
+    // OPENCODE_-prefixed environment variable keeps working
+    USE_ISOLATED_HOME: parseBoolean(
+        process.env.OPENCODE_USE_ISOLATED_HOME ?? process.env.USE_ISOLATED_HOME,
+        parseBoolean(fileConfig.USE_ISOLATED_HOME, defaultConfig.USE_ISOLATED_HOME)
+    ),
     // LOG_LEVEL: env takes precedence over config.json; when neither is explicitly set, undefined is passed
     // through and startProxy falls back to the default info while keeping the legacy DEBUG -> debug level interlock
     LOG_LEVEL: process.env.LOG_LEVEL || fileConfig.LOG_LEVEL || undefined
@@ -98,6 +105,7 @@ logger.info(`  - Bind Host for OpenCode backend: ${finalConfig.OPENCODE_BIND_HOS
 logger.info(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
 logger.info(`  - API Key: ${finalConfig.API_KEY === DEFAULT_API_KEY ? `default (${DEFAULT_API_KEY})` : 'custom'} - authentication always enforced`);
 logger.info(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
+logger.info(`  - Isolated HOME for OpenCode: ${finalConfig.USE_ISOLATED_HOME ? 'Yes' : 'No'}`);
 logger.info(`  - Log Level (requested): ${finalConfig.LOG_LEVEL || 'info (default)'}`);
 
 // Start the proxy

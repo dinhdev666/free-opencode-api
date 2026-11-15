@@ -1539,8 +1539,7 @@ async function ensureBackend(config, options = {}) {
             const isWindows = process.platform === 'win32';
             const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
                 ? USE_ISOLATED_HOME
-                : String(process.env.OPENCODE_USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
-                process.env.OPENCODE_USE_ISOLATED_HOME === '1';
+                : parseBoolean(process.env.OPENCODE_USE_ISOLATED_HOME, false);
 
             // On Windows, don't use isolated fake-home to avoid path issues
             // On Unix-like systems, use jail for isolation
@@ -1696,12 +1695,10 @@ export function startProxy(options) {
         // Raw LOG_LEVEL value: index.js already merged it as "env > config.json" and passes it in; when startProxy is
         // called directly, fall back to reading the environment variable
         LOG_LEVEL: options.LOG_LEVEL ?? options.logLevel ?? process.env.LOG_LEVEL ?? null,
-        USE_ISOLATED_HOME: typeof options.USE_ISOLATED_HOME === 'boolean'
-            ? options.USE_ISOLATED_HOME
-            : String(options.USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
-            options.USE_ISOLATED_HOME === '1' ||
-            String(process.env.OPENCODE_USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
-            process.env.OPENCODE_USE_ISOLATED_HOME === '1',
+        USE_ISOLATED_HOME: parseBoolean(
+            options.USE_ISOLATED_HOME,
+            parseBoolean(process.env.OPENCODE_USE_ISOLATED_HOME, false)
+        ),
         REQUEST_TIMEOUT_MS: (() => {
             // A malformed value must fall back to the default: Number('abc') is NaN and setTimeout(NaN) fires
             // immediately, which would turn every completion into a 504
@@ -1709,10 +1706,7 @@ export function startProxy(options) {
             return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_REQUEST_TIMEOUT_MS;
         })(),
         DISABLE_TOOLS: disableTools,
-        DEBUG: String(options.DEBUG || '').toLowerCase() === 'true' ||
-            options.DEBUG === '1' ||
-            String(process.env.OPENCODE_PROXY_DEBUG || '').toLowerCase() === 'true' ||
-            process.env.OPENCODE_PROXY_DEBUG === '1'
+        DEBUG: parseBoolean(options.DEBUG, parseBoolean(process.env.OPENCODE_PROXY_DEBUG, false))
     };
 
     // Log level resolution (calibrated at startup; all later log output follows this level):

@@ -162,6 +162,21 @@ export const clientFacingText = (value) => {
         : masked;
 };
 
+/**
+ * The sentence a failed completion shows a client and logs, read from whatever the route handler caught.
+ *
+ * `error.message` is the usual shape, but the handler can also be rejected with something else - a thrown string, an
+ * object without a `message`, a library that throws `undefined` - and reading `.message` off that put `undefined` in
+ * the body of a `500`. Masked by `clientFacingText()` when there is anything to mask, and otherwise kept exactly as it
+ * arrived: an empty message stays empty instead of becoming the word `Error`, which would invent a cause.
+ * @param {*} error whatever was thrown or rejected with
+ * @returns {string} the sentence to send and log
+ */
+export const handlerFailureMessage = (error) => {
+    const raw = typeof error?.message === 'string' ? error.message : String(error);
+    return clientFacingText(raw) || raw;
+};
+
 // A client-supplied value on its way into a response body, under one rule.
 //
 // The `415` media-type message already replaced control characters and cut the echoed type; the other sites copied the
@@ -2987,6 +3002,13 @@ function createApp(config) {
                 }
                 return reply;
             }
+            // Built before the log lines below read it: a `const` read ahead of its declaration is a ReferenceError,
+            // and that one would replace the cause of the 500 with a bug in this catch (the operator sees
+            // "Cannot access 'handlerMessage' before initialization" and no reason at all).
+            // This catch writes the body itself, so the top-level handler's masking never sees it: a 500 here is the
+            // same kind of sentence - written by whatever threw - and gets the same treatment, in the body and in the
+            // log line.
+            const handlerMessage = handlerFailureMessage(error);
             // The last line of defence is the queue timer (waiting for a slot, or running longer than the whole
             // budget). That is a gateway timeout, not a gateway bug: answering 500 for it hid the timeout and leaked
             // the internal budget number to the client.
@@ -2996,11 +3018,6 @@ function createApp(config) {
             } else {
                 logger.error('[Proxy] Request Handler Error:', { message: handlerMessage, stack: error.stack });
             }
-            // This catch writes the body itself, so the top-level handler's masking never sees it: a 500 here is the
-            // same kind of sentence - written by whatever threw - and gets the same treatment, in the body and in the
-            // log line above.
-            const rawMessage = typeof error?.message === 'string' ? error.message : String(error);
-            const handlerMessage = clientFacingText(rawMessage) || rawMessage;
             const payload = {
                 error: {
                     message: timedOut

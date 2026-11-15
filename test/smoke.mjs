@@ -600,6 +600,35 @@ async function run() {
     check('every completion deletes the session it created',
         stubStats && stubStats.deleted > 0 && stubStats.live === 0, JSON.stringify(stubStats));
 
+    // --- a backend URL with a trailing slash --------------------------------------------------------------
+    // Every SDK call would be `//session` (404 on the backend), which used to look like "the backend cannot start"
+    const slashPort = GATEWAY_PORT + 6;
+    const slashUrl = `http://127.0.0.1:${slashPort}`;
+    const slashGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(slashPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `${STUB_URL}/`,
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(slashGateway);
+    slashGateway.stdout.on('data', () => {});
+    slashGateway.stderr.on('data', () => {});
+    await waitForOk(`${slashUrl}/health`);
+    const slashHealth = await fetch(`${slashUrl}/health`).then((r) => r.json()).catch(() => null);
+    check('a trailing slash in the backend URL is normalised',
+        slashHealth?.backend === STUB_URL, JSON.stringify(slashHealth));
+    const slashCompletion = await fetch(`${slashUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+    }).then((r) => r.text());
+    check('completions work with a trailing-slash backend URL',
+        slashCompletion.includes(ANSWER), slashCompletion.slice(0, 160));
+
     // --- bounded queue -----------------------------------------------------------------------------------
     // OPENCODE_PROXY_MAX_QUEUE=0 removes every waiting slot: a completion is refused only when every slot is busy,
     // never when one is free (the cap counts waiting requests, not all requests)

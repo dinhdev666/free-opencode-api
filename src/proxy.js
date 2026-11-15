@@ -202,6 +202,25 @@ function resolveOpencodePath(requestedPath) {
     return { path: null, source: 'not-found' };
 }
 
+// A backend URL that ends in a slash makes every SDK call a path with a double slash (`//session`), which an
+// OpenCode server answers with 404: the gateway then looks like it cannot start its backend at all. Normalising the
+// value once at startup is cheaper than wondering why nothing works.
+function normalizeBackendUrl(raw) {
+    let url = String(raw || '').trim();
+    const notes = [];
+    if (url === '') return { url: 'http://127.0.0.1:4097', notes };
+    if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)) {
+        notes.push(`OPENCODE_SERVER_URL='${url}' has no scheme, assuming http://`);
+        url = `http://${url}`;
+    }
+    const stripped = url.replace(/\/+$/, '');
+    if (stripped !== url) {
+        notes.push(`OPENCODE_SERVER_URL had a trailing slash, using '${stripped}'`);
+        url = stripped;
+    }
+    return { url, notes };
+}
+
 // Reads an integer limit from the environment. A value that cannot be used must not look like it took effect: an
 // operator who raises OPENCODE_PROXY_MAX_CONCURRENCY (a throughput knob) and sees no change has no way to tell a typo
 // from a clamp, so every adjustment is kept as a note for the startup summary.
@@ -1840,11 +1859,14 @@ export function startProxy(options) {
         parseBoolean(process.env.DISABLE_TOOLS) ??
         false;
 
+    // Normalised once: a trailing slash in OPENCODE_SERVER_URL turns every SDK path into `//session` (404)
+    const backendUrl = normalizeBackendUrl(options.OPENCODE_SERVER_URL || 'http://127.0.0.1:4097');
+
     const config = {
         PORT: options.PORT || 8083,
         // Empty/blank values fall back to DEFAULT_API_KEY: authentication is always on
         API_KEY: resolveApiKey(options.API_KEY),
-        OPENCODE_SERVER_URL: options.OPENCODE_SERVER_URL || 'http://127.0.0.1:4097',
+        OPENCODE_SERVER_URL: backendUrl.url,
         OPENCODE_BIND_HOST: options.OPENCODE_BIND_HOST || options.openCodeBindHost || process.env.OPENCODE_BIND_HOST || '127.0.0.1',
         OPENCODE_PATH: options.OPENCODE_PATH || 'opencode',
         BIND_HOST: options.BIND_HOST || options.bindHost || process.env.OPENCODE_PROXY_BIND_HOST || '127.0.0.1',
@@ -1874,6 +1896,7 @@ export function startProxy(options) {
     } else if (!levelResolution.explicit && config.DEBUG) {
         levelResolution = logger.setLevel('debug');
     }
+    backendUrl.notes.forEach((note) => logger.warn(`[Config] ${note}`));
     config.LOG_LEVEL = logger.level;
     const levelSource = !levelResolution.explicit
         ? (config.DEBUG ? 'legacy DEBUG flag' : 'default')

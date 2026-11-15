@@ -64,7 +64,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 99 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 101 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -179,6 +179,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   "off" inside the container); do not add a third.
 - **Configuration** follows the precedence env > `config.json` > default, and every new key must be added to
   `config.json.example`, the README configuration table and — for container-relevant keys — `docker/docker-entrypoint.sh`.
+  `OPENCODE_SERVER_URL` is normalised at startup (`normalizeBackendUrl`): a trailing slash is stripped and a missing
+  scheme is read as `http://`, both with a `[Config]` warning. A trailing slash made every SDK path `//session`, which
+  the backend answers with 404 — the gateway then reported "backend exited during startup", which points nowhere near
+  the real cause.
 - **Polling answers with the finished message.** `pollForAssistantResponse` is called with `requireDone: true` on
   every path that emits the final answer: the poll loop can start while the answer is still being written, and
   returning the first non-empty message truncated it (`"Hello from t"` for a 41-character answer). A message whose

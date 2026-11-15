@@ -2301,6 +2301,33 @@ async function run() {
         /rejected the provider listing \(status 500\)/.test(failProvidersOutput) &&
         !/reported no models/.test(failProvidersOutput),
         JSON.stringify(failProvidersOutput.split('\n').find((line) => line.includes('provider listing')) || '').slice(0, 200));
+    // The fallback is deliberately not cached so a recovering backend is picked up, but "not cached" was one backend
+    // round trip per listing: a provider answering 500 was asked again for every request in front of it
+    const failProvidersUrl = `http://127.0.0.1:${failProvidersStubPort + 1}`;
+    const failStubCalls = async () => (await (await fetch(`http://127.0.0.1:${failProvidersStubPort}/__sessions`)).json()).providerCalls;
+    const listAgainstFailures = () => fetch(`${failProvidersUrl}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then((r) => r.json()).catch(() => null);
+    // The listing above may have started a hold of its own, so the window is measured from this point: the five
+    // listings below must not reach the provider at all
+    await sleep(1100);
+    const failCallsBefore = await failStubCalls();
+    const heldListings = await Promise.all(Array.from({ length: 5 }, listAgainstFailures));
+    const failCallsAfter = await failStubCalls();
+    check('five listings inside the fallback window cost one provider call',
+        heldListings.every((listing) => listing?.data?.length === 1) && failCallsAfter - failCallsBefore === 1,
+        `provider calls: ${failCallsAfter - failCallsBefore}, statuses ${JSON.stringify(heldListings.map((l) => l?.data?.length))}`);
+    const heldAgain = await listAgainstFailures();
+    const failCallsAfterHold = await failStubCalls();
+    check('a listing inside the fallback hold does not ask the provider again',
+        heldAgain?.data?.length === 1 && failCallsAfterHold === failCallsAfter,
+        `provider calls: ${failCallsAfterHold - failCallsAfter}`);
+    await sleep(1100);
+    // The hold expires and the next listing asks the backend again, because the fallback is not the answer to pin
+    const afterHold = await listAgainstFailures();
+    const failCallsRecovered = await failStubCalls();
+    check('a listing after the hold asks the failing provider again',
+        afterHold?.data?.length === 1 && failCallsRecovered === failCallsAfterHold + 1,
+        `provider calls: ${failCallsRecovered - failCallsAfterHold}, body: ${JSON.stringify(afterHold)?.slice(0, 100)}`);
     stopGateway(failProvidersGateway);
     await waitForExit(failProvidersGateway);
     stop(failProvidersStub);

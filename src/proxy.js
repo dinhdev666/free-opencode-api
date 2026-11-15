@@ -1089,6 +1089,17 @@ function createApp(config) {
     const MODELS_CACHE_TTL_MS = 5000;
     // What a client sees when the provider list cannot be read: a single model, never an empty list
     const STATIC_FALLBACK_MODELS = [DEFAULT_MODEL];
+    // A failing provider is not asked again for a second. The fallback is deliberately not cached - a recovering
+    // backend must be picked up - but "not cached" became "one backend round trip per listing": with a provider that
+    // answers 500, five listings produced five provider calls and the route measured 58.6k req/s against a 93.1k
+    // warm-cache baseline (-37 %), all of it spent producing a constant. The hold keeps the recovery intent and states
+    // its bound.
+    const FALLBACK_HOLD_MS = 1000;
+    let modelsFallbackAt = 0;
+    const serveFallback = () => {
+        modelsFallbackAt = Date.now();
+        return STATIC_FALLBACK_MODELS;
+    };
     const MODELS_TIMEOUT_MS = Math.min(REQUEST_TIMEOUT_MS, METADATA_TIMEOUT_CAP_MS);
     const TOOL_IDS_TIMEOUT_MS = MODELS_TIMEOUT_MS;
     let modelsCache = null;
@@ -1110,6 +1121,7 @@ function createApp(config) {
         // A cold cache under a burst (an autoscaler probe, a client retrying a startup listing) would otherwise put
         // one provider round trip behind every request in that burst; the first caller does the work and the rest
         // await the same promise
+        if (modelsFallbackAt && now - modelsFallbackAt < FALLBACK_HOLD_MS) return STATIC_FALLBACK_MODELS;
         if (modelsInFlight) return modelsInFlight;
         modelsInFlight = fetchModels();
         try {
@@ -1130,7 +1142,7 @@ function createApp(config) {
                 logger.warn(
                     `[Proxy] The backend rejected the provider listing${status ? ` (status ${status})` : ''}${reason}, using the static fallback`
                 );
-                return STATIC_FALLBACK_MODELS;
+                return serveFallback();
             }
             const providersRaw = providersRes.data?.providers || [];
             const models = [];
@@ -1142,7 +1154,7 @@ function createApp(config) {
                 // nothing) answered 200 with no models. Serving `{"data":[]}` is as useless to a client as an error -
                 // clients show no models at all - so an empty list takes the same fallback path and is not cached.
                 logger.warn('[Proxy] The backend reported no models, using the static fallback');
-                return STATIC_FALLBACK_MODELS;
+                return serveFallback();
             }
 
             list.forEach((p) => {
@@ -1162,9 +1174,10 @@ function createApp(config) {
                 // answer 200 with nothing to choose from: that takes the same fallback path as an empty provider
                 // list, and - unlike a real listing - is not cached.
                 logger.warn('[Proxy] The backend reported no models, using the static fallback');
-                return STATIC_FALLBACK_MODELS;
+                return serveFallback();
             }
             modelsCache = { object: 'list', data: models };
+            modelsFallbackAt = 0;
             modelsCacheBody = JSON.stringify(modelsCache);
             modelsById = new Map(models.map((model) => [model.id, model]));
             // Stamped when the answer arrives, not when the round trip started: the TTL used to be measured from the
@@ -1175,7 +1188,7 @@ function createApp(config) {
         } catch (error) {
             logger.error('[Proxy] Model Fetch Error:', { error: error.message, status: error.status, body: error.response?.data || error.responseBody || null });
             // Same item shape as a provider-served model, and not cached: the next request probes the backend again
-            return STATIC_FALLBACK_MODELS;
+            return serveFallback();
         }
     };
 

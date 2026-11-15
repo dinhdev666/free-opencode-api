@@ -906,9 +906,12 @@ function createApp(config) {
                                 deltaChars += delta.length;
                             }
                         }
+                        // Any completed assistant message ends the stream: `finish` is not always "stop" (a tool-call
+                        // answer reports "tool-calls", other backends report "end" or only time.completed), and
+                        // requiring the exact word "stop" left such an answer waiting for the 8 s idle timeout
                         if (event.type === 'message.updated' &&
                             props.info?.sessionID === sessionId &&
-                            props.info?.finish === 'stop') {
+                            (props.info?.finish || props.info?.time?.completed)) {
                             logDebug('SSE completed', {
                                 sessionId,
                                 ms: Date.now() - startedAt,

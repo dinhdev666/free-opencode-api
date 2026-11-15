@@ -84,7 +84,7 @@ async function stallAfterTwoDeltas(sessionID) {
 // Wait (briefly) for the gateway to be subscribed before emitting, then replay the answer as incremental updates.
 // `pieces`/`delayMs` let a test ask for a deliberately slow answer (a prompt containing SLOW) so it can abort a
 // stream while the backend is still working.
-async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, delayMs = 5, chunks = null } = {}) {
+async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, delayMs = 5, chunks = null, finish = 'stop' } = {}) {
     const full = text;
     for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
 
@@ -127,7 +127,8 @@ async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, de
                 id: `msg_${sessionID}`,
                 sessionID,
                 role: 'assistant',
-                finish: 'stop',
+                // A provider may report a finish reason other than "stop" (tool calls, "end", ...)
+                ...(finish === 'completed-only' ? {} : { finish }),
                 time: { created: Date.now(), completed: Date.now() }
             }
         }
@@ -231,12 +232,15 @@ const server = http.createServer(async (req, res) => {
             // Fire and forget: the gateway collects the answer from /event (or polling). A prompt containing SLOW
             // is answered over ~2 s so a test can abort mid-stream while the backend is still working.
             const slow = session.promptText.includes('SLOW');
+            // A provider that ends the message without the literal "stop" (only time.completed is set)
+            const completedOnly = session.promptText.includes('ENDONLY');
             const options = slow ? { pieces: 10, delayMs: 200 } : {};
             if (toolTag) {
                 // A tool-call block cut in the middle of both its tags: nothing of it may reach the client
                 options.chunks = ['hello ', '<function_ca', 'lls>secret</function_ca', 'lls> world'];
                 options.delayMs = 1;
             }
+            if (completedOnly) options.finish = 'completed-only';
             streamAssistantReply(id, toolTag ? TOOL_TAG_ANSWER : ANSWER, REASONING, options).catch(() => {});
             return;
         }

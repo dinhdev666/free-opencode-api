@@ -133,6 +133,27 @@ export function parseBoolean(value, fallback = undefined) {
     return fallback;
 }
 
+/**
+ * A boolean option read from the environment or `config.json`, with the rule the numeric tuning keys follow: a value
+ * that is present but cannot be read is named together with the value actually used, instead of falling back in
+ * silence. `DISABLE_TOOLS: "maybe"` (or `OPENCODE_PROXY_DEBUG=ture`) used to leave the feature off while the operator
+ * believed it was on - and for DISABLE_TOOLS that means the model's `<function_calls>` markup reaches the client,
+ * which is exactly what the switch exists to hide. `parseBoolean()` stays the single parser; this only reports.
+ */
+export function readFlag(label, value, fallback) {
+    const parsed = parseBoolean(value, undefined);
+    if (parsed !== undefined) return parsed;
+    if (value === undefined || value === null) return fallback;
+    const shown = String(value).trim();
+    if (shown === '') return fallback;
+    // The value is operator input and the line is one log record: control characters out, length bounded
+    logger.warn(
+        `[Config] ${label}='${shown.replace(/[\u0000-\u001f\u007f]/g, '?').slice(0, 64)}' is not a boolean ` +
+        `(use true/false, yes/no, on/off or 1/0), using ${fallback}`
+    );
+    return fallback;
+}
+
 const OPENCODE_BASENAME = 'opencode';
 
 function splitPathEnv() {

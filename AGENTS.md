@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 244 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 245 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -378,7 +378,15 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`.
 - **Boolean options go through `parseBoolean()`** (exported from `src/proxy.js`), the single parser used by
   `index.js` and `startProxy()`. Two implementations of that rule drifted once already (`-e DISABLE_TOOLS=yes` meant
-  "off" inside the container); do not add a third.
+  "off" inside the container); do not add a third. A value that is present but cannot be read is **named with the
+  value actually used** (`readFlag()` in `src/proxy.js`, used by `index.js` for `DISABLE_TOOLS`,
+  `USE_ISOLATED_HOME` and `DEBUG`): `[Config] DISABLE_TOOLS='maybe' is not a boolean (use true/false, yes/no, on/off
+  or 1/0), using false`. The flags used to fall back in silence, which is the same failure the numeric tuning keys
+  were fixed for — and for `DISABLE_TOOLS` the consequence is the one the switch exists to prevent: a typo leaves the
+  model's `<function_calls>` markup in the answer while the operator believes it is filtered out. `parseBoolean()`
+  stays the only parser (it is also used on request bodies, where a warning would be wrong); `readFlag()` only
+  reports. The label repeats the name the operator used — an environment variable or `config.json DISABLE_TOOLS` —
+  and the echoed value is stripped of control characters and cut at 64, because it lands in a log line.
 - **Configuration** follows the precedence env > `config.json` > default, and every new key must be added to
   `config.json.example`, the README configuration table and — for container-relevant keys — `docker/docker-entrypoint.sh`.
   `config.json` is read from the **application directory** (`path.join(__dirname, 'config.json')`), not from the

@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 178 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 190 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -187,6 +187,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (`USER: …`, `ASSISTANT: …`) and sent as text. `developer` is OpenAI's newer name for the system role, so a client
   using it must not end up with "DEVELOPER: …" inside the conversation. The stub reports the last system prompt it
   received (`GET /__sessions` → `lastSystemPrompt`) so the suite can assert it.
+- A `messages[].role` that is present but not a string (`5`, `{}`, `[]`, `true`) is a `400`
+  (`messages[0].role must be a string`): `(role || 'user').toLowerCase()` threw on a truthy non-string, so a client's
+  bad field was answered `500` with the internal expression in the message. A missing or `null` role keeps its lenient
+  `user` default.
 - A `model` id whose provider or model half is empty (`"opencode/"`, `"/big-pickle"`) is a `400` in the
   `invalid_request_error` envelope naming the value: `/v1/models` answers `404` for the same ids, and sending them to
   the backend only produced an opaque upstream error. An absent or blank `model` still means `DEFAULT_MODEL`.
@@ -255,12 +259,24 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - CORS headers are set on the raw response for every request, including hijacked streams:
   `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, OPTIONS`, `Allow-Headers: Content-Type,
   Authorization, X-Api-Key, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`.
+- A request the HTTP parser rejects (a malformed request line or header, an oversized header block, a header
+  timeout) never reaches a hook, so it is answered by `clientErrorHandler`, registered through the
+  `clientErrorHandler` Fastify option: `400` for a parse error, `431` for `HPE_HEADER_OVERFLOW`, `408` for
+  `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope (`type: "invalid_request_error"`, the parser's code in `code`
+  when it is a plain `[A-Z_]+` token) with the CORS headers, an `X-Request-Id` and a `warn` log line. Fastify's own
+  handler answered `{"error":"Bad Request","message":"Client Error","statusCode":400}` — no `type`, no CORS, no
+  request id, no log — for a class of requests that the contract above covers like any other.
 - Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
   to a log entry. An incoming `X-Request-Id` is echoed when it is a short printable token
   (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a
   response header, so a header value carrying spaces, newlines or control characters must never be copied through.
   `Access-Control-Expose-Headers: X-Request-Id` lets a browser client read it back.
 - Request log format: `METHOD url -> status Xms [reqId] model=… stream=…` (info for `/v1/*`, debug otherwise).
+  The `model` value and the URL are client-controlled, so both are normalised before they are logged
+  (`loggableModelId()`: control characters replaced, 128 characters max; a URL over 512 characters is cut with a
+  `…[truncated N chars]` marker): one log line is one record, and a newline in a model id used to start a second,
+  attacker-written line (`FORGED [INFO] …`), while a 2 MB model id produced a 2 MB info line. The backend still
+  receives the id verbatim — the contract does not restrict model ids, only what is logged is normalised.
 
 ## Working rules for code changes
 
@@ -306,11 +322,27 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   silence while the startup summary reported the default — the same class of failure as a `config.json` in the wrong
   directory. `startProxy()` applies the resolved queue limits and backend timings before the server listens, and
   `getQueueLimits()` takes the merged configuration so the summary cannot disagree with what the gateway uses.
+  A value that is present but unusable is **named in a `[Config]` warning with the value actually used**
+  (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS='0' is not a positive number, using 300000`, `… HEALTH_CACHE_MS='abc' is not a
+  number, using 2000`): falling back to the default in silence left the operator convinced a value was in force while
+  the gateway ran the default, which is the same failure the precedence rule above exists to prevent.
 - **Polling answers with the finished message.** `pollForAssistantResponse` is called with `requireDone: true` on
   every path that emits the final answer: the poll loop can start while the answer is still being written, and
   returning the first non-empty message truncated it (`"Hello from t"` for a 41-character answer). A message whose
-  text stops growing for three consecutive polls is accepted anyway, so a provider that never marks its message
-  finished still gets an answer.
+  text stops growing for `stablePollsRequired * intervalMs` is accepted anyway, so a provider that never marks its
+  message finished still gets an answer. That window is measured in **time, not in polls** (`stableWindowMs`): the
+  first polls are much shorter than the interval (`POLL_BACKOFF_MS` = 25/50/100/200 ms), and counting "three identical
+  polls" would have shrunk the documented ~1.5 s of silence to ~75 ms and started serving half-written answers. The
+  first four polls use `min(intervalMs, POLL_BACKOFF_MS[i])` because an answer that lands a few tens of milliseconds
+  after the prompt returned used to wait a whole interval before the next poll saw it (measured p50 507 ms → 90 ms,
+  for a few extra cheap `GET …/message` calls). Do not remove the backoff without keeping the time window: the two
+  belong together.
+- **A completion has one budget, not one per phase.** The prompt, the event subscription and the polling fallback all
+  take what is left of `REQUEST_TIMEOUT_MS` (`remainingBudget()` in the handler) instead of each starting a fresh
+  copy: a streaming request whose event stream timed out spent a second full budget polling, so the client waited
+  about twice the advertised timeout (measured 60 s for a 40 s budget) and the queue timer's message named a budget
+  that had already been exceeded. `remainingBudget()` never goes below 1 ms, so an exhausted budget surfaces as the
+  timeout it is rather than as a loop that spins.
 - **A failed poll does not end the completion.** `pollForAssistantResponse` retries a poll that answers with an error
   (a 5xx while the backend is busy) or throws (a connection reset while it restarts): one bad poll used to lose an
   answer that was one poll away - the thrown case surfaced as `502 "fetch failed"`. Only `MAX_POLL_FAILURES` (5)
@@ -372,6 +404,15 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   response finishes with the request body unread, the kernel answers the client's remaining bytes with RST, and the
   client could lose the 413 completely - CI on Node 24 aborted the suite with "fetch failed" instead of the envelope.
   A client that keeps writing is cut off after the drain window rather than holding the socket.
+- **The container runs as the unprivileged `node` user.** `docker/Dockerfile` chowns `/app` and declares
+  `USER node` (uid/gid 1000) after the CLI install, so the gateway, the backend it spawns and every tool that backend
+  runs are not UID 0. The entrypoint still writes `/app/config.json` (0600, owned by that user) on first boot, so
+  anything bind-mounted there must be readable - and a credentials directory writable - by uid 1000
+  (`docker/README.md`). CI asserts the uid is not 0.
+- **Workflow actions are pinned to commit SHAs.** Every `uses:` in `.github/workflows/` names a 40-character commit
+  with the release in a trailing comment (`actions/checkout@<sha> # v4.4.0`), and a CI step fails the build when a
+  movable ref reappears: `docker-publish.yml` leaves a write-scoped registry token on the runner, so an action resolved
+  through a retagged major tag is code nobody froze.
 - **The image pins the CLI, and the pin is the 1.x line.** `docker/Dockerfile` installs `opencode-ai` with
   `ARG OPENCODE_VERSION=1.19.5` (the newest 1.x release, matching the bundled `@opencode-ai/sdk`). `latest` now
   resolves to the 2.x line, whose `opencode serve` serves the web UI — it answers `/health` with HTML (so the readiness
@@ -404,7 +445,20 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `ownedJailRoots` before replacing it.
 - **Backend lifecycle changes** must keep these properties: `ensureBackend()` trusts a successful probe for
   `OPENCODE_PROXY_HEALTH_CACHE_MS`, connection failures clear that trust, a spawned process that exits during startup
-  aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm.
+  aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm. A backend that is known
+  to be healthy but whose trust window has expired is re-probed **in the background** (`refreshBackendHealthInBackground()`,
+  at most one probe in flight) and the request proceeds: with the default 2 s window and the serialized queue almost
+  every interactive completion arrived after it and paid a `/health` round trip before `session.create` (+3.2 ms on
+  loopback). A backend that died is still recovered by the request that hits it (`session.create` fails on the
+  connection error, clears `healthyAt` and calls `ensureBackend()` again), a backend that never answered still takes
+  the blocking path, and `OPENCODE_PROXY_HEALTH_CACHE_MS=0` keeps its documented "probe on every request" meaning.
+- **The backend child does not inherit the gateway's credentials.** The `opencode serve` spawn deletes `API_KEY`
+  (and `OPENCODE_PROXY_DEBUG`) from the environment it passes on, and the version probe does the same: the child is an
+  agent runtime that runs model-directed tools, and it authenticates nothing with a key that only guards this gateway.
+  Provider credentials the CLI needs live in its own auth store or under their own names, so they stay. The jail
+  directory (`<tmp>/opencode-proxy-jail/<salt>`, the child's cwd and its whole `HOME` under `USE_ISOLATED_HOME`) is
+  created with mode `0700`: on a shared `/tmp` the default `0755` let every other local user list and traverse it,
+  which is the isolation the option is for.
 - **A cached healthy answer does not fail the request it was wrong about.** `session.create` that throws a connection
   error (the backend died within `OPENCODE_PROXY_HEALTH_CACHE_MS` of the trusted probe) drops that trust, calls
   `ensureBackend()` again and retries the call once; the crash-recovery then happens for the request that hit it

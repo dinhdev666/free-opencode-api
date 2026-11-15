@@ -485,14 +485,57 @@ function lock(task, timeout = 120000) {
 const healthAgent = new http.Agent({ keepAlive: true, maxSockets: 4 });
 const healthAgentSecure = new https.Agent({ keepAlive: true, maxSockets: 4 });
 
+// Credentials lifted out of OPENCODE_SERVER_URL by resolveBackendAuth(); the probe sends them the same way the SDK
+// does, otherwise a backend behind a credential-requiring proxy answers the probe with 401 and the gateway concludes
+// its backend is gone (and tries to start a local one).
+let BACKEND_AUTHORIZATION = null;
+
+/**
+ * Split a configured backend URL into the URL the SDK is given and the header that carries its credentials.
+ *
+ * `http://user:secret@host:4097` - a proxy in front of the backend - was documented as supported but could not work:
+ * every SDK call goes through Node's `fetch`, which refuses a URL with credentials ("Request cannot be constructed
+ * from a URL that includes credentials: …"), so every completion answered `502` and the runtime's message carried the
+ * secret into that response body and into the error log. The userinfo is therefore removed from the URL (which is
+ * what the masking in `maskBackendUrl()` already assumed the gateway was doing) and sent as a Basic `Authorization`
+ * header instead, which is what such a proxy reads.
+ * @param {string} serverUrl normalised backend URL
+ * @returns {{url: string, authorization: string|null}}
+ */
+export function resolveBackendAuth(serverUrl) {
+    const raw = String(serverUrl);
+    let parsed;
+    try {
+        parsed = new URL(raw);
+    } catch {
+        // Not a URL the gateway can parse: leave it exactly as configured and let the caller report the failure
+        return { url: raw, authorization: null };
+    }
+    if (!parsed.username && !parsed.password) return { url: raw, authorization: null };
+    let user = parsed.username;
+    let password = parsed.password;
+    try {
+        user = decodeURIComponent(user);
+        password = decodeURIComponent(password);
+    } catch {
+        // Keep the percent-encoded form when it is not valid encoding (the credential is still well defined)
+    }
+    const scheme = `${parsed.protocol}//`;
+    const authority = raw.slice(scheme.length).split(/[/?#]/)[0];
+    const withoutUserInfo = `${scheme}${authority.slice(authority.lastIndexOf('@') + 1)}${raw.slice(scheme.length + authority.length)}`;
+    return { url: withoutUserInfo, authorization: `Basic ${Buffer.from(`${user}:${password}`, 'utf8').toString('base64')}` };
+}
+
 /**
  * Robust Health Check Helper
  */
-function checkHealth(serverUrl) {
+function checkHealth(serverUrl, authorization = BACKEND_AUTHORIZATION) {
     const secure = String(serverUrl).startsWith('https://');
     const transport = secure ? https : http;
     return new Promise((resolve, reject) => {
-        const req = transport.get(`${serverUrl}/health`, { agent: secure ? healthAgentSecure : healthAgent }, (res) => {
+        const options = { agent: secure ? healthAgentSecure : healthAgent };
+        if (authorization) options.headers = { authorization };
+        const req = transport.get(`${serverUrl}/health`, options, (res) => {
             // Drain the body so the socket goes back to the keep-alive pool
             res.resume();
             if (res.statusCode === 200) resolve(true);
@@ -796,7 +839,17 @@ function createApp(config) {
         done(null, body);
     });
 
-    const client = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL });
+    // A credential in OPENCODE_SERVER_URL (`http://user:secret@host:4097`, a proxy in front of the backend) cannot be
+    // handed to the SDK: it calls every endpoint through Node's `fetch`, which refuses such a URL, so the whole gateway
+    // answered 502 while the runtime's message published the secret. The userinfo leaves the URL and travels as a
+    // Basic Authorization header instead - for the SDK, which merges `config.headers` into every request, and for the
+    // health probe, which the backend (or the proxy) would otherwise refuse with 401 and look like a missing backend.
+    const backendAuth = resolveBackendAuth(OPENCODE_SERVER_URL);
+    BACKEND_AUTHORIZATION = backendAuth.authorization;
+    const client = createOpencodeClient({
+        baseUrl: backendAuth.url,
+        ...(backendAuth.authorization ? { headers: { authorization: backendAuth.authorization } } : {})
+    });
 
     // Precomputed once: comparing against a ready-made buffer avoids rebuilding the token on every request.
     // resolveApiKey() guarantees a non-empty key, so authentication can never be switched off.
@@ -2778,7 +2831,9 @@ async function ensureBackend(config, options = {}) {
             }
             // The probe above suspended for up to its timeout, which is exactly the window a shutdown can land in
             if (state.shuttingDown) throw new Error('The gateway is shutting down');
-            logger.info(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
+            // Masked: the URL can carry a credential (see resolveBackendAuth), and this line is the one an operator
+            // reads in `docker logs`
+            logger.info(`[Proxy] OpenCode backend not found at ${maskBackendUrl(OPENCODE_SERVER_URL)}. Starting...`);
 
             // Kill the existing process if any, and wait for it to be gone before spawning a replacement: SIGTERM
             // was sent and the new backend started on the next line, so the old child still held the port and the
@@ -2919,7 +2974,7 @@ async function ensureBackend(config, options = {}) {
             try {
                 port = new URL(OPENCODE_SERVER_URL).port || '4097';
             } catch (e) {
-                logger.warn(`[Proxy] Could not parse OPENCODE_SERVER_URL '${OPENCODE_SERVER_URL}', assuming port 4097`);
+                logger.warn(`[Proxy] Could not parse OPENCODE_SERVER_URL '${maskBackendUrl(OPENCODE_SERVER_URL)}', assuming port 4097`);
             }
             const resolved = resolveOpencodePath(OPENCODE_PATH);
             const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;

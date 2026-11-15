@@ -147,6 +147,14 @@ async function run() {
     const modelIds = Array.isArray(models.json?.data) ? models.json.data.map((m) => m.id) : [];
     check('GET /v1/models lists provider/model ids', modelIds.includes('opencode/kimi-k2.5-free'), JSON.stringify(modelIds));
 
+    const knownModel = await request('/v1/models/opencode%2Fkimi-k2.5-free');
+    check('GET /v1/models/:id returns the listed model', knownModel.response.status === 200 &&
+        knownModel.json?.id === 'opencode/kimi-k2.5-free', knownModel.text.slice(0, 120));
+    const otherModel = await request('/v1/models/some-other-model');
+    check('GET /v1/models/:id describes an unlisted model instead of 404', otherModel.response.status === 200 &&
+        otherModel.json?.id === 'some-other-model' && otherModel.json?.owned_by === 'opencode',
+        otherModel.text.slice(0, 120));
+
     // --- validation -------------------------------------------------------------------------------------
     const invalid = await request('/v1/chat/completions', { method: 'POST', body: {} });
     check('missing messages array returns 400', invalid.response.status === 400, `status ${invalid.response.status}`);

@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 43 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 45 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -97,11 +97,16 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - `GET /health` → `200 {"status":"ok","backend":"<OPENCODE_SERVER_URL>"}`, never touches the backend.
 - `GET /v1/models` → `200 {"object":"list","data":[{id,name,object,owned_by}, …]}`; 5 s cache; failures fall back to a
   single static model and are not cached.
+- `GET /v1/models/:modelId` → `200 {id,name,object,owned_by}` from the same cache; an id the provider list does not
+  contain is described from the id itself (`provider` = text before `/`, default `opencode`) rather than 404, because
+  `/v1/chat/completions` does not restrict the model either.
 - `POST /v1/chat/completions` non-streaming → `chat.completion` with
   `choices[0].message.{role,content,reasoning_content}`, `finish_reason:"stop"` and a `usage` block of zeroes
   (upstream does not report token counts).
 - `POST /v1/chat/completions` streaming → `text/event-stream`, frames `data: {…chat.completion.chunk…}\n\n`,
   a final frame with `"finish_reason":"stop"`, then `data: [DONE]\n\n`. Reasoning deltas use `reasoning_content`.
+  Before the first delta, a `: keep-alive` comment line is written every 15 s (ignored by OpenAI clients, keeps idle
+  proxies from dropping the connection); it stops as soon as real frames flow.
 - Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request), `401` (auth), `404` (unknown route),
   `502` (upstream/provider error), `503` (`type: "queue_full"`, the wait queue is full), `504` (timeout), `500`
   (anything else).

@@ -2949,12 +2949,24 @@ async function ensureBackend(config, options = {}) {
  * Starts the OpenCode-to-OpenAI Proxy server.
  */
 export function startProxy(options) {
-    const disableTools =
-        parseBoolean(options.DISABLE_TOOLS) ??
-        parseBoolean(options.disableTools) ??
-        parseBoolean(process.env.OPENCODE_DISABLE_TOOLS) ??
-        parseBoolean(process.env.DISABLE_TOOLS) ??
-        false;
+    // A value the caller resolved is taken as given (index.js already reported an unusable one, so warning here again
+    // would print the same line twice). The environment is read only when the option is absent, and through
+    // readFlag() so an embedder that calls startProxy() directly gets the same `[Config]` warning the entry point
+    // emits instead of a silent fallback: `DISABLE_TOOLS=maybe` in the environment turned the tool guard off with no
+    // report at all on that path.
+    const flagEnvValue = (names) => {
+        for (const name of names) {
+            const value = process.env[name];
+            if (value !== undefined && String(value).trim() !== '') return { name, value };
+        }
+        return null;
+    };
+    const flagOption = (given, names, fallback) => {
+        if (given !== undefined && given !== null && String(given).trim() !== '') return readFlag(names[0], given, fallback);
+        const source = flagEnvValue(names);
+        return source ? readFlag(source.name, source.value, fallback) : fallback;
+    };
+    const disableTools = flagOption(options.DISABLE_TOOLS ?? options.disableTools, ['OPENCODE_DISABLE_TOOLS', 'DISABLE_TOOLS'], false);
 
     // Normalised once: a trailing slash in OPENCODE_SERVER_URL turns every SDK path into `//session` (404)
     const backendUrl = normalizeBackendUrl(options.OPENCODE_SERVER_URL || 'http://127.0.0.1:4097');
@@ -2970,9 +2982,10 @@ export function startProxy(options) {
         // Raw LOG_LEVEL value: index.js already merged it as "env > config.json" and passes it in; when startProxy is
         // called directly, fall back to reading the environment variable
         LOG_LEVEL: options.LOG_LEVEL ?? options.logLevel ?? process.env.LOG_LEVEL ?? null,
-        USE_ISOLATED_HOME: parseBoolean(
+        USE_ISOLATED_HOME: flagOption(
             options.USE_ISOLATED_HOME ?? options.useIsolatedHome,
-            parseBoolean(process.env.OPENCODE_USE_ISOLATED_HOME ?? process.env.USE_ISOLATED_HOME, false)
+            ['OPENCODE_USE_ISOLATED_HOME', 'USE_ISOLATED_HOME'],
+            false
         ),
         REQUEST_TIMEOUT_MS: (() => {
             // A malformed value must fall back to the default: Number('abc') is NaN and setTimeout(NaN) fires
@@ -2991,7 +3004,7 @@ export function startProxy(options) {
             return DEFAULT_REQUEST_TIMEOUT_MS;
         })(),
         DISABLE_TOOLS: disableTools,
-        DEBUG: parseBoolean(options.DEBUG, parseBoolean(process.env.OPENCODE_PROXY_DEBUG, false))
+        DEBUG: flagOption(options.DEBUG, ['OPENCODE_PROXY_DEBUG'], false)
     };
 
     // The queue limits follow the same precedence as every other key (environment, then config.json, then default).

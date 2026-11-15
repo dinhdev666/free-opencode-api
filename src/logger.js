@@ -103,11 +103,16 @@ export function serializeDetail(value) {
     return truncateText(text, MAX_SERIALIZED_LENGTH);
 }
 
-/** Mask a sensitive string: keep a few leading/trailing characters, mask the middle */
+/**
+ * Mask a sensitive string. The prefix is kept so an operator can tell which credential was used, but nothing is
+ * revealed from the tail: keeping four trailing characters leaked 8 of the 12 characters of a short key such as
+ * `sk-dummy-123`, which is most of its entropy in a log that is collected as often as not. Very short values reveal
+ * nothing at all, and the length is reported instead (the container entrypoint uses the same shape).
+ */
 export function maskSecret(text) {
     const str = String(text);
-    if (str.length <= 8) return '***';
-    return `${str.slice(0, 4)}***${str.slice(-4)}`;
+    if (str.length <= 16) return `***(${str.length} chars)`;
+    return `${str.slice(0, 4)}***(${str.length} chars)`;
 }
 
 // Request header names that must be masked before output (lowercase)

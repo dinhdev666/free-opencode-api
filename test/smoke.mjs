@@ -273,6 +273,18 @@ async function run() {
     });
     check('a wrong Authorization header is not rescued by a correct X-Api-Key',
         bothHeaders.status === 401, `status ${bothHeaders.status}`);
+    // Presence decides, not the parsed token: a proxy that injects `Authorization: Basic ...` (or a client that sends a
+    // bare `Bearer`) presented an Authorization header, and the alias used to rescue it because the token was empty
+    const otherScheme = await fetch(`${BASE}/v1/models`, {
+        headers: { authorization: 'Basic dXNlcjpwYXNz', 'x-api-key': API_KEY }
+    });
+    check('a non-Bearer Authorization header is not rescued by a correct X-Api-Key',
+        otherScheme.status === 401, `status ${otherScheme.status}`);
+    const bareBearer = await fetch(`${BASE}/v1/models`, {
+        headers: { authorization: 'Bearer', 'x-api-key': API_KEY }
+    });
+    check('a bare Bearer scheme is not rescued by a correct X-Api-Key',
+        bareBearer.status === 401, `status ${bareBearer.status}`);
 
     // --- preflight --------------------------------------------------------------------------------------
     const preflight = await fetch(`${BASE}/v1/chat/completions`, { method: 'OPTIONS' });
@@ -323,6 +335,18 @@ async function run() {
     check('a whitespace model id is a missing route',
         blankEncoded.status === 404 && blankEncoded.json?.error?.type === 'not_found',
         `status ${blankEncoded.status} ${JSON.stringify(blankEncoded.json)?.slice(0, 120)}`);
+    // An id whose last segment is empty addresses no model either: `/v1/models/%2F` is "/" and
+    // `/v1/models/opencode%2F` is "opencode/", both described as a model with an empty name
+    const separatorOnly = await fetch(`${BASE}/v1/models/%2F`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then(async (r) => ({ status: r.status, json: await r.json() }));
+    check('a separator-only model id is a missing route',
+        separatorOnly.status === 404 && separatorOnly.json?.error?.type === 'not_found',
+        `status ${separatorOnly.status} ${JSON.stringify(separatorOnly.json)?.slice(0, 120)}`);
+    const emptyName = await fetch(`${BASE}/v1/models/opencode%2F`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then(async (r) => ({ status: r.status, json: await r.json() }));
+    check('a model id with an empty trailing segment is a missing route',
+        emptyName.status === 404 && emptyName.json?.error?.type === 'not_found',
+        `status ${emptyName.status} ${JSON.stringify(emptyName.json)?.slice(0, 120)}`);
     const trailingSlash = await request('/v1/models/');
     check('the trailing-slash listing still answers', trailingSlash.response.status === 200 &&
         trailingSlash.json?.object === 'list', trailingSlash.text.slice(0, 120));
@@ -333,6 +357,20 @@ async function run() {
     check('400 uses the OpenAI error envelope', typeof invalid.json?.error?.message === 'string', invalid.text.slice(0, 120));
     check('400 carries the invalid_request_error type', invalid.json?.error?.type === 'invalid_request_error',
         invalid.text.slice(0, 120));
+
+    // A model id whose provider or model half is empty is not a model: `/v1/models` answers 404 for the same ids, and
+    // sending one to the backend only produced an upstream error the client could not act on
+    for (const badModel of ['opencode/', '/big-pickle']) {
+        const badModelResponse = await request('/v1/chat/completions', {
+            method: 'POST',
+            body: { model: badModel, messages: [{ role: 'user', content: 'hi' }] }
+        });
+        check(`a model id with an empty half is rejected: ${badModel}`,
+            badModelResponse.response.status === 400 &&
+            badModelResponse.json?.error?.type === 'invalid_request_error' &&
+            String(badModelResponse.json?.error?.message).includes(badModel),
+            `status ${badModelResponse.response.status} ${badModelResponse.text.slice(0, 120)}`);
+    }
 
     // Fastify rejects the body before the handler runs; its error must use the same envelope as ours
     const badJson = await fetch(`${BASE}/v1/chat/completions`, {
@@ -375,6 +413,50 @@ async function run() {
     check('an unparsable text/plain body names the real problem',
         textPlainBad.status === 400 && /Content-Type: application\/json/.test(textPlainBadJson?.error?.message || ''),
         `${textPlainBad.status} ${JSON.stringify(textPlainBadJson).slice(0, 160)}`);
+
+    // `curl -d '{...}'` without `-H 'content-type: application/json'` sends the body as
+    // `application/x-www-form-urlencoded`, which Fastify answers with a bare 415: the documented "the content-type
+    // header is optional" path failed for the most common hand-written client. The form type is handed to the handler
+    // as the same unparsed string instead.
+    const formBody = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/x-www-form-urlencoded' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: false })
+    });
+    const formJson = await formBody.json().catch(() => null);
+    check('a JSON body sent as a form body (curl -d without the header) is still served',
+        formBody.status === 200 && formJson?.choices?.[0]?.message?.content === ANSWER,
+        `status ${formBody.status} ${JSON.stringify(formJson).slice(0, 120)}`);
+    const formBad = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'not json at all'
+    });
+    const formBadJson = await formBad.json().catch(() => null);
+    check('an unparsable form body keeps the 400 envelope',
+        formBad.status === 400 && formBadJson?.error?.type === 'invalid_request_error',
+        `${formBad.status} ${JSON.stringify(formBadJson).slice(0, 160)}`);
+    const xmlBody = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/xml' },
+        body: '<a/>'
+    });
+    check('an unrelated content type still reports the media type (415)', xmlBody.status === 415, `status ${xmlBody.status}`);
+    // The gateway does not decompress request bodies, so a gzipped one used to reach the JSON parser and be reported
+    // as "body is not valid JSON" - blaming the payload for an unsupported encoding.
+    const gzipped = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+            authorization: `Bearer ${API_KEY}`,
+            'content-type': 'application/json',
+            'content-encoding': 'gzip'
+        },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+    });
+    const gzippedJson = await gzipped.json().catch(() => null);
+    check('a Content-Encoding the gateway cannot read is named in the 415',
+        gzipped.status === 415 && /Content-Encoding: gzip/.test(gzippedJson?.error?.message || ''),
+        `${gzipped.status} ${JSON.stringify(gzippedJson).slice(0, 160)}`);
 
     const badModel = await request('/v1/chat/completions', {
         method: 'POST',
@@ -651,6 +733,67 @@ async function run() {
         growing.json?.choices?.[0]?.message?.content === ANSWER,
         JSON.stringify(growing.json?.choices?.[0]?.message?.content));
 
+    // --- a finished message in the prompt response is used as-is -----------------------------------------
+    // The backend answers POST /session/:id/message with the message it produced, so a finished one is the answer and
+    // the follow-up GET is pure overhead. The stub stores nothing for this marker: answering 200 at all proves the
+    // prompt response was used, and the poll counter proves no round trip was spent on it.
+    const pollsBeforeFastPath = (await fetch(`${STUB_URL}/__sessions`).then((r) => r.json())).messagePolls;
+    const fastPath = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'PROMPTDONE' }], stream: false }
+    });
+    const pollsAfterFastPath = (await fetch(`${STUB_URL}/__sessions`).then((r) => r.json())).messagePolls;
+    check('a finished message in the prompt response answers without polling',
+        fastPath.response.status === 200 && fastPath.json?.choices?.[0]?.message?.content === ANSWER,
+        `status ${fastPath.response.status} ${JSON.stringify(fastPath.json?.choices?.[0]?.message?.content)}`);
+    check('the fast path spends no message poll',
+        pollsAfterFastPath === pollsBeforeFastPath,
+        `message polls ${pollsBeforeFastPath} -> ${pollsAfterFastPath}`);
+
+    // --- the newer `developer` role is an instruction, not a chat turn -----------------------------------
+    // OpenAI renamed the system role to `developer`; a client that sends it means the instructions. Prefixing it with
+    // "DEVELOPER: …" and pushing it into the conversation changed how a model reads it.
+    const developerRole = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'developer', content: 'answer in one word' }, { role: 'user', content: 'hi' }] }
+    });
+    const developerStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    check('a developer message reaches the backend as its system prompt',
+        developerRole.response.status === 200 && /answer in one word/.test(String(developerStats?.lastSystemPrompt)),
+        `status ${developerRole.response.status} system ${JSON.stringify(developerStats?.lastSystemPrompt)}`);
+    check('a developer message is not turned into a conversation part',
+        !/DEVELOPER/i.test(String(developerStats?.lastSystemPrompt)) && developerRole.response.status === 200,
+        JSON.stringify(developerStats?.lastSystemPrompt));
+
+    // --- a rejected prompt is an upstream failure ---------------------------------------------------------
+    // The SDK resolves with { error, response } on a non-2xx answer instead of throwing, so a rejected prompt used to
+    // look like a slow answer: no message ever existed and the request burned its whole budget to answer 504.
+    const promptRejectedAt = Date.now();
+    const promptRejected = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'REJECTPROMPT' }], stream: false }
+    });
+    const promptRejectedMs = Date.now() - promptRejectedAt;
+    check('a rejected prompt answers 502, not a timeout',
+        promptRejected.response.status === 502, `status ${promptRejected.response.status}`);
+    check('the rejected prompt reports the upstream status and reason',
+        typeof promptRejected.json?.error?.message === 'string' &&
+        promptRejected.json.error.message.includes('status 500') &&
+        promptRejected.json.error.message.includes('provider refused the prompt'),
+        String(promptRejected.json?.error?.message));
+    check('a rejected prompt fails fast instead of waiting for the budget', promptRejectedMs < 5000,
+        `${promptRejectedMs} ms`);
+    const promptRejectedStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'REJECTPROMPT' }], stream: true },
+        stream: true
+    });
+    check('a rejected prompt in streaming mode answers the same 502',
+        promptRejectedStream.response.status === 502, `status ${promptRejectedStream.response.status}`);
+    const afterRejection = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    check('a rejected prompt still deletes its session',
+        afterRejection && afterRejection.live === 0, JSON.stringify(afterRejection));
+
     // --- a provider failure in non-streaming mode ---------------------------------------------------------
     const failed = await request('/v1/chat/completions', {
         method: 'POST',
@@ -800,6 +943,11 @@ async function run() {
     const cappedRefused = await cappedRequest('SLOW queued behind');
     check('a busy queue of 0 is answered with 503', cappedRefused.status === 503, `status ${cappedRefused.status}`);
     check('503 uses the queue_full envelope', cappedRefused.json?.error?.type === 'queue_full',
+        JSON.stringify(cappedRefused.json));
+    // The refusal is read by a human as often as by an SDK: with the queue configured to hold nothing, "0 completions
+    // are already waiting" described the setting as if it were the bug.
+    check('a refused completion names the disabled queue instead of reporting "0 waiting"',
+        /OPENCODE_PROXY_MAX_QUEUE=0/.test(cappedRefused.json?.error?.message || ''),
         JSON.stringify(cappedRefused.json));
     // A retryable refusal has to say how long to wait, or an OpenAI SDK gives up instead of retrying
     check('a full queue tells the client when to retry', cappedRefused.retryAfter === '1',
@@ -1259,6 +1407,60 @@ async function run() {
     stop(rejectStub);
     await waitForExit(rejectStub);
 
+    // --- a backend that rejects the event stream ---------------------------------------------------------
+    // A build whose SSE endpoint moved, or a proxy in front of it, answers /health and the session calls but refuses
+    // GET /event. The SDK reports that as an error tuple with no stream, so the gateway must fall back to polling and
+    // still answer: a streaming client that gets a 502 (or a hang) because of a missing event stream is a broken
+    // gateway, not a broken model.
+    const noEventsStubPort = GATEWAY_PORT + 15;
+    const noEventsStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(noEventsStubPort), STUB_FAIL_EVENTS: '1' }
+    });
+    children.push(noEventsStub);
+    noEventsStub.stdout.on('data', () => {});
+    noEventsStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${noEventsStubPort}/health`);
+    const noEventsGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(noEventsStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${noEventsStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(noEventsGateway);
+    noEventsGateway.stdout.on('data', () => {});
+    noEventsGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${noEventsStubPort + 1}/health`);
+    const noEventsUrl = `http://127.0.0.1:${noEventsStubPort + 1}`;
+    const noEventsResponse = await fetch(`${noEventsUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true }),
+        signal: AbortSignal.timeout(20000)
+    }).then(async (r) => ({ status: r.status, text: await r.text() }))
+        .catch((error) => ({ status: 0, text: String(error) }));
+    const noEventsFrames = parseSseFrames(noEventsResponse.text);
+    const noEventsText = noEventsFrames
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => { try { return JSON.parse(frame); } catch { return null; } })
+        .filter(Boolean)
+        .map((chunk) => chunk.choices?.[0]?.delta?.content || '')
+        .join('');
+    check('a rejected event stream still answers the streaming request',
+        noEventsResponse.status === 200 && noEventsText === ANSWER,
+        `status ${noEventsResponse.status} content ${JSON.stringify(noEventsText)}`);
+    check('the polling fallback still terminates the stream',
+        noEventsFrames[noEventsFrames.length - 1] === '[DONE]',
+        JSON.stringify(noEventsFrames.slice(-2)));
+    stopGateway(noEventsGateway);
+    await waitForExit(noEventsGateway);
+    stop(noEventsStub);
+    await waitForExit(noEventsStub);
+
     // --- a backend that reports no models ---------------------------------------------------------------
     // A provider payload the gateway cannot read (a changed shape, a version that reports nothing) answers 200 with an
     // empty list. Serving {"data":[]} leaves a client with no model to choose, so the gateway falls back to its single
@@ -1289,13 +1491,15 @@ async function run() {
     await waitForOk(`${emptyUrl}/health`);
     const emptyList = await fetch(`${emptyUrl}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
         .then((r) => r.json()).catch(() => null);
-    check('an empty provider list falls back to the static model',
+    // The second call reports a provider whose model map the gateway cannot read, so both shapes of an unreadable
+    // payload take the fallback path
+    check('an empty or model-less provider list falls back to the static model',
         emptyList?.object === 'list' && emptyList.data?.length === 1 && emptyList.data[0].id === 'opencode/big-pickle' &&
         emptyList.data[0].name === 'Big Pickle' && emptyList.data[0].owned_by === 'opencode',
         JSON.stringify(emptyList)?.slice(0, 140));
     const emptyListAgain = await fetch(`${emptyUrl}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
         .then((r) => r.json()).catch(() => null);
-    check('the empty answer is not cached',
+    check('the fallback answer is not cached',
         emptyListAgain?.data?.length === 1 && emptyListAgain.data[0].id === 'opencode/big-pickle',
         JSON.stringify(emptyListAgain)?.slice(0, 140));
     stopGateway(emptyGateway);

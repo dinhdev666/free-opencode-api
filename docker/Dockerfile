@@ -42,8 +42,12 @@ COPY . .
 # Approach: the official npm package opencode-ai, which bundles linux x64/arm64 binaries for both glibc and musl,
 #           and installs the executable into the npm global bin directory, i.e. /usr/local/bin/opencode
 # (npm is only used here to install this third-party CLI, not for the project's own dependencies)
-# OPENCODE_VERSION pins it for reproducible builds: docker build --build-arg OPENCODE_VERSION=1.2.3
-ARG OPENCODE_VERSION=latest
+# OPENCODE_VERSION pins it for reproducible builds AND for the API the gateway drives: `latest` now resolves to the 2.x
+# line, whose `opencode serve` serves the web UI instead of the 1.x session API (`/session`, `/session/:id/message`),
+# so every completion in a `latest` image failed with "rejected session creation (status 405)". 1.19.5 is the newest
+# 1.x release and matches the bundled `@opencode-ai/sdk`; override to try another one:
+#   docker build --build-arg OPENCODE_VERSION=1.19.5
+ARG OPENCODE_VERSION=1.19.5
 RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" \
     && npm cache clean --force
 # Alternative (if the npm package installation has problems, use the official install script):

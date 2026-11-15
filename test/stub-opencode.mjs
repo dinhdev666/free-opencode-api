@@ -22,6 +22,9 @@ const EMPTY_PROVIDERS = process.env.STUB_EMPTY_PROVIDERS === '1';
 // Reject POST /session (an incompatible backend, a proxy in front of it) so a test can prove the gateway reports the
 // upstream status and reason instead of a bare 500
 const FAIL_SESSION = process.env.STUB_FAIL_SESSION === '1';
+// Reject GET /event with a 500 (a build whose event stream moved, a proxy in front of it) so a test can prove a
+// streaming request still answers from the polling fallback instead of failing
+const FAIL_EVENTS = process.env.STUB_FAIL_EVENTS === '1';
 // Fail the first N polls of a session's messages with a 500 (a transient backend hiccup), or every poll
 // (STUB_ALWAYS_FAIL_MESSAGES=1), so a test can prove the gateway retries a failed poll and gives up in bounded time
 const FAIL_MESSAGES = Number(process.env.STUB_FAIL_MESSAGES || 0);
@@ -30,6 +33,8 @@ const ALWAYS_FAIL_MESSAGES = process.env.STUB_ALWAYS_FAIL_MESSAGES === '1';
 const DROP_MESSAGES = Number(process.env.STUB_DROP_MESSAGES || 0);
 let failedMessagePolls = 0;
 let droppedMessagePolls = 0;
+// Counts GET /session/:id/message calls, so a test can prove the non-streaming fast path needed no poll at all
+let messagePolls = 0;
 // An answer with a tool-call block whose tags are cut in the middle by the delta boundaries (prompt marker TOOLTAG)
 const TOOL_TAG_ANSWER = 'hello <function_calls>secret</function_calls> world';
 // An answer whose last delta ends with a fragment that looks like the start of a tool-call tag but never becomes
@@ -48,6 +53,9 @@ let deletedSessions = 0;
 let promptedSessions = 0;
 // Counts /config/providers calls, so a test can prove the gateway collapses a cold-cache burst into one round trip
 let providerCalls = 0;
+// The system prompt of the most recent prompt body: the gateway folds `system`/`developer` messages into it, so a
+// test can prove they never reach the conversation parts
+let lastSystemPrompt = '';
 
 const sendJson = (res, statusCode, body) => {
     const payload = JSON.stringify(body);
@@ -180,15 +188,21 @@ const server = http.createServer(async (req, res) => {
             created: sessionSeq,
             deleted: deletedSessions,
             prompts: promptedSessions,
-            providerCalls
+            providerCalls,
+            messagePolls,
+            lastSystemPrompt
         });
     }
 
     if (path === '/config/providers') {
         providerCalls += 1;
-        // A backend version whose payload the gateway cannot read answers with no models at all; an empty listing is as
-        // useless to a client as a failed call, so a test can prove the gateway falls back instead of serving []
-        if (EMPTY_PROVIDERS) return sendJson(res, 200, { providers: [] });
+        // A backend version whose payload the gateway cannot read answers with nothing to choose from; a listing with
+        // no models at all is as useless to a client as a failed call, so a test can prove the gateway falls back
+        // instead of serving []. The first call reports an empty provider list and every later one a provider whose
+        // model map the gateway cannot read, so one stub covers both shapes of an unreadable answer.
+        if (EMPTY_PROVIDERS) {
+            return sendJson(res, 200, providerCalls === 1 ? { providers: [] } : { providers: [{ id: 'opencode' }] });
+        }
         return sendJson(res, 200, {
             providers: [
                 {
@@ -227,11 +241,23 @@ const server = http.createServer(async (req, res) => {
             try {
                 const parsed = JSON.parse((await readBody(req)) || '{}');
                 session.promptText = (parsed.parts || []).map((part) => part?.text || '').join(' ');
+                lastSystemPrompt = typeof parsed.system === 'string' ? parsed.system : '';
             } catch {
                 session.promptText = '';
+                lastSystemPrompt = '';
             }
             session.prompted = true;
             promptedSessions += 1;
+            if (session.promptText.includes('REJECTPROMPT')) {
+                // The SDK resolves with { error, response } on a non-2xx answer instead of throwing: a gateway that
+                // ignores that tuple waits for an assistant message that will never exist and answers 504
+                return sendJson(res, 500, { error: { message: 'provider refused the prompt' } });
+            }
+            if (session.promptText.includes('PROMPTDONE')) {
+                // The prompt response already carries the finished message and nothing is stored for polling: an answer
+                // served without a single GET /session/:id/message proves the fast path was used
+                return sendJson(res, 200, buildAssistantMessage(id, ANSWER, REASONING));
+            }
             if (session.promptText.includes('FAIL')) {
                 // A provider failure: the assistant message carries an error and no content, so a non-streaming
                 // request must answer 502 and a streaming one must end with an in-band error frame
@@ -353,6 +379,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (isMessage && req.method === 'GET') {
+            messagePolls += 1;
             droppedMessagePolls += 1;
             if (droppedMessagePolls <= DROP_MESSAGES) {
                 req.destroy();
@@ -367,6 +394,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === '/event') {
+        if (FAIL_EVENTS) return sendJson(res, 500, { error: { message: 'event stream unavailable' } });
         res.writeHead(200, {
             'content-type': 'text/event-stream',
             'cache-control': 'no-cache',

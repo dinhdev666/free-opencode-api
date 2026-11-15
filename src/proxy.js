@@ -126,6 +126,39 @@ const urlPath = (url) => {
     return query === -1 ? url : url.slice(0, query);
 };
 
+
+// Upstream text on its way to a client or a log line: masked and bounded. Module scope because the top-level error
+// handler writes 5xx sentences too, and those are written by whatever threw.
+//
+// A backend (or a proxy in front of it) can quote a URL inside an error payload, and a configured backend URL may
+// carry a credential - Node's `fetch` answered `Request cannot be constructed from a URL that includes
+// credentials: http://user:secret@host:4097/session`, which reached the client-facing 502 body and this process's
+// log verbatim. The query string is masked for the same reason it is masked on a request URL, and the length is
+// bounded so a backend cannot answer a client with a reason the size of the request body limit.
+const MAX_UPSTREAM_TEXT_CHARS = 512;
+// Only the URL-shaped words of the text are masked. `maskUrlQuery()` is written for a URL: given a sentence it
+// read everything after the first `?` as that parameter's value, so `…?x=1: connection refused` answered
+// `…?x=***` and lost the half of the reason that explains the failure.
+//
+// The words are found by splitting on whitespace rather than with `/\S+:\/\/\S+/`, which backtracked over a
+// million-character token with no `://` in it one character at a time: a provider error of 1 MB parked the request
+// for longer than its whole budget. `includes('://')` decides per token, and a token is at most a word.
+const maskUrlsInText = (text) => {
+    const value = String(text);
+    if (!value.includes('://')) return value;
+    return value
+        .split(/(\s+)/)
+        .map((token) => (token.includes('://') ? maskUrlQuery(maskUrlCredentials(token)) : token))
+        .join('');
+};
+export const clientFacingText = (value) => {
+    if (typeof value !== 'string' || value === '') return '';
+    const masked = maskUrlsInText(value);
+    return masked.length > MAX_UPSTREAM_TEXT_CHARS
+        ? `${masked.slice(0, MAX_UPSTREAM_TEXT_CHARS)}…[truncated ${masked.length - MAX_UPSTREAM_TEXT_CHARS} chars]`
+        : masked;
+};
+
 // A client-supplied value on its way into a response body, under one rule.
 //
 // The `415` media-type message already replaced control characters and cut the echoed type; the other sites copied the
@@ -1540,37 +1573,6 @@ function createApp(config) {
             if (status !== undefined) this.status = status;
         }
     }
-
-    // Upstream text on its way to a client or a log line: masked and bounded.
-    //
-    // A backend (or a proxy in front of it) can quote a URL inside an error payload, and a configured backend URL may
-    // carry a credential - Node's `fetch` answered `Request cannot be constructed from a URL that includes
-    // credentials: http://user:secret@host:4097/session`, which reached the client-facing 502 body and this process's
-    // log verbatim. The query string is masked for the same reason it is masked on a request URL, and the length is
-    // bounded so a backend cannot answer a client with a reason the size of the request body limit.
-    const MAX_UPSTREAM_TEXT_CHARS = 512;
-    // Only the URL-shaped words of the text are masked. `maskUrlQuery()` is written for a URL: given a sentence it
-    // read everything after the first `?` as that parameter's value, so `…?x=1: connection refused` answered
-    // `…?x=***` and lost the half of the reason that explains the failure.
-    //
-    // The words are found by splitting on whitespace rather than with `/\S+:\/\/\S+/`, which backtracked over a
-    // million-character token with no `://` in it one character at a time: a provider error of 1 MB parked the request
-    // for longer than its whole budget. `includes('://')` decides per token, and a token is at most a word.
-    const maskUrlsInText = (text) => {
-        const value = String(text);
-        if (!value.includes('://')) return value;
-        return value
-            .split(/(\s+)/)
-            .map((token) => (token.includes('://') ? maskUrlQuery(maskUrlCredentials(token)) : token))
-            .join('');
-    };
-    const clientFacingText = (value) => {
-        if (typeof value !== 'string' || value === '') return '';
-        const masked = maskUrlsInText(value);
-        return masked.length > MAX_UPSTREAM_TEXT_CHARS
-            ? `${masked.slice(0, MAX_UPSTREAM_TEXT_CHARS)}…[truncated ${masked.length - MAX_UPSTREAM_TEXT_CHARS} chars]`
-            : masked;
-    };
 
     // Describes a failed SDK call: the status and the reason the backend gave. The SDK hands back the parsed body
     // as-is (`{error:{message}}`, `{message}` or a plain string), so taking the first object would print
@@ -3109,7 +3111,14 @@ function createApp(config) {
             }
             return err.message;
         };
-        const errorMessage = errorMessageFor(error);
+        // A 5xx sentence is the one message in this handler nobody here wrote: it comes from whatever threw - the SDK,
+        // Node's `fetch`, a library - and an error raised while talking to a backend behind a credential-bearing URL
+        // can quote that URL. Every other upstream sentence already goes through `clientFacingText()`; this is the
+        // path that did not, so the credential `OPENCODE_SERVER_URL` may carry (`?token=…`) could reach a client in a
+        // 500 body. A 4xx message is the gateway's own words about the client's request (`echoedValue()` already
+        // bounds the echoed parts) and is left as it is.
+        const rawMessage = errorMessageFor(error);
+        const errorMessage = statusCode >= 500 ? clientFacingText(rawMessage) || rawMessage : rawMessage;
         const detail = {
             method: request.method,
             // Client input: a credential in the query string is masked and a pathological URL is cut, the same way

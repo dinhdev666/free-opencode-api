@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
-import { parseBoolean, resolveBackendAuth, timeoutMessage } from '../src/proxy.js';
+import { clientFacingText, parseBoolean, resolveBackendAuth, timeoutMessage } from '../src/proxy.js';
 import { readConfigFile, findUnknownKeys, CONFIG_FILE_KEYS } from '../src/config.js';
 import {
     createLogger, maskBackendUrl, maskHeaders, maskSecret, maskUrlCredentials, maskUrlQuery, serializeDetail,
@@ -351,6 +351,35 @@ async function run() {
     check('a credential-free message is left exactly as it was',
         maskUrlCredentials(undefined) === 'undefined' && maskUrlCredentials('plain text') === 'plain text',
         `${maskUrlCredentials(undefined)} / ${maskUrlCredentials('plain text')}`);
+
+    // Every upstream sentence the gateway writes goes through `clientFacingText()`; the top-level error handler was
+    // the one path that did not, and a 5xx sentence there is the only message nobody in the gateway wrote - it comes
+    // from whatever threw, and an error raised while talking to a backend behind a credential-bearing URL can quote
+    // that URL. The rule is asserted on the helper: URL-shaped words masked (userinfo *and* query, because the URL the
+    // SDK is given keeps its query), the rest of the sentence readable, and the length bounded.
+    const clientFacingCases = [
+        ['connect ECONNREFUSED http://user:secret@127.0.0.1:4097/session?token=abc',
+            'connect ECONNREFUSED http://***@127.0.0.1:4097/session?token=***'],
+        ['request to http://host:4097/session?api_key=k failed: ECONNRESET',
+            'request to http://host:4097/session?api_key=*** failed: ECONNRESET'],
+        ['boom', 'boom'],
+        ['', ''],
+        [undefined, '']
+    ];
+    const clientFacingResults = clientFacingCases.map(([input, expected]) => [String(input), clientFacingText(input), expected]);
+    check('a server-side sentence is masked before a client reads it',
+        clientFacingResults.every(([, actual, expected]) => actual === expected),
+        JSON.stringify(clientFacingResults.filter(([, actual, expected]) => actual !== expected)));
+    const longSentence = clientFacingText('e'.repeat(600));
+    check('a server-side sentence is bounded, so a throwing library cannot answer with a body-sized reason',
+        longSentence.length === 533 && longSentence.slice(512) === '…[truncated 88 chars]', longSentence.slice(500));
+
+    // The helper matters only where it is used. A 5xx written by an unexpected throw cannot be provoked from outside -
+    // no request the gateway accepts makes a handler throw - so the wiring is asserted on the source: the sentence a
+    // 500/502/504 body carries is the masked one.
+    check('the top-level error handler sends a 5xx sentence through the masking',
+        proxySource.includes('const errorMessage = statusCode >= 500 ? clientFacingText(rawMessage)'),
+        'src/proxy.js no longer masks the message a 5xx body carries');
 
     // `http://user:secret@host:4097` was documented as supported and could not work: the SDK calls every endpoint
     // through Node's fetch, which refuses a URL carrying credentials, so every completion answered 502 and the

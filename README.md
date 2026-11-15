@@ -405,6 +405,11 @@ that names its position and type, because the gateway forwards text to a CLI ses
 {"error":{"message":"messages[0].content[1] uses an unsupported content part type \"image_url\"; this gateway forwards text only","type":"invalid_request_error"}}
 ```
 
+A part whose `text` field is missing is told which field is missing rather than which type is unsupported
+(`messages[0].content[0].text is required for a text part`), and an object with neither a `type` nor a `text`
+(`{}`, `{"type":5}`) is refused as one (`… must be a string or an object with a text field, found an object without a
+text field`) — neither quotes a type the client did not send.
+
 Dropping those parts instead (the previous behaviour) answered a question the backend never received, and a request
 whose only part was an image was reported as missing text it had never been asked for.
 

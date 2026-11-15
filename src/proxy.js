@@ -2183,7 +2183,22 @@ function createApp(config) {
                                     if ('text' in part && typeof part.text !== 'string') {
                                         return { text, unsupported: { index: i, field: 'text', found: jsonTypeName(part.text) } };
                                     }
-                                    return { text, unsupported: { index: i, type: typeof part.type === 'string' ? part.type : 'unknown' } };
+                                    // A text part whose `text` field is *missing* (`{"type":"text"}`) is the same
+                                    // mistake one step earlier, and it used to be answered with that same "unsupported
+                                    // type text" sentence: name the missing field.
+                                    if (part.type === 'text' || part.type === 'input_text') {
+                                        return { text, unsupported: { index: i, field: 'text', required: true } };
+                                    }
+                                    // A part with no usable `type` at all (`{}`, `{"foo":1}`, `{"type":5}`,
+                                    // `{"type":""}`) was answered `uses an unsupported content part type "unknown"`,
+                                    // quoting a value the client never sent in the slot that means "the type you sent".
+                                    // It is an object with no text to forward, which is what the scalar-part sentence
+                                    // already describes.
+                                    const partType = typeof part.type === 'string' ? part.type : '';
+                                    if (!partType) {
+                                        return { text, unsupported: { index: i, found: 'an object without a text field' } };
+                                    }
+                                    return { text, unsupported: { index: i, type: partType } };
                                 }
                                 // null/number/boolean parts carry no content either, and dropping them in silence ended
                                 // the request at "messages must include at least one non-system text message" - about
@@ -2202,7 +2217,14 @@ function createApp(config) {
                             if ('text' in content && typeof content.text !== 'string') {
                                 return { text: '', unsupported: { field: 'text', found: jsonTypeName(content.text) } };
                             }
-                            return { text: '', unsupported: { type: typeof content.type === 'string' ? content.type : 'unknown' } };
+                            // The same two shapes as a part inside an array: a text part missing its field, and an
+                            // object with no usable `type` (which is not a part type the client named)
+                            if (content.type === 'text' || content.type === 'input_text') {
+                                return { text: '', unsupported: { field: 'text', required: true } };
+                            }
+                            const contentPartType = typeof content.type === 'string' ? content.type : '';
+                            if (!contentPartType) return { text: '', unsupported: { found: 'an object without a text field' } };
+                            return { text: '', unsupported: { type: contentPartType } };
                         }
                         if (content === null || content === undefined) return { text: '' };
                         // A scalar `content` (`42`, `true`) is not text the client wrote: stringifying it sent the model
@@ -2229,6 +2251,7 @@ function createApp(config) {
                                     partIndex: parsed.unsupported.index,
                                     type: parsed.unsupported.type,
                                     field: parsed.unsupported.field,
+                                    required: parsed.unsupported.required,
                                     found: parsed.unsupported.found
                                 };
                             }
@@ -2306,7 +2329,9 @@ function createApp(config) {
                         // gateway does forward - and dropped a scalar part in silence, so the request ended at
                         // "messages must include at least one non-system text message" instead.
                         const message = unsupported.field
-                            ? `${at}.${unsupported.field} must be a string, found ${unsupported.found}`
+                            ? unsupported.required
+                                ? `${at}.${unsupported.field} is required for a text part`
+                                : `${at}.${unsupported.field} must be a string, found ${unsupported.found}`
                             : unsupported.found
                                 ? `${at} must be a string or an object with a text field, found ${unsupported.found}`
                                 : `${at} uses an unsupported content part type "${echoedValue(unsupported.type)}"; this gateway forwards text only`;

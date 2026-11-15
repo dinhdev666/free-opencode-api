@@ -29,6 +29,9 @@ const FAIL_SESSION = process.env.STUB_FAIL_SESSION === '1';
 // does when it cannot reach it: the gateway copies that reason into a client-facing 502 body and into its log, so a
 // test can prove both are masked
 const URL_IN_ERROR = process.env.STUB_URL_IN_ERROR === '1';
+// Refuse POST /session with a megabyte of JSON in the body (a proxy in front of the backend answering its own error
+// page): the gateway keeps 500 characters of it as a log summary, and used to serialise all of it first
+const BIG_ERROR_BODY = process.env.STUB_BIG_ERROR_BODY === '1';
 // Reject GET /event with a 500 (a build whose event stream moved, a proxy in front of it) so a test can prove a
 // streaming request still answers from the polling fallback instead of failing
 const FAIL_EVENTS = process.env.STUB_FAIL_EVENTS === '1';
@@ -277,6 +280,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === '/session' && req.method === 'POST') {
+        if (BIG_ERROR_BODY) {
+            return sendJson(res, 502, { error: { message: 'x'.repeat(1000000), detail: { nested: ['y'.repeat(200000)] } } });
+        }
         if (FAIL_SESSION) return sendJson(res, 405, { error: { message: 'session creation is not supported by this build' } });
         if (URL_IN_ERROR) {
             return sendJson(res, 502, {

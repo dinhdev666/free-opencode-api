@@ -74,7 +74,7 @@ function truncateText(text, maxLen) {
  * header parser drops a header named `__proto__`, so `maskHeaders` only ever sees one from a caller that built the
  * object itself - both are reasons the helpers must not be the thing that loses it.)
  */
-function setOwnProperty(target, key, value) {
+export function setOwnProperty(target, key, value) {
     if (key === '__proto__') {
         Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
         return;

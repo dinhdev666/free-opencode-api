@@ -2035,6 +2035,59 @@ async function run() {
     stop(rejectStub);
     await waitForExit(rejectStub);
 
+    // --- a backend error body larger than the summary --------------------------------------------------
+    // The 500 characters the gateway keeps as a log summary used to come from `JSON.stringify(body).slice(0, 500)`:
+    // the whole backend payload was serialised first, so a proxy answering with a megabyte of JSON paid a megabyte
+    // string on the error path. The summary is bounded before it is built, and the log line stays short.
+    const bigErrorStubPort = GATEWAY_PORT + 60;
+    const bigErrorStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(bigErrorStubPort), STUB_BIG_ERROR_BODY: '1' }
+    });
+    children.push(bigErrorStub);
+    bigErrorStub.stdout.on('data', () => {});
+    bigErrorStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${bigErrorStubPort}/health`);
+    let bigErrorOutput = '';
+    const bigErrorGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(bigErrorStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${bigErrorStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(bigErrorGateway);
+    bigErrorGateway.stdout.on('data', (chunk) => { bigErrorOutput += chunk; });
+    bigErrorGateway.stderr.on('data', (chunk) => { bigErrorOutput += chunk; });
+    const bigErrorUrl = `http://127.0.0.1:${bigErrorStubPort + 1}`;
+    await waitForOk(`${bigErrorUrl}/health`);
+    const bigErrorStartedAt = Date.now();
+    const bigErrorAnswer = await fetch(`${bigErrorUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(20000)
+    }).then((r) => r.json().then((json) => ({ status: r.status, json })))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    const bigErrorMs = Date.now() - bigErrorStartedAt;
+    await sleep(150);
+    const bigErrorLine = bigErrorOutput.split('\n').find((line) => line.includes('[Proxy] API Error')) || '';
+    check('a backend error body of 1 MB is summarised, not copied',
+        bigErrorAnswer.status === 502 && bigErrorLine.length > 0 && bigErrorLine.length < 1200,
+        `status ${bigErrorAnswer.status}, summary line ${bigErrorLine.length} chars`);
+    check('the summarised backend body keeps the shape of the payload',
+        bigErrorLine.includes('"bodySummary"') && bigErrorLine.includes('…'),
+        bigErrorLine.slice(0, 200));
+    check('a 1 MB backend error body is handled without a stall',
+        bigErrorMs < 8000, `${bigErrorMs} ms`);
+    stopGateway(bigErrorGateway);
+    await waitForExit(bigErrorGateway);
+    stop(bigErrorStub);
+    await waitForExit(bigErrorStub);
+
     // --- a backend that rejects the event stream ---------------------------------------------------------
     // A build whose SSE endpoint moved, or a proxy in front of it, answers /health and the session calls but refuses
     // GET /event. The SDK reports that as an error tuple with no stream, so the gateway must fall back to polling and

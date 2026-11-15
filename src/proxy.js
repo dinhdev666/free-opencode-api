@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
-import { logger, maskBackendUrl, maskHeaders, maskUrlCredentials, maskUrlQuery } from './logger.js';
+import { logger, maskBackendUrl, maskHeaders, maskUrlCredentials, maskUrlQuery, setOwnProperty } from './logger.js';
 
 
 // --- Mutex Logic with Timeout ---
@@ -652,12 +652,27 @@ process.on('exit', cleanupTempDirs);
 function extractUpstreamError(error) {
     const status = error?.response?.status ?? error?.status ?? error?.statusCode ?? null;
     const body = error?.response?.data ?? error?.responseBody ?? error?.data ?? error?.body ?? null;
+    // Bounded *before* it is serialised. This used to be `JSON.stringify(body).slice(0, 500)`, which built the whole
+    // string - a proxy in front of the backend answering a megabyte of JSON paid a full serialisation and a megabyte
+    // string on the completion's error path - to keep 500 characters of it. The summary is a log line either way.
+    const MAX_SUMMARY_STRING_CHARS = 200;
+    const boundedCopy = (value, depth = 0) => {
+        if (typeof value === 'string') {
+            return value.length > MAX_SUMMARY_STRING_CHARS ? `${value.slice(0, MAX_SUMMARY_STRING_CHARS)}…` : value;
+        }
+        if (value === null || typeof value !== 'object') return value;
+        if (depth >= 4) return '[…]';
+        if (Array.isArray(value)) return value.slice(0, 32).map((entry) => boundedCopy(entry, depth + 1));
+        const copy = {};
+        for (const key of Object.keys(value).slice(0, 32)) setOwnProperty(copy, key, boundedCopy(value[key], depth + 1));
+        return copy;
+    };
     let bodySummary = null;
     if (typeof body === 'string') {
         bodySummary = body.slice(0, 500) || null;
     } else if (body !== null && body !== undefined) {
         try {
-            bodySummary = JSON.stringify(body).slice(0, 500);
+            bodySummary = JSON.stringify(boundedCopy(body)).slice(0, 500);
         } catch (e) {
             // Never fail silently on serialization: record the reason in the summary
             bodySummary = `[unserializable: ${e?.message || 'unknown error'}]`;
@@ -1418,7 +1433,18 @@ function createApp(config) {
     // Only the URL-shaped words of the text are masked. `maskUrlQuery()` is written for a URL: given a sentence it
     // read everything after the first `?` as that parameter's value, so `…?x=1: connection refused` answered
     // `…?x=***` and lost the half of the reason that explains the failure.
-    const maskUrlsInText = (text) => String(text).replace(/\S+:\/\/\S+/g, (url) => maskUrlQuery(maskUrlCredentials(url)));
+    //
+    // The words are found by splitting on whitespace rather than with `/\S+:\/\/\S+/`, which backtracked over a
+    // million-character token with no `://` in it one character at a time: a provider error of 1 MB parked the request
+    // for longer than its whole budget. `includes('://')` decides per token, and a token is at most a word.
+    const maskUrlsInText = (text) => {
+        const value = String(text);
+        if (!value.includes('://')) return value;
+        return value
+            .split(/(\s+)/)
+            .map((token) => (token.includes('://') ? maskUrlQuery(maskUrlCredentials(token)) : token))
+            .join('');
+    };
     const clientFacingText = (value) => {
         if (typeof value !== 'string' || value === '') return '';
         const masked = maskUrlsInText(value);

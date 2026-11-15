@@ -536,7 +536,12 @@ async function run() {
     // --- auth -------------------------------------------------------------------------------------------
     const noAuth = await request('/v1/models', { key: null });
     check('unauthenticated /v1/models is rejected', noAuth.response.status === 401, `status ${noAuth.response.status}`);
-    check('401 uses the OpenAI error envelope', noAuth.json?.error?.message === 'Unauthorized', noAuth.text.slice(0, 120));
+    // `Unauthorized` was the one refusal that named nothing: a reader could not tell a missing header from a wrong
+    // key, and a proxy-injected `Authorization: Basic …` reads as "wrong key" while the fix is to drop that header.
+    // The message names which of the three causes it saw and never the value that was sent.
+    check('401 uses the OpenAI error envelope',
+        noAuth.json?.error?.message === 'the request carries no API key; send Authorization: Bearer <API_KEY>',
+        noAuth.text.slice(0, 160));
     check('401 carries a type and code', noAuth.json?.error?.type === 'invalid_request_error' &&
         noAuth.json?.error?.code === 'invalid_api_key', noAuth.text.slice(0, 160));
     check('the response echoes the request id used in the log line', /^gw-[a-z0-9]+$/.test(
@@ -544,6 +549,10 @@ async function run() {
 
     const wrongKey = await request('/v1/models', { key: 'sk-wrong' });
     check('a wrong bearer token is rejected', wrongKey.response.status === 401, `status ${wrongKey.response.status}`);
+    check('a wrong bearer token is named as a wrong Authorization header',
+        wrongKey.json?.error?.message ===
+            'the Authorization header does not carry the gateway API key; send Authorization: Bearer <API_KEY>',
+        wrongKey.text.slice(0, 160));
 
     // The auth scheme is case-insensitive (RFC 7235) and whitespace-padded values are common; none of that is a
     // reason to reject a correct key, and none of it may accept a wrong one
@@ -569,6 +578,11 @@ async function run() {
     check('X-Api-Key is accepted as an alias for the bearer token', viaHeader.status === 200, `status ${viaHeader.status}`);
     const viaHeaderWrong = await fetch(`${BASE}/v1/models`, { headers: { 'x-api-key': 'sk-wrong' } });
     check('a wrong X-Api-Key is rejected', viaHeaderWrong.status === 401, `status ${viaHeaderWrong.status}`);
+    const wrongAlias = await viaHeaderWrong.json().catch(() => null);
+    check('a wrong X-Api-Key is named as a wrong X-Api-Key header',
+        wrongAlias?.error?.message ===
+            'the X-Api-Key header does not carry the gateway API key; send Authorization: Bearer <API_KEY>',
+        JSON.stringify(wrongAlias).slice(0, 160));
     const bothHeaders = await fetch(`${BASE}/v1/models`, {
         headers: { authorization: 'Bearer sk-wrong', 'x-api-key': API_KEY }
     });

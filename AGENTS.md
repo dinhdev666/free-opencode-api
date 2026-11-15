@@ -17,17 +17,18 @@ There is no database, no plugin system, no multi-provider routing layer: anythin
 
 These are product decisions, not implementation details. Do not "improve" them without an explicit request:
 
-1. **Authentication is always enforced.** Every route except `OPTIONS`, `/health` and `/` requires
-   `Authorization: Bearer <API_KEY>`; the scheme is matched case-insensitively with any amount of whitespace, and
-   `X-Api-Key: <key>` is accepted as an alias when no `Authorization` header is sent (the preflight advertises that
-   header, and clients configured with an api-key header send it) — a present `Authorization` header always decides,
-   so a wrong one is never rescued by the alias. Presence decides, not the parsed token: a proxy injecting
-   `Authorization: Basic …` or a bare `Bearer` sends a header the gateway could not read, and testing the parsed token
-   let the alias rescue it. A blank or missing `API_KEY` falls back to the built-in default
-   `sk-dummy-123` (`resolveApiKey()` in `src/proxy.js`). Never add a "disable auth" switch, never treat an empty key
-   as "no auth". The bearer is compared in **bytes** (`timingSafeEqual` on two `Buffer`s of equal length): a key with
-   non-ASCII characters matches in string length while differing in byte length, and comparing strings threw a
-   `RangeError` that turned a wrong key into a `500` instead of a `401`.
+1. **Authentication is always enforced.** Every route except `OPTIONS`, `/health` and `/` requires `Authorization:
+   Bearer <API_KEY>`; the scheme is matched case-insensitively with any amount of whitespace, and `X-Api-Key: <key>` is
+   accepted as an alias when no `Authorization` header is sent (the preflight advertises that header, and clients
+   configured with an api-key header send it) — a present `Authorization` header always decides, so a wrong one is never
+   rescued by the alias. Presence decides, not the parsed token: a proxy injecting `Authorization: Basic …` or a bare
+   `Bearer` sends a header the gateway could not read, and testing the parsed token let the alias rescue it. A blank or
+   missing `API_KEY` falls back to the built-in default `sk-dummy-123` (`resolveApiKey()` in `src/proxy.js`). Never add a
+   "disable auth" switch, never treat an empty key as "no auth". The bearer is compared in **bytes** (`timingSafeEqual`
+   on two `Buffer`s of equal length): a non-ASCII key matches in string length but not in byte length, and comparing
+   strings threw a `RangeError` that turned a wrong key into a `500`. The refusal names the cause the reader can act on -
+   no key sent, a wrong `Authorization` header (a proxy-injected `Basic …` included) or a wrong `X-Api-Key` header - and
+   never the value; `Unauthorized` alone named none of them.
 2. **The default key stays visible and warned about.** `index.js` logs a `[Security]` warning when the built-in key is
    in use; the startup summary states that authentication is enforced.
 3. **OpenAI wire format is the contract.** Success and error bodies, SSE frames, status codes and header names must
@@ -69,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 345 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 347 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 

@@ -382,7 +382,9 @@ and on the parser-level rejections alike).
 
 Errors follow the OpenAI error envelope (`{"error": {"message": ..., "type": ...}}`): `400` for an invalid request
 (`type: "invalid_request_error"`, with Fastify's own `code` such as `FST_ERR_CTP_INVALID_JSON_BODY` when the body could
-not be parsed), `401` for a missing or wrong key (`type: "invalid_request_error"`, `code: "invalid_api_key"`), `404` for
+not be parsed), `401` for a missing or wrong key (`type: "invalid_request_error"`, `code: "invalid_api_key"`; the
+message names which of the three causes it saw — no key at all, a wrong `Authorization` header, a wrong `X-Api-Key`
+header — and never the value that was sent), `404` for
 an unknown route (`type: "not_found"`), `408`/`431` for a request the HTTP parser rejected (a timeout, an oversized
 header block; ordinary parse errors are `400`) — those also answer the envelope, with CORS headers and an
 `X-Request-Id`, `413` for a body over `OPENCODE_PROXY_MAX_BODY_MB` (50 MiB by default; the message names the limit it
@@ -594,7 +596,7 @@ git push origin v3.0.0
 | Symptom | Likely cause and fix |
 | --- | --- |
 | `Cannot verify OpenCode installation` | The `opencode` binary is not on `PATH`; install the CLI or set `OPENCODE_PATH` to its absolute path. |
-| `401 Unauthorized` | The request has a missing or mismatched `Authorization: Bearer …` header; send the configured `API_KEY` (default `sk-dummy-123`). |
+| `401 Unauthorized` | The request has a missing or mismatched `Authorization: Bearer …` header (the message says which: no key, a wrong `Authorization` header, or a wrong `X-Api-Key` header); send the configured `API_KEY` (default `sk-dummy-123`). |
 | Requests time out | The backend is slow or unavailable; check `/health`, verify `opencode auth login` was completed, and consider raising `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`. |
 | Empty streaming responses | Update the OpenCode CLI; the gateway already handles the SSE event changes in opencode ≥ 1.19. |
 | `503 queue_full` with `Retry-After: 1` | Every completion slot is busy and the wait queue is full (`OPENCODE_PROXY_MAX_QUEUE`, default 64). Retry after the advertised delay, or raise `OPENCODE_PROXY_MAX_CONCURRENCY` — only if the backend tolerates concurrent sessions. |

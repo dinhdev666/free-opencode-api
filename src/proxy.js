@@ -1707,7 +1707,11 @@ function createApp(config) {
             if (error && error.name === 'QueueFullError') {
                 logger.warn('[Proxy] Request rejected:', { message: error.message, waiting: queue.length });
                 if (!reply.raw.headersSent) {
-                    reply.code(503).send({ error: { message: error.message, type: 'queue_full' } });
+                    // A full queue is temporary, and OpenAI SDKs retry a 503 only when the answer tells them to wait:
+                    // without the header the request fails instead of backing off and being served a moment later
+                    reply.code(503)
+                        .header('Retry-After', '1')
+                        .send({ error: { message: error.message, type: 'queue_full' } });
                 }
                 return reply;
             }

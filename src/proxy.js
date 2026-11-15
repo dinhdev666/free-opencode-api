@@ -1940,6 +1940,17 @@ function createApp(config) {
                             return { text };
                         }
                         if (content && typeof content.text === 'string') return { text: content.text };
+                        // A single part sent as an object instead of a one-element array (`{"content":{"type":
+                        // "image_url",…}}`, or `{"type":"text","text":5}`): the same three refusals as a part inside an
+                        // array, reported without a part index because the client sent no array to index into. Dropping
+                        // it answered a question the backend never received - and for a `system` message it dropped the
+                        // instructions instead, which is the same silent wrongness with a worse consequence.
+                        if (content && typeof content === 'object') {
+                            if ('text' in content && typeof content.text !== 'string') {
+                                return { text: '', unsupported: { field: 'text', found: jsonTypeName(content.text) } };
+                            }
+                            return { text: '', unsupported: { type: typeof content.type === 'string' ? content.type : 'unknown' } };
+                        }
                         if (content === null || content === undefined) return { text: '' };
                         if (typeof content === 'number' || typeof content === 'boolean') return { text: String(content) };
                         return { text: '' };
@@ -2026,7 +2037,10 @@ function createApp(config) {
                     // Named before the "no text at all" check: a request whose only part is an image must say that the
                     // gateway cannot carry images, not that the client forgot to write any text
                     if (unsupported) {
-                        const at = `messages[${unsupported.messageIndex}].content[${unsupported.partIndex}]`;
+                        // No index when the content itself was the part (a single object instead of an array)
+                        const at = unsupported.partIndex === undefined || unsupported.partIndex === null
+                            ? `messages[${unsupported.messageIndex}].content`
+                            : `messages[${unsupported.messageIndex}].content[${unsupported.partIndex}]`;
                         // Three causes, three messages: a part of a type the gateway cannot forward (an image), a text
                         // part whose `text` is not a string, and a part that is not a part at all (`42`, `null`). One
                         // message for all three used to call a `text` part unsupported - naming the only part type the

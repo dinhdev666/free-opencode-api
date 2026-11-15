@@ -199,7 +199,8 @@ docker run -d --restart=always --network common-all --name free-opencode-api -p 
   container killed mid-write cannot leave a truncated `config.json` behind (which made every later start exit with
   "is not valid JSON" until a human deleted it).
 - The first-boot line in `docker logs` shows the generated settings with the **API key masked** (`sk-a***(22 chars)`,
-  nothing at all up to 16 characters — the same rule the in-process logger uses):
+  nothing at all up to 16 characters — the same rule the in-process logger uses) and a credential in
+  `OPENCODE_SERVER_URL` masked the same way (`http://***@host:4097`, `?token=***`):
   the file it writes is `0600`, owned by the container user (`node`, uid 1000), and holds the real key, but container
   logs are usually collected and shipped, so the key must never be printed. The startup `[Security]` warning still
   tells you when the built-in `sk-dummy-123` is in use.

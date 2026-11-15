@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
-import { logger, maskHeaders, maskUrlQuery } from './logger.js';
+import { logger, maskBackendUrl, maskHeaders, maskUrlQuery } from './logger.js';
 
 
 // --- Mutex Logic with Timeout ---
@@ -290,12 +290,12 @@ function normalizeBackendUrl(raw) {
     const notes = [];
     if (url === '') return { url: 'http://127.0.0.1:4097', notes };
     if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)) {
-        notes.push(`OPENCODE_SERVER_URL='${url}' has no scheme, assuming http://`);
+        notes.push(`OPENCODE_SERVER_URL='${maskBackendUrl(url)}' has no scheme, assuming http://`);
         url = `http://${url}`;
     }
     const stripped = url.replace(/\/+$/, '');
     if (stripped !== url) {
-        notes.push(`OPENCODE_SERVER_URL had a trailing slash, using '${stripped}'`);
+        notes.push(`OPENCODE_SERVER_URL had a trailing slash, using '${maskBackendUrl(stripped)}'`);
         url = stripped;
     }
     return { url, notes };
@@ -2453,7 +2453,7 @@ function createApp(config) {
 
     // Health check. The body never changes for the lifetime of the process, so it is serialized once and sent as a
     // ready-made string instead of going through a serializer on every probe.
-    const healthBody = JSON.stringify({ status: 'ok', backend: OPENCODE_SERVER_URL });
+    const healthBody = JSON.stringify({ status: 'ok', backend: maskBackendUrl(OPENCODE_SERVER_URL) });
     // Not async: a sync handler skips the promise Fastify would otherwise await on every probe, and the body is
     // already serialized - a liveness probe is the one request that never needs to suspend.
     app.get('/health', { schema: { response: { 200: HEALTH_SCHEMA } } }, (request, reply) =>

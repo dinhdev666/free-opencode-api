@@ -28,8 +28,8 @@ purpose is to disable authentication.
 ## Local setup
 
 ```bash
-git clone https://github.com/dinhdev666/free-deepseek-api.git
-cd free-deepseek-api
+git clone https://github.com/dinhdev666/free-opencode-api.git
+cd free-opencode-api
 pnpm install --frozen-lockfile     # use plain `pnpm install` when you intentionally change dependencies
 cp config.json.example config.json  # optional: file-based configuration
 pnpm test                           # smoke suite (stub backend, no OpenCode CLI needed)
@@ -237,7 +237,7 @@ Write scope). Never commit these values.
 - Treat user-supplied values (model ids, paths, prompts) as untrusted; `OPENCODE_PATH` is spawned as a process, so it
   must never be constructed from request data.
 - Report vulnerabilities privately through a GitHub security advisory on
-  <https://github.com/dinhdev666/free-deepseek-api/security/advisories/new> rather than a public issue.
+  <https://github.com/dinhdev666/free-opencode-api/security/advisories/new> rather than a public issue.
 
 ## License
 

@@ -12,7 +12,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import { parseBoolean, resolveBackendAuth, timeoutMessage } from '../src/proxy.js';
-import { readConfigFile, findUnknownKeys } from '../src/config.js';
+import { readConfigFile, findUnknownKeys, CONFIG_FILE_KEYS } from '../src/config.js';
 import {
     createLogger, maskBackendUrl, maskHeaders, maskSecret, maskUrlCredentials, maskUrlQuery, serializeDetail,
     SENSITIVE_NAME_ALTERNATIVES
@@ -209,6 +209,32 @@ async function run() {
     check('the entrypoint masks the same credential names as the logger',
         entrypointSource.includes(`(${SENSITIVE_NAME_ALTERNATIVES})`),
         JSON.stringify(SENSITIVE_NAME_ALTERNATIVES));
+
+    // A configuration key lives in four places: the keys the entry point reads (`CONFIG_FILE_KEYS`), the template
+    // operators copy (`config.json.example`), the README table they read, and the generated file the container
+    // entrypoint writes. A key added to one of them only is silent in the worst way - documented but unread (the
+    // gateway runs the default while the operator is sure its value is in force), or written by the container into a
+    // file key nothing reads, which the unknown-key warning reports only after a start.
+    const configKeys = [...CONFIG_FILE_KEYS].sort();
+    const exampleKeys = Object.keys(JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json.example'), 'utf8'))).sort();
+    check('config.json.example lists exactly the keys the gateway reads',
+        exampleKeys.join(',') === configKeys.join(','),
+        `example=[${exampleKeys.join(',')}] read=[${configKeys.join(',')}]`);
+
+    // The entrypoint builds its object with `KEY: <String|env|flag>(...)`; every key it writes has to be one the
+    // entry point reads, otherwise `docker run -e …` produces a file the gateway ignores.
+    const writtenKeys = [...new Set(
+        [...entrypointSource.matchAll(/^\s+([A-Z][A-Z0-9_]{2,}): (?:String|env|flag)\(/gm)].map((match) => match[1])
+    )].sort();
+    const unreadKeys = writtenKeys.filter((key) => !CONFIG_FILE_KEYS.includes(key));
+    check('the container entrypoint writes only keys the gateway reads',
+        writtenKeys.length >= 8 && unreadKeys.length === 0,
+        `written=[${writtenKeys.join(',')}] unread=[${unreadKeys.join(',')}]`);
+
+    const readmeSource = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+    const undocumented = configKeys.filter((key) => !readmeSource.includes(`| \`${key}\` |`));
+    check('every configurable key has a row in the README configuration table',
+        undocumented.length === 0, `missing=[${undocumented.join(',')}]`);
 
     // The commit-message rules live in two places - the CONTRIBUTING.md tables and test/check-commit-messages.mjs -
     // and CI enforces the second over the commits a push adds. A scope added to the document alone would reject every

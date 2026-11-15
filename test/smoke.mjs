@@ -122,6 +122,11 @@ async function run() {
     check('GET /health returns 200', health.response.status === 200, `status ${health.response.status}`);
     check('GET /health reports gateway status ok', health.json?.status === 'ok', health.text.slice(0, 120));
     check('GET /health reports the backend URL', health.json?.backend === STUB_URL, health.text.slice(0, 120));
+    check('GET /health keeps the exact documented body',
+        health.text === JSON.stringify({ status: 'ok', backend: STUB_URL }), health.text);
+    check('GET /health is served as JSON',
+        (health.response.headers.get('content-type') || '').includes('application/json'),
+        health.response.headers.get('content-type'));
 
     // --- auth -------------------------------------------------------------------------------------------
     const noAuth = await request('/v1/models', { key: null });
@@ -146,6 +151,28 @@ async function run() {
     const invalid = await request('/v1/chat/completions', { method: 'POST', body: {} });
     check('missing messages array returns 400', invalid.response.status === 400, `status ${invalid.response.status}`);
     check('400 uses the OpenAI error envelope', typeof invalid.json?.error?.message === 'string', invalid.text.slice(0, 120));
+
+    const nullBody = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: 'null'
+    });
+    const nullBodyJson = await nullBody.json().catch(() => null);
+    check('a JSON null body returns 400', nullBody.status === 400, `status ${nullBody.status}`);
+    check('400 for a null body keeps the envelope', typeof nullBodyJson?.error?.message === 'string', JSON.stringify(nullBodyJson));
+
+    const badModel = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 5, messages: [{ role: 'user', content: 'hi' }] }
+    });
+    check('a non-string model returns 400', badModel.response.status === 400, `status ${badModel.response.status}`);
+
+    const stringStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'hi' }], stream: 'false' }
+    });
+    check('stream: "false" is treated as non-streaming', stringStream.json?.object === 'chat.completion',
+        stringStream.text.slice(0, 120));
 
     const unknownRoute = await request('/nope');
     check('unknown route returns 404', unknownRoute.response.status === 404, `status ${unknownRoute.response.status}`);
@@ -227,6 +254,64 @@ async function run() {
     check('sequential stream requests stay well under the old 4 s stall',
         durations.every((duration) => duration < 2000),
         `durations ${durations.join(', ')} ms`);
+
+    // --- an abandoned stream must free the completion slot ------------------------------------------------
+    // Regression guard: the queue has one slot by default, so a stream nobody reads used to block every other
+    // client until the backend finished (or the 5 minute timeout hit).
+    const abortController = new AbortController();
+    const slowRequest = fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'SLOW reply please' }], stream: true }),
+        signal: abortController.signal
+    }).then((response) => response.text()).catch(() => null);
+    await sleep(250);
+    abortController.abort();
+    await slowRequest;
+
+    const afterAbortAt = Date.now();
+    const afterAbort = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'hi' }] }
+    });
+    const afterAbortMs = Date.now() - afterAbortAt;
+    check('a completion after an aborted stream succeeds', afterAbort.response.status === 200,
+        `status ${afterAbort.response.status}`);
+    check('an aborted stream releases its queue slot before the backend finishes', afterAbortMs < 1200,
+        `${afterAbortMs} ms (the slow reply takes ~2000 ms)`);
+
+    // --- bounded queue -----------------------------------------------------------------------------------
+    // OPENCODE_PROXY_MAX_QUEUE=0 removes every waiting slot, so a completion is refused instead of queued
+    const cappedPort = GATEWAY_PORT + 1;
+    const cappedUrl = `http://127.0.0.1:${cappedPort}`;
+    const cappedGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(cappedPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'warn',
+            OPENCODE_PROXY_MAX_QUEUE: '0'
+        }
+    });
+    children.push(cappedGateway);
+    cappedGateway.stdout.on('data', () => {});
+    cappedGateway.stderr.on('data', () => {});
+    await waitForOk(`${cappedUrl}/health`);
+
+    const cappedBody = JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] });
+    const cappedResponse = await fetch(`${cappedUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: cappedBody
+    });
+    check('a full queue is answered with 503', cappedResponse.status === 503, `status ${cappedResponse.status}`);
+    const cappedJson = await cappedResponse.json().catch(() => null);
+    check('503 uses the queue_full envelope', cappedJson?.error?.type === 'queue_full', JSON.stringify(cappedJson));
+    const cappedHealth = await fetch(`${cappedUrl}/health`);
+    check('rejected requests leave the gateway healthy', cappedHealth.status === 200, `status ${cappedHealth.status}`);
+    await cappedHealth.text();
 
     // --- graceful shutdown ------------------------------------------------------------------------------
     const exitCode = await new Promise((resolve) => {

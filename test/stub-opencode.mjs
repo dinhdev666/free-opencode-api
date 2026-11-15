@@ -38,7 +38,14 @@ const sendJson = (res, statusCode, body) => {
 
 const sendEvent = (payload) => {
     const frame = `data: ${JSON.stringify(payload)}\n\n`;
-    for (const client of eventClients) client.write(frame);
+    for (const client of eventClients) {
+        // A subscriber may disconnect mid-answer; writing to it must not take the stub down
+        try {
+            client.write(frame);
+        } catch {
+            eventClients.delete(client);
+        }
+    }
 };
 
 const partUpdate = (sessionID, part) => ({
@@ -60,20 +67,22 @@ const buildAssistantMessage = (sessionID, text, reasoning) => ({
     ]
 });
 
-// Wait (briefly) for the gateway to be subscribed before emitting, then replay the answer as incremental updates
-async function streamAssistantReply(sessionID, text, reasoning) {
+// Wait (briefly) for the gateway to be subscribed before emitting, then replay the answer as incremental updates.
+// `pieces`/`delayMs` let a test ask for a deliberately slow answer (a prompt containing SLOW) so it can abort a
+// stream while the backend is still working.
+async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, delayMs = 5 } = {}) {
     for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
 
     sendEvent(partUpdate(sessionID, { type: 'reasoning', text: reasoning }));
-    await sleep(5);
+    await sleep(delayMs);
 
-    const step = Math.max(1, Math.ceil(text.length / 3));
+    const step = Math.max(1, Math.ceil(text.length / pieces));
     for (let end = step; end < text.length; end += step) {
         sendEvent(partUpdate(sessionID, { type: 'text', text: text.slice(0, end) }));
-        await sleep(5);
+        await sleep(delayMs);
     }
     sendEvent(partUpdate(sessionID, { type: 'text', text }));
-    await sleep(5);
+    await sleep(delayMs);
 
     sendEvent({
         type: 'message.updated',
@@ -89,7 +98,14 @@ async function streamAssistantReply(sessionID, text, reasoning) {
     });
 }
 
-const server = http.createServer((req, res) => {
+// The prompt body is only needed to decide whether a test asked for a slow answer
+const readBody = async (req) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    return Buffer.concat(chunks).toString('utf8');
+};
+
+const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || HOST}`);
     const path = url.pathname;
 
@@ -126,11 +142,20 @@ const server = http.createServer((req, res) => {
         if (isMessage && req.method === 'POST') {
             if (!session) return sendJson(res, 404, { error: 'unknown session' });
             if (session.prompted) return sendJson(res, 200, { info: buildAssistantMessage(id, ANSWER, REASONING).info, parts: [] });
+            try {
+                const parsed = JSON.parse((await readBody(req)) || '{}');
+                session.promptText = (parsed.parts || []).map((part) => part?.text || '').join(' ');
+            } catch {
+                session.promptText = '';
+            }
             session.prompted = true;
             session.messages.push(buildAssistantMessage(id, ANSWER, REASONING));
             sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-            // Fire and forget: the gateway collects the answer from /event (or polling)
-            streamAssistantReply(id, ANSWER, REASONING).catch(() => {});
+            // Fire and forget: the gateway collects the answer from /event (or polling). A prompt containing SLOW
+            // is answered over ~2 s so a test can abort mid-stream while the backend is still working.
+            const slow = session.promptText.includes('SLOW');
+            const options = slow ? { pieces: 10, delayMs: 200 } : {};
+            streamAssistantReply(id, ANSWER, REASONING, options).catch(() => {});
             return;
         }
 

@@ -68,6 +68,13 @@ function truncateText(text, maxLen) {
 function safeClone(value, seen = new WeakSet(), depth = 0) {
     if (value === null || value === undefined) return value;
     if (typeof value === 'bigint') return `${value}n`;
+    // A single long string is the common shape of an over-large detail (a request body's message content), and the
+    // 32 KB cap at the end of serializeDetail() only applies after the whole payload has been cloned and stringified:
+    // one debug line carrying a 50 MB body (the default OPENCODE_PROXY_MAX_BODY_MB) allocated ~2x that and blocked the
+    // event loop for ~43 ms. Cutting it here keeps the same output and the same annotation for a fraction of the cost.
+    if (typeof value === 'string') {
+        return value.length > MAX_SERIALIZED_LENGTH ? truncateText(value, MAX_SERIALIZED_LENGTH) : value;
+    }
     if (typeof value !== 'object') return value;
     if (value instanceof Error) {
         return {
@@ -127,7 +134,10 @@ export function maskSecret(text) {
     return `${str.slice(0, 4)}***(${str.length} chars)`;
 }
 
-// Request header names that must be masked before output (lowercase)
+// Request header names that must be masked before output (lowercase). The set covers the names this gateway and
+// OpenAI clients use, and the pattern below covers the rest: a client or an upstream proxy can forward any credential
+// under its own name (`x-goog-api-key`, `x-auth-token`, `openai-api-key`, `authentication`,
+// `x-forwarded-authorization`), and the full header dump at debug level used to print those verbatim.
 const SENSITIVE_HEADER_NAMES = new Set([
     'authorization',
     'proxy-authorization',
@@ -137,9 +147,32 @@ const SENSITIVE_HEADER_NAMES = new Set([
     'cookie',
     'set-cookie'
 ]);
+const SENSITIVE_HEADER_PATTERN = /(^|[-_])(auth|token|secret|cookie|session|passw)([-_]|$)|authorization|authentication|api[-_]?key/i;
+
+const isSensitiveHeader = (lowerName) => SENSITIVE_HEADER_NAMES.has(lowerName) || SENSITIVE_HEADER_PATTERN.test(lowerName);
 
 /**
- * Copy a request-header object and mask sensitive headers (authorization/api-key/cookie etc.)
+ * Mask a value carried in the query string. A client that sends its key as `?api_key=…` (an OpenAI-compatible
+ * convention some tools still use) wrote it into `docker logs` on every request, because the request summary, the
+ * debug dump and the rejected-request warning log the raw URL. The URL itself is kept: only values whose *name* looks
+ * like a credential are replaced.
+ * @param {string} url raw request URL
+ * @returns {string} the URL with credential query values masked
+ */
+export function maskUrlQuery(url) {
+    return String(url).replace(/([?&])([^=&#]+)=([^&#]*)/g, (match, separator, name, value) => {
+        let decoded = name;
+        try {
+            decoded = decodeURIComponent(name);
+        } catch {
+            // a name that is not valid percent-encoding is compared as written
+        }
+        return isSensitiveHeader(decoded.toLowerCase()) ? `${separator}${name}=***` : match;
+    });
+}
+
+/**
+ * Copy a request-header object and mask sensitive headers (authorization/api-key/cookie/token etc.)
  * @param {object} headers original request headers
  * @returns {object} masked copy (the original object is left untouched)
  */
@@ -148,7 +181,7 @@ export function maskHeaders(headers) {
     Object.keys(headers || {}).forEach((name) => {
         const lower = String(name).toLowerCase();
         const value = headers[name];
-        masked[name] = SENSITIVE_HEADER_NAMES.has(lower) ? maskSecret(value) : value;
+        masked[name] = isSensitiveHeader(lower) ? maskSecret(value) : value;
     });
     return masked;
 }
@@ -161,10 +194,12 @@ export function createLogger(options = {}) {
     const prefix = options.prefix || PREFIX;
     const state = { level: resolveLogLevel(options.level).level };
 
-    // The ISO stamp is only changed when the second it names changes: `new Date().toISOString()` allocates a Date and
-    // formats it on every line (measured 355 ns vs 31 ns for the cached form), log lines are written on the request
-    // path, and a burst of debug lines per completion is exactly where that adds up. Two lines written within the same
-    // millisecond still carry their own (identical) stamp, so nothing a reader relies on changes.
+    // The ISO second is only reformatted when the second it names changes: `new Date().toISOString()` allocates a Date
+    // and formats it on every line (measured 355 ns vs 31 ns for the cached form), log lines are written on the request
+    // path, and a burst of debug lines per completion is exactly where that adds up. The milliseconds are appended from
+    // Date.now() itself: caching the *whole* stamp kept the first line's millisecond for the rest of the second, so a
+    // line could be stamped up to 1 s before it was written and a reader correlating a request's logged duration with
+    // the wall clock was reading a timestamp that was never taken.
     let stampSecond = -1;
     let stampText = '';
     const isoTimestamp = () => {
@@ -172,13 +207,16 @@ export function createLogger(options = {}) {
         const second = Math.floor(now / 1000);
         if (second !== stampSecond) {
             stampSecond = second;
-            stampText = new Date(now).toISOString();
+            stampText = new Date(now).toISOString().slice(0, 19);
         }
-        return stampText;
+        return `${stampText}.${String(now % 1000).padStart(3, '0')}Z`;
     };
 
     function write(stream, levelName, message, detail) {
-        let line = `${prefix} ${isoTimestamp()} [${levelName.toUpperCase()}] ${message}`;
+        // A logging call must never be the thing that fails a request: the message is interpolated into the line, so a
+        // non-string (a Symbol throws on coercion) would surface as an exception from inside the logger
+        const text = typeof message === 'string' ? message : String(message);
+        let line = `${prefix} ${isoTimestamp()} [${levelName.toUpperCase()}] ${text}`;
         if (detail !== undefined) {
             const serialized = serializeDetail(detail);
             if (serialized !== '') line += ` ${serialized}`;

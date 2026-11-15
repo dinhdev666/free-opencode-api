@@ -1,8 +1,9 @@
 name: Publish image
 
 # Publishes a multi-architecture image (linux/amd64 + linux/arm64) to Docker Hub. Triggered by pushing a version
-# tag, so the released image always matches a reviewable commit. `workflow_dispatch` runs must be started from a tag
-# ref as well (Actions -> Publish image -> Run workflow -> "Use workflow from" = the tag).
+# tag, so the released image always matches a reviewable commit. A `workflow_dispatch` run is only published when it is
+# started from a tag ref too (Actions -> Publish image -> Run workflow -> "Use workflow from" = the tag): the publish
+# job itself carries `if: startsWith(github.ref, 'refs/tags/v')`, so a run from a branch stops before it logs in.
 #
 # Required repository secrets (Settings -> Secrets and variables -> Actions):
 #   DOCKERHUB_USERNAME  Docker Hub account, for example dinhdev666
@@ -31,12 +32,15 @@ jobs:
     name: Publish the container image
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # A manual run from a branch used to go straight to login and push: the version check below is skipped for a
+    # non-tag ref (`if: startsWith(github.ref, 'refs/tags/v')`), so nothing stopped a `workflow_dispatch` from main
+    # from publishing an image with no release behind it. The job is refused unless the ref is a v*.*.* tag.
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Verify the tag matches package.json
-        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           package_version="$(node -p "require('./package.json').version")"
           tag_version="${GITHUB_REF_NAME#v}"

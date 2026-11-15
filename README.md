@@ -172,6 +172,10 @@ curl -X POST http://127.0.0.1:8083/v1/chat/completions \
 
 Settings are resolved in this order: **environment variables → `config.json` → built-in defaults**.
 
+A `config.json` that exists but cannot be used stops the gateway (`exit 1`) with the reason logged: falling back to
+the defaults would ignore the port and the key you wrote and serve traffic with the built-in `sk-dummy-123`. A
+missing file is normal and simply means "defaults plus environment".
+
 `config.json` (see [config.json.example](config.json.example)):
 
 | Key | Default | Description |
@@ -374,6 +378,7 @@ git push origin v1.0.1
 | Requests time out | The backend is slow or unavailable; check `/health`, verify `opencode auth login` was completed, and consider raising `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`. |
 | Empty streaming responses | Update the OpenCode CLI; the gateway already handles the SSE event changes in opencode ≥ 1.19. |
 | Port already in use | Change `PORT` in `config.json` or the environment. |
+| The gateway exits immediately, `config.json is not valid JSON …` | Fix the syntax or delete `config.json`; the process refuses to start rather than ignore a key you configured. |
 
 ---
 

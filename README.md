@@ -184,7 +184,7 @@ missing file is normal and simply means "defaults plus environment".
 | `PORT` | `8083` | Gateway listen port |
 | `BIND_HOST` | `127.0.0.1` | Gateway bind address; use `0.0.0.0` to expose it on all interfaces |
 | `API_KEY` | `sk-dummy-123` | Bearer token clients must send. Authentication is always on — an empty or blank value falls back to `sk-dummy-123` |
-| `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway |
+| `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway; a trailing slash is stripped and a missing scheme is read as `http://` (both are reported in the startup log) |
 | `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend |
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
 | `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files |

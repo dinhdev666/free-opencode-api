@@ -434,7 +434,9 @@ All output goes to stdout/stderr with a `[gateway]` prefix:
 
 A request body that carries `__proto__` or `constructor` as a property name is refused with `400` before it reaches
 the handler (Fastify's prototype-poisoning guard); the message names that reason rather than claiming the JSON is
-invalid, because a body with one of those keys parses fine and the fix is to remove the key, not the comma.
+invalid, because a body with one of those keys parses fine and the fix is to remove the key, not the comma. A `415`
+likewise names what it refused: `unsupported content type "application/xml"; send Content-Type: application/json`, and
+`the request has a body but no Content-Type header; send Content-Type: application/json` when the header is missing.
 
 Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked before they are logged, and so are
 credential values sent in a query string (`?api_key=…`) and a credential carried by the configured backend URL

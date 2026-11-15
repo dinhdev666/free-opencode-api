@@ -2493,15 +2493,34 @@ function createApp(config) {
 
     app.setErrorHandler((error, request, reply) => {
         const statusCode = error.statusCode && error.statusCode >= 400 ? error.statusCode : 500;
-        // Fastify's content-type parser rejects a body that does not parse **and** one that carries a property name its
-        // prototype-poisoning guard refuses (`__proto__`, `constructor`); both arrive as FST_ERR_CTP_INVALID_JSON_BODY
-        // with the same generic text, so a client whose JSON was perfectly valid - and whose only sin was that key
-        // name - was told its JSON was invalid and had nothing to fix in the syntax. Naming both possible causes
-        // keeps the reader from rewriting a body that parses fine.
-        const errorMessage = error && error.code === 'FST_ERR_CTP_INVALID_JSON_BODY'
-            ? 'request body is not valid JSON, or it carries a forbidden property name (__proto__, constructor); '
-                + 'send Content-Type: application/json'
-            : error.message;
+        // Two refusals the content-type layer makes arrive with text that names nothing the client can act on, so the
+        // envelope says what was actually wrong and what to send instead:
+        //
+        // - FST_ERR_CTP_INVALID_JSON_BODY covers both a body that does not parse **and** one that carries a property
+        //   name Fastify's prototype-poisoning guard refuses (`__proto__`, `constructor`), so a body that parsed
+        //   perfectly was told its JSON was invalid and had nothing to fix in the syntax.
+        // - FST_ERR_CTP_INVALID_MEDIA_TYPE arrives as "Unsupported Media Type" for any type the gateway does not
+        //   parse, including a request that sends a body with **no** Content-Type header at all - the likeliest
+        //   hand-written mistake there is, answered with a message that names neither the type nor the fix.
+        const errorMessageFor = (err) => {
+            if (!err) return 'Internal Server Error';
+            if (err.code === 'FST_ERR_CTP_INVALID_JSON_BODY') {
+                return 'request body is not valid JSON, or it carries a forbidden property name (__proto__, constructor); '
+                    + 'send Content-Type: application/json';
+            }
+            if (err.code === 'FST_ERR_CTP_INVALID_MEDIA_TYPE') {
+                const rawType = request.headers['content-type'];
+                if (typeof rawType !== 'string' || rawType.trim() === '') {
+                    return 'the request has a body but no Content-Type header; send Content-Type: application/json';
+                }
+                // Client input reaching a response body: control characters replaced and the value cut, like every
+                // other client-controlled string the gateway echoes back
+                const type = rawType.split(';')[0].trim().replace(/[\u0000-\u001f\u007f]/g, '?').slice(0, 64);
+                return `unsupported content type "${type}"; send Content-Type: application/json`;
+            }
+            return err.message;
+        };
+        const errorMessage = errorMessageFor(error);
         const detail = {
             method: request.method,
             // Client input: a credential in the query string is masked and a pathological URL is cut, the same way

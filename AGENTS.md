@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 240 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 241 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -224,6 +224,14 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   one. A body sent with a `Content-Encoding` other than `identity` (a client that gzips, a compressing proxy) is a
   `415` naming the header: the gateway does not decompress, so the compressed bytes reached the JSON parser and were
   reported as "body is not valid JSON", which blames the one part of the request that was correct.
+- A `415` names what it refused and what to send. `FST_ERR_CTP_INVALID_MEDIA_TYPE` used to arrive as Fastify's bare
+  `Unsupported Media Type` for any type the gateway does not parse — including a request that carries a **body with no
+  `Content-Type` header at all**, which is the likeliest hand-written mistake there is and reached the same message.
+  The status and the code stay; the message becomes `unsupported content type "application/xml"; send
+  Content-Type: application/json`, or `the request has a body but no Content-Type header; send Content-Type:
+  application/json` when the header is missing (the value is client input echoed into a response body, so control
+  characters are replaced and it is cut at 64 characters). Recognised types are unchanged: `application/json`,
+  `application/x-www-form-urlencoded` and `text/plain` (handed to the handler as text and parsed there).
 - A body carrying a **forbidden property name** (`__proto__`, `constructor`) is refused by Fastify's
   prototype-poisoning guard before any handler runs, and that refusal arrives as the same
   `FST_ERR_CTP_INVALID_JSON_BODY` a syntax error produces: the client was told `Body is not valid JSON but

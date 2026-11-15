@@ -10,6 +10,7 @@
  *   node test/check-commit-messages.mjs                 # the last commit (HEAD~1..HEAD)
  *   node test/check-commit-messages.mjs origin/main..HEAD
  *   COMMIT_RANGE=abc123..def456 node test/check-commit-messages.mjs
+ *   node test/check-commit-messages.mjs --subject "fix(proxy): add the thing (#123)"
  *
  * The range is handed to `git rev-list`, so any revision syntax works. Merge commits are checked like every other
  * commit: a merge is where a PR's title lands in `main`, so it is the commit most likely to carry a message nobody
@@ -46,36 +47,7 @@ const defaultRange = () => {
     }
 };
 
-const range = process.argv[2] || process.env.COMMIT_RANGE || defaultRange();
-
-let commits;
-try {
-    const out = git(['rev-list', '--reverse', range]);
-    commits = out.split('\n').filter(Boolean);
-} catch (error) {
-    // A shallow clone (actions/checkout defaults to depth 1) cannot resolve the base of a range: saying so is the
-    // difference between a one-line CI fix (`fetch-depth: 0`, or fetch the base) and a search through the workflow
-    const detail = String(error.stderr || error.message).trim().split('\n')[0];
-    console.error(`[commits] cannot read the range "${range}": ${detail}`);
-    console.error('[commits] a shallow clone has no commit for the start of the range; fetch that commit first');
-    process.exit(1);
-}
-
-if (commits.length === 0) {
-    // An empty range is a re-run, or a push that left the tip where it was: there is nothing to judge, and failing the
-    // build over it would put a red check on a change that added no commit
-    console.log(`[commits] the range "${range}" contains no commit, nothing to check`);
-    process.exit(0);
-}
-
-const subjects = new Map();
-for (const hash of commits) {
-    const message = git(['show', '-s', '--format=%B', hash]);
-    subjects.set(hash, message.split('\n')[0].replace(/\r$/, ''));
-}
-
-let failures = 0;
-for (const [hash, subject] of subjects) {
+const subjectProblems = (subject) => {
     const problems = [];
 
     if (subject.length > MAX_SUBJECT_LENGTH) {
@@ -108,6 +80,61 @@ for (const [hash, subject] of subjects) {
         }
         if (!/^[a-z0-9]/.test(rest)) problems.push('the subject does not start lowercase');
     }
+    return problems;
+};
+
+// A merge subject only exists after the merge, and a protected branch cannot correct it: `gh pr merge --subject`
+// appends `(#123)` after the 72 characters a writer counted, and the overflow lands in `main` permanently (the merge of
+// #118 answered 76 characters and left a red check on the branch). `--subject` judges the string before it is used.
+const subjectIndex = process.argv.indexOf('--subject');
+if (subjectIndex !== -1) {
+    const candidate = process.argv[subjectIndex + 1];
+    if (!candidate) {
+        console.error('[commits] --subject needs the message to check, for example: --subject "feat(proxy): add it (#1)"');
+        process.exit(1);
+    }
+    const problems = subjectProblems(candidate);
+    if (problems.length > 0) {
+        console.error(`[commits] ${candidate}`);
+        for (const problem of problems) console.error(`          - ${problem}`);
+        console.error(`[commits] ${problems.length} problem(s) with this subject; shorten or reword it before it is published`);
+        process.exit(1);
+    }
+    console.log(`[commits] "${candidate}" follows the convention (${candidate.length}/${MAX_SUBJECT_LENGTH} characters)`);
+    process.exit(0);
+}
+
+const range = process.argv[2] || process.env.COMMIT_RANGE || defaultRange();
+
+let commits;
+try {
+    const out = git(['rev-list', '--reverse', range]);
+    commits = out.split('\n').filter(Boolean);
+} catch (error) {
+    // A shallow clone (actions/checkout defaults to depth 1) cannot resolve the base of a range: saying so is the
+    // difference between a one-line CI fix (`fetch-depth: 0`, or fetch the base) and a search through the workflow
+    const detail = String(error.stderr || error.message).trim().split('\n')[0];
+    console.error(`[commits] cannot read the range "${range}": ${detail}`);
+    console.error('[commits] a shallow clone has no commit for the start of the range; fetch that commit first');
+    process.exit(1);
+}
+
+if (commits.length === 0) {
+    // An empty range is a re-run, or a push that left the tip where it was: there is nothing to judge, and failing the
+    // build over it would put a red check on a change that added no commit
+    console.log(`[commits] the range "${range}" contains no commit, nothing to check`);
+    process.exit(0);
+}
+
+const subjects = new Map();
+for (const hash of commits) {
+    const message = git(['show', '-s', '--format=%B', hash]);
+    subjects.set(hash, message.split('\n')[0].replace(/\r$/, ''));
+}
+
+let failures = 0;
+for (const [hash, subject] of subjects) {
+    const problems = subjectProblems(subject);
 
     if (problems.length > 0) {
         failures += 1;

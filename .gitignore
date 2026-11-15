@@ -6,5 +6,12 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 .pnpm-store
+# Credentials. `.env` and `config.json` were the only protected names, so `.env.local`, `config.local.json` and a
+# private key dropped in the tree were one `git add -A` away from being committed
 .env
+.env.*
 config.json
+config.*.json
+!config.json.example
+*.pem
+*.key

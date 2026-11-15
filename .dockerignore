@@ -6,11 +6,24 @@ node_modules
 .git
 .gitignore
 .github
+# Credentials: the exact names were the only ones kept out, so `.env.local` / `config.local.json` / a private key
+# sitting in the working tree were baked into the image layer that `COPY . .` creates
 .env
+.env.*
 config.json
+config.*.json
+*.pem
+*.key
 *.log
 .DS_Store
 .vscode
 .idea
 # The smoke suite needs a stub backend and a writable port; it is not part of the runtime image
 test
+# Documentation is not part of the runtime image either: it was shipped into /app (AGENTS.md alone is ~48 KB) and
+# nothing in the container reads it. LICENSE stays, because it has to travel with the code.
+AGENTS.md
+CONTRIBUTING.md
+IMPROVEMENT_PROPOSALS.md
+README.md
+docker/README.md

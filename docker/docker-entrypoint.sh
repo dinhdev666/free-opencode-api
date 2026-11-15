@@ -3,8 +3,9 @@
 # On first boot (no /app/config.json inside the container) the config is generated from `docker run -e`
 # environment variables; an existing config.json (e.g. persisted via -v mount) is used as-is and is not
 # overwritten by -e
-# Supported (written into config.json): PORT API_KEY BIND_HOST DISABLE_TOOLS OPENCODE_PATH OPENCODE_SERVER_URL
-# OPENCODE_BIND_HOST USE_ISOLATED_HOME (from OPENCODE_USE_ISOLATED_HOME)
+# Supported (written into config.json): PORT API_KEY BIND_HOST OPENCODE_PATH OPENCODE_SERVER_URL OPENCODE_BIND_HOST
+# and the two boolean flags, under both their names (DISABLE_TOOLS / OPENCODE_DISABLE_TOOLS,
+# USE_ISOLATED_HOME / OPENCODE_USE_ISOLATED_HOME)
 # The log level LOG_LEVEL (error/warn/info/debug, case-insensitive) is NOT written into config.json:
 #   the node process reads the environment variable directly, so it takes precedence over the LOG_LEVEL field in
 #   config.json; when unset it defaults to info
@@ -19,18 +20,23 @@ if [ ! -f "$CONFIG" ]; then
     node -e '
         const fs = require("fs");
         const env = (k, d) => { const v = process.env[k]; return (v === undefined || v === "") ? d : v; };
-        // Same truthy values as parseBool in index.js, so `-e DISABLE_TOOLS=yes` means the same inside and outside
-        // the container
-        const flag = (k, d) => ["1", "true", "yes", "y", "on"].includes(String(env(k, d)).trim().toLowerCase());
+        // The first name that is set wins, so both spellings of a flag behave the same as they do in index.js
+        const either = (keys, d) => { for (const k of keys) { const v = process.env[k]; if (v !== undefined && v !== "") return v; } return d; };
+        // Same truthy values as parseBoolean() in src/proxy.js, so the value written here agrees with what the
+        // process reads from the environment (`-e DISABLE_TOOLS=yes` and `-e DISABLE_TOOLS=n` both mean the same
+        // thing inside and outside the container)
+        const flag = (keys, d) => ["1", "true", "yes", "y", "on"].includes(String(either(keys, d)).trim().toLowerCase());
         const cfg = {
-            PORT: parseInt(env("PORT", "8083"), 10),
+            // Written as text: index.js validates the port and warns about a bad value, so there is one validator
+            // rather than a silent parseInt() here and a real check there
+            PORT: String(env("PORT", "8083")).trim(),
             API_KEY: env("API_KEY", "sk-dummy-123"),
             BIND_HOST: env("BIND_HOST", "0.0.0.0"),
-            DISABLE_TOOLS: flag("DISABLE_TOOLS", "true"),
+            DISABLE_TOOLS: flag(["OPENCODE_DISABLE_TOOLS", "DISABLE_TOOLS"], "true"),
             OPENCODE_PATH: env("OPENCODE_PATH", ""),
             OPENCODE_SERVER_URL: env("OPENCODE_SERVER_URL", "http://127.0.0.1:4097"),
             OPENCODE_BIND_HOST: env("OPENCODE_BIND_HOST", "0.0.0.0"),
-            USE_ISOLATED_HOME: flag("OPENCODE_USE_ISOLATED_HOME", "false")
+            USE_ISOLATED_HOME: flag(["OPENCODE_USE_ISOLATED_HOME", "USE_ISOLATED_HOME"], "false")
         };
         fs.writeFileSync("/app/config.json", JSON.stringify(cfg, null, 4));
         console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(cfg));

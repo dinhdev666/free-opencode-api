@@ -68,7 +68,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 140 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 143 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -140,7 +140,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   empty parameter, and an empty id is not a model. `/v1/models/` itself still answers the listing.
 - `POST /v1/chat/completions` non-streaming → `chat.completion` with
   `choices[0].message.{role,content,reasoning_content}`, `finish_reason:"stop"` and a `usage` block of zeroes
-  (upstream does not report token counts).
+  (upstream does not report token counts). The `id` is `chatcmpl-<base36 stamp><counter>` and is unique per
+  response: it used to be `chatcmpl-<epoch>`, so two completions that finished in the same millisecond carried the
+  same id and a client keying its messages by id merged them — which concurrency above 1 makes routine.
 - `POST /v1/chat/completions` streaming → `text/event-stream`, frames `data: {…chat.completion.chunk…}\n\n`,
   a final frame with `"finish_reason":"stop"`, then `data: [DONE]\n\n`. Reasoning deltas use `reasoning_content`.
   The first delta frame carries `"role":"assistant"` (with the first delta, not as an extra empty frame): OpenAI opens

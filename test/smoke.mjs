@@ -850,6 +850,41 @@ async function run() {
     stopGateway(abandonedGateway);
     await waitForExit(abandonedGateway);
 
+    // --- concurrent completions get distinct ids -----------------------------------------------------------
+    // The id was `chatcmpl-<epoch>`, so two answers that finished in the same millisecond carried the very same id and
+    // a client that keys its messages by id merged them. Twenty parallel completions land inside a couple of
+    // milliseconds, which is what makes the collision reproducible.
+    const idPort = GATEWAY_PORT + 21;
+    const idGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(idPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            OPENCODE_PROXY_MAX_CONCURRENCY: '20',
+            OPENCODE_PROXY_MAX_QUEUE: '64',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(idGateway);
+    const idUrl = `http://127.0.0.1:${idPort}`;
+    await waitForOk(`${idUrl}/health`);
+    const completions = await Promise.all(Array.from({ length: 20 }, () => fetch(`${idUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+    }).then((response) => response.json())));
+    const ids = completions.map((body) => body?.id);
+    check('parallel completions all answer', completions.every((body) => body?.object === 'chat.completion'),
+        JSON.stringify(completions.filter((body) => body?.object !== 'chat.completion').slice(0, 2)));
+    check('every parallel completion carries a distinct id', new Set(ids).size === ids.length,
+        `${new Set(ids).size} distinct ids for ${ids.length} completions`);
+    check('completion ids keep the OpenAI prefix', ids.every((id) => typeof id === 'string' && id.startsWith('chatcmpl-')),
+        JSON.stringify(ids.slice(0, 3)));
+    stopGateway(idGateway);
+    await waitForExit(idGateway);
+
     // --- a configured limit is reported --------------------------------------------------------------------
     // A clamp or a typo used to be invisible: the gateway silently ran with a different limit than the one configured
     const limitPort = GATEWAY_PORT + 5;

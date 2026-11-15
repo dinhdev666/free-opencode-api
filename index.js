@@ -64,7 +64,12 @@ const finalConfig = {
     OPENCODE_BIND_HOST: process.env.OPENCODE_BIND_HOST || fileConfig.OPENCODE_BIND_HOST || defaultConfig.OPENCODE_BIND_HOST,
     OPENCODE_PATH: process.env.OPENCODE_PATH || fileConfig.OPENCODE_PATH || defaultConfig.OPENCODE_PATH,
     BIND_HOST: process.env.BIND_HOST || fileConfig.BIND_HOST || defaultConfig.BIND_HOST,
-    DISABLE_TOOLS: parseBool(process.env.OPENCODE_DISABLE_TOOLS, parseBool(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)),
+    // The legacy OPENCODE_-prefixed name keeps working; the bare name matches every other key and the container's
+    // `-e DISABLE_TOOLS=...` flag
+    DISABLE_TOOLS: parseBool(
+        process.env.OPENCODE_DISABLE_TOOLS ?? process.env.DISABLE_TOOLS,
+        parseBool(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)
+    ),
     // LOG_LEVEL: env takes precedence over config.json; when neither is explicitly set, undefined is passed
     // through and startProxy falls back to the default info while keeping the legacy DEBUG -> debug level interlock
     LOG_LEVEL: process.env.LOG_LEVEL || fileConfig.LOG_LEVEL || undefined

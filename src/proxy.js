@@ -584,34 +584,66 @@ function createApp(config) {
         return trim ? cleaned.trim() : cleaned;
     };
 
+    // Streaming version of stripFunctionCalls. A delta can end in the middle of `<function_calls>` (or of its
+    // closing tag), so a trailing fragment that is still a prefix of either tag is held back until the next delta
+    // either completes it or rules it out - otherwise the raw markup leaks into the answer the client sees.
     const createToolCallFilter = () => {
-        if (!DISABLE_TOOLS) return (chunk) => chunk;
+        if (!DISABLE_TOOLS) {
+            const passThrough = (chunk) => chunk;
+            passThrough.flush = () => '';
+            return passThrough;
+        }
+        const OPEN_TAG = '<function_calls>';
+        const CLOSE_TAG = '</function_calls>';
         let inBlock = false;
-        return (chunk) => {
-            if (!chunk) return chunk;
+        let held = '';
+        // Splits text into the part that can be written out and the suffix that could still become a tag
+        const splitAtPossibleTag = (text) => {
+            for (let length = Math.min(text.length, OPEN_TAG.length - 1); length > 0; length -= 1) {
+                const tail = text.slice(text.length - length);
+                if (OPEN_TAG.startsWith(tail) || CLOSE_TAG.startsWith(tail)) {
+                    return [text.slice(0, text.length - length), tail];
+                }
+            }
+            return [text, ''];
+        };
+        const filter = (chunk) => {
+            if (!chunk && !held) return chunk;
+            let buffer = held + (chunk || '');
+            held = '';
             let output = '';
-            let remaining = chunk;
-            while (remaining.length) {
+            while (buffer.length) {
                 if (inBlock) {
-                    const endIdx = remaining.indexOf('</function_calls>');
+                    const endIdx = buffer.indexOf(CLOSE_TAG);
                     if (endIdx === -1) {
+                        // Inside a block the text is dropped; only a partial closing tag is worth keeping
+                        held = splitAtPossibleTag(buffer)[1];
                         return output;
                     }
-                    remaining = remaining.slice(endIdx + '</function_calls>'.length);
+                    buffer = buffer.slice(endIdx + CLOSE_TAG.length);
                     inBlock = false;
                     continue;
                 }
-                const startIdx = remaining.indexOf('<function_calls>');
+                const startIdx = buffer.indexOf(OPEN_TAG);
                 if (startIdx === -1) {
-                    output += remaining;
-                    return output;
+                    const [emit, tail] = splitAtPossibleTag(buffer);
+                    held = tail;
+                    return output + emit;
                 }
-                output += remaining.slice(0, startIdx);
-                remaining = remaining.slice(startIdx + '<function_calls>'.length);
+                output += buffer.slice(0, startIdx);
+                buffer = buffer.slice(startIdx + OPEN_TAG.length);
                 inBlock = true;
             }
             return output;
         };
+        // End of stream: a held fragment turned out not to be a tag
+        filter.flush = () => {
+            if (inBlock) return '';
+            const rest = held;
+            held = '';
+            return rest;
+        };
+        return filter;
     };
 
     const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
@@ -1212,6 +1244,14 @@ function createApp(config) {
                            polling is also empty. Polling twice is pointless, so an earlier poll disables this. */
                         if (!polled && !clientGone && collected && !streamedContent && !streamedReasoning) {
                             await emitPolled(false);
+                        }
+
+                        // A fragment held back at the very end of the stream turned out not to be a tag
+                        if (!clientGone && DISABLE_TOOLS) {
+                            const tailContent = filterContentDelta.flush();
+                            if (tailContent) await sendDelta(tailContent, false);
+                            const tailReasoning = filterReasoningDelta.flush();
+                            if (tailReasoning) await sendDelta(tailReasoning, true);
                         }
 
                         stopKeepAlive();

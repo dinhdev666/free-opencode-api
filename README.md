@@ -186,7 +186,7 @@ Environment variables:
 | `OPENCODE_SERVER_URL` | `OPENCODE_SERVER_URL` |
 | `OPENCODE_BIND_HOST` | `OPENCODE_BIND_HOST` |
 | `OPENCODE_PATH` | `OPENCODE_PATH` |
-| `OPENCODE_DISABLE_TOOLS` | `DISABLE_TOOLS` |
+| `DISABLE_TOOLS` | `DISABLE_TOOLS` (`OPENCODE_DISABLE_TOOLS` is still read as an alias, for setups that predate the rename) |
 | `LOG_LEVEL` | `LOG_LEVEL` |
 
 Advanced tuning (environment only):

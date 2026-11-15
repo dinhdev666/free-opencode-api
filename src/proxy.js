@@ -697,6 +697,35 @@ function createApp(config) {
         closeSocketAfterFlush(socket);
     };
 
+    // The router cannot decode a URL such as `/v1/models/%E0%A4%A`, so the request never reaches a hook. Fastify's
+    // own handler answered `{"error":"Bad Request","code":"FST_ERR_BAD_URL",…}` - no `type`, no CORS headers, no
+    // request id, no log line - for a class of requests the contract covers like any other: every error body carries a
+    // `type` and every response an `X-Request-Id`. `find-my-way` hands this handler the raw request and response, so
+    // the envelope, the CORS headers and the id are written here, the same way `clientErrorHandler` does it.
+    const badUrlHandler = (path, rawRequest, rawResponse) => {
+        const reqId = `gw-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        // The path is the client's own bytes: truncated and stripped of anything that could forge a log line
+        logger.warn(`[Proxy] Rejected a URL that cannot be decoded: ${loggableUrl(String(path ?? '').split('?')[0])}`);
+        const body = JSON.stringify({
+            error: {
+                message: 'The request URL could not be decoded',
+                type: 'invalid_request_error',
+                code: 'FST_ERR_BAD_URL'
+            }
+        });
+        rawResponse.writeHead(400, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Length': Buffer.byteLength(body),
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key, X-Requested-With',
+            'Access-Control-Max-Age': '600',
+            'Access-Control-Expose-Headers': 'X-Request-Id',
+            'X-Request-Id': reqId
+        });
+        rawResponse.end(body);
+    };
+
     // Performance-oriented setup: no built-in logger (we log ourselves, so Fastify's automatic request logging has
     // nothing to write to anyway), 50 MB JSON body limit, and trailing-slash tolerance matching the previous behavior.
     const app = Fastify({
@@ -704,7 +733,7 @@ function createApp(config) {
         // Resolved from OPENCODE_PROXY_MAX_BODY_MB (see MAX_BODY_MB): the wait queue pins every waiting request's
         // parsed body, so this is the other half of the gateway's memory bound
         bodyLimit: MAX_BODY_MB * 1024 * 1024,
-        routerOptions: { ignoreTrailingSlash: true },
+        routerOptions: { ignoreTrailingSlash: true, onBadUrl: badUrlHandler },
         trustProxy: false,
         // Replaces Fastify's default handler for requests the HTTP parser rejects (see clientErrorHandler)
         clientErrorHandler

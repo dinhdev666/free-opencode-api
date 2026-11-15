@@ -59,8 +59,8 @@ The gateway accepts OpenAI-shaped requests, translates them into OpenCode sessio
 
 ## Performance
 
-The HTTP layer is Fastify 5 with a deliberately thin lifecycle: three `onRequest` hooks (request id/logging,
-CORS, auth) and no plugin-level middleware chain. Additional choices that matter under load:
+The HTTP layer is Fastify 5 with a deliberately thin lifecycle: a single `onRequest` hook (trace id and log
+summary, CORS headers, bearer auth) and no plugin-level middleware chain. Additional choices that matter under load:
 
 - **Precompiled response schemas** — `/health` and `/v1/models` are serialized through `fast-json-stringify`
   schemas compiled at startup instead of the generic `JSON.stringify` path.
@@ -93,7 +93,12 @@ CORS, auth) and no plugin-level middleware chain. Additional choices that matter
   can be raised to run independent sessions in parallel.
 - **A client that gives up frees its slot** — when the client closes the connection, a streaming request aborts its
   event subscription and a non-streaming one stops polling at the next tick, so the queue moves on instead of
-  holding a slot for an answer nobody will read.
+  holding a slot for an answer nobody will read. A client that stops *reading* without closing is dropped after 30 s
+  instead of parking the slot forever, and no single backend call is left without a deadline.
+- **No redundant round trip per completion** — `POST /session/:id/message` already returns the message the provider
+  produced, so when that message is finished the gateway serves it directly instead of asking for it again with
+  `GET /session/:id/message` (one fewer backend call per non-streaming completion, plus the poll interval it used to
+  wait for). A message that is still being written keeps using the poll loop, so a partial answer is never served.
 
 Local benchmarks, `autocannon`, same machine (Node.js 26, macOS 27 on an Apple M4, loopback), against the
 smoke-test stub (`test/stub-opencode.mjs`). The stub answers in ~1 ms and streams its answer with deliberate 5 ms
@@ -101,10 +106,10 @@ gaps, so these numbers measure this gateway plus the stub — never a model:
 
 | Scenario | Throughput | Avg latency |
 | --- | --- | --- |
-| `GET /health`, `-c 100 -d 10` | ~93,500 req/s | 0.4 ms |
-| `GET /` (service index), `-c 100 -d 10` | ~97,800 req/s | 0.3 ms |
-| `GET /v1/models` (5 s cache), `-c 100 -d 10` | ~88,100 req/s | 0.5 ms |
-| `POST /v1/chat/completions` non-stream, `-c 10 -d 8` | ~2,900 req/s | 3.0 ms |
+| `GET /health`, `-c 100 -d 10` | ~109,600 req/s | 0.04 ms |
+| `GET /` (service index), `-c 100 -d 10` | ~115,400 req/s | 0.03 ms |
+| `GET /v1/models` (5 s cache), `-c 100 -d 10` | ~103,200 req/s | 0.09 ms |
+| `POST /v1/chat/completions` non-stream, `-c 10 -d 8` | ~3,400 req/s | 2.4 ms |
 | `POST /v1/chat/completions` non-stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | ~3,900 req/s | 2.0 ms |
 | `POST /v1/chat/completions` stream, `-c 1 -d 6` | ~33 req/s | 29 ms |
 | `POST /v1/chat/completions` stream, `-c 10 -d 8` | ~28 req/s | 344 ms (mostly queue wait) |
@@ -128,7 +133,7 @@ harness at the time; the Fastify rewrite answers ~94,000 req/s on the same endpo
 | --- | --- |
 | **Node.js** | 20.0 or newer (required by Fastify 5) |
 | **pnpm** | 12.0 or newer (the project's package manager) |
-| **OpenCode CLI** | Installed and authenticated once (`opencode auth login`) |
+| **OpenCode CLI** | A **1.x** release (the SDK the gateway uses, `@opencode-ai/sdk`, drives the 1.x `opencode serve` API), installed and authenticated once (`opencode auth login`) |
 
 Install pnpm if you do not have it yet:
 
@@ -138,17 +143,23 @@ corepack enable pnpm
 npm install -g pnpm
 ```
 
-Install the OpenCode CLI if you do not have it yet:
+Install the OpenCode CLI if you do not have it yet — a **1.x** release, which is what the gateway drives:
 
 ```bash
-# Windows
-npm install -g opencode-ai
+# Every platform with npm: pins the 1.x line (the Docker image uses the same pin)
+npm install -g "opencode-ai@1"
 
-# Linux / macOS
+# Linux / macOS alternative: the install script fetches the newest release, so check what you got
 curl -fsSL https://opencode.ai/install | bash
+opencode --version   # must report 1.x; if it reports 2.x, use the npm command above
 ```
 
 > npm appears above only for third-party CLI installation; the project's own dependencies are managed with pnpm.
+
+The 2.x CLI is a different server: its `opencode serve` serves the web UI (and answers `/health` with an HTML page),
+not the session API this gateway calls, so a 2.x binary on `PATH` produces
+`502 … rejected session creation (status 405)` on every completion. Install a 1.x release (for example
+`npm install -g opencode-ai@1`) or point `OPENCODE_PATH` at one.
 
 ---
 
@@ -223,7 +234,7 @@ Environment variables:
 | `LOG_LEVEL` | `LOG_LEVEL` |
 | `OPENCODE_USE_ISOLATED_HOME` | `USE_ISOLATED_HOME` (`USE_ISOLATED_HOME` is read as an alias) |
 
-Advanced tuning (environment only):
+Advanced tuning (environment or `config.json`; the environment wins when both set the same key):
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -232,7 +243,9 @@ Advanced tuning (environment only):
 | `OPENCODE_PROXY_START_RETRY_MS` | `15000` | Cooldown after a failed backend start attempt; requests fail fast instead of retrying immediately |
 | `OPENCODE_PROXY_MAX_CONCURRENCY` | `1` | Number of chat completions processed in parallel (1..32). `1` keeps the historical serialized behaviour; raise it only if the backend/provider tolerates concurrent sessions |
 | `OPENCODE_PROXY_MAX_QUEUE` | `64` | How many completions may wait for a free slot before the gateway answers `503 queue_full` instead of accepting more work (the queue holds request bodies, so it is bounded). Counts waiting requests only: `0` rejects a completion when no slot is free instead of queueing it. A slot frees as soon as its response is written (the session cleanup that follows does not hold it) |
+| `OPENCODE_PROXY_MAX_BODY_MB` | `50` | Largest accepted request body in MiB (1..200). It is the other half of the memory bound: a waiting completion pins its parsed body, so the worst case is this value times `OPENCODE_PROXY_MAX_QUEUE`. Prompts are small, so lowering it is the cheap way to bound a gateway whose clients are not trusted. A larger body is refused with `413` after the upload is drained (bounded to 5 s), so the client reads that error instead of a reset connection |
 | `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` (legacy alias; prefer `LOG_LEVEL=debug`) |
+| `DEBUG` | `false` | The same switch as `config.json` spells it (`OPENCODE_PROXY_DEBUG` is the environment name); `LOG_LEVEL=debug` is still the preferred way |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Fallback bind address when `BIND_HOST` is not set |
 
 > `LOG_LEVEL` is read directly from the environment by the Node process, so it always wins over the `LOG_LEVEL` field in `config.json`.
@@ -272,9 +285,11 @@ knobs (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `presence_penalty`,
 settings, so a request that relies on them gets the model's defaults. `n` is ignored too — a completion always
 returns exactly one choice.
 
-The request body is JSON, but a JSON body sent under another content type (`curl -d '{…}'` without
-`-H "Content-Type: application/json"`, or a client that labels it `text/plain`) is parsed and served all the same;
-only an unparsable body is a `400`, and that message names the header.
+The request body is JSON, but a JSON body sent under `application/x-www-form-urlencoded` (what `curl -d '{…}'` labels
+it when you omit the header) or `text/plain` is parsed from the string it carries and served all the same. An
+unparsable body is a `400` whose message names the content type; an unrelated type (`application/xml`) is a `415`, and
+so is a compressed body (`Content-Encoding: gzip`): the gateway does not decompress, and answering "not valid JSON"
+would blame the one part of the request that was correct.
 
 ```bash
 curl -X POST http://127.0.0.1:8083/v1/chat/completions \
@@ -295,7 +310,9 @@ clients can read it.
 Errors follow the OpenAI error envelope (`{"error": {"message": ..., "type": ...}}`): `400` for an invalid request
 (`type: "invalid_request_error"`, with Fastify's own `code` such as `FST_ERR_CTP_INVALID_JSON_BODY` when the body could
 not be parsed), `401` for a missing or wrong key (`type: "invalid_request_error"`, `code: "invalid_api_key"`), `404` for
-an unknown route (`type: "not_found"`), `502` for an upstream/provider failure (streaming requests included: a
+an unknown route (`type: "not_found"`), `413` for a body over `OPENCODE_PROXY_MAX_BODY_MB` (50 MiB by default),
+`415` for a content type or content encoding the
+gateway cannot read, `502` for an upstream/provider failure (streaming requests included: a
 provider failure that arrives before the first token is an HTTP error, not an empty answer, and a backend that dies
 mid-request is an upstream failure rather than a `500` — the next request starts it again, a backend that refuses
 to create a session reports its status and reason in the message instead of a bare `500`, and a backend that keeps
@@ -360,8 +377,11 @@ All output goes to stdout/stderr with a `[gateway]` prefix:
 Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked before they are logged.
 
 The startup summary prints the effective port, backend URL, tool filtering, log level and capacity
-(`Concurrency: … completion(s) processed in parallel`, `Wait queue: … waiting completion(s) before 503 queue_full`). A
-`OPENCODE_PROXY_MAX_CONCURRENCY` / `OPENCODE_PROXY_MAX_QUEUE` value that is not a number, or is outside its range, is
+(`Concurrency: … completion(s) processed in parallel`, `Wait queue: … waiting completion(s) before 503 queue_full`). The
+`opencode` version follows it as its own line: it is read beside the running server, because a `--version` that hangs
+(a wrapper script, a cold npm shim) must not keep the gateway from binding. A
+`OPENCODE_PROXY_MAX_CONCURRENCY` / `OPENCODE_PROXY_MAX_QUEUE` / `OPENCODE_PROXY_MAX_BODY_MB` value that is not a
+number, or is outside its range, is
 reported as a `warn` line next to it instead of being applied silently — a throughput knob that quietly falls back to
 the default is indistinguishable from one that has no effect.
 
@@ -436,6 +456,10 @@ git push origin v2.0.0
 | `401 Unauthorized` | The request has a missing or mismatched `Authorization: Bearer …` header; send the configured `API_KEY` (default `sk-dummy-123`). |
 | Requests time out | The backend is slow or unavailable; check `/health`, verify `opencode auth login` was completed, and consider raising `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`. |
 | Empty streaming responses | Update the OpenCode CLI; the gateway already handles the SSE event changes in opencode ≥ 1.19. |
+| `503 queue_full` with `Retry-After: 1` | Every completion slot is busy and the wait queue is full (`OPENCODE_PROXY_MAX_QUEUE`, default 64). Retry after the advertised delay, or raise `OPENCODE_PROXY_MAX_CONCURRENCY` — only if the backend tolerates concurrent sessions. |
+| `400 model "…" must be a "provider/model" id` | The `model` value had an empty half (`opencode/` or `/big-pickle`). Send a full id from `/v1/models`, or omit `model` to use `opencode/big-pickle`. |
+| `502 OpenCode backend rejected …` | The backend answered a non-2xx to a gateway call (session creation, prompt, message poll, event stream). The message carries the upstream status and reason; check `opencode --version` and the backend log. |
+| `502 … rejected session creation (status 405)` | The `opencode` on `PATH` is a 2.x release, whose `serve` exposes the web UI instead of the 1.x session API. Install a 1.x version (`npm install -g opencode-ai@1`) or set `OPENCODE_PATH` to one; the gateway logs a warning naming this cause. |
 | Port already in use | Change `PORT` in `config.json` or the environment. |
 | The gateway exits immediately, `config.json is not valid JSON …` | Fix the syntax or delete `config.json`; the process refuses to start rather than ignore a key you configured. |
 

@@ -7,10 +7,8 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { timingSafeEqual } from 'crypto';
-import { fileURLToPath } from 'url';
 import { logger, maskHeaders } from './logger.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // --- Mutex Logic with Timeout ---
 const queue = [];
@@ -32,6 +30,12 @@ const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
 // connection while the backend is still thinking. The tick is shorter so the silence stays close to the interval.
 const SSE_KEEPALIVE_INTERVAL_MS = 15000;
 const SSE_KEEPALIVE_TICK_MS = 5000;
+// How long a streaming write may wait for a client that is not reading before the client is treated as gone. Without
+// a bound, one stalled reader parked the completion in `await drain` forever and held the only completion slot.
+const SSE_CLIENT_WRITE_TIMEOUT_MS = 30000;
+// How long an oversized request body is still read and thrown away after it has been refused. Closing the socket at
+// once left the client's remaining bytes unread, and the kernel answers those with RST, so the 413 was lost.
+const BODY_DRAIN_TIMEOUT_MS = 5000;
 // After the idle timeout the gateway polls for the rest of the answer; this is how many identical polls (a full idle
 // window worth) that recovery tolerates before it accepts a message the backend never marks finished.
 const IDLE_RECOVERY_STALL_POLLS = Math.max(3, Math.ceil(DEFAULT_EVENT_IDLE_TIMEOUT_MS / DEFAULT_POLL_INTERVAL_MS));
@@ -235,12 +239,14 @@ function normalizeBackendUrl(raw) {
     return { url, notes };
 }
 
-// Reads an integer limit from the environment. A value that cannot be used must not look like it took effect: an
-// operator who raises OPENCODE_PROXY_MAX_CONCURRENCY (a throughput knob) and sees no change has no way to tell a typo
-// from a clamp, so every adjustment is kept as a note for the startup summary.
-function readLimit(name, { min, max, fallback }) {
-    const raw = process.env[name];
-    if (raw === undefined || String(raw).trim() === '') return { value: fallback, note: null };
+// Reads an integer limit through the documented precedence (environment, then config.json, then the default). A value
+// that cannot be used must not look like it took effect: an operator who raises OPENCODE_PROXY_MAX_CONCURRENCY (a
+// throughput knob) and sees no change has no way to tell a typo from a clamp, so every adjustment is kept as a note
+// for the startup summary.
+function readLimit(name, { min, max, fallback }, fileValue) {
+    const fromEnv = process.env[name];
+    const raw = (fromEnv === undefined || String(fromEnv).trim() === '') ? fileValue : fromEnv;
+    if (raw === undefined || raw === null || String(raw).trim() === '') return { value: fallback, note: null };
     const parsed = Number(raw);
     if (!Number.isFinite(parsed)) {
         return { value: fallback, note: `${name}='${raw}' is not a number, using ${fallback}` };
@@ -253,13 +259,24 @@ function readLimit(name, { min, max, fallback }) {
 
 // How many chat completions may run at the same time. 1 (the default) preserves the historical behaviour of
 // serializing every completions request; raise it to let independent OpenCode sessions run in parallel.
-const concurrencyLimit = readLimit('OPENCODE_PROXY_MAX_CONCURRENCY', { min: 1, max: 32, fallback: 1 });
-const MAX_CONCURRENCY = concurrencyLimit.value;
+// Resolved again by startProxy() so a value in config.json takes effect too: it used to be read from the environment
+// only, so the same key in the file was silently ignored while the startup summary reported the default.
+let MAX_CONCURRENCY = readLimit('OPENCODE_PROXY_MAX_CONCURRENCY', { min: 1, max: 32, fallback: 1 }).value;
+
+// Largest request body accepted, in MiB. Every waiting completion pins its parsed body, so the memory a burst can hold
+// is this value times OPENCODE_PROXY_MAX_QUEUE: the 50 MiB default times the 64-entry default queue allows 3.2 GiB that
+// no small host plans for, and a prompt is a few kilobytes. Lowering it is the cheap way to bound a gateway that faces
+// clients it does not trust. Resolved again by startProxy() so a value in config.json takes effect too.
+const DEFAULT_MAX_BODY_MB = 50;
+let MAX_BODY_MB = readLimit('OPENCODE_PROXY_MAX_BODY_MB', { min: 1, max: 200, fallback: DEFAULT_MAX_BODY_MB }).value;
 
 let activeTasks = 0;
 
 function runQueuedTask() {
-    const { task, timeout, resolve, reject } = queue.shift();
+    const entry = queue.shift();
+    const { task, timeout, resolve, reject } = entry;
+    // The admission timer armed in lock() covers the wait for a slot; from here the execution budget applies instead
+    if (entry.waitTimer) clearTimeout(entry.waitTimer);
     activeTasks += 1;
     // The slot is freed by the handler as soon as the response is complete, not when the task promise settles:
     // the session cleanup that follows the answer (a backend round trip) used to keep the slot busy after the client
@@ -307,19 +324,33 @@ function processQueue() {
 // Every waiting request holds its parsed body (up to the 50 MB body limit), so the wait queue is bounded:
 // past this point new requests are rejected immediately with a 503 instead of growing memory until they time out.
 // A missing or malformed value must never disable the cap (Number('abc') is NaN, which would compare false forever)
-const queueLimit = readLimit('OPENCODE_PROXY_MAX_QUEUE', { min: 0, max: 4096, fallback: 64 });
-const MAX_QUEUE_LENGTH = queueLimit.value;
+let MAX_QUEUE_LENGTH = readLimit('OPENCODE_PROXY_MAX_QUEUE', { min: 0, max: 4096, fallback: 64 }).value;
 
 // The resolved capacity, for the entry point's startup summary: an operator who sets a limit must be able to see the
-// value the gateway actually uses (and why it differs from what was asked for).
-export function getQueueLimits() {
-    const notes = [concurrencyLimit.note, queueLimit.note].filter(Boolean);
-    return { concurrency: MAX_CONCURRENCY, queue: MAX_QUEUE_LENGTH, notes };
+// value the gateway actually uses (and why it differs from what was asked for). Resolved from the merged configuration
+// so the summary and the gateway cannot disagree, and so a config.json value is visible rather than ignored.
+export function getQueueLimits(fileConfig = {}) {
+    const concurrency = readLimit(
+        'OPENCODE_PROXY_MAX_CONCURRENCY',
+        { min: 1, max: 32, fallback: 1 },
+        fileConfig.OPENCODE_PROXY_MAX_CONCURRENCY
+    );
+    const queue = readLimit(
+        'OPENCODE_PROXY_MAX_QUEUE',
+        { min: 0, max: 4096, fallback: 64 },
+        fileConfig.OPENCODE_PROXY_MAX_QUEUE
+    );
+    const notes = [concurrency.note, queue.note].filter(Boolean);
+    return { concurrency: concurrency.value, queue: queue.value, notes };
 }
 
 class QueueFullError extends Error {
     constructor() {
-        super(`Queue full: ${MAX_QUEUE_LENGTH} completions are already waiting, retry later`);
+        // `0` is a supported setting ("never queue"), so the default wording would report a full queue that is
+        // configured to hold zero requests - a number that reads like a bug in the report, not like the setting it is.
+        super(MAX_QUEUE_LENGTH === 0
+            ? 'Queue full: waiting is disabled (OPENCODE_PROXY_MAX_QUEUE=0), retry later'
+            : `Queue full: ${MAX_QUEUE_LENGTH} completions are already waiting, retry later`);
         this.name = 'QueueFullError';
     }
 }
@@ -333,7 +364,17 @@ function lock(task, timeout = 120000) {
             reject(new QueueFullError());
             return;
         }
-        queue.push({ task, timeout, resolve, reject });
+        // A request that never reaches a slot used to wait without any deadline at all: while one stalled completion
+        // held the only slot, everything behind it sat in the queue forever - no 503, no 504, no closed connection.
+        // Waiting for a slot is now bounded by the same budget the execution gets.
+        const entry = { task, timeout, resolve, reject, waitTimer: null };
+        entry.waitTimer = setTimeout(() => {
+            const index = queue.indexOf(entry);
+            if (index === -1) return;
+            queue.splice(index, 1);
+            reject(new Error(`Request timeout after ${timeout}ms waiting for a free completion slot`));
+        }, timeout);
+        queue.push(entry);
         processQueue();
     });
 }
@@ -364,18 +405,22 @@ function checkHealth(serverUrl) {
     });
 }
 
-// How long a successful health probe is trusted before the next one (0 disables the cache)
-const BACKEND_HEALTH_CACHE_MS = (() => {
-    const raw = Number(process.env.OPENCODE_PROXY_HEALTH_CACHE_MS);
-    return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 2000;
-})();
+// How long a successful health probe is trusted before the next one (0 disables the cache). Resolved again by
+// startProxy() from the merged configuration, so a value in config.json is honoured and not silently ignored - the
+// README documents every tuning key as env > config.json > default.
+const readMilliseconds = (name, fallback, fileValue) => {
+    const fromEnv = process.env[name];
+    const raw = (fromEnv === undefined || String(fromEnv).trim() === '') ? fileValue : fromEnv;
+    if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+};
+
+let BACKEND_HEALTH_CACHE_MS = readMilliseconds('OPENCODE_PROXY_HEALTH_CACHE_MS', 2000);
 
 // After a failed start attempt (missing binary, backend never became healthy) requests fail fast for this long
 // instead of repeating a multi-minute startup wait on every single request
-const BACKEND_START_RETRY_COOLDOWN_MS = (() => {
-    const raw = Number(process.env.OPENCODE_PROXY_START_RETRY_MS);
-    return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 15000;
-})();
+let BACKEND_START_RETRY_COOLDOWN_MS = readMilliseconds('OPENCODE_PROXY_START_RETRY_MS', 15000);
 
 // A wedged backend - one that still answers /health but never answers /session - used to hang the request handler
 // forever: node's fetch has no default timeout, so the SDK promise never settled, the client waited with no answer and
@@ -542,9 +587,22 @@ function createApp(config) {
     // nothing to write to anyway), 50 MB JSON body limit, and trailing-slash tolerance matching the previous behavior.
     const app = Fastify({
         logger: false,
-        bodyLimit: 50 * 1024 * 1024,
+        // Resolved from OPENCODE_PROXY_MAX_BODY_MB (see MAX_BODY_MB): the wait queue pins every waiting request's
+        // parsed body, so this is the other half of the gateway's memory bound
+        bodyLimit: MAX_BODY_MB * 1024 * 1024,
         routerOptions: { ignoreTrailingSlash: true },
         trustProxy: false
+    });
+
+    // Fastify parses `application/json` (and `text/plain` as an opaque string the handler reads as JSON), but a body
+    // sent with `application/x-www-form-urlencoded` - which is what `curl -d '{...}'` sends when the header is left out -
+    // was answered with a bare 415 "Unsupported Media Type". The body is a completion payload in every one of these
+    // cases, so the form type is handed over as the same unparsed string and the handler decides: a body that is valid
+    // JSON is served, one that is not answers 400 naming the content type. Only that one type is taken over; anything
+    // else still gets the media-type error, because a gateway that parses every content type is a gateway that cannot
+    // tell a malformed client from an unsupported one.
+    app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (request, body, done) => {
+        done(null, body);
     });
 
     const client = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL });
@@ -594,13 +652,18 @@ function createApp(config) {
         // The summary is emitted from the raw response's events so hijacked SSE streams (which bypass the normal
         // reply lifecycle) are covered too; whichever event arrives first wins.
         let logged = false;
+        const isApiPath = path.startsWith('/v1/');
+        // The level is checked first: building this line is the only allocation the summary costs, and a gateway
+        // running at LOG_LEVEL=warn paid for it on every request while the logger dropped the result
+        const summaryEnabled = isApiPath ? logger.isEnabled('info') : logger.isEnabled('debug');
         const logSummary = () => {
             if (logged) return;
             logged = true;
+            if (!summaryEnabled) return;
             const model = meta.model || '-';
             const streamText = typeof meta.stream === 'boolean' ? String(meta.stream) : '-';
             const line = `${request.method} ${request.url} -> ${reply.raw.statusCode} ${Date.now() - startedAt}ms [${meta.reqId}] model=${model} stream=${streamText}`;
-            if (path.startsWith('/v1/')) logger.info(line);
+            if (isApiPath) logger.info(line);
             else logger.debug(line);
         };
         reply.raw.once('finish', logSummary);
@@ -636,12 +699,30 @@ function createApp(config) {
         // `Authorization: Bearer <key>` is the contract; the scheme is case-insensitive per RFC 7235, and a client
         // that sends `bearer <key>`, `BEARER <key>` or `Bearer   <key>` (extra whitespace) is not wrong. `X-Api-Key`
         // is accepted as an alias because the preflight above advertises it and clients configured with an api-key
-        // header send it; an `Authorization` header that is present always wins, so a wrong one is not overridden.
-        const presented = authorizationToken(request.headers.authorization)
-            || apiKeyHeaderToken(request.headers['x-api-key']);
+        // header send it. Presence decides, not a parsed token: an `Authorization` header that is present always
+        // wins, so a wrong one - or one a proxy injected with another scheme - is never overridden by the alias.
+        const presented = Object.prototype.hasOwnProperty.call(request.headers, 'authorization')
+            ? authorizationToken(request.headers.authorization)
+            : apiKeyHeaderToken(request.headers['x-api-key']);
 
         if (!matchesToken(presented)) {
             reply.code(401).send({ error: { message: 'Unauthorized', type: 'invalid_request_error', code: 'invalid_api_key' } });
+            return;
+        }
+
+        // A compressed body is not decompressed by the gateway, so the JSON parser saw the gzip bytes and answered
+        // "body is not valid JSON", blaming the payload for what is an unsupported encoding: a client behind a
+        // compressing proxy got a message that pointed at the one thing that was correct. Naming the header is the
+        // difference between a one-line fix and debugging a body that is valid on the wire. Checked after the auth
+        // test, so an unauthenticated caller still learns nothing about the gateway.
+        const contentEncoding = request.headers['content-encoding'];
+        if (contentEncoding && contentEncoding.toLowerCase() !== 'identity') {
+            reply.code(415).send({
+                error: {
+                    message: `Request bodies with Content-Encoding: ${contentEncoding} are not supported; send the body uncompressed (drop that header)`,
+                    type: 'invalid_request_error'
+                }
+            });
             return;
         }
         done();
@@ -718,6 +799,13 @@ function createApp(config) {
                     });
                 }
             });
+            if (models.length === 0) {
+                // Providers the gateway cannot read a model out of (no `models` map, an empty one, a changed shape)
+                // answer 200 with nothing to choose from: that takes the same fallback path as an empty provider
+                // list, and - unlike a real listing - is not cached.
+                logger.warn('[Proxy] The backend reported no models, using the static fallback');
+                return STATIC_FALLBACK_MODELS;
+            }
             modelsCache = { object: 'list', data: models };
             modelsCacheAt = now;
             return models;
@@ -746,12 +834,16 @@ function createApp(config) {
         return { id: requestedId, name, object: 'model', owned_by: provider };
     };
     const modelByIdSchema = { schema: { response: { 200: MODEL_SCHEMA } } };
+    // An id whose last segment is empty addresses no model: `/v1/models/%2F` and `/v1/models/opencode%2F` reached the
+    // routes below with `/` and `opencode/` and were described as models with an empty (or separator) name - the same
+    // class of non-model the blank id was.
+    const isDescribableModelId = (id) => Boolean(id && id.split('/').pop());
     // A blank id (`/v1/models//`, `/v1/models/%20`) reaches this route with an empty param, because a doubled slash is
     // read as a trailing slash. Describing "" answered 200 with `{"id":"","name":""}` - not a model at all - so a blank
     // id is a missing route instead. `/v1/models/` itself still answers the listing.
     app.get('/v1/models/:modelId', modelByIdSchema, async (request, reply) => {
         const modelId = String(request.params?.modelId || '').trim();
-        if (!modelId) return reply.callNotFound();
+        if (!isDescribableModelId(modelId)) return reply.callNotFound();
         return describeModel(modelId);
     });
     // Model ids contain slashes (`opencode/big-pickle`), and clients send them unencoded as often as escaped:
@@ -761,7 +853,7 @@ function createApp(config) {
         // a blank segment. Describing "" would answer 200 with `{"id":"","name":""}`, which is not a model at all - the
         // request addressed a route that does not exist.
         const modelId = String(request.params?.['*'] || '').trim();
-        if (!modelId) return reply.callNotFound();
+        if (!isDescribableModelId(modelId)) return reply.callNotFound();
         return describeModel(modelId);
     });
 
@@ -797,11 +889,16 @@ function createApp(config) {
         }
         const OPEN_TAG = '<function_calls>';
         const CLOSE_TAG = '</function_calls>';
+        // The longest partial tag that must be held back is one character shorter than the longest tag, and the
+        // closing tag is longer than the opening one: sizing the window from OPEN_TAG alone missed a delta boundary
+        // that fell one character into the closing tag (`</function_calls` without the `>`), which dropped that
+        // character, never matched the tag again, and silently discarded the rest of the answer.
+        const MAX_HELD = Math.max(OPEN_TAG.length, CLOSE_TAG.length) - 1;
         let inBlock = false;
         let held = '';
         // Splits text into the part that can be written out and the suffix that could still become a tag
         const splitAtPossibleTag = (text) => {
-            for (let length = Math.min(text.length, OPEN_TAG.length - 1); length > 0; length -= 1) {
+            for (let length = Math.min(text.length, MAX_HELD); length > 0; length -= 1) {
                 const tail = text.slice(text.length - length);
                 if (OPEN_TAG.startsWith(tail) || CLOSE_TAG.startsWith(tail)) {
                     return [text.slice(0, text.length - length), tail];
@@ -864,6 +961,13 @@ function createApp(config) {
         }
         try {
             const idsRes = await client.tool.ids(backendDeadline(TOOL_IDS_TIMEOUT_MS));
+            // The SDK resolves on a non-2xx answer instead of throwing: an error tuple carries no data, so it used to
+            // be read as "the backend has no tools" and cached as a *success* - DISABLE_TOOLS then sent no tool
+            // switches at all for the whole cache window, leaving every tool enabled.
+            if (idsRes && idsRes.error) {
+                const { status } = upstreamFailureReason(idsRes);
+                throw new Error(`tool list rejected${status ? ` (status ${status})` : ''}`);
+            }
             const ids = Array.isArray(idsRes?.data)
                 ? idsRes.data
                 : Array.isArray(idsRes)
@@ -936,10 +1040,27 @@ function createApp(config) {
         const candidate = typeof raw === 'string'
             ? raw
             : (raw?.data?.message ?? raw?.message ?? (typeof raw?.error === 'string' ? raw.error : raw?.error?.message));
+        // A thrown call carries the runtime's own wording (`fetch failed` for a dead or refused backend), which names
+        // no cause at all; the same phrase a client would read from the top-level handler is used here.
+        const reason = typeof candidate === 'string' && candidate && isConnectionError({ message: candidate })
+            ? `the backend is not reachable (${candidate})`
+            : candidate;
         return {
             status,
-            reason: typeof candidate === 'string' && candidate ? `: ${candidate}` : ''
+            reason: typeof reason === 'string' && reason ? `: ${reason}` : ''
         };
+    };
+
+    // What actually arrived, for a debug line: the top-level type and a few keys tell an envelope change (a "data" or
+    // "messages" wrapper) from an error body, which is the whole question when a poll answers with a payload nobody
+    // can read.
+    const describePayload = (value) => {
+        if (value === null) return 'null';
+        if (value === undefined) return 'undefined';
+        if (Array.isArray(value)) return `array(${value.length})`;
+        if (typeof value !== 'object') return typeof value;
+        const keys = Object.keys(value);
+        return `object(${keys.slice(0, 6).join(',')}${keys.length > 6 ? ',...' : ''})`;
     };
 
     function extractFromParts(parts) {
@@ -955,6 +1076,45 @@ function createApp(config) {
         }
         return { content, reasoning };
     }
+
+    /**
+     * The assistant message `client.session.prompt` already returned, when the provider is done writing it.
+     *
+     * The backend answers `POST /session/:id/message` with the message it produced, so a finished message *is* the
+     * answer: asking for it again with `GET /session/:id/message` was one backend round trip per completion (plus up
+     * to a poll interval when the message was not yet marked finished) spent on data the gateway already held. A
+     * message that is still being written carries no `finish`, and that case keeps using the poll loop.
+     */
+    const completedPromptMessage = (result) => {
+        const message = result?.data;
+        const info = message?.info;
+        if (!info) return null;
+        // opencode reports the end of a message either with a finish reason or with a completion stamp only
+        if (!info.finish && !info.time?.completed) return null;
+        const parts = Array.isArray(message.parts) ? message.parts : [];
+        const { content, reasoning } = extractFromParts(parts);
+        const error = info.error || null;
+        // Nothing to serve and no failure to report: the staged message is not the answer, poll for it
+        if (!content && !reasoning && !error) return null;
+        return { content, reasoning, error };
+    };
+
+    /**
+     * Turns a rejected `client.session.prompt` into the same upstream failure the other backend calls report.
+     *
+     * The SDK does not throw on a non-2xx answer: it resolves with `{ error, response }`. Ignoring that tuple made a
+     * prompt the backend rejected (expired credentials, a rate limit, an unknown model, an incompatible version) look
+     * like a slow answer - no assistant message was ever created, so polling could only run out the whole request
+     * budget and answer 504 while holding the queue slot for minutes.
+     */
+    const throwIfPromptRejected = (result, hasAnswer) => {
+        if (!result || !result.error || hasAnswer) return;
+        const { status, reason } = upstreamFailureReason(result);
+        throw new ProviderError(
+            `OpenCode backend rejected the prompt${status ? ` (status ${status})` : ''}${reason}`,
+            status
+        );
+    };
 
     async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS, shouldAbort = null, options = {}) {
         const pollStart = Date.now();
@@ -985,7 +1145,13 @@ function createApp(config) {
             }
             let messagesRes = null;
             try {
-                messagesRes = await client.session.messages({ path: { id: sessionId }, ...backendDeadline(timeoutMs) });
+                // Each poll gets the budget that is left, not a fresh copy of it: a poll started just before the
+                // deadline used to run for another full budget, so a wedged backend kept a completion alive for
+                // about twice the advertised timeout (beyond the queue timer, which then answered a generic 500).
+                messagesRes = await client.session.messages({
+                    path: { id: sessionId },
+                    ...backendDeadline(Math.max(1, timeoutMs - (Date.now() - startedAt)))
+                });
             } catch (error) {
                 // The deadline is the caller's budget, not a failed poll: it still surfaces as a timeout
                 if (isTimeoutError(error)) throw error;
@@ -997,14 +1163,32 @@ function createApp(config) {
             if (!messages) {
                 consecutiveFailures += 1;
                 const { status, reason } = upstreamFailureReason(messagesRes);
-                logger.warn('[Proxy] Polling failed', { sessionId, attempt: consecutiveFailures, status });
+                // A 2xx answer whose body is not a message list is not the backend saying "200: failed" - it is a
+                // payload the gateway cannot read (an envelope change, a body from something that is not an OpenCode
+                // backend). The shape is named instead, because `failed ... (status 200)` reads like a gateway bug and
+                // sends the reader looking in the wrong place.
+                const statusPhrase = status !== undefined && status >= 400 ? ` (status ${status})` : '';
+                const unreadable = !reason && !statusPhrase
+                    ? `: the backend answered with a payload that is not a message list (status ${status === undefined ? 'unknown' : status})`
+                    : '';
+                const detail = `${statusPhrase}${reason || unreadable}`;
+                logger.warn('[Proxy] Polling failed', {
+                    sessionId,
+                    attempt: consecutiveFailures,
+                    status: status === undefined ? null : status,
+                    payload: logger.isEnabled('debug') ? describePayload(messagesRes) : undefined
+                });
                 if (consecutiveFailures >= MAX_POLL_FAILURES) {
                     throw new ProviderError(
-                        `OpenCode backend failed while polling the answer${status ? ` (status ${status})` : ''}${reason}`,
+                        `OpenCode backend failed while polling the answer${detail}`,
                         status
                     );
                 }
             } else if (messages.length) {
+                // A poll that answers is a healthy backend, whatever came before it: the limit is on *consecutive*
+                // failures. Counting total ones ended a completion that was busy writing its answer - five hiccups
+                // spread over a minute reported the upstream as gone while the answer was one poll away.
+                consecutiveFailures = 0;
                 for (let i = messages.length - 1; i >= 0; i -= 1) {
                     const entry = messages[i];
                     const info = entry?.info;
@@ -1021,14 +1205,16 @@ function createApp(config) {
                         if (error) {
                             logger.error('[Proxy] OpenCode assistant error:', { sessionId, error });
                         }
-                        logDebug('Polling completed', {
-                            sessionId,
-                            ms: Date.now() - pollStart,
-                            done,
-                            contentLen: content.length,
-                            reasoningLen: reasoning.length,
-                            error: error ? error.name : null
-                        });
+                        if (logger.isEnabled('debug')) {
+                            logger.debug('Polling completed', {
+                                sessionId,
+                                ms: Date.now() - pollStart,
+                                done,
+                                contentLen: content.length,
+                                reasoningLen: reasoning.length,
+                                error: error ? error.name : null
+                            });
+                        }
                         return { content, reasoning, error };
                     }
                 }
@@ -1050,7 +1236,17 @@ function createApp(config) {
     async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs) {
         const controller = new AbortController();
         const eventStreamResult = await client.event.subscribe({ signal: controller.signal });
-        const eventStream = eventStreamResult.stream;
+        const eventStream = eventStreamResult?.stream;
+        // A rejected subscription resolves with an error tuple instead of throwing (the SDK never throws on a non-2xx
+        // answer), so there is no stream to read: without this check the failure surfaced as "Cannot read properties
+        // of undefined" and lost the upstream status that says what actually went wrong.
+        if (!eventStream) {
+            const { status, reason } = upstreamFailureReason(eventStreamResult);
+            throw new ProviderError(
+                `OpenCode backend rejected the event subscription${status ? ` (status ${status})` : ''}${reason}`,
+                status
+            );
+        }
         let finished = false;
         let content = '';
         let reasoning = '';
@@ -1088,11 +1284,13 @@ function createApp(config) {
             if (idleTimer) clearTimeout(idleTimer);
             idleTimer = setTimeout(() => {
                 if (finished) return;
-                logDebug('Event idle timeout', {
-                    sessionId,
-                    ms: Date.now() - startedAt,
-                    deltaChars
-                });
+                if (logger.isEnabled('debug')) {
+                    logger.debug('Event idle timeout', {
+                        sessionId,
+                        ms: Date.now() - startedAt,
+                        deltaChars
+                    });
+                }
                 settle({
                     content,
                     reasoning,
@@ -1137,11 +1335,13 @@ function createApp(config) {
                                 scheduleIdleTimer();
                                 if (!firstDeltaAt) {
                                     firstDeltaAt = Date.now();
-                                    logDebug('SSE first delta', {
-                                        sessionId,
-                                        ms: firstDeltaAt - startedAt,
-                                        type: part.type
-                                    });
+                                    if (logger.isEnabled('debug')) {
+                                        logger.debug('SSE first delta', {
+                                            sessionId,
+                                            ms: firstDeltaAt - startedAt,
+                                            type: part.type
+                                        });
+                                    }
                                 }
                                 if (part.type === 'reasoning') {
                                     reasoning += delta;
@@ -1159,11 +1359,13 @@ function createApp(config) {
                         if (event.type === 'message.updated' &&
                             props.info?.sessionID === sessionId &&
                             (props.info?.finish || props.info?.time?.completed)) {
-                            logDebug('SSE completed', {
-                                sessionId,
-                                ms: Date.now() - startedAt,
-                                deltaChars
-                            });
+                            if (logger.isEnabled('debug')) {
+                                logger.debug('SSE completed', {
+                                    sessionId,
+                                    ms: Date.now() - startedAt,
+                                    deltaChars
+                                });
+                            }
                             settle({ content, reasoning });
                             break;
                         }
@@ -1226,6 +1428,9 @@ function createApp(config) {
                 let sessionId = null;
                 // Assigned once the session exists; the error path uses it to clean up
                 let cleanupSession = null;
+                // Assigned by the streaming path; the error path uses it to drop the backend event subscription
+                // instead of leaving it open until its own deadline (up to the whole request budget)
+                let abortStream = null;
 
                 try {
                     reqId = request.gatewayLog?.reqId || null;
@@ -1282,6 +1487,17 @@ function createApp(config) {
                     const modelSlash = modelId.indexOf('/');
                     const pID = modelSlash === -1 ? 'opencode' : modelId.slice(0, modelSlash);
                     const mID = modelSlash === -1 ? modelId : modelId.slice(modelSlash + 1);
+                    // Same rule the model routes apply: an id whose provider or model half is empty (`opencode/`,
+                    // `/big-pickle`) is not a model id. Sending it to the backend only produced an opaque upstream
+                    // error a client could not act on - and it names the value it refused.
+                    if (!pID || !mID) {
+                        return reply.code(400).send({
+                            error: {
+                                message: `model "${modelId}" must be a "provider/model" id`,
+                                type: 'invalid_request_error'
+                            }
+                        });
+                    }
                     if (request.gatewayLog) {
                         request.gatewayLog.model = `${pID}/${mID}`;
                         request.gatewayLog.stream = wantsStream;
@@ -1309,7 +1525,10 @@ function createApp(config) {
                         rawMessages.forEach((m) => {
                             const role = (m?.role || 'user').toLowerCase();
                             const content = normalizeMessageContent(m?.content);
-                            if (role === 'system') {
+                            // `developer` is OpenAI's newer name for the system role: a client that sends it means the
+                            // instructions, not a chat turn, and embedding it as "DEVELOPER: …" in the conversation
+                            // changed how a model reads it
+                            if (role === 'system' || role === 'developer') {
                                 if (content) systemChunks.push(content);
                                 return;
                             }
@@ -1334,27 +1553,65 @@ function createApp(config) {
                     if (!parts.length) {
                         return reply.code(400).send({ error: { message: 'messages must include at least one non-system text message', type: 'invalid_request_error' } });
                     }
-                    logDebug('Request start', {
-                        model: `${pID}/${mID}`,
-                        stream: wantsStream,
-                        userMessages: messages.length,
-                        system: Boolean(systemMsg),
-                        lastUserLength: lastUserMsg.length,
-                        parts: parts.length,
-                        disableTools: DISABLE_TOOLS
-                    });
+                    // Guarded: the literal is the only allocation on this path that cannot be avoided otherwise, and
+                    // this runs for every completion
+                    if (logger.isEnabled('debug')) {
+                        logger.debug('Request start', {
+                            model: `${pID}/${mID}`,
+                            stream: wantsStream,
+                            userMessages: messages.length,
+                            system: Boolean(systemMsg),
+                            lastUserLength: lastUserMsg.length,
+                            parts: parts.length,
+                            disableTools: DISABLE_TOOLS
+                        });
+                    }
 
                     // Ensure backend is running
                     await ensureBackend(config);
 
                     // Create session
-                    const sessionRes = await client.session.create(backendDeadline(REQUEST_TIMEOUT_MS));
+                    let sessionRes;
+                    try {
+                        sessionRes = await client.session.create(backendDeadline(REQUEST_TIMEOUT_MS));
+                    } catch (createError) {
+                        // A backend that died between the cached "healthy" answer and this call fails here with a
+                        // connection error. ensureBackend() trusted a probe from up to OPENCODE_PROXY_HEALTH_CACHE_MS
+                        // ago, so this request answered "fetch failed" while a restart was a single probe away - the
+                        // client had to retry to get the recovery the gateway could do itself. Drop the cached trust,
+                        // start the backend again and retry the call once; a deadline or a backend that is really gone
+                        // is not retried (a timeout keeps its own 504, and the retry would spend the budget twice).
+                        if (!isConnectionError(createError)) throw createError;
+                        logDebug('Session creation failed on a connection error, restarting the backend', {
+                            error: createError.message
+                        });
+                        const backend = backendState.get(OPENCODE_SERVER_URL);
+                        if (backend) backend.healthyAt = 0;
+                        try {
+                            await ensureBackend(config);
+                        } catch (startError) {
+                            // No restart happened (cooldown, missing binary): report the upstream failure this
+                            // request actually hit, not the start error an internal retry produced
+                            throw createError;
+                        }
+                        sessionRes = await client.session.create(backendDeadline(REQUEST_TIMEOUT_MS));
+                    }
                     sessionId = sessionRes.data?.id;
                     if (!sessionId) {
                         // A backend that answers /health but rejects POST /session (a version whose API moved, a proxy
                         // in front of it, an error body) used to surface as a bare 500 "Failed to create OpenCode
                         // session": no status, no reason, and it blamed the gateway for an upstream failure.
                         const { status: upstreamStatus, reason } = upstreamFailureReason(sessionRes);
+                        if (upstreamStatus === 405) {
+                            // The one cause worth naming: `opencode serve` from the 2.x CLI serves the web UI and
+                            // answers /health with HTML, so the gateway's readiness probe passes and every
+                            // completion then fails here. A 502 alone does not say that.
+                            logger.warn(
+                                '[Proxy] The backend does not expose the OpenCode session API (405). ' +
+                                'The installed `opencode` CLI is probably a 2.x release: install a 1.x version, which is what ' +
+                                '@opencode-ai/sdk drives, or upgrade the SDK.'
+                            );
+                        }
                         throw new ProviderError(
                             `OpenCode backend rejected session creation${upstreamStatus ? ` (status ${upstreamStatus})` : ''}${reason}`,
                             upstreamStatus
@@ -1369,8 +1626,19 @@ function createApp(config) {
                         if (!sessionId || sessionCleaned) return;
                         sessionCleaned = true;
                         try {
-                            await client.session.delete({ path: { id: sessionId }, ...backendDeadline(SESSION_CLEANUP_TIMEOUT_MS) });
-                            logDebug('Session deleted', { sessionId });
+                            const deleteResult = await client.session.delete({ path: { id: sessionId }, ...backendDeadline(SESSION_CLEANUP_TIMEOUT_MS) });
+                            // The SDK resolves on a non-2xx answer as well, so a rejected delete used to be logged as
+                            // "Session deleted" while the session stayed on the backend
+                            if (deleteResult && deleteResult.error) {
+                                const { status, reason } = upstreamFailureReason(deleteResult);
+                                logger.warn('[Proxy] Failed to delete session:', {
+                                    sessionId,
+                                    status,
+                                    error: `delete rejected${reason}`
+                                });
+                            } else {
+                                logDebug('Session deleted', { sessionId });
+                            }
                         } catch (e) {
                             logger.debug('[Proxy] Failed to delete session:', { sessionId, error: e.message });
                         }
@@ -1451,7 +1719,10 @@ function createApp(config) {
                         };
                         const noteClientGone = () => {
                             stopKeepAlive();
-                            if (raw.writableEnded) return;
+                            // No `writableEnded` short-circuit: when someone else already ended the response (the
+                            // request timeout answered in-band) the socket is still open, and leaving the flag false
+                            // let the task write into an ended stream, where the drain never comes and the slot was
+                            // lost for the rest of the process lifetime.
                             clientGone = true;
                             if (collectorHandle) collectorHandle.abort();
                         };
@@ -1473,18 +1744,35 @@ function createApp(config) {
                         }, SSE_KEEPALIVE_TICK_MS);
                         keepAliveTimer.unref();
 
-                        // Respect write backpressure so a slow reader cannot force the whole answer into memory
+                        // Respect write backpressure so a slow reader cannot force the whole answer into memory.
+                        // The wait is bounded: a client that stops reading without closing the connection (a tab
+                        // that stops consuming, a buffering proxy, a stalled phone link) never drains, and an
+                        // unbounded await left the task - and with it the only completion slot - parked forever
+                        // while /health still answered 200. A reader that makes no progress for the whole window is
+                        // treated as gone and its socket destroyed.
                         const writeFrame = async (frame) => {
-                            if (clientGone) return;
+                            if (clientGone || raw.writableEnded || raw.destroyed) return;
                             lastWriteAt = Date.now();
                             if (raw.write(frame)) return;
                             await new Promise((resolve) => {
+                                let timer = null;
                                 const settleDrain = () => {
+                                    if (timer) clearTimeout(timer);
                                     raw.off('drain', settleDrain);
                                     raw.off('close', settleDrain);
                                     raw.off('error', settleDrain);
                                     resolve();
                                 };
+                                timer = setTimeout(() => {
+                                    logger.warn('[Proxy] Streaming client stopped reading, dropping the response', {
+                                        sessionId,
+                                        ms: SSE_CLIENT_WRITE_TIMEOUT_MS
+                                    });
+                                    noteClientGone();
+                                    settleDrain();
+                                    if (!raw.destroyed) raw.destroy();
+                                }, SSE_CLIENT_WRITE_TIMEOUT_MS);
+                                timer.unref();
                                 raw.once('drain', settleDrain);
                                 raw.once('close', settleDrain);
                                 raw.once('error', settleDrain);
@@ -1525,17 +1813,28 @@ function createApp(config) {
                             DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
                             DEFAULT_EVENT_IDLE_TIMEOUT_MS
                         );
+                        // An error before the subscription is ready still has to end it (once it is): otherwise the
+                        // backend keeps a live event stream per failed completion until the collector's own deadline
+                        let streamAborted = false;
+                        abortStream = () => {
+                            streamAborted = true;
+                            if (collectorHandle) collectorHandle.abort();
+                        };
                         const safeCollect = collectDeferred
                             .then((collector) => {
                                 collectorHandle = collector;
-                                // The client left before the subscription was ready: stop it right away
-                                if (clientGone) collector.abort();
+                                // The client left, or the request failed before the subscription was ready: stop it
+                                // right away instead of leaving it open until its own deadline
+                                if (clientGone || streamAborted) collector.abort();
                                 return collector.promise;
                             })
                             .catch((err) => ({ __error: err }));
                         const promptStart = Date.now();
-                        await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                        const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                         logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
+                        // A prompt the backend rejected is an upstream failure, not a slow answer: waiting for an
+                        // assistant message that will never exist held the slot until the whole budget expired.
+                        throwIfPromptRejected(promptResult, Boolean(streamedContent || streamedReasoning));
                         // The prompt has returned: if the stream never delivered a delta, stop waiting for one
                         const collector = await collectDeferred.catch(() => null);
                         if (collector) collector.endFirstDeltaWait();
@@ -1644,9 +1943,17 @@ function createApp(config) {
                             clientGone = true;
                         });
                         const promptStart = Date.now();
-                        await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                        const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                         logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
-                        const { content, reasoning, error } = await pollForAssistantResponse(
+                        // A prompt the backend rejected is an upstream failure, not a slow answer: polling would never
+                        // find a message and the client got a 504 after the whole request budget.
+                        throwIfPromptRejected(promptResult, false);
+                        // A finished message in the prompt response is the answer itself: the follow-up poll was one
+                        // backend round trip spent on data already in hand. A message still being written has no
+                        // `finish`, and that case polls as before (a partial answer must never be served).
+                        const fromPrompt = completedPromptMessage(promptResult);
+                        if (fromPrompt) logDebug('Polling skipped (prompt carried the finished message)', { sessionId });
+                        const { content, reasoning, error } = fromPrompt || await pollForAssistantResponse(
                             sessionId,
                             REQUEST_TIMEOUT_MS,
                             DEFAULT_POLL_INTERVAL_MS,
@@ -1706,6 +2013,7 @@ function createApp(config) {
                 } catch (error) {
                     // Upstream (opencode serve) call chain failed: always emitted at error level with status code and
                     // error-body summary; the full error object goes to debug level
+                    if (abortStream) abortStream();
                     const upstream = extractUpstreamError(error);
                     logger.error('[Proxy] API Error (upstream call failed)', {
                         reqId,
@@ -1740,6 +2048,12 @@ function createApp(config) {
                     // a bug" instead of "the upstream is gone".
                     if (error.name === 'ProviderError' || isConnectionError(error)) {
                         statusCode = 502;
+                    }
+                    // The connection branch says what happened instead of forwarding Node's own wording: `fetch failed`
+                    // is what a dead or refused backend produces, and a client reading it cannot tell whether the
+                    // gateway, the backend or its own request is at fault.
+                    if (error.name !== 'ProviderError' && isConnectionError(error)) {
+                        errorMessage = `OpenCode backend is not reachable (${error.message})`;
                     }
                     if (error.message && error.message.includes('ENOENT')) {
                         errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
@@ -1777,14 +2091,30 @@ function createApp(config) {
                 }
                 return reply;
             }
-            logger.error('[Proxy] Request Handler Error:', { message: error.message, stack: error.stack });
-            const payload = { error: { message: error.message, type: 'server_error' } };
+            // The last line of defence is the queue timer (waiting for a slot, or running longer than the whole
+            // budget). That is a gateway timeout, not a gateway bug: answering 500 for it hid the timeout and leaked
+            // the internal budget number to the client.
+            const timedOut = typeof error?.message === 'string' && error.message.includes('Request timeout');
+            if (timedOut) {
+                logger.warn('[Proxy] Completion timed out:', { message: error.message });
+            } else {
+                logger.error('[Proxy] Request Handler Error:', { message: error.message, stack: error.stack });
+            }
+            const payload = {
+                error: {
+                    message: timedOut
+                        ? `OpenCode gateway did not finish the completion within ${REQUEST_TIMEOUT_MS}ms`
+                        : error.message,
+                    type: 'server_error'
+                }
+            };
+            const statusCode = timedOut ? 504 : 500;
             if (!reply.raw.headersSent) {
                 if (hijacked) {
-                    reply.raw.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+                    reply.raw.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
                     reply.raw.end(JSON.stringify(payload));
                 } else {
-                    reply.code(500).send(payload);
+                    reply.code(statusCode).send(payload);
                 }
             } else if (hijacked) {
                 failHijackedStream(reply.raw, payload);
@@ -1809,11 +2139,43 @@ function createApp(config) {
     // Health check. The body never changes for the lifetime of the process, so it is serialized once and sent as a
     // ready-made string instead of going through a serializer on every probe.
     const healthBody = JSON.stringify({ status: 'ok', backend: OPENCODE_SERVER_URL });
-    app.get('/health', { schema: { response: { 200: HEALTH_SCHEMA } } }, async (request, reply) =>
+    // Not async: a sync handler skips the promise Fastify would otherwise await on every probe, and the body is
+    // already serialized - a liveness probe is the one request that never needs to suspend.
+    app.get('/health', { schema: { response: { 200: HEALTH_SCHEMA } } }, (request, reply) =>
         reply.type('application/json; charset=utf-8').send(healthBody));
 
     // Uniform OpenAI-style error envelope for anything Fastify itself rejects (invalid JSON, body too large,
     // unknown route, ...) instead of the framework's default { statusCode, code, error, message } shape
+    /**
+     * An oversized body is refused while the client is still uploading it. Node ends the socket as soon as a response
+     * finishes with the request body unread (so the leftover bytes cannot be parsed as another request), and that
+     * close carries the kernel's RST for whatever the client is still writing - the client could lose the 413
+     * completely and report a bare connection error (Node 24's fetch said "fetch failed") for a request it would then
+     * retry forever. So the refusal is written only once the body has been read to its end, bounded: a client that
+     * keeps writing is cut off after BODY_DRAIN_TIMEOUT_MS instead of holding the socket.
+     */
+    function refuseOversizedBody(request, send) {
+        const raw = request.raw;
+        if (raw.destroyed || raw.readableEnded) return send();
+        let settled = false;
+        const finish = (destroyAfter) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(cut);
+            raw.off('end', finishBody);
+            raw.off('close', finishBody);
+            send();
+            if (destroyAfter && !raw.destroyed) raw.destroy();
+        };
+        const finishBody = () => finish(false);
+        const cut = setTimeout(() => finish(true), BODY_DRAIN_TIMEOUT_MS);
+        cut.unref();
+        raw.once('error', finishBody);
+        raw.once('end', finishBody);
+        raw.once('close', finishBody);
+        raw.resume();
+    }
+
     app.setErrorHandler((error, request, reply) => {
         const statusCode = error.statusCode && error.statusCode >= 400 ? error.statusCode : 500;
         const detail = {
@@ -1828,7 +2190,7 @@ function createApp(config) {
             if (!reply.raw.writableEnded) reply.raw.end();
             return;
         }
-        reply.code(statusCode).send({
+        const sendRefusal = () => reply.code(statusCode).send({
             error: {
                 message: error.message,
                 type: statusCode >= 500 ? 'server_error' : 'invalid_request_error',
@@ -1836,6 +2198,11 @@ function createApp(config) {
                 code: error.code || error.name || 'Error'
             }
         });
+        if (statusCode === 413) {
+            refuseOversizedBody(request, sendRefusal);
+            return;
+        }
+        sendRefusal();
     });
 
     // Unknown routes use the same OpenAI-style envelope
@@ -1854,6 +2221,18 @@ function createApp(config) {
 // Backend management state (per-instance)
 const backendState = new Map();
 
+// Waits (bounded) for a start attempt that was still in flight when the gateway began shutting down, so a child it
+// spawned a moment later is tracked instead of orphaned. The attempt aborts at its next checkpoint and the wait only
+// has to cover what it is already inside: a health probe (2 s timeout) or the SIGTERM/SIGKILL escalation of the
+// previous child (3 s). It stays under the 5 s hard exit `index.js` keeps as a backstop.
+const PENDING_START_WAIT_MS = 3500;
+async function waitForPendingStart(state) {
+    const deadline = Date.now() + PENDING_START_WAIT_MS;
+    while (state.isStarting && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 50));
+    }
+}
+
 /**
  * Backend Lifecycle Management
  */
@@ -1864,6 +2243,9 @@ async function ensureBackend(config, options = {}) {
     if (!backendState.has(stateKey)) {
         backendState.set(stateKey, {
             isStarting: false,
+            // Set by killBackend(): a start attempt that is still in flight must not spawn a backend after the
+            // gateway has gone, otherwise that child outlives the process that owns it and holds the backend port.
+            shuttingDown: false,
             process: null,
             jailRoot: null,
             healthyAt: 0,
@@ -1874,6 +2256,9 @@ async function ensureBackend(config, options = {}) {
 
     const state = backendState.get(stateKey);
 
+    // The gateway is going away: never start (or restart) a backend from here
+    if (state.shuttingDown) throw new Error('The gateway is shutting down');
+
     // A recent successful probe is trusted for BACKEND_HEALTH_CACHE_MS so a burst of chat requests shares one
     // health round trip instead of one per request; connection failures reset the timestamp (see chat error path)
     if (options.force !== true && BACKEND_HEALTH_CACHE_MS > 0 && state.healthyAt && Date.now() - state.healthyAt < BACKEND_HEALTH_CACHE_MS) {
@@ -1881,9 +2266,10 @@ async function ensureBackend(config, options = {}) {
     }
 
     if (state.isStarting) {
-        // Another request (or the startup warmup) is starting the backend: wait for it instead of starting a second one
+        // Another request (or the startup warmup) is starting the backend: wait for it instead of starting a second one.
+        // The probe comes first and the sleep sits between attempts: sleeping before every probe made a request that
+        // arrived during a start attempt wait a full second even though the backend was already answering.
         for (let i = 0; i < STARTING_WAIT_ITERATIONS; i++) {
-            await new Promise(r => setTimeout(r, STARTING_WAIT_INTERVAL_MS));
             try {
                 await checkHealth(OPENCODE_SERVER_URL);
                 state.healthyAt = Date.now();
@@ -1893,36 +2279,80 @@ async function ensureBackend(config, options = {}) {
             // this request - the first request after a backend crash used to answer an error even though a start was
             // now possible. The start path itself still honours the retry cooldown, so this cannot become a storm.
             if (!state.isStarting) break;
+            await new Promise(r => setTimeout(r, STARTING_WAIT_INTERVAL_MS));
         }
         if (state.isStarting) throw new Error('Backend startup timeout');
     }
 
+    // Claim the start attempt *before* the probe that may suspend: the claim used to happen only after that probe
+    // failed, so two callers arriving within one probe round trip (the startup warmup racing the first request, or two
+    // concurrent completions) both spawned a backend. The second spawn killed the first one's child and overwrote the
+    // tracked process, so the first child was left behind and outlived the gateway.
+    state.isStarting = true;
     try {
-        await checkHealth(OPENCODE_SERVER_URL);
-        state.healthyAt = Date.now();
-        state.lastStartFailureAt = 0;
-    } catch (err) {
-        // Recent start attempt already failed: answer immediately instead of retrying the whole startup wait
-        if (state.lastStartFailureAt && Date.now() - state.lastStartFailureAt < BACKEND_START_RETRY_COOLDOWN_MS) {
-            throw new Error(`OpenCode backend unavailable (last start attempt failed: ${state.lastStartError || 'unknown error'})`);
-        }
-        state.isStarting = true;
         try {
+            await checkHealth(OPENCODE_SERVER_URL);
+            state.healthyAt = Date.now();
+            state.lastStartFailureAt = 0;
+            return;
+        } catch (err) {
+            // Recent start attempt already failed: answer immediately instead of retrying the whole startup wait
+            if (state.lastStartFailureAt && Date.now() - state.lastStartFailureAt < BACKEND_START_RETRY_COOLDOWN_MS) {
+                throw new Error(`OpenCode backend unavailable (last start attempt failed: ${state.lastStartError || 'unknown error'})`);
+            }
+            // The probe above suspended for up to its timeout, which is exactly the window a shutdown can land in
+            if (state.shuttingDown) throw new Error('The gateway is shutting down');
             logger.info(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
 
-            // Kill existing process if any
+            // Kill the existing process if any, and wait for it to be gone before spawning a replacement: SIGTERM
+            // was sent and the new backend started on the next line, so the old child still held the port and the
+            // replacement failed to bind ("exited during startup"), which then tripped the retry cooldown - one
+            // wedged backend turned its own recovery into a 15 s outage. SIGKILL after 3 s for a child that ignores
+            // SIGTERM, like killBackend() does.
             if (state.process) {
-                try {
-                    state.process.kill();
-                } catch (e) { }
+                const previous = state.process;
+                if (previous.exitCode === null && previous.signalCode === null) {
+                    const exited = new Promise((resolve) => {
+                        let settled = false;
+                        const done = () => {
+                            if (settled) return;
+                            settled = true;
+                            clearTimeout(escalate);
+                            resolve();
+                        };
+                        const escalate = setTimeout(() => {
+                            try {
+                                previous.kill('SIGKILL');
+                            } catch (e) { }
+                            done();
+                        }, 3000);
+                        if (escalate.unref) escalate.unref();
+                        previous.once('exit', done);
+                    });
+                    try {
+                        previous.kill();
+                    } catch (e) { }
+                    await exited;
+                }
             }
 
-            // Cleanup old temp dir
-            if (state.jailRoot && fs.existsSync(state.jailRoot)) {
-                try {
-                    fs.rmSync(state.jailRoot, { recursive: true, force: true });
-                } catch (e) { }
+            // Cleanup old temp dir - after the child is gone, because it is that child's working directory. The path
+            // leaves the tracked set too: it used to stay in it, so every respawn added an entry that cleanupTempDirs()
+            // then tried to remove again at shutdown.
+            if (state.jailRoot) {
+                const previousJail = state.jailRoot;
+                state.jailRoot = null;
+                ownedJailRoots.delete(previousJail);
+                if (fs.existsSync(previousJail)) {
+                    try {
+                        fs.rmSync(previousJail, { recursive: true, force: true });
+                    } catch (e) { }
+                }
             }
+
+            // Last checkpoint before the spawn below, which has no suspension of its own: the wait for the previous
+            // child (up to 3 s) can end with the process already shutting down.
+            if (state.shuttingDown) throw new Error('The gateway is shutting down');
 
             const isWindows = process.platform === 'win32';
             const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
@@ -2072,9 +2502,11 @@ async function ensureBackend(config, options = {}) {
                 state.lastStartFailureAt = Date.now();
                 throw new Error('Backend start timeout');
             }
-        } finally {
-            state.isStarting = false;
         }
+    } finally {
+        // Released on every path (healthy probe, cooldown refusal, spawn failure, timeout): the flag is what makes the
+        // other callers wait for this attempt instead of starting a second backend
+        state.isStarting = false;
     }
 }
 
@@ -2110,27 +2542,59 @@ export function startProxy(options) {
         REQUEST_TIMEOUT_MS: (() => {
             // A malformed value must fall back to the default: Number('abc') is NaN and setTimeout(NaN) fires
             // immediately, which would turn every completion into a 504
-            const raw = Number(options.REQUEST_TIMEOUT_MS ?? process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS);
+            const raw = Number(
+                options.REQUEST_TIMEOUT_MS ??
+                process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS ??
+                options.OPENCODE_PROXY_REQUEST_TIMEOUT_MS
+            );
             return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_REQUEST_TIMEOUT_MS;
         })(),
         DISABLE_TOOLS: disableTools,
         DEBUG: parseBoolean(options.DEBUG, parseBoolean(process.env.OPENCODE_PROXY_DEBUG, false))
     };
 
+    // The queue limits follow the same precedence as every other key (environment, then config.json, then default).
+    // They used to be resolved from the environment alone, so the same keys in config.json were silently ignored and
+    // the gateway kept the documented default while the operator believed a different value was in force.
+    const resolvedLimits = getQueueLimits(options);
+    MAX_CONCURRENCY = resolvedLimits.concurrency;
+    MAX_QUEUE_LENGTH = resolvedLimits.queue;
+    resolvedLimits.notes.forEach((note) => logger.warn(`[Config] ${note}`));
+    // Same treatment for the body limit: a value that cannot be used must not look like it took effect
+    const resolvedBodyLimit = readLimit(
+        'OPENCODE_PROXY_MAX_BODY_MB',
+        { min: 1, max: 200, fallback: DEFAULT_MAX_BODY_MB },
+        options.OPENCODE_PROXY_MAX_BODY_MB
+    );
+    MAX_BODY_MB = resolvedBodyLimit.value;
+    if (resolvedBodyLimit.note) logger.warn(`[Config] ${resolvedBodyLimit.note}`);
+    // The two backend timings follow the same precedence
+    BACKEND_HEALTH_CACHE_MS = readMilliseconds(
+        'OPENCODE_PROXY_HEALTH_CACHE_MS',
+        2000,
+        options.OPENCODE_PROXY_HEALTH_CACHE_MS
+    );
+    BACKEND_START_RETRY_COOLDOWN_MS = readMilliseconds(
+        'OPENCODE_PROXY_START_RETRY_MS',
+        15000,
+        options.OPENCODE_PROXY_START_RETRY_MS
+    );
+
     // Log level resolution (calibrated at startup; all later log output follows this level):
     // 1) LOG_LEVEL (options/env, case-insensitive) 2) when not explicitly set but the legacy DEBUG switch is on,
     // promote to debug (backward compatible) 3) default info; invalid values fall back to info with a warning
     let levelResolution = logger.setLevel(config.LOG_LEVEL);
+    let levelSource = levelResolution.explicit ? 'LOG_LEVEL' : 'default';
     if (!levelResolution.valid) {
         logger.warn(`Invalid LOG_LEVEL '${levelResolution.requested}', fallback to 'info' (valid values: error/warn/info/debug)`);
     } else if (!levelResolution.explicit && config.DEBUG) {
-        levelResolution = logger.setLevel('debug');
+        // setLevel() reports the promotion as explicit, so the source has to be recorded here: reading it back from
+        // the resolved object claimed the operator had set LOG_LEVEL, which is not where `debug` came from.
+        logger.setLevel('debug');
+        levelSource = 'legacy DEBUG flag';
     }
     backendUrl.notes.forEach((note) => logger.warn(`[Config] ${note}`));
     config.LOG_LEVEL = logger.level;
-    const levelSource = !levelResolution.explicit
-        ? (config.DEBUG ? 'legacy DEBUG flag' : 'default')
-        : 'LOG_LEVEL';
 
     const { app } = createApp(config);
 
@@ -2154,34 +2618,70 @@ export function startProxy(options) {
     // Expose the Fastify instance as `server`: it implements close(cb), which index.js uses for shutdown
     return {
         server: app,
+        // Stops the backend and resolves once it is really gone. The entry point awaits this before exiting: it used
+        // to send SIGTERM and call process.exit() on the next line, so the SIGKILL escalation below never ran and a
+        // backend that ignores SIGTERM outlived the gateway that owns it.
         killBackend: () => {
             const state = backendState.get(config.OPENCODE_SERVER_URL);
-            if (state && state.process && state.process.exitCode === null && state.process.signalCode === null) {
-                const child = state.process;
+            if (!state) return Promise.resolve();
+            // The jail directory is the child's cwd, so it goes only after the child is gone
+            const removeJail = () => {
+                if (!state.jailRoot || process.platform === 'win32') return;
+                const jail = state.jailRoot;
+                try {
+                    fs.rmSync(jail, { recursive: true, force: true });
+                    ownedJailRoots.delete(jail);
+                } catch (e) { }
+            };
+            // SIGTERM, then SIGKILL after 3 s: a backend that ignores SIGTERM must not survive the gateway. Both timers
+            // are unref'd so they cannot hold the process open, and the child keeps the loop alive while it still runs.
+            const terminate = (child) => new Promise((resolve) => {
+                let settled = false;
+                let killTimer = null;
+                let graceTimer = null;
+                const finish = () => {
+                    if (settled) return;
+                    settled = true;
+                    if (killTimer) clearTimeout(killTimer);
+                    if (graceTimer) clearTimeout(graceTimer);
+                    resolve();
+                };
+                child.once('exit', finish);
                 try {
                     child.kill('SIGTERM');
                 } catch (e) {
                     // already gone
+                    finish();
+                    return;
                 }
-                // Escalate if the backend ignores SIGTERM; unref so this cannot hold the process open
-                const escalated = setTimeout(() => {
-                    if (child.exitCode === null && child.signalCode === null) {
-                        try {
-                            child.kill('SIGKILL');
-                        } catch (e) {
-                            // already gone
-                        }
+                killTimer = setTimeout(() => {
+                    if (child.exitCode !== null || child.signalCode !== null) {
+                        finish();
+                        return;
                     }
+                    try {
+                        child.kill('SIGKILL');
+                    } catch (e) {
+                        finish();
+                        return;
+                    }
+                    // A killed child still has to be reaped; stop waiting if the exit event does not arrive
+                    graceTimer = setTimeout(finish, 1000);
+                    graceTimer.unref();
                 }, 3000);
-                escalated.unref();
-            }
-            // Cleanup temp dir (only on non-Windows where we use jail)
-            if (state && state.jailRoot && process.platform !== 'win32') {
-                try {
-                    fs.rmSync(state.jailRoot, { recursive: true, force: true });
-                    ownedJailRoots.delete(state.jailRoot);
-                } catch (e) { }
-            }
+                killTimer.unref();
+            });
+            return (async () => {
+                // Tell any start attempt in flight to stop: one that is still waiting on a health probe (or on the
+                // previous child) would otherwise spawn a backend after this function resolved and after the gateway
+                // exited, leaving an orphaned `opencode serve` that holds the backend port. The attempt notices the flag
+                // at its next checkpoint and throws instead.
+                state.shuttingDown = true;
+                if (state.isStarting) await waitForPendingStart(state);
+                const child = state.process;
+                if (child && child.exitCode === null && child.signalCode === null) await terminate(child);
+                removeJail();
+            })();
         }
     };
 }

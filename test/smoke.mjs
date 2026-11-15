@@ -9,6 +9,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import { parseBoolean } from '../src/proxy.js';
 import { readConfigFile } from '../src/config.js';
@@ -38,6 +39,21 @@ const record = (name, ok, detail) => {
 const check = (name, condition, detail) => record(name, Boolean(condition), detail);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// The gateway answers the client before deleting the session: the delete is a backend round trip that has nothing to
+// do with the answer, and making the client wait for it held the completion slot. A single read of the stub's counters
+// therefore races with it - on a slow runner the session was still alive a few milliseconds after the response and the
+// "still deletes its session" checks failed with `live: 1`. Wait for the deletion to land instead of sampling one
+// instant, and keep the whole window bounded so a real leak still fails.
+async function sessionsAfterCleanup(url, timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    let stats = null;
+    for (;;) {
+        stats = await fetch(`${url}/__sessions`).then((r) => r.json()).catch(() => null);
+        if (!stats || stats.live === 0 || Date.now() >= deadline) return stats;
+        await sleep(50);
+    }
+}
 
 async function waitForOk(url, timeoutMs = 20000) {
     const deadline = Date.now() + timeoutMs;
@@ -273,6 +289,18 @@ async function run() {
     });
     check('a wrong Authorization header is not rescued by a correct X-Api-Key',
         bothHeaders.status === 401, `status ${bothHeaders.status}`);
+    // Presence decides, not the parsed token: a proxy that injects `Authorization: Basic ...` (or a client that sends a
+    // bare `Bearer`) presented an Authorization header, and the alias used to rescue it because the token was empty
+    const otherScheme = await fetch(`${BASE}/v1/models`, {
+        headers: { authorization: 'Basic dXNlcjpwYXNz', 'x-api-key': API_KEY }
+    });
+    check('a non-Bearer Authorization header is not rescued by a correct X-Api-Key',
+        otherScheme.status === 401, `status ${otherScheme.status}`);
+    const bareBearer = await fetch(`${BASE}/v1/models`, {
+        headers: { authorization: 'Bearer', 'x-api-key': API_KEY }
+    });
+    check('a bare Bearer scheme is not rescued by a correct X-Api-Key',
+        bareBearer.status === 401, `status ${bareBearer.status}`);
 
     // --- preflight --------------------------------------------------------------------------------------
     const preflight = await fetch(`${BASE}/v1/chat/completions`, { method: 'OPTIONS' });
@@ -323,6 +351,18 @@ async function run() {
     check('a whitespace model id is a missing route',
         blankEncoded.status === 404 && blankEncoded.json?.error?.type === 'not_found',
         `status ${blankEncoded.status} ${JSON.stringify(blankEncoded.json)?.slice(0, 120)}`);
+    // An id whose last segment is empty addresses no model either: `/v1/models/%2F` is "/" and
+    // `/v1/models/opencode%2F` is "opencode/", both described as a model with an empty name
+    const separatorOnly = await fetch(`${BASE}/v1/models/%2F`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then(async (r) => ({ status: r.status, json: await r.json() }));
+    check('a separator-only model id is a missing route',
+        separatorOnly.status === 404 && separatorOnly.json?.error?.type === 'not_found',
+        `status ${separatorOnly.status} ${JSON.stringify(separatorOnly.json)?.slice(0, 120)}`);
+    const emptyName = await fetch(`${BASE}/v1/models/opencode%2F`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then(async (r) => ({ status: r.status, json: await r.json() }));
+    check('a model id with an empty trailing segment is a missing route',
+        emptyName.status === 404 && emptyName.json?.error?.type === 'not_found',
+        `status ${emptyName.status} ${JSON.stringify(emptyName.json)?.slice(0, 120)}`);
     const trailingSlash = await request('/v1/models/');
     check('the trailing-slash listing still answers', trailingSlash.response.status === 200 &&
         trailingSlash.json?.object === 'list', trailingSlash.text.slice(0, 120));
@@ -333,6 +373,20 @@ async function run() {
     check('400 uses the OpenAI error envelope', typeof invalid.json?.error?.message === 'string', invalid.text.slice(0, 120));
     check('400 carries the invalid_request_error type', invalid.json?.error?.type === 'invalid_request_error',
         invalid.text.slice(0, 120));
+
+    // A model id whose provider or model half is empty is not a model: `/v1/models` answers 404 for the same ids, and
+    // sending one to the backend only produced an upstream error the client could not act on
+    for (const badModel of ['opencode/', '/big-pickle']) {
+        const badModelResponse = await request('/v1/chat/completions', {
+            method: 'POST',
+            body: { model: badModel, messages: [{ role: 'user', content: 'hi' }] }
+        });
+        check(`a model id with an empty half is rejected: ${badModel}`,
+            badModelResponse.response.status === 400 &&
+            badModelResponse.json?.error?.type === 'invalid_request_error' &&
+            String(badModelResponse.json?.error?.message).includes(badModel),
+            `status ${badModelResponse.response.status} ${badModelResponse.text.slice(0, 120)}`);
+    }
 
     // Fastify rejects the body before the handler runs; its error must use the same envelope as ours
     const badJson = await fetch(`${BASE}/v1/chat/completions`, {
@@ -375,6 +429,50 @@ async function run() {
     check('an unparsable text/plain body names the real problem',
         textPlainBad.status === 400 && /Content-Type: application\/json/.test(textPlainBadJson?.error?.message || ''),
         `${textPlainBad.status} ${JSON.stringify(textPlainBadJson).slice(0, 160)}`);
+
+    // `curl -d '{...}'` without `-H 'content-type: application/json'` sends the body as
+    // `application/x-www-form-urlencoded`, which Fastify answers with a bare 415: the documented "the content-type
+    // header is optional" path failed for the most common hand-written client. The form type is handed to the handler
+    // as the same unparsed string instead.
+    const formBody = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/x-www-form-urlencoded' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: false })
+    });
+    const formJson = await formBody.json().catch(() => null);
+    check('a JSON body sent as a form body (curl -d without the header) is still served',
+        formBody.status === 200 && formJson?.choices?.[0]?.message?.content === ANSWER,
+        `status ${formBody.status} ${JSON.stringify(formJson).slice(0, 120)}`);
+    const formBad = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'not json at all'
+    });
+    const formBadJson = await formBad.json().catch(() => null);
+    check('an unparsable form body keeps the 400 envelope',
+        formBad.status === 400 && formBadJson?.error?.type === 'invalid_request_error',
+        `${formBad.status} ${JSON.stringify(formBadJson).slice(0, 160)}`);
+    const xmlBody = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/xml' },
+        body: '<a/>'
+    });
+    check('an unrelated content type still reports the media type (415)', xmlBody.status === 415, `status ${xmlBody.status}`);
+    // The gateway does not decompress request bodies, so a gzipped one used to reach the JSON parser and be reported
+    // as "body is not valid JSON" - blaming the payload for an unsupported encoding.
+    const gzipped = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+            authorization: `Bearer ${API_KEY}`,
+            'content-type': 'application/json',
+            'content-encoding': 'gzip'
+        },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+    });
+    const gzippedJson = await gzipped.json().catch(() => null);
+    check('a Content-Encoding the gateway cannot read is named in the 415',
+        gzipped.status === 415 && /Content-Encoding: gzip/.test(gzippedJson?.error?.message || ''),
+        `${gzipped.status} ${JSON.stringify(gzippedJson).slice(0, 160)}`);
 
     const badModel = await request('/v1/chat/completions', {
         method: 'POST',
@@ -651,6 +749,67 @@ async function run() {
         growing.json?.choices?.[0]?.message?.content === ANSWER,
         JSON.stringify(growing.json?.choices?.[0]?.message?.content));
 
+    // --- a finished message in the prompt response is used as-is -----------------------------------------
+    // The backend answers POST /session/:id/message with the message it produced, so a finished one is the answer and
+    // the follow-up GET is pure overhead. The stub stores nothing for this marker: answering 200 at all proves the
+    // prompt response was used, and the poll counter proves no round trip was spent on it.
+    const pollsBeforeFastPath = (await fetch(`${STUB_URL}/__sessions`).then((r) => r.json())).messagePolls;
+    const fastPath = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'PROMPTDONE' }], stream: false }
+    });
+    const pollsAfterFastPath = (await fetch(`${STUB_URL}/__sessions`).then((r) => r.json())).messagePolls;
+    check('a finished message in the prompt response answers without polling',
+        fastPath.response.status === 200 && fastPath.json?.choices?.[0]?.message?.content === ANSWER,
+        `status ${fastPath.response.status} ${JSON.stringify(fastPath.json?.choices?.[0]?.message?.content)}`);
+    check('the fast path spends no message poll',
+        pollsAfterFastPath === pollsBeforeFastPath,
+        `message polls ${pollsBeforeFastPath} -> ${pollsAfterFastPath}`);
+
+    // --- the newer `developer` role is an instruction, not a chat turn -----------------------------------
+    // OpenAI renamed the system role to `developer`; a client that sends it means the instructions. Prefixing it with
+    // "DEVELOPER: …" and pushing it into the conversation changed how a model reads it.
+    const developerRole = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'developer', content: 'answer in one word' }, { role: 'user', content: 'hi' }] }
+    });
+    const developerStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    check('a developer message reaches the backend as its system prompt',
+        developerRole.response.status === 200 && /answer in one word/.test(String(developerStats?.lastSystemPrompt)),
+        `status ${developerRole.response.status} system ${JSON.stringify(developerStats?.lastSystemPrompt)}`);
+    check('a developer message is not turned into a conversation part',
+        !/DEVELOPER/i.test(String(developerStats?.lastSystemPrompt)) && developerRole.response.status === 200,
+        JSON.stringify(developerStats?.lastSystemPrompt));
+
+    // --- a rejected prompt is an upstream failure ---------------------------------------------------------
+    // The SDK resolves with { error, response } on a non-2xx answer instead of throwing, so a rejected prompt used to
+    // look like a slow answer: no message ever existed and the request burned its whole budget to answer 504.
+    const promptRejectedAt = Date.now();
+    const promptRejected = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'REJECTPROMPT' }], stream: false }
+    });
+    const promptRejectedMs = Date.now() - promptRejectedAt;
+    check('a rejected prompt answers 502, not a timeout',
+        promptRejected.response.status === 502, `status ${promptRejected.response.status}`);
+    check('the rejected prompt reports the upstream status and reason',
+        typeof promptRejected.json?.error?.message === 'string' &&
+        promptRejected.json.error.message.includes('status 500') &&
+        promptRejected.json.error.message.includes('provider refused the prompt'),
+        String(promptRejected.json?.error?.message));
+    check('a rejected prompt fails fast instead of waiting for the budget', promptRejectedMs < 5000,
+        `${promptRejectedMs} ms`);
+    const promptRejectedStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'REJECTPROMPT' }], stream: true },
+        stream: true
+    });
+    check('a rejected prompt in streaming mode answers the same 502',
+        promptRejectedStream.response.status === 502, `status ${promptRejectedStream.response.status}`);
+    const afterRejection = await sessionsAfterCleanup(STUB_URL);
+    check('a rejected prompt still deletes its session',
+        afterRejection && afterRejection.live === 0, JSON.stringify(afterRejection));
+
     // --- a provider failure in non-streaming mode ---------------------------------------------------------
     const failed = await request('/v1/chat/completions', {
         method: 'POST',
@@ -660,7 +819,7 @@ async function run() {
     check('a 502 carries the server_error envelope with the provider error code',
         failed.json?.error?.type === 'server_error' && failed.json?.error?.code === 'ProviderError',
         failed.text.slice(0, 160));
-    const afterFailure = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    const afterFailure = await sessionsAfterCleanup(STUB_URL);
     check('a failed completion still deletes its session',
         afterFailure && afterFailure.live === 0, JSON.stringify(afterFailure));
 
@@ -706,7 +865,7 @@ async function run() {
 
     // --- session lifecycle -------------------------------------------------------------------------------
     // One session is created and must be deleted per completion; a leak would grow the backend without bound
-    const stubStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    const stubStats = await sessionsAfterCleanup(STUB_URL);
     check('every completion deletes the session it created',
         stubStats && stubStats.deleted > 0 && stubStats.live === 0, JSON.stringify(stubStats));
 
@@ -800,6 +959,11 @@ async function run() {
     const cappedRefused = await cappedRequest('SLOW queued behind');
     check('a busy queue of 0 is answered with 503', cappedRefused.status === 503, `status ${cappedRefused.status}`);
     check('503 uses the queue_full envelope', cappedRefused.json?.error?.type === 'queue_full',
+        JSON.stringify(cappedRefused.json));
+    // The refusal is read by a human as often as by an SDK: with the queue configured to hold nothing, "0 completions
+    // are already waiting" described the setting as if it were the bug.
+    check('a refused completion names the disabled queue instead of reporting "0 waiting"',
+        /OPENCODE_PROXY_MAX_QUEUE=0/.test(cappedRefused.json?.error?.message || ''),
         JSON.stringify(cappedRefused.json));
     // A retryable refusal has to say how long to wait, or an OpenAI SDK gives up instead of retrying
     check('a full queue tells the client when to retry', cappedRefused.retryAfter === '1',
@@ -926,6 +1090,83 @@ async function run() {
     check('a clamped limit is explained instead of applied silently',
         limitOutput.includes('OPENCODE_PROXY_MAX_CONCURRENCY=99 is above the maximum 32'),
         limitOutput.split('\n').filter((line) => line.includes('MAX_CONCURRENCY')).join(' | '));
+
+    // --- the accepted body size is configurable -----------------------------------------------------------
+    // Every waiting completion pins its parsed body, so the memory a burst can hold is the body limit times the queue
+    // length: the 50 MiB and 64-entry defaults allow 3.2 GiB. A gateway facing clients it does not trust lowers it, and
+    // a limit that is configured but not applied is worse than none.
+    stopGateway(limitGateway);
+    await waitForExit(limitGateway);
+    const bodyPort = GATEWAY_PORT + 7;
+    const bodyUrl = `http://127.0.0.1:${bodyPort}`;
+    const bodyGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(bodyPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'warn',
+            OPENCODE_PROXY_MAX_BODY_MB: '1'
+        }
+    });
+    children.push(bodyGateway);
+    bodyGateway.stdout.on('data', () => {});
+    bodyGateway.stderr.on('data', () => {});
+    await waitForOk(`${bodyUrl}/health`);
+    const oversized = await fetch(`${bodyUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'x'.repeat(2 * 1024 * 1024) }] })
+    });
+    const oversizedJson = await oversized.json().catch(() => null);
+    check('a body over the configured limit answers 413', oversized.status === 413, `status ${oversized.status}`);
+    check('the 413 keeps the OpenAI envelope', oversizedJson?.error?.type === 'invalid_request_error',
+        JSON.stringify(oversizedJson)?.slice(0, 160));
+    const withinLimit = await fetch(`${bodyUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+    });
+    check('a body under the configured limit is served', withinLimit.status === 200, `status ${withinLimit.status}`);
+
+    // The refusal is decided while the client is still uploading. Node ends the socket when a response finishes with
+    // the request body unread, and the kernel resets whatever the client is still writing: CI on Node 24 lost the 413
+    // here and the suite aborted with "fetch failed". `fetch` cannot express "still uploading", so this uploads over a
+    // raw socket and keeps writing until the answer arrives.
+    const oversizedUpload = await new Promise((resolve) => {
+        const total = 3 * 1024 * 1024;
+        const head = '{"messages":[{"role":"user","content":"';
+        const tail = '"}]}';
+        const declared = Buffer.byteLength(head) + total + Buffer.byteLength(tail);
+        const socket = net.connect(bodyPort, '127.0.0.1');
+        let answer = '';
+        let writeError = null;
+        socket.on('error', (error) => { writeError = error.code || error.message; });
+        socket.on('data', (chunk) => { answer += chunk.toString('latin1'); });
+        socket.on('close', () => resolve({ answer, writeError }));
+        socket.on('connect', async () => {
+            socket.write('POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+                + `Authorization: Bearer ${API_KEY}\r\nContent-Type: application/json\r\n`
+                + `Content-Length: ${declared}\r\n\r\n` + head);
+            let sent = 0;
+            while (sent < total) {
+                const piece = 'x'.repeat(Math.min(65536, total - sent));
+                if (!socket.write(piece)) {
+                    await new Promise((next) => { socket.once('drain', next); setTimeout(next, 20); });
+                }
+                sent += piece.length;
+                await new Promise((next) => setTimeout(next, 2));
+            }
+            socket.end(tail);
+        });
+    });
+    check('an oversized body that is still uploading still gets its 413',
+        /^HTTP\/1\.1 413/.test(oversizedUpload.answer) && oversizedUpload.writeError === null,
+        `${oversizedUpload.answer.split('\r\n')[0] || 'no answer'}, write error ${oversizedUpload.writeError}`);
+
+    stopGateway(bodyGateway);
+    await waitForExit(bodyGateway);
 
     // --- a stalled stream still ends ---------------------------------------------------------------------
     // A backend that goes silent mid-answer used to leave the SSE connection open with no terminator: the client
@@ -1157,16 +1398,14 @@ async function run() {
 
     // A backend that disappears in the middle of a request is an upstream failure (502), not a gateway bug (500),
     // and the next request must start it again instead of failing until the process is restarted
-    const killInFlight = fetch(`${gatewayUrl}/v1/chat/completions`, {
+    // The stub kills itself as soon as it has accepted the prompt, so this needs no timer of its own: a SIGKILL from
+    // the test after a sleep raced the gateway's "three identical polls is an answer" rule, and a loaded runner let
+    // the kill land after a partial answer had been accepted (the test then read a 200 for a dead backend).
+    const killedAnswer = await fetch(`${gatewayUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ messages: [{ role: 'user', content: 'HOLD while the backend dies' }] })
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'SUICIDE while the backend dies' }] })
     }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
-    await sleep(250);
-    try {
-        process.kill(Number(fs.readFileSync(fakePidFile, 'utf8').trim()), 'SIGKILL');
-    } catch { /* already gone */ }
-    const killedAnswer = await killInFlight;
     check('a backend that dies mid request is reported as an upstream error',
         killedAnswer.status === 502 && killedAnswer.json?.error?.type === 'server_error',
         `status ${killedAnswer.status} ${JSON.stringify(killedAnswer.json)?.slice(0, 140)}`);
@@ -1259,6 +1498,60 @@ async function run() {
     stop(rejectStub);
     await waitForExit(rejectStub);
 
+    // --- a backend that rejects the event stream ---------------------------------------------------------
+    // A build whose SSE endpoint moved, or a proxy in front of it, answers /health and the session calls but refuses
+    // GET /event. The SDK reports that as an error tuple with no stream, so the gateway must fall back to polling and
+    // still answer: a streaming client that gets a 502 (or a hang) because of a missing event stream is a broken
+    // gateway, not a broken model.
+    const noEventsStubPort = GATEWAY_PORT + 15;
+    const noEventsStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(noEventsStubPort), STUB_FAIL_EVENTS: '1' }
+    });
+    children.push(noEventsStub);
+    noEventsStub.stdout.on('data', () => {});
+    noEventsStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${noEventsStubPort}/health`);
+    const noEventsGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(noEventsStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${noEventsStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(noEventsGateway);
+    noEventsGateway.stdout.on('data', () => {});
+    noEventsGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${noEventsStubPort + 1}/health`);
+    const noEventsUrl = `http://127.0.0.1:${noEventsStubPort + 1}`;
+    const noEventsResponse = await fetch(`${noEventsUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true }),
+        signal: AbortSignal.timeout(20000)
+    }).then(async (r) => ({ status: r.status, text: await r.text() }))
+        .catch((error) => ({ status: 0, text: String(error) }));
+    const noEventsFrames = parseSseFrames(noEventsResponse.text);
+    const noEventsText = noEventsFrames
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => { try { return JSON.parse(frame); } catch { return null; } })
+        .filter(Boolean)
+        .map((chunk) => chunk.choices?.[0]?.delta?.content || '')
+        .join('');
+    check('a rejected event stream still answers the streaming request',
+        noEventsResponse.status === 200 && noEventsText === ANSWER,
+        `status ${noEventsResponse.status} content ${JSON.stringify(noEventsText)}`);
+    check('the polling fallback still terminates the stream',
+        noEventsFrames[noEventsFrames.length - 1] === '[DONE]',
+        JSON.stringify(noEventsFrames.slice(-2)));
+    stopGateway(noEventsGateway);
+    await waitForExit(noEventsGateway);
+    stop(noEventsStub);
+    await waitForExit(noEventsStub);
+
     // --- a backend that reports no models ---------------------------------------------------------------
     // A provider payload the gateway cannot read (a changed shape, a version that reports nothing) answers 200 with an
     // empty list. Serving {"data":[]} leaves a client with no model to choose, so the gateway falls back to its single
@@ -1289,13 +1582,15 @@ async function run() {
     await waitForOk(`${emptyUrl}/health`);
     const emptyList = await fetch(`${emptyUrl}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
         .then((r) => r.json()).catch(() => null);
-    check('an empty provider list falls back to the static model',
+    // The second call reports a provider whose model map the gateway cannot read, so both shapes of an unreadable
+    // payload take the fallback path
+    check('an empty or model-less provider list falls back to the static model',
         emptyList?.object === 'list' && emptyList.data?.length === 1 && emptyList.data[0].id === 'opencode/big-pickle' &&
         emptyList.data[0].name === 'Big Pickle' && emptyList.data[0].owned_by === 'opencode',
         JSON.stringify(emptyList)?.slice(0, 140));
     const emptyListAgain = await fetch(`${emptyUrl}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
         .then((r) => r.json()).catch(() => null);
-    check('the empty answer is not cached',
+    check('the fallback answer is not cached',
         emptyListAgain?.data?.length === 1 && emptyListAgain.data[0].id === 'opencode/big-pickle',
         JSON.stringify(emptyListAgain)?.slice(0, 140));
     stopGateway(emptyGateway);
@@ -1414,14 +1709,59 @@ async function run() {
         /status 500/.test(String(failPolled.json?.error?.message)),
         `status ${failPolled.status} ${JSON.stringify(failPolled.json)?.slice(0, 160)}`);
     check('the failed poll gives up well before the request timeout', failPollMs < 7000, `${failPollMs}ms`);
-    const failPollSessions = await fetch(`http://127.0.0.1:${failPollStubPort}/__sessions`)
-        .then((r) => r.json()).catch(() => null);
+    const failPollSessions = await sessionsAfterCleanup(`http://127.0.0.1:${failPollStubPort}`);
     check('the failed poll still deletes its session', failPollSessions?.live === 0,
         JSON.stringify(failPollSessions)?.slice(0, 120));
     stopGateway(failPollGateway);
     await waitForExit(failPollGateway);
     stop(failPollStub);
     await waitForExit(failPollStub);
+
+    // A poll that answers 2xx with something that is not a message list is an unreadable upstream, not the backend
+    // saying "200: failed": the message has to name the shape, because `failed ... (status 200)` sends the reader
+    // looking for a gateway bug instead of an envelope change (or a proxy in front of the backend).
+    const oddPollStubPort = GATEWAY_PORT + 19;
+    const oddPollStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(oddPollStubPort), STUB_UNREADABLE_MESSAGES: '1' }
+    });
+    children.push(oddPollStub);
+    oddPollStub.stdout.on('data', () => {});
+    oddPollStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${oddPollStubPort}/health`);
+    const oddPollGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(oddPollStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${oddPollStubPort}`,
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '8000',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(oddPollGateway);
+    oddPollGateway.stdout.on('data', () => {});
+    oddPollGateway.stderr.on('data', () => {});
+    const oddPollUrl = `http://127.0.0.1:${oddPollStubPort + 1}`;
+    await waitForOk(`${oddPollUrl}/health`);
+    const oddPolled = await fetch(`${oddPollUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(30000)
+    }).then((r) => r.json().then((json) => ({ status: r.status, json })))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    const oddPollMessage = String(oddPolled.json?.error?.message || '');
+    check('a poll answer that is not a message list is reported as unreadable',
+        oddPolled.status === 502 && /payload that is not a message list/.test(oddPollMessage),
+        `status ${oddPolled.status} ${oddPollMessage.slice(0, 160)}`);
+    check('the unreadable poll message does not read like a failed request that succeeded',
+        !/failed while polling the answer \(status 200\)/.test(oddPollMessage), oddPollMessage.slice(0, 160));
+    stopGateway(oddPollGateway);
+    await waitForExit(oddPollGateway);
+    stop(oddPollStub);
+    await waitForExit(oddPollStub);
 
     // --- a backend that answers /health but nothing else -------------------------------------------------
     // A wedged opencode process (health OK, /session silent) used to hang the request handler forever: fetch has no
@@ -1520,6 +1860,105 @@ async function run() {
     check('SIGINT shuts the gateway down cleanly', longLivedExit === 0, `exit ${longLivedExit}`);
     check('the shutdown leaves no truncated answer behind', heldLongLivedAnswer.status === 200,
         `status ${heldLongLivedAnswer.status}`);
+}
+
+// --- a stop request leaves no backend behind ---------------------------------------------------------------
+// killBackend() is what the entry point awaits before exiting, so it has to mean "no backend is running, and none
+// will start": a start attempt that was still inside its health probe used to spawn `opencode serve` after
+// killBackend() had already resolved, so the child outlived the gateway it belongs to and kept the backend port.
+// The CLI here is a stand-in that records its pid, and the backend URL points at a server that accepts connections
+// and never answers, which is exactly the window the shutdown lands in. The driver imports startProxy() so the stop
+// can be observed without exiting the process, as a library embedder would do it.
+if (process.platform !== 'win32') {
+    const shutdownDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-stop-'));
+    const pidFile = path.join(shutdownDir, 'child.pid');
+    const fakeCli = path.join(shutdownDir, 'opencode');
+    fs.writeFileSync(fakeCli, [
+        '#!/usr/bin/env node',
+        "if (process.argv.includes('--version')) { process.stdout.write('1.19.5\\n'); process.exit(0); }",
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+        'setInterval(() => {}, 1000);',
+        ''
+    ].join('\n'));
+    fs.chmodSync(fakeCli, 0o755);
+    // Accepts the probe's connection and never answers, so checkHealth stays inside that connection for its timeout
+    const silent = http.createServer(() => { });
+    await new Promise((resolve) => silent.listen(GATEWAY_PORT + 8, '127.0.0.1', resolve));
+    const driverPort = GATEWAY_PORT + 9;
+    const driverSource = [
+        "import { startProxy } from './src/proxy.js';",
+        `const proxy = startProxy({ PORT: ${driverPort}, API_KEY: 'stop-key', OPENCODE_SERVER_URL: 'http://127.0.0.1:${GATEWAY_PORT + 8}', OPENCODE_PATH: ${JSON.stringify(fakeCli)}, LOG_LEVEL: 'error' });`,
+        'await new Promise((r) => setTimeout(r, 300));',
+        'await proxy.killBackend();',
+        "process.stdout.write('stopped\\n');",
+        'await new Promise((r) => setTimeout(r, 3000));',
+        'process.exit(0);',
+        ''
+    ].join('\n');
+    const driver = spawn(process.execPath, ['--input-type=module', '-e', driverSource], {
+        cwd: ROOT,
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let driverOut = '';
+    driver.stdout.on('data', (chunk) => { driverOut += chunk; });
+    driver.stderr.on('data', () => { });
+    const driverExit = await new Promise((resolve) => driver.once('exit', (code) => resolve(code)));
+    const spawnedPid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, 'utf8')) : null;
+    if (spawnedPid) {
+        try { process.kill(spawnedPid, 'SIGKILL'); } catch (e) { }
+    }
+    check('killBackend() resolves after the stop', driverOut.includes('stopped') && driverExit === 0,
+        `exit ${driverExit}, output ${JSON.stringify(driverOut.trim())}`);
+    check('a start attempt in flight spawns no backend once the gateway is stopping', spawnedPid === null,
+        `spawned pid ${spawnedPid}`);
+    await new Promise((resolve) => silent.close(resolve));
+    fs.rmSync(shutdownDir, { recursive: true, force: true });
+
+// --- a closed log reader does not take the gateway down ---------------------------------------------------
+// `node index.js | head -3`, a log shipper that restarts, `docker logs` closing mid-write: the next write emits EPIPE
+// on stdout, an unhandled stream 'error' is thrown as an uncaught exception, and it killed a gateway that was still
+// serving. Destroying the read end of the child's stdout is exactly that pipe closing.
+// The main stub is long gone by this point, so this needs a backend of its own
+const pipeStubPort = GATEWAY_PORT + 22;
+const pipeStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+    cwd: ROOT,
+    env: { ...process.env, STUB_PORT: String(pipeStubPort) }
+});
+children.push(pipeStub);
+pipeStub.stdout.on('data', () => {});
+pipeStub.stderr.on('data', () => {});
+await waitForOk(`http://127.0.0.1:${pipeStubPort}/health`);
+const pipePort = GATEWAY_PORT + 21;
+const pipeGateway = spawn(process.execPath, ['index.js'], {
+    cwd: ROOT,
+    env: {
+        ...process.env,
+        PORT: String(pipePort),
+        BIND_HOST: '127.0.0.1',
+        OPENCODE_SERVER_URL: `http://127.0.0.1:${pipeStubPort}`,
+        LOG_LEVEL: 'info'
+    }
+});
+children.push(pipeGateway);
+pipeGateway.stdout.on('data', () => {});
+pipeGateway.stderr.on('data', () => {});
+await waitForOk(`http://127.0.0.1:${pipePort}/health`);
+pipeGateway.stdout.destroy();
+await sleep(400);
+const afterClosedPipe = await fetch(`http://127.0.0.1:${pipePort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    signal: AbortSignal.timeout(30000)
+}).then((r) => r.text().then((body) => ({ status: r.status, body })))
+    .catch((error) => ({ status: 0, body: error.message }));
+check('a closed log pipe does not stop the gateway',
+    afterClosedPipe.status === 200 && afterClosedPipe.body.includes(ANSWER),
+    `status ${afterClosedPipe.status} ${afterClosedPipe.body.slice(0, 120)}`);
+stopGateway(pipeGateway);
+await waitForExit(pipeGateway);
+stop(pipeStub);
+await waitForExit(pipeStub);
 }
 
 const TIMEOUT_MS = 120000;

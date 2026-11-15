@@ -2321,6 +2321,24 @@ async function run() {
         /messages\[0\]\.role must be a string/.test(badRole.json?.error?.message || '') && !/toLowerCase/.test(badRole.text),
         badRole.text.slice(0, 160));
 
+    // An entry that is not a message object (`"hi"`, `42`, `null`, `[]`) was read through `m?.role`/`m?.content` as an
+    // empty user message, so the whole request ended at "messages must include at least one non-system text message":
+    // a complaint about text the client never sent, for an array whose entries are not messages at all.
+    for (const [entry, described] of [['"hi"', 'a string'], ['42', 'a number'], ['null', 'null'], ['[]', 'an array']]) {
+        const notAMessage = await request('/v1/chat/completions', {
+            method: 'POST',
+            body: { messages: [{ role: 'user', content: 'hi' }, JSON.parse(entry)] }
+        });
+        check(`a message entry that is not an object is named: ${described}`,
+            notAMessage.response.status === 400 &&
+            notAMessage.json?.error?.message === `messages[1] must be a message object, found ${described}`,
+            `${notAMessage.response.status} ${notAMessage.text.slice(0, 160)}`);
+    }
+    const stringEntry = await request('/v1/chat/completions', { method: 'POST', body: { messages: ['hi'] } });
+    check('a bare string in the messages array is not reported as missing text',
+        stringEntry.response.status === 400 && !/non-system text message/.test(stringEntry.text),
+        stringEntry.text.slice(0, 160));
+
     // A content part the gateway cannot forward used to be dropped in silence: a multimodal request was answered from
     // the text alone, and one that carried only an image was answered with "messages must include at least one
     // non-system text message", which blames the client's text instead of the part it actually sent.

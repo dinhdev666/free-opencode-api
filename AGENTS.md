@@ -189,10 +189,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   slot is served, which is what makes a `0` configuration safe to try). A slot is released when its response is
   complete (`release()` in `runQueuedTask`), not when the task promise settles: the session deletion after the answer
   is a backend round trip, and holding the slot through it made an immediate follow-up request look like a full
-  gateway. `.finally(release)` stays the safety net, so `release()` is idempotent and every path frees the slot. A request whose client disconnects while it is
-  still queued is dropped when its turn comes (`reply.raw` 'close'), so it never spends backend time or delays the
-  requests behind it. Do not use `request.raw.destroyed` as the disconnect signal: the request stream is destroyed as
-  soon as its body has been read, which is the normal case.
+  gateway. `.finally(release)` stays the safety net, so `release()` is idempotent and every path frees the slot. A
+  request whose client disconnects while it is still queued is dropped when its turn comes (`reply.raw` 'close'), so
+  it never spends backend time or delays the requests behind it. Do not use `request.raw.destroyed` as the disconnect
+  signal: the request stream is destroyed as soon as its body has been read, which is the normal case.
 - **The backend command survives the shell it runs in.** `opencodeBin` is quoted whenever the spawn uses a shell
   (`C:\Program Files\...opencode.cmd` does not start unquoted, and `;`/`&` in a path would be read as operators);
   paths carrying `"`, `$` or a backtick are refused instead, because quoting cannot neutralise them. A configured

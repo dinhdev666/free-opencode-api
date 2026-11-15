@@ -67,7 +67,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 131 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 135 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -94,7 +94,10 @@ without waiting for the idle timeout) and
 `GROW` (an answer that is still being written when the prompt returns, so a test can prove the polled answer is never
 truncated), `STUB_EMPTY_PROVIDERS=1` (a provider list with no models, so a test can prove the model listing falls back
 instead of serving an empty list) and `STUB_FAIL_SESSION=1` (a 405 for `POST /session`, so a test can prove an
-incompatible backend is reported as an upstream error with its status and reason) and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
+incompatible backend is reported as an upstream error with its status and reason), `STUB_FAIL_MESSAGES=<n>` (the first
+n message polls answer 500) and `STUB_DROP_MESSAGES=<n>` (the first n message polls drop the connection) — both with
+`STUB_ALWAYS_FAIL_MESSAGES=1` to fail every poll, so a test can prove a completion survives a transient poll failure
+and gives up on a persistent one and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
 backend is killed or the gateway is shutting down) and `TAILTAG` (an answer whose last delta ends in a tag prefix that
 never becomes a tag, so a test can prove the held fragment is still delivered). Extend that stub and
 `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
@@ -216,6 +219,13 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   returning the first non-empty message truncated it (`"Hello from t"` for a 41-character answer). A message whose
   text stops growing for three consecutive polls is accepted anyway, so a provider that never marks its message
   finished still gets an answer.
+- **A failed poll does not end the completion.** `pollForAssistantResponse` retries a poll that answers with an error
+  (a 5xx while the backend is busy) or throws (a connection reset while it restarts): one bad poll used to lose an
+  answer that was one poll away - the thrown case surfaced as `502 "fetch failed"`. Only `MAX_POLL_FAILURES` (5)
+  consecutive failures give up, and they report an upstream error with the status and reason
+  (`OpenCode backend failed while polling the answer (status 500): …`) in ~2 s instead of burning the whole request
+  budget and answering `504`. An empty list is a normal "not written yet" poll, not a failure, and an expired
+  deadline still surfaces as the timeout it is.
 - **A finished message ends the stream, whatever the finish reason.** The collector settles on any non-empty
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.

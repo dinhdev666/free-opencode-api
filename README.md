@@ -287,7 +287,7 @@ Advanced tuning (environment or `config.json`; the environment wins when both se
 | `OPENCODE_PROXY_START_RETRY_MS` | `15000` | Cooldown after a failed backend start attempt; requests fail fast instead of retrying immediately |
 | `OPENCODE_PROXY_MAX_CONCURRENCY` | `1` | Number of chat completions processed in parallel (1..32). `1` keeps the historical serialized behaviour; raise it only if the backend/provider tolerates concurrent sessions |
 | `OPENCODE_PROXY_MAX_QUEUE` | `64` | How many completions may wait for a free slot before the gateway answers `503 queue_full` instead of accepting more work (the queue holds request bodies, so it is bounded). Counts waiting requests only: `0` rejects a completion when no slot is free instead of queueing it. A slot frees as soon as its response is written (the session cleanup that follows does not hold it) |
-| `OPENCODE_PROXY_MAX_BODY_MB` | `50` | Largest accepted request body in MiB (1..200). It is the other half of the memory bound: a waiting completion pins its parsed body, so the worst case is this value times `OPENCODE_PROXY_MAX_QUEUE`. Prompts are small, so lowering it is the cheap way to bound a gateway whose clients are not trusted. A larger body is refused with `413` after the upload is drained (bounded to 5 s), so the client reads that error instead of a reset connection |
+| `OPENCODE_PROXY_MAX_BODY_MB` | `50` | Largest accepted request body in MiB (1..200). It is the other half of the memory bound: a waiting completion pins its parsed body, so the worst case is this value times `OPENCODE_PROXY_MAX_QUEUE`. Prompts are small, so lowering it is the cheap way to bound a gateway whose clients are not trusted. A larger body is refused with `413` naming this limit, after the upload is drained (bounded to 5 s) so the client reads that error instead of a reset connection |
 | `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` **when no explicit `LOG_LEVEL` is set** — an explicit level wins and the switch is then ignored with a `[Config]` warning. This is the **environment name** of the switch (the `config.json` key is `DEBUG`, and the environment variable `DEBUG` has no effect); `LOG_LEVEL=debug` is the preferred way |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Fallback bind address when `BIND_HOST` is not set — **environment only**: `config.json` has just `BIND_HOST`, and this name in the file is reported as an unknown key and ignored |
 
@@ -379,8 +379,8 @@ Errors follow the OpenAI error envelope (`{"error": {"message": ..., "type": ...
 not be parsed), `401` for a missing or wrong key (`type: "invalid_request_error"`, `code: "invalid_api_key"`), `404` for
 an unknown route (`type: "not_found"`), `408`/`431` for a request the HTTP parser rejected (a timeout, an oversized
 header block; ordinary parse errors are `400`) — those also answer the envelope, with CORS headers and an
-`X-Request-Id`, `413` for a body over `OPENCODE_PROXY_MAX_BODY_MB` (50 MiB by default),
-`415` for a content type or content encoding the
+`X-Request-Id`, `413` for a body over `OPENCODE_PROXY_MAX_BODY_MB` (50 MiB by default; the message names the limit it
+enforced, since sending less or raising the knob is the fix), `415` for a content type or content encoding the
 gateway cannot read, `502` for an upstream/provider failure (streaming requests included: a
 provider failure that arrives before the first token is an HTTP error, not an empty answer, and a backend that dies
 mid-request is an upstream failure rather than a `500` — the next request starts it again, a backend that refuses

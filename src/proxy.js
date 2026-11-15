@@ -875,13 +875,17 @@ function createApp(config) {
         rawResponse.end(body);
     };
 
+    // The body limit this app enforces, read once: the parser gets the bytes and the 413 below quotes the number, and
+    // both have to name the same value
+    const bodyLimitMb = MAX_BODY_MB;
+
     // Performance-oriented setup: no built-in logger (we log ourselves, so Fastify's automatic request logging has
     // nothing to write to anyway), 50 MB JSON body limit, and trailing-slash tolerance matching the previous behavior.
     const app = Fastify({
         logger: false,
         // Resolved from OPENCODE_PROXY_MAX_BODY_MB (see MAX_BODY_MB): the wait queue pins every waiting request's
         // parsed body, so this is the other half of the gateway's memory bound
-        bodyLimit: MAX_BODY_MB * 1024 * 1024,
+        bodyLimit: bodyLimitMb * 1024 * 1024,
         routerOptions: { ignoreTrailingSlash: true, onBadUrl: badUrlHandler },
         trustProxy: false,
         // Replaces Fastify's default handler for requests the HTTP parser rejects (see clientErrorHandler)
@@ -2993,7 +2997,7 @@ function createApp(config) {
 
     app.setErrorHandler((error, request, reply) => {
         const statusCode = error.statusCode && error.statusCode >= 400 ? error.statusCode : 500;
-        // Two refusals the content-type layer makes arrive with text that names nothing the client can act on, so the
+        // Three refusals the content-type layer makes arrive with text that names nothing the client can act on, so the
         // envelope says what was actually wrong and what to send instead:
         //
         // - FST_ERR_CTP_INVALID_JSON_BODY covers both a body that does not parse **and** one that carries a property
@@ -3002,8 +3006,15 @@ function createApp(config) {
         // - FST_ERR_CTP_INVALID_MEDIA_TYPE arrives as "Unsupported Media Type" for any type the gateway does not
         //   parse, including a request that sends a body with **no** Content-Type header at all - the likeliest
         //   hand-written mistake there is, answered with a message that names neither the type nor the fix.
+        // - FST_ERR_CTP_BODY_TOO_LARGE says only that something was too large. The limit is a knob
+        //   (`OPENCODE_PROXY_MAX_BODY_MB`) and the client's fix depends on the number: send less, or raise it. It is
+        //   read from the value this app was built with, so the sentence cannot disagree with `bodyLimit`.
         const errorMessageFor = (err) => {
             if (!err) return 'Internal Server Error';
+            if (err.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+                return `request body is too large (limit ${bodyLimitMb} MiB); send a smaller body or raise `
+                    + 'OPENCODE_PROXY_MAX_BODY_MB';
+            }
             if (err.code === 'FST_ERR_CTP_INVALID_JSON_BODY') {
                 return 'request body is not valid JSON, or it carries a forbidden property name (__proto__, constructor); '
                     + 'send Content-Type: application/json';

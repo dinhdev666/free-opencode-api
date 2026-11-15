@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 336 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 337 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -193,7 +193,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   position and type (`messages[0] must be a message object, found a string`).
 - A `messages[].role` that is present but not a string (`5`, `{}`, `[]`, `true`) is a `400`
   (`messages[0].role must be a string`): `(role || 'user').toLowerCase()` threw on a truthy non-string, so a client's
-  bad field was answered `500` with the internal expression in the message. A missing or `null` role keeps its lenient
+  bad field was answered `500` with the internal expression. A missing or `null` role keeps its lenient
   `user` default.
 - **Content parts must be text.** A `content` array may carry strings and parts with a `text` field (`text`, and the
   Responses-API spelling `input_text`). Any other part (`image_url`, `input_audio`, `file`) is refused with a `400`
@@ -203,7 +203,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   (`messages[0].content[1].text must be a string, found a number`) and a part that is not a part at all (`… must be a
   string or an object with a text field, found a number`, for `42`, `null`, `true`, which were dropped in silence). A
   `content` that is a **single object instead of an array** follows the same three rules without a part index; it used
-  to be read as an empty message, so a request that also carried text got an answer built from that text alone. A bare
+  to be read as an empty message, so a request that also carried text was answered from that text alone. A bare
   scalar `content` (`42`, `true`) is refused the same way, without a part index: stringifying it sent the model the
   number as the question.
 - **A message `name` is a label, not prompt text.** It is interpolated as `USER(name): …` only when it is a string,
@@ -216,8 +216,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   answering the `408` envelope when nothing has been sent. It closes the **request's** socket, not `reply.raw`: a
   keep-alive response is detached from the connection once it ends, so destroying that closed nothing.
 - A `model` id whose provider or model half is empty (`"opencode/"`, `"/big-pickle"`) is a `400` in the
-  `invalid_request_error` envelope naming the value: `/v1/models` answers `404` for the same ids, and sending them to
-  the backend only produced an opaque upstream error. An absent or blank `model` means `DEFAULT_MODEL`.
+  `invalid_request_error` envelope naming the value: sending them to the backend only produced an opaque upstream
+error. An absent or blank `model` means `DEFAULT_MODEL`.
 - A completion body sent under a non-JSON content type (`curl -d '{…}'` without the header, `text/plain`) reaches the
   handler as an unparsed string; it is parsed there and served. Answering "messages array is required" blamed a body
   valid for a missing header. A string that is not JSON answers `400` naming the content type.
@@ -306,7 +306,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   `431` for `HPE_HEADER_OVERFLOW`, `408` for `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope
   (`type: "invalid_request_error"`, the parser's code in `code` when it is a plain `[A-Z_]+` token) with CORS headers,
   an `X-Request-Id` and a `warn` log line, where Fastify's own
-  handler answered a bare `Bad Request` with none of those. It writes the envelope,
+  handler answered a bare `Bad Request`. It writes the envelope,
   then closes with `socket.end()` (`closeSocketAfterFlush()`), never `socket.destroy()`: `destroy()` discards buffered
   writes, so under backpressure the client got a reset instead of its error.
 - A URL the **router** cannot decode (a percent escape that is not valid UTF-8, `GET /v1/models/%E0%A4%A`) never reaches
@@ -367,7 +367,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   (`GET /v1/models#access_token=…`) even though `curl` and browsers strip it, and Node logs the URL as it arrived. The
   list is one exported string because
   `docker/docker-entrypoint.sh` cannot import this module and repeats it for its own first-boot dump; the smoke suite
-  asserts the two copies are identical, the way `CORS_ALLOW_HEADERS` is the one place the CORS list lives.
+  asserts the two copies are identical.
   A request body reaches the debug dump through `maskDetail()` (the same name list on a bounded copy), and the
   model-fetch error line uses the same helpers for `error.message` and the upstream body. A detail object handed to a
   debug line is **truncated before it is cloned** (`serializeDetail()`): a 50 MB body used to be cloned and
@@ -375,7 +375,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   Masking replaces a value and never drops the key: the copy these helpers build is assigned to with
   `setOwnProperty()` (a `defineProperty` for exactly the name `__proto__`) because `copy[key] = value` runs the
   `__proto__` setter, so a key of that name vanished from the masked header dump and the debug detail, and
-  assigning a non-object through that setter is a silent no-op. A backend
+  assigning a non-object through it is a silent no-op. A backend
   payload reaches these helpers through plain `JSON.parse`, so a provider can put that key in a logged body; a request
   body cannot (Fastify's poisoning guard refuses it first) and Node's header parser drops it. Neither copy's prototype
   is touched either way (asserted).
@@ -454,8 +454,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   first polls are much shorter than the interval (`POLL_BACKOFF_MS` = 25/50/100/200 ms), and counting polls would have shrunk the
   documented ~1.5 s of silence to ~75 ms and started serving half-written answers. It
   watches the whole visible answer, `content` **and** `reasoning`, and requires one of them to be non-empty: watching
-  `content` alone left the window at 0 for a reasoning-only message, so a provider that never reports `finish` could
-  not be accepted and the completion answered `504`. `extractFromParts()` reads a part's `text` only when it is a string, like the streaming
+  `content` alone left the window at 0 for a reasoning-only message, so such a provider was answered `504`. `extractFromParts()` reads a part's `text` only when it is a string, like the streaming
   collector and the request parser: concatenating whatever arrived served a numeric part as answer text
   (`parts: [{text: 42}, {text: 'Alpha'}]` answered `"42Alpha"`). The
   first four polls use `min(intervalMs, POLL_BACKOFF_MS[i])`, an answer landing a few tens of milliseconds after
@@ -497,7 +496,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   as `alpha alpha beta alpha beta gamma …`). The compare is also O(1) per event (`snapshotDelta()`: a length check
   plus a 32-character head and tail window against the part's *previous* snapshot, `SNAPSHOT_EDGE_CHARS`), where
   `startsWith` against the whole answer forced a rope flatten and a full compare per event — measured 299 ms of
-  gateway CPU for a 200 KB answer, 823 ms for 400 KB, 31–34 % of the collector's whole cost, growing quadratically.
+  gateway CPU for a 200 KB answer, 823 ms for 400 KB, growing quadratically.
   A snapshot that is not an extension of the previous one is forwarded whole; the 32-character window is the
   deliberate limit, so a rewrite *inside* it reads as a continuation. The snapshot is recorded on **every** event that
   carries one, including events that also carry a `delta` (the SDK's event type allows both): recording it only on the
@@ -513,7 +512,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   handler waiting forever, so the client got nothing and the slot was never released — at concurrency 1 that stops the
   whole gateway. Session cleanup uses its own shorter budget
   (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client already has its answer, so it must not hold the slot for
-  the full request budget. The metadata calls (`/v1/models`, the tool list) are capped separately
+  the full budget. The metadata calls (`/v1/models`, the tool list) are capped separately
   (`METADATA_TIMEOUT_CAP_MS`, never above `REQUEST_TIMEOUT_MS`), because they fall back — a client listing models must
   get the static fallback quickly instead of waiting a completion budget.
 - **A promise that loses a race needs a handler.** `promptWithTimeout` races the prompt against its own timer and the
@@ -538,11 +537,14 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   deletion after the answer is a backend round trip, and holding the slot through it made a follow-up request look like
   a full gateway. `.finally(release)` stays the safety net, so `release()` is idempotent. A request whose client
   disconnects while queued is dropped when its turn comes (`reply.raw` 'close'), so it never spends backend time. The
-  disconnect signal is not `request.raw.destroyed`: that stream is destroyed once its body is read, the normal case.
+  disconnect signal is not `request.raw.destroyed`: that stream is destroyed once its body is read.
   A body over `OPENCODE_PROXY_MAX_BODY_MB` is still refused with `413`, but only after the body has been read to its
   end (`refuseOversizedBody()`, bounded by `BODY_DRAIN_TIMEOUT_MS`): Node ends the socket when a response finishes with
   the request body unread, and the kernel answers the client's remaining bytes with RST, so the client could lose the
-  413 entirely. A client that keeps writing is cut off after the drain window.
+  413 entirely. A client that keeps writing is cut off after the drain window. The message names the limit in force
+  (`request body is too large (limit 50 MiB); send a smaller body or raise OPENCODE_PROXY_MAX_BODY_MB`) instead of
+  Fastify's bare sentence: the fix depends on a number only the gateway knows, and it comes from the value
+  `createApp()` was built with (`bodyLimitMb`), so it cannot disagree with the parser.
 - **The container runs as the unprivileged `node` user.** `docker/Dockerfile` chowns `/app` and declares
   `USER node` (uid/gid 1000) after the CLI install, so the gateway, the backend it spawns and every tool it runs are
   not UID 0. The entrypoint still writes `/app/config.json` (0600, owned by that user) on first boot, so a bind mount
@@ -589,8 +591,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm. A backend that is known
   to be healthy but whose trust window has expired is re-probed **in the background** (`refreshBackendHealthInBackground()`,
   at most one probe in flight) and the request proceeds: with the default 2 s window and the serialized queue almost
-  every interactive completion arrived after it and paid a `/health` round trip before `session.create` (+3.2 ms on
-  loopback). A backend that died is still recovered by the request that hits it (`session.create` fails on the
+  every interactive completion arrived after it and paid a `/health` round trip before `session.create`. A backend that died is still recovered by the request that hits it (`session.create` fails on the
   connection error, clears `healthyAt` and calls `ensureBackend()` again), a backend that never answered still takes
   the blocking path, and `OPENCODE_PROXY_HEALTH_CACHE_MS=0` keeps its documented "probe on every request" meaning.
 - **The backend child does not inherit the gateway's credentials.** The `opencode serve` spawn deletes `API_KEY`
@@ -609,7 +610,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   spawning on the next line let the old child hold the port, so the replacement failed to bind ("exited during
   startup") and tripped the retry cooldown - one wedged backend turned its own recovery into an outage. "Exits" means
   `exitCode !== null || signalCode !== null`: a child killed by a signal reports `exitCode === null`, and testing the
-  exit code alone let a SIGKILLed backend look alive for the whole 60-iteration startup budget while
+  exit code alone let a SIGKILLed backend look alive for the whole startup budget while
   `isStarting` stayed true. A request waiting on someone else's start attempt falls through to its own attempt when
   that attempt ends without a reachable backend (the retry cooldown still applies): the first request after a crash
   should restart the backend, not report it gone.

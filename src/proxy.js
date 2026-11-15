@@ -1196,7 +1196,14 @@ function createApp(config) {
             modelsCacheAt = Date.now();
             return models;
         } catch (error) {
-            logger.error('[Proxy] Model Fetch Error:', { error: error.message, status: error.status, body: error.response?.data || error.responseBody || null });
+            // Every other upstream payload that reaches a log line or a response goes through the masking helpers:
+            // this line quoted `error.message` (the documented symptom of a credential-bearing backend URL) and the
+            // raw `error.response` body, so a proxy in front of the backend could have put a secret in `docker logs`.
+            logger.error('[Proxy] Model Fetch Error:', {
+                error: clientFacingText(error.message),
+                status: error.status,
+                body: maskDetail(error.response?.data ?? error.responseBody ?? null)
+            });
             // Same item shape as a provider-served model, and not cached: the next request probes the backend again
             return serveFallback();
         }
@@ -1831,10 +1838,16 @@ function createApp(config) {
                             // part.type here would throw and abort a subscription that is still usable
                             if (!part) continue;
                             /* opencode>=1.19 events carry no delta field: part.text is that part's current full text, so the increment is its previous snapshot diffed away (snapshotDelta) */
-                            let delta = props.delta;
-                            if (!delta && (part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
+                            let delta = typeof props.delta === 'string' ? props.delta : '';
+                            // The snapshot is recorded on every event that carries one, not only on the delta-less
+                            // branch: the SDK's own event type allows `delta` and a cumulative `part.text` on the same
+                            // event, and a backend (or a version transition) that sends a delta on the streaming
+                            // updates and the finished part without one had its whole part re-sent - the delta-bearing
+                            // events left this map unset, so the next delta-less event diffed against '' and duplicated
+                            // the answer the client already had.
+                            if ((part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
                                 const partKey = part.id || part.type;
-                                delta = snapshotDelta(partTexts.get(partKey) || '', part.text);
+                                if (!delta) delta = snapshotDelta(partTexts.get(partKey) || '', part.text);
                                 partTexts.set(partKey, part.text);
                             }
                             if (delta) {
@@ -2228,7 +2241,11 @@ function createApp(config) {
                     // Create session
                     let sessionRes;
                     try {
-                        sessionRes = await client.session.create(backendDeadline(REQUEST_TIMEOUT_MS));
+                        // What is left of the request budget, not a fresh one: with a full budget here a
+                        // completion that had waited in the queue was granted a second create deadline and could
+                        // answer past the timeout it had already advertised (measured: 3.66 s for a 2 s budget,
+                        // 1.67 s of it spent queued).
+                        sessionRes = await client.session.create(backendDeadline(remainingBudget()));
                     } catch (createError) {
                         // A backend that died between the cached "healthy" answer and this call fails here with a
                         // connection error. ensureBackend() trusted a probe from up to OPENCODE_PROXY_HEALTH_CACHE_MS
@@ -2249,7 +2266,7 @@ function createApp(config) {
                             // request actually hit, not the start error an internal retry produced
                             throw createError;
                         }
-                        sessionRes = await client.session.create(backendDeadline(REQUEST_TIMEOUT_MS));
+                        sessionRes = await client.session.create(backendDeadline(remainingBudget()));
                     }
                     sessionId = sessionRes.data?.id;
                     if (!sessionId) {
@@ -2500,6 +2517,18 @@ function createApp(config) {
 
                         // One place that turns a polled assistant message into deltas. `appendOnly` trims the part that
                         // was already streamed over SSE, so an idle-timeout fallback never repeats itself.
+                        // The streamed text exists in two forms: `collected.content`/`collected.reasoning` is the raw
+                        // text the collector handed to the streaming tool-call filter, and `streamedContent`/
+                        // `streamedReasoning` is what that filter released. A polled answer that extends the raw text is
+                        // appended as the *raw* remainder through the filter: the filter's state belongs to this stream
+                        // (it was built from exactly that raw text), so it finishes the tag it was holding, or the tag a
+                        // boundary fell inside. Handing it the already-stripped reminder of the answer instead re-filtered
+                        // tag-free text with the state of the interrupted stream, so a cut inside a `<function_calls>`
+                        // block either leaked the raw markup (`held` was a real tag prefix) or swallowed the rest of the
+                        // answer (`inBlock` dropped every buffer that did not contain the closing tag) - both reported to
+                        // the client with `finish_reason: "stop"`. A rewritten answer (the polled text does not extend
+                        // what the collector saw) has no raw stream left to continue, so it is stripped and written
+                        // around the filter, whose stale state is discarded first.
                         const emitPolled = async (appendOnly, stallPolls = 3) => {
                             const { content, reasoning, error } = await pollForAssistantResponse(
                                 sessionId,
@@ -2514,18 +2543,28 @@ function createApp(config) {
                                 // stream with an error frame instead of streaming the message back as model output
                                 throw new ProviderError(`${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             }
-                            let safeReasoning = stripFunctionCalls(reasoning, false) || '';
-                            let safeContent = stripFunctionCalls(content, false) || '';
-                            if (appendOnly) {
-                                if (streamedReasoning && safeReasoning.startsWith(streamedReasoning)) {
-                                    safeReasoning = safeReasoning.slice(streamedReasoning.length);
+                            const emitPolledKind = async (text, kind, isReasoning) => {
+                                if (!text) return;
+                                const rawSeen = kind === 'reasoning' ? collected?.reasoning : collected?.content;
+                                if (appendOnly && rawSeen && text.startsWith(rawSeen)) {
+                                    await sendDelta(text.slice(rawSeen.length), isReasoning);
+                                    return;
                                 }
-                                if (streamedContent && safeContent.startsWith(streamedContent)) {
-                                    safeContent = safeContent.slice(streamedContent.length);
+                                let safe = stripFunctionCalls(text, false) || '';
+                                const filteredSeen = isReasoning ? streamedReasoning : streamedContent;
+                                if (appendOnly && filteredSeen && safe.startsWith(filteredSeen)) {
+                                    safe = safe.slice(filteredSeen.length);
                                 }
-                            }
-                            if (safeReasoning) await sendDelta(safeReasoning, true);
-                            if (safeContent) await sendDelta(safeContent, false);
+                                if (!safe) return;
+                                // Written around the filter, not through it: this text is already tag-free, and a held
+                                // fragment is a partial tag from a stream that is not being continued - discarding it
+                                // loses nothing, because the trimmed remainder below already carries whatever that
+                                // fragment turned out to be.
+                                (isReasoning ? filterReasoningDelta : filterContentDelta).flush();
+                                await sendReleasedDelta(safe, isReasoning);
+                            };
+                            await emitPolledKind(reasoning, 'reasoning', true);
+                            await emitPolledKind(content, 'content', false);
                         };
 
                         let polled = false;

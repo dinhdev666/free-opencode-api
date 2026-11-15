@@ -11,7 +11,7 @@ by driving an `opencode serve` process through the OpenCode SDK. The gateway own
 spawn, health checking, teardown), creates one OpenCode session per chat completion, and translates the result back
 into OpenAI shapes (JSON or SSE).
 
-There is no database, no plugin system, no multi-provider routing layer. Anything that does not serve the
+There is no database, no plugin system, no multi-provider routing layer: anything outside the
 "OpenAI client → gateway → OpenCode" path is out of scope.
 
 ## Non-negotiable invariants
@@ -49,16 +49,16 @@ These are product decisions, not implementation details. Do not "improve" them w
 | --- | --- |
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved concurrency/queue capacity and any clamp, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
-| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because silently continuing would run with the built-in key instead of the configured one or with a value nobody wrote. A key the gateway does not read is returned by `findUnknownKeys()` so the entry point can name it (with the key a case/separator typo probably meant) and ignore it. A UTF-8 BOM is tolerated. |
+| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because silently continuing would run with the built-in key instead of the configured one. A key the gateway does not read is returned by `findUnknownKeys()` so the entry point can name it (with the key a case/separator typo probably meant). A BOM is tolerated. |
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`) plus `serializeDetail()` (bounded, truncate-before-stringify) used by debug logging. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
-| `test/smoke.mjs` | End-to-end contract checks: boots the stub and the gateway, asserts status codes, envelopes, SSE frames and clean shutdown. |
+| `test/smoke.mjs` | End-to-end contract checks: boots stub and gateway, asserts status codes, envelopes, SSE frames and clean shutdown. |
 | `test/check-syntax.mjs` | Walks the repository and runs `node --check` on every `.js`/`.mjs` file, so a new source file is checked without editing a list. |
-| `test/check-commit-messages.mjs` | Applies the CONTRIBUTING.md commit-message rules to every commit in a range; CI runs it over the commits a push or pull request adds, because a subject cannot be corrected after it is published. |
+| `test/check-commit-messages.mjs` | Applies the CONTRIBUTING.md commit-message rules to every commit in a range; CI runs it over the commits a push or pull request adds, because a published subject cannot be corrected. |
 | `.github/workflows/ci.yml` | CI: `pnpm run check`, shell check, `pnpm test` on Node 20/22/24, plus a Docker build with a container health check. |
-| `.github/workflows/docker-publish.yml` | Publishes `linux/amd64` + `linux/arm64` images to Docker Hub when a `v*.*.*` tag is pushed (secrets `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`). |
+| `.github/workflows/docker-publish.yml` | Publishes `linux/amd64` + `linux/arm64` to Docker Hub on a `v*.*.*` tag (secrets `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`). |
 | `README.md` | User-facing documentation: features, configuration tables, API reference, client examples, performance, troubleshooting. |
 
 Request flow (short version): `index.js` → Fastify hooks → auth → route handler → queue (`lock()`) → validate and
@@ -70,26 +70,26 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 ```bash
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
-pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm run check:commits           # commit subjects in the last commits against CONTRIBUTING.md (test/check-commit-messages.mjs)
-pnpm test                        # smoke suite: stub backend + gateway, 308 contract assertions
+pnpm run check                   # node --check every JavaScript source file
+pnpm run check:commits           # commit subjects against CONTRIBUTING.md
+pnpm test                        # smoke suite: stub backend + gateway, 313 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
 `pnpm test` needs no OpenCode CLI and no network: it starts `test/stub-opencode.mjs` on port 4199 and the gateway on
 port 8199 (override with `SMOKE_STUB_PORT` / `SMOKE_PORT`). CI runs `pnpm run check` and `pnpm test` on Node 20, 22
-and 24, and `test/check-commit-messages.mjs` over the commits a push or pull request adds. There is still no linter or
-formatter, so style is a review concern. Do not claim checks passed if they were not run.
+and 24, plus `test/check-commit-messages.mjs` over the added commits. There is still no linter or formatter, so style
+is a review concern. Do not claim checks passed if they were not run.
 
-Releases are published from tags, not from a laptop: bump `version` in `package.json`, then `git tag vX.Y.Z` and push
-the tag. `docker-publish.yml` refuses a tag that does not match `package.json`, builds both architectures and pushes to
-Docker Hub.
+Releases come from tags, not from a laptop: bump `version` in `package.json`, then `git tag vX.Y.Z` and push the tag.
+`docker-publish.yml` refuses a tag that does not match `package.json`, builds both architectures and pushes to Docker
+Hub.
 
 ## Verifying without the OpenCode CLI
 
-`pnpm test` covers the whole HTTP contract against the stub shipped in `test/stub-opencode.mjs` (health, providers,
-sessions, messages and SSE events, plus a test-only `GET /__sessions` reporting created/deleted/live counts,
-`lastSystemPrompt`, `lastPromptText` and `messagePolls`). Behaviour is selected by markers in the prompt text - `SLOW`
+`pnpm test` covers the HTTP contract against the stub in `test/stub-opencode.mjs` (health, providers, sessions,
+messages and SSE events, plus a test-only `GET /__sessions` reporting created/deleted/live counts, `lastSystemPrompt`,
+`lastPromptText` and `messagePolls`). Behaviour is selected by markers in the prompt text - `SLOW`
 (an answer slow enough to abort mid-stream), `STALL` (silence after two deltas), `TOOLTAG` (a tool-call block cut inside
 both of its tags), `FAIL` (a provider error with no content), `ENDONLY` (a finish event carrying only `time.completed`),
 `GROW` (an answer still being written when the prompt returns), `SUICIDE` (the stub SIGKILLs itself after accepting the
@@ -98,12 +98,15 @@ flight while the backend is killed or the gateway shuts down), `SLOWFINISH` (fin
 delta ending in a tag prefix that never becomes a tag), `REJECTPROMPT` (a 500 for `POST /session/:id/message`),
 `PROMPTDONE` (the prompt response already carries the finished message), `CUTSTREAM` (two cumulative snapshots then
 a dropped event connection), `MULTIPART` (one message whose two text parts send their own cumulative snapshots,
-interleaved), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `TOOLSPAM` (a tool-call
+interleaved), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `MIXED` (part updates
+carrying both a `delta` and the part's cumulative text, then one closing update with neither),
+`CUTTOOL`/`OPENTOOL` (a tool-call answer whose stream is cut inside the closing/opening tag), `TOOLSPAM` (a tool-call
 block repeated by the answer) and `LEAKYFAIL` (a provider error quoting a credential-bearing URL behind a long
 message) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
 `POST /session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 502 whose message quotes a
 credential-bearing URL), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
-list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_EMPTY_PROVIDERS=1` (both shapes of an
+list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every session creation after the n-th is accepted and
+never answered), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
 body, for the summary bound). Extend that stub and `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is already taken (a stale process would answer
 with someone else's build) and SIGKILLs any child that ignores SIGTERM.
@@ -121,8 +124,7 @@ curl -s -H 'Authorization: Bearer sk-dummy-123' -H 'Content-Type: application/js
   http://127.0.0.1:8080/v1/chat/completions
 ```
 
-Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keeping becomes part of
-`test/stub-opencode.mjs`.
+One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub-opencode.mjs`.
 
 ## API contract (must not drift)
 
@@ -138,27 +140,23 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   a single static model and are not cached, but a served fallback is held for 1 s (`FALLBACK_HOLD_MS`) so a failing
   provider is not asked once per listing. A fresh cache answers with the body built when it was filled
   (`modelsCacheBody`; by-id answers read `modelsById`), so the serializer no longer re-runs for bytes that cannot
-  change. That model is `opencode/big-pickle` (`DEFAULT_MODEL` in `src/proxy.js`), which is also the model a chat
-  request that omits `model` is sent to; both uses read the same constant, so the fallback listing and the request
-  default cannot name different ids. `big-pickle` is an **alias**: OpenCode routes it
-  to whichever model it currently serves and never publishes which one, so it is the only id worth hardcoding — and the
-  reason its entry carries just the four OpenAI fields. Do not add capabilities, limits or pricing to it: they would
-  describe a model the gateway cannot see, and the concrete ids around it rotate.
-  An **empty** provider list takes the same fallback: a payload the gateway
-  cannot read (a changed shape, a version reporting nothing) answers `200 {"providers":[]}`, and `{"data":[]}` is as
-  useless to a client as an error. So does a provider
-  list that is not empty but yields no model (a provider without a `models` map, an empty one): the empty check runs
-  after the extraction, not on the provider list before it, because the answer - and the "do not cache it" rule - is
-  the same for both shapes.
+  change. That model is `opencode/big-pickle` (`DEFAULT_MODEL` in `src/proxy.js`), also the model a chat request
+  without `model` is sent to (one constant, so the two cannot name different ids). `big-pickle` is an **alias**: OpenCode
+  routes it to whichever model it serves and never publishes which, so it is the only id worth hardcoding and its entry
+  carries just the four OpenAI fields - do not add capabilities, limits or pricing describing a model the gateway
+  cannot see.
+  An **empty** provider list takes the same fallback: an unreadable payload (a changed shape, a version reporting
+  nothing) answers `200 {"providers":[]}`, and `{"data":[]}` is as useless as an error. So does a non-empty list that
+  yields no model (no `models` map, an empty one): the empty check runs after the extraction, because the answer - and
+  the "do not cache it" rule - is identical for both shapes.
 - `GET /v1/models/:modelId` and `GET /v1/models/<id with slashes>` → `200 {id,name,object,owned_by}` from the same
   cache; an id the provider list does not contain is described from the id itself (`provider` = text before `/`,
   default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either — the one
   exception is `opencode/big-pickle`, answered from `DEFAULT_MODEL` so it keeps its `Big Pickle` name instead of the
-  id-derived `big-pickle`. The
-  wildcard route exists because clients send `opencode/big-pickle` unencoded as often as `%2F`-escaped. A **blank**
-  id (`/v1/models//`, `/v1/models/%20`) is a `404` in the usual `not_found` envelope instead of a `200` whose body is
-  `{"id":"","name":""}`: a doubled slash is read as a trailing slash, so those paths reached the by-id route with an
-  empty parameter, and an empty id is not a model. An id whose **last segment** is empty (`/v1/models/%2F` → `/`,
+  id-derived `big-pickle`. The wildcard route exists because clients send `opencode/big-pickle` unencoded as often as
+  `%2F`-escaped. A **blank** id (`/v1/models//`, `/v1/models/%20`) is a `404` in the usual `not_found` envelope instead
+  of a `200` whose body is `{"id":"","name":""}`: a doubled slash reads as a trailing slash, so those paths reached the
+  by-id route with an empty parameter, and an empty id is not a model. An id whose **last segment** is empty (`/v1/models/%2F` → `/`,
   `/v1/models/opencode%2F` → `opencode/`) is the same class of non-model and answers `404` too. `/v1/models/`
   itself still answers the listing.
 - `POST /v1/chat/completions` non-streaming → `chat.completion` with
@@ -172,8 +170,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   its stream that way, and a client that creates the message from `delta.role` had to infer it from the request.
   The terminal frame carries the whole envelope (`id`, `object`, `created`, `model`) like every delta, not just
   `{id, choices}`: clients that check the object type of each frame rejected a bare terminal chunk.
-  A `: keep-alive` comment line (ignored by OpenAI clients) is written whenever the stream has been silent for 15 s,
-  before the first delta and between deltas: a long think must not let an idle proxy drop the connection.
+  A `: keep-alive` comment line (ignored by OpenAI clients) is written whenever the stream has been silent for 15 s:
+  a long think must not let an idle proxy drop the connection.
   `stream_options.include_usage` adds one more chunk with `choices: []` and a zeroed `usage` block, after the finish
   chunk and before `[DONE]`: the OpenAI SDK reads the stream's usage from exactly that frame, and ignoring the option
   left it with no numbers at all. It is emitted only when the client asks for it — a stream that did not request it
@@ -199,15 +197,13 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **Content parts must be text.** A `content` array may carry strings and parts with a `text` field (`text`, and the
   Responses-API spelling `input_text`). Any other part (`image_url`, `input_audio`, `file`) is refused with a `400`
   naming its position and type (`messages[0].content[1] uses an unsupported content part type "image_url"; this gateway
-  forwards text only`). Dropping them instead answered a question the backend never received — a confidently wrong
-  answer — and a request whose only part was an image was reported as `messages must include at least one non-system
-  text message`. Three causes, three messages, and the part check runs first for that reason: an unsupported type (the
-  message above), a `text` part whose `text` is not a string (`messages[0].content[1].text must be a string, found a
-  number`) and a part that is not a part at all (`messages[0].content[0] must be a string or an object with a text
-  field, found a number`, for `42`, `null`, `true`, which were dropped in silence). A `content` that is a **single
-  object instead of an array** follows the same three rules without a part index; it used to be read as an empty
-  message, so a request that also carried text got an answer built from that text alone. A single object with a string
-  `text` is still forwarded.
+  forwards text only`): dropping them answered a question the backend never received, and a request whose only part was
+  an image was reported as `messages must include at least one non-system text message`. Three causes, three messages,
+  part check first: an unsupported type (above), a `text` part whose `text` is not a string
+  (`messages[0].content[1].text must be a string, found a number`) and a part that is not a part at all (`… must be a
+  string or an object with a text field, found a number`, for `42`, `null`, `true`, which were dropped in silence). A
+  `content` that is a **single object instead of an array** follows the same three rules without a part index; it used
+  to be read as an empty message, so a request that also carried text got an answer built from that text alone.
 - **A message `name` is a label, not prompt text.** It is interpolated as `USER(name): …` only when it is a string,
   with control characters replaced and the value cut: a non-string reached the model as `USER([object Object]): …`.
 - **An announced request body has a deadline.** Fastify sets `requestTimeout: 0`, so nothing bounded the wait: a client
@@ -216,24 +212,23 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   alive to drain a body it will never read. `armBodyDeadline()` in the `onRequest` hook (armed before auth, only when
   the request announces a body, cleared on `end`/`close`/`error`) closes it after `min(30 s, REQUEST_TIMEOUT_MS)`,
   answering the `408` envelope when nothing has been sent. It closes the **request's** socket, not `reply.raw`: a
-  keep-alive response is detached from the connection once it ends, so destroying the response closed nothing.
+  keep-alive response is detached from the connection once it ends, so destroying that closed nothing.
 - A `model` id whose provider or model half is empty (`"opencode/"`, `"/big-pickle"`) is a `400` in the
   `invalid_request_error` envelope naming the value: `/v1/models` answers `404` for the same ids, and sending them to
-  the backend only produced an opaque upstream error. An absent or blank `model` still means `DEFAULT_MODEL`.
+  the backend only produced an opaque upstream error. An absent or blank `model` means `DEFAULT_MODEL`.
 - A completion body sent under a non-JSON content type (`curl -d '{…}'` without the header, `text/plain`) reaches the
   handler as an unparsed string; it is parsed there and served. Answering "messages array is required" blamed a body
   that was perfectly valid for a missing header. A string that is not JSON answers `400` naming the content type.
   `curl -d` actually labels the body `application/x-www-form-urlencoded` (not `text/plain`), so that type is handed
-  over as the same string by an explicit `addContentTypeParser` — Fastify answered it with a bare `415` and the
-  documented header-free path did not work for the most common hand-written client. Other content types keep the
-  `415` media-type error, because a gateway that parses every type cannot tell a malformed client from an unsupported
-  one. A body sent with a `Content-Encoding` other than `identity` (a client that gzips, a compressing proxy) is a
-  `415` naming the header: the gateway does not decompress, so the compressed bytes reached the JSON parser and were
-  reported as "body is not valid JSON", which blames the one part of the request that was correct.
+  over as the same string by an explicit `addContentTypeParser` — Fastify answered it with a bare `415`, so the
+  documented header-free path did not work for the most common hand-written client. Other content types keep the `415`
+  media-type error, because a gateway that parses every type cannot tell a malformed client from an unsupported one. A
+  body sent with a `Content-Encoding` other than `identity` is a `415` naming the header: the gateway does not
+  decompress, so the compressed bytes reached the JSON parser and were reported as "body is not valid JSON", which
+  blames the one part of the request that was correct.
 - A `415` names what it refused and what to send. `FST_ERR_CTP_INVALID_MEDIA_TYPE` used to arrive as Fastify's bare
-  `Unsupported Media Type` for any type the gateway does not parse — including a request that carries a **body with no
-  `Content-Type` header at all**, which is the likeliest hand-written mistake there is and reached the same message.
-  The status and the code stay; the message becomes `unsupported content type "application/xml"; send
+  `Unsupported Media Type` for any type the gateway does not parse — including a **body with no `Content-Type` header at
+  all**, the likeliest hand-written mistake there is. The status and the code stay; the message becomes `unsupported content type "application/xml"; send
   Content-Type: application/json`, or `the request has a body but no Content-Type header; send Content-Type:
   application/json` when the header is missing (the value is client input echoed into a response body, so
   `echoedValue()` replaces control characters and cuts it at 64 characters). Recognised types are unchanged:
@@ -242,10 +237,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   prototype-poisoning guard before any handler runs, and that refusal arrives as the same
   `FST_ERR_CTP_INVALID_JSON_BODY` a syntax error produces: the client was told `Body is not valid JSON but
   content-type is set to 'application/json'` about a body that parses perfectly, which sends the reader looking for a
-  missing comma. The envelope keeps Fastify's `code` for support tickets and names both causes
-  (`request body is not valid JSON, or it carries a forbidden property name (__proto__, constructor); send
-  Content-Type: application/json`). The refusal itself stays: an OpenAI client does not send those names, and
-  `onProtoPoisoning: 'remove'` would silently drop a field the client did send.
+  missing comma. The envelope keeps Fastify's `code` and names both causes (`request body is not valid JSON, or it
+  carries a forbidden property name (__proto__, constructor); send Content-Type: application/json`). The refusal stays:
+  an OpenAI client does not send those names, and `onProtoPoisoning: 'remove'` would silently drop a field it did send.
 - Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request, `type: "invalid_request_error"`, plus
   Fastify's `code` when it rejected the body), `401` (auth, `type: "invalid_request_error"`,
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error, with a
@@ -270,14 +264,14 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `504`. A streaming request keeps streaming only when deltas already reached the client.
 - **A finished message in the prompt response is the answer.** `POST /session/:id/message` returns the message it
   produced; when it already carries `finish` or `time.completed`, the non-streaming path serves it instead of spending
-  a `GET /session/:id/message` round trip (plus up to a poll interval) on data it already holds. A message that is
-  still being written has no `finish` and keeps using the poll loop, so a partial answer is never served.
+  a `GET …/message` round trip (plus up to a poll interval) on data it holds. A message still being written has no
+  `finish` and keeps using the poll loop, so a partial answer is never served.
 - Every SDK call hands back an error tuple instead of throwing, and every tuple is inspected: `session.create`,
   `session.prompt`, `session.messages`, `session.delete`, `config.providers`, `tool.ids` and `event.subscribe`.
-  A refused `event.subscribe` carries no stream, so the streaming path falls back to polling and still answers;
-  reading any of these as "the backend returned nothing" turned a refusal into a missing answer (`tool.ids` was the
-  worst case: an error tuple cached an empty override map as a success, so `DISABLE_TOOLS` sent no tool switches at
-  all for the whole cache window).
+  A refused `event.subscribe` carries no stream, so the streaming path falls back to polling and still answers.
+  Reading any of these as "the backend returned nothing" turned a refusal into a missing answer (`tool.ids` was the
+  worst case: an error tuple cached an empty override map, so `DISABLE_TOOLS` sent no tool switches for the whole
+  cache window).
 - A provider failure is an upstream error in both modes. Non-streaming answers `502`; a streaming request whose
   provider failed before the first frame answers the same `502` envelope (the stream never started), and one that
   fails after frames are on the wire ends with the in-band error frame. It must never be streamed as assistant text:
@@ -286,13 +280,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   the polling fallbacks are skipped (the backend keeps finishing on its own). A reader that stops reading without
   closing the connection (a tab that stops consuming, a buffering proxy, a stalled phone link) is treated the same
   way: a write that does not drain within `SSE_CLIENT_WRITE_TIMEOUT_MS` (30 s) marks the client gone, aborts the
-  collector and destroys the socket. An unbounded `drain` wait parked the task - and with it the only completion slot
-  at the default concurrency of 1 - for the rest of the process lifetime while `/health` kept answering 200.
-  The gone flag is set even when the response was already ended by someone else (the in-band timeout path): the
-  socket is still open then, and the short-circuit left the task writing into an ended stream. A client that
-  disconnects during a **non-streaming** completion is handled the same way: the closed response socket stops the
-  poll loop, so the slot is free at the next poll tick instead of being held for the whole answer — a client that closed the tab used to block
-  every other request for up to the request budget at the default concurrency of 1.
+  collector and destroys the socket - an unbounded `drain` wait parked the task, and with it the only completion slot
+  at the default concurrency of 1, for the rest of the process lifetime while `/health` kept answering 200. The gone
+  flag is set even when someone else already ended the response (the in-band timeout path): the socket is still open
+  then, and the short-circuit left the task writing into an ended stream. A **non-streaming** client that disconnects
+  is handled the same way: the closed socket stops the poll loop, so the slot is free at the next tick instead of
+  being held for the whole answer.
 - An error after the first SSE frame is delivered in-band (`data: {"error":…}` then `data: [DONE]`) and closes the
   stream. A hijacked response must always be terminated: writing a JSON body into a frame stream (or leaving the
   socket open) breaks or hangs the client.
@@ -307,23 +300,22 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   Authorization, X-Api-Key, X-Request-Id, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`. The
   allow-list lives in one constant (`CORS_ALLOW_HEADERS` in `createApp()`) because it is written on three paths — the
   `onRequest` hook, `clientErrorHandler` and `badUrlHandler`. It carries `X-Request-Id` because the gateway reads and
-  echoes that header: a browser client that sets its own trace id sent a header its own preflight did not grant, and
-  the browser refused the request before it left the page (the response side was already exposed).
+  echoes that header: a browser client setting its own trace id sent a header its own preflight did not grant, so the
+  browser refused the request before it left the page.
 - A request the HTTP parser rejects (a malformed request line or header, an oversized header block, a header
   timeout) never reaches a hook, so it is answered by `clientErrorHandler`, registered through the
   `clientErrorHandler` Fastify option: `400` for a parse error, `431` for `HPE_HEADER_OVERFLOW`, `408` for
   `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope (`type: "invalid_request_error"`, the parser's code in `code`
   when it is a plain `[A-Z_]+` token) with the CORS headers, an `X-Request-Id` and a `warn` log line. Fastify's own
   handler answered `{"error":"Bad Request","message":"Client Error","statusCode":400}` — no `type`, no CORS, no
-  request id, no log. The handler writes the envelope and then closes with `socket.end()` (`closeSocketAfterFlush()`),
-  never `socket.destroy()` on the next line: `destroy()` discards userland buffered writes, so under backpressure the
-  client got a reset instead of the error it was promised.
+  request id, no log. It writes the envelope, then closes with `socket.end()` (`closeSocketAfterFlush()`), never
+  `socket.destroy()` on the next line: `destroy()` discards buffered writes, so under backpressure the client got a
+  reset instead of the error it was promised.
 - A URL the **router** cannot decode (a percent escape that is not valid UTF-8, `GET /v1/models/%E0%A4%A`) never reaches
   a hook, so Fastify answered its own body — `{"error":"Bad Request","code":"FST_ERR_BAD_URL",…}` with no `type`, no
   CORS, no `X-Request-Id` and no log line. `routerOptions.onBadUrl` (`badUrlHandler`) writes the usual envelope, with a
   generated request id and one `warn` line carrying the path truncated by `loggableUrl`. It is handed the raw
-  request/response (`find-my-way` builds no Fastify request for a path it cannot route), exactly like
-  `clientErrorHandler`.
+  request/response (`find-my-way` builds no Fastify request for a routable-less path), like `clientErrorHandler`.
 - Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
   to a log entry. An incoming `X-Request-Id` is echoed when it is a short printable token
   (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a
@@ -348,8 +340,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   The `model` value and the URL are client-controlled, so both are normalised before they are logged
   (`loggableModelId()`: control characters replaced, 128 characters max; a URL over 512 characters is cut with a
   `…[truncated N chars]` marker): one log line is one record, and a newline in a model id used to start a second,
-  attacker-written line (`FORGED [INFO] …`), while a 2 MB model id produced a 2 MB info line. The backend still
-  receives the id verbatim — the contract does not restrict model ids, only what is logged is normalised.
+  attacker-written line (`FORGED [INFO] …`) while a 2 MB id produced a 2 MB line. The backend still receives the id
+  verbatim - the contract does not restrict model ids, only what is logged is normalised.
 
 ## Working rules for code changes
 
@@ -364,7 +356,7 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `console.log` in `src/` or `index.js`. Never log an unmasked `authorization` header, and never print the API key:
   `docker/docker-entrypoint.sh` reports the key it generated as `sk-a***(22 chars)` — nothing but the length up to 16
   characters — because `docker logs` is collected as often as not (`maskHeaders`/`maskSecret` in `src/logger.js` are
-  the in-process equivalents, and the two rules are deliberately identical). Header **names** are matched against
+  the in-process equivalents, deliberately identical). Header **names** are matched against
   `SENSITIVE_HEADER_PATTERN`, built from the exported `SENSITIVE_NAME_ALTERNATIVES` (`auth`, `authorization`,
   `authentication`, `api-key`/`apikey`, `token`, `secret`, `cookie`, `session`, `passw`, `key`, `code`, `sig`,
   `signature`, `credential`, `bearer` as whole name segments) rather than a fixed denylist: a credential forwarded as
@@ -375,9 +367,11 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   reached the default info line verbatim until the list carried those names. The list is one exported string because
   `docker/docker-entrypoint.sh` cannot import this module and repeats it for its own first-boot dump; the smoke suite
   asserts the two copies are identical, the way `CORS_ALLOW_HEADERS` is the one place the CORS list lives.
-  A request body reaches the debug dump through `maskDetail()` (the same name list on a bounded copy). A detail
-  object handed to a debug line is **truncated before it is cloned** (`serializeDetail()`): a 50 MB
-  body used to be structured-cloned and re-stringified to produce a 32 KB line (43 ms and +100 MB of heap per line).
+  A request body reaches the debug dump through `maskDetail()` (the same name list on a bounded copy); the
+  model-fetch error line uses the same two helpers, because it quoted `error.message` (whose documented symptom is a
+  credential-bearing backend URL) and the raw upstream body. A detail object handed to a debug line is **truncated
+  before it is cloned** (`serializeDetail()`): a 50 MB body used to be structured-cloned and re-stringified to produce
+  a 32 KB line (43 ms and +100 MB of heap per line).
   Masking replaces a value and never drops the key: the copy these helpers build is assigned to with
   `setOwnProperty()` (a `defineProperty` for exactly the name `__proto__`) because `copy[key] = value` runs the
   `__proto__` setter — a key of that name vanished from the masked header dump and from the debug detail while nothing
@@ -388,8 +382,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   drops a header of that name. Neither copy's prototype is touched either way (asserted).
   A **closed reader** on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream
   `error` with no listener is an uncaught exception, and `node index.js | head -3` killed a gateway that was still
-  serving. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that log line is lost, the process keeps answering. The
-  smoke suite destroys the read end of the child's stdout to assert it.
+  serving. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that line is lost, the process keeps answering. The
+  suite destroys the read end of the child's stdout to assert it.
 - **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
   boundary can fall inside either of them; the held fragment is flushed at end of stream. The filter is one
@@ -397,7 +391,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   backtracked quadratically from every open tag (64 000 tags in a 1 MB answer took 8.5 s, so one client-supplied body
   can wedge the only completion slot) and the scan answers the same 15 shapes byte-identically. The flush must write
   the frame directly (`sendReleasedDelta`): passing the fragment back through the filter holds the same prefix again,
-  and with no further delta to disambiguate it, the tail of the answer disappears. `DISABLE_TOOLS` is read
+  and with no further delta to disambiguate it, the tail of the answer disappears. The recovery poll appends the
+  **raw** remainder of the stream through that filter (`collected.content` is the text the filter saw), never the
+  already-stripped answer: handing tag-free text to a filter that still holds the interrupted stream's state leaked the
+  held tag prefix, or dropped everything after it (a cut inside a block answered `hello ` with
+  `finish_reason: "stop"`). An answer the backend rewrote is written around the filter (`sendReleasedDelta`) instead.
+  `DISABLE_TOOLS` is read
   from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`.
 - **Boolean options go through `parseBoolean()`** (exported from `src/proxy.js`), the single parser used by
   `index.js` and `startProxy()`. Two implementations of that rule drifted once already (`-e DISABLE_TOOLS=yes` meant
@@ -421,10 +420,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   complete silence, which looks exactly like a broken file, so startup now warns
   `[Config] config.json is read from …; the file at … is ignored`.
   An environment variable that is present but **blank** counts as unset (`envOrFile()` in `src/config.js`): `PORT` and
-  `API_KEY` were the two keys read with `??`, where an empty string is a value, so `API_KEY= PORT=` shadowed
-  `config.json` — the gateway listened on the default port and authenticated with the built-in public key while the
-  file named a different port and a real secret. Every other key falls through on a blank value (`||` or a parser
-  that ignores blanks); keep it that way.
+  `API_KEY` were read with `??`, where an empty string is a value, so `API_KEY= PORT=` shadowed `config.json` — the
+  gateway listened on the default port and authenticated with the built-in public key while the file named a
+  different port and a real secret. Every other key falls through on a blank value; keep it that way.
   A **key nobody reads** is named at startup and ignored (`[Config] config.json has an unknown key 'APIKEY' (did you
   mean 'API_KEY'?) - it is ignored`, via `findUnknownKeys()`): a misspelled key changed nothing at all in complete
   silence, so the gateway ran the default while the operator was sure the value in the file was in force. A
@@ -444,11 +442,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `OPENCODE_PROXY_START_RETRY_MS` are read through `readLimit()` / `readMilliseconds()`, which take the `config.json`
   value as the fallback and let the environment win. They used to be read from the environment alone, so the same keys
   in `config.json` were ignored in silence while the summary reported the default. `startProxy()` applies the resolved
-  queue limits and backend timings before the server listens, and `getQueueLimits()` takes the merged configuration so the summary cannot disagree with what the gateway uses.
+  queue limits and backend timings before the server listens, and `getQueueLimits()` takes the merged configuration so
+  the summary cannot disagree with what the gateway uses.
   A value that is present but unusable is **named in a `[Config]` warning with the value actually used**
   (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS='0' is not a positive number, using 300000`, `… HEALTH_CACHE_MS='abc' is not a
-  number, using 2000`): falling back to the default in silence left the operator convinced a value was in force while
-  the gateway ran the default, which is the same failure the precedence rule above exists to prevent.
+  number, using 2000`): a silent fallback left the operator convinced a value was in force while the gateway ran the
+  default, the failure the precedence rule above exists to prevent.
 - **Polling answers with the finished message.** `pollForAssistantResponse` is called with `requireDone: true` on
   every path that emits the final answer: the poll loop can start while the answer is still being written, and
   returning the first non-empty message truncated it (`"Hello from t"` for a 41-character answer). A message whose
@@ -456,16 +455,16 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   message finished still gets an answer. That window is measured in **time, not in polls** (`stableWindowMs`): the
   first polls are much shorter than the interval (`POLL_BACKOFF_MS` = 25/50/100/200 ms), and counting "three identical
   polls" would have shrunk the documented ~1.5 s of silence to ~75 ms and started serving half-written answers. The
-  first four polls use `min(intervalMs, POLL_BACKOFF_MS[i])` because an answer that lands a few tens of milliseconds
-  after the prompt returned used to wait a whole interval before the next poll saw it (measured p50 507 ms → 90 ms,
-  for a few extra cheap `GET …/message` calls). Do not remove the backoff without keeping the time window: the two
-  belong together.
+  first four polls use `min(intervalMs, POLL_BACKOFF_MS[i])`, because an answer landing a few tens of milliseconds after
+  the prompt returned used to wait a whole interval (measured p50 507 ms → 90 ms, for a few cheap extra
+  `GET …/message` calls). Do not remove the backoff without keeping the time window: the two belong together.
 - **A completion has one budget, not one per phase.** The prompt, the event subscription and the polling fallback all
   take what is left of `REQUEST_TIMEOUT_MS` (`remainingBudget()` in the handler) instead of each starting a fresh
   copy: a streaming request whose event stream timed out spent a second full budget polling, so the client waited
   about twice the advertised timeout (measured 60 s for a 40 s budget) and the queue timer's message named a budget
   that had already been exceeded. `remainingBudget()` never goes below 1 ms, so an exhausted budget surfaces as the
-  timeout it is rather than as a loop that spins.
+  timeout it is rather than as a loop that spins. `client.session.create` takes it too: with a fresh budget there, a
+  completion that had queued 3 s answered at 5.7 s with a 4 s budget.
 - **A failed poll does not end the completion.** `pollForAssistantResponse` retries a poll that answers with an error
   (a 5xx while the backend is busy) or throws (a connection reset while it restarts): one bad poll used to lose an
   answer that was one poll away - the thrown case surfaced as `502 "fetch failed"`. Only `MAX_POLL_FAILURES` (5)
@@ -479,15 +478,15 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   debug line next to it, which is what tells an envelope change from an error body.
 - **An idle stream is recovered, not ended.** When the event stream goes silent for `DEFAULT_EVENT_IDLE_TIMEOUT_MS`
   the gateway polls for the rest of the answer and appends only what the client does not have yet. That recovery poll
-  tolerates a full idle window of further silence (`IDLE_RECOVERY_STALL_POLLS`) before it accepts a message the
-  backend never marks finished: the default allowance of three intervals of no growth (~1.5 s, measured as time
-  rather than as a count of polls) is right after a normal prompt, but applied to a stream already silent for 8 s it
-  ended the response with `finish_reason: "stop"` on text that stopped mid-sentence.
+  tolerates a full idle window of further silence (`IDLE_RECOVERY_STALL_POLLS`) before accepting a message the backend
+  never marks finished: the default three intervals of no growth (~1.5 s, measured as time not as polls) is right after
+  a normal prompt, but applied to a stream already silent for 8 s it ended the response with `finish_reason: "stop"`
+  on text that stopped mid-sentence.
 - **A stream that ends without a finish event is recovered, not timed out.** When the event stream is closed
   mid-answer (backend restart, a proxy dropping idle SSE connections) the collector settles with
   `streamEnded: true` and the streaming path polls for the rest of the answer, appending only what the client does not
-  have yet — exactly like the idle-timeout path. Before that it stayed silent until the whole request budget ran out
-  and then wrote an in-band error (`5992 ms` of a `6000 ms` budget for an answer the backend had already finished).
+  have yet — exactly like the idle-timeout path. Before that it stayed silent until the whole budget ran out and then
+  wrote an in-band error (`5992 ms` of a `6000 ms` budget for an answer the backend had finished).
 - **A cumulative part snapshot is diffed against that part, not against the answer.** opencode ≥ 1.19 sends no
   `delta`: `part.text` is the part's current full text, so the gateway derives the increment. It belongs to the part
   it came from (`partTexts` in `collectFromEvents`): measuring it against the accumulated `content` never matched a
@@ -497,7 +496,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `startsWith` against the whole answer forced a rope flatten and a full compare per event — measured 299 ms of
   gateway CPU for a 200 KB answer, 823 ms for 400 KB, 31–34 % of the collector's whole cost, growing quadratically.
   A snapshot that is not an extension of the previous one is forwarded whole; the 32-character window is the
-  deliberate limit, so a rewrite *inside* it reads as a continuation.
+  deliberate limit, so a rewrite *inside* it reads as a continuation. The snapshot is recorded on **every** event that
+  carries one, including events that also carry a `delta` (the SDK's event type allows both): recording it only on the
+  delta-less branch left a mixed backend's closing update diffed against `''` and delivered the whole part twice
+  (`Hello worldHello world`). A `delta` that is not a string is ignored, so the event takes the snapshot path.
 - **A finished message ends the stream, whatever the finish reason.** The collector settles on any non-empty
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.
@@ -511,35 +513,34 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   the full request budget. The metadata calls (`/v1/models`, the tool list) are capped separately
   (`METADATA_TIMEOUT_CAP_MS`, never above `REQUEST_TIMEOUT_MS`), because they fall back — a client listing models must
   get the static fallback quickly instead of waiting a completion budget for a silent provider.
-- **A promise that loses a race needs a handler.** `promptWithTimeout` races the prompt against its own timer, and the
-  losing promise keeps running: a rejection that arrives afterwards (the backend dies, or the deadline aborts the
-  fetch) reached nothing and became an unhandled rejection, which terminates the process by default — one slow
-  completion could take the whole gateway down. Every raced promise gets a `.catch(() => {})` attached.
+- **A promise that loses a race needs a handler.** `promptWithTimeout` races the prompt against its own timer and the
+  losing promise keeps running: a rejection arriving afterwards (the backend dies, the deadline aborts the fetch)
+  reached nothing and became an unhandled rejection, which terminates the process by default — one slow completion
+  could take the whole gateway down. Every raced promise gets a `.catch(() => {})`.
 - **Timeouts and fallbacks are behavioural contracts.** The polling fallback, the shortened first-delta wait, the
-  health-probe cache and the backend start-failure cooldown exist because of real OpenCode protocol quirks
-  (opencode ≥ 1.19 event payloads, free zen models). Do not remove them without replacing the behaviour they cover.
+  health-probe cache and the start-failure cooldown exist because of real OpenCode protocol quirks (opencode ≥ 1.19
+  event payloads, free zen models). Do not remove them without replacing the behaviour they cover.
 - **Signals belong to the entry point.** `index.js` owns `SIGINT`/`SIGTERM`: it closes the HTTP server, lets the
   responses in flight finish (1.5 s grace), stops the backend and exits, with a watchdog so an open SSE stream cannot
   block shutdown. The backend is stopped *after* that grace period, not before it: killing it first turned a
   completion the gateway was already serving into an upstream error, which is the opposite of a graceful shutdown.
-  Every exit path stops the backend exactly once, so it can never outlive the gateway. Do not register signal handlers
-  that call `process.exit()` from a module — they win the race and skip backend teardown.
+  Every exit path stops the backend exactly once. Do not register signal handlers that call `process.exit()` from a
+  module — they win the race and skip backend teardown.
 - **The wait queue is bounded** (`OPENCODE_PROXY_MAX_QUEUE`, default 64) because every waiting request pins its parsed
   body; overflow answers `503 queue_full` instead of growing memory. The other half is `OPENCODE_PROXY_MAX_BODY_MB`
   (default 50, the Fastify `bodyLimit`): together they allow 3.2 GiB of pinned bodies, which no small host plans for,
   so both are documented knobs. The cap counts *waiting* requests, so it is reached only while every slot is busy: `0`
-  means "never queue", not "refuse every completion" (a lone request with a free slot is served). A slot is released
+  means "never queue", not "refuse every completion" (a lone request with a free slot is served anyway). A slot is released
   when its response is complete (`release()` in `runQueuedTask`), not when the task promise settles: the session
   deletion after the answer is a backend round trip, and holding the slot through it made a follow-up request look like
   a full gateway. `.finally(release)` stays the safety net, so `release()` is idempotent. A request whose client
-  disconnects while queued is dropped when its turn comes (`reply.raw` 'close'), so it never spends backend time. Do
-  not use `request.raw.destroyed` as the disconnect signal: the request stream is destroyed once its body is read,
-  which is the normal case.
-  A body over `OPENCODE_PROXY_MAX_BODY_MB` is still refused with `413`, but the refusal is written only after the body
-  has been read to its end (`refuseOversizedBody()`, bounded by `BODY_DRAIN_TIMEOUT_MS`): Node ends the socket when a
-  response finishes with the request body unread, the kernel answers the client's remaining bytes with RST, and the
-  client could lose the 413 completely - CI on Node 24 aborted the suite with "fetch failed" instead of the envelope.
-  A client that keeps writing is cut off after the drain window rather than holding the socket.
+  disconnects while queued is dropped when its turn comes (`reply.raw` 'close'), so it never spends backend time. The
+  disconnect signal is not `request.raw.destroyed`: that stream is destroyed once its body is read, the normal case.
+  A body over `OPENCODE_PROXY_MAX_BODY_MB` is still refused with `413`, but only after the body has been read to its
+  end (`refuseOversizedBody()`, bounded by `BODY_DRAIN_TIMEOUT_MS`): Node ends the socket when a response finishes with
+  the request body unread, the kernel answers the client's remaining bytes with RST, and the client could lose the 413
+  completely - CI on Node 24 aborted the suite with "fetch failed" instead of the envelope. A client that keeps writing
+  is cut off after the drain window rather than holding the socket.
 - **The container runs as the unprivileged `node` user.** `docker/Dockerfile` chowns `/app` and declares
   `USER node` (uid/gid 1000) after the CLI install, so the gateway, the backend it spawns and every tool it runs are
   not UID 0. The entrypoint still writes `/app/config.json` (0600, owned by that user) on first boot, so a bind mount
@@ -567,17 +568,17 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `OPENCODE_PATH` that does not exist is warned about rather than silently replaced by whatever the PATH search finds.
 - **The start attempt is claimed before the probe.** `state.isStarting` is set synchronously, before the
   `checkHealth` call that may suspend, and released in a `finally` on every path: claiming it only after that probe
-  failed let two callers arriving within one probe round trip (the startup warmup racing the first request, or two
+  failed let two callers arriving within one probe round trip (the warmup racing the first request, or two
   completions) both spawn a backend, and the second spawn killed the first one's child and overwrote the tracked
-  process. A caller waiting on someone else's attempt probes first and sleeps between attempts, so a request that
-  arrives during a start is served as soon as the backend answers instead of waiting a full interval.
+  process. A caller waiting on someone else's attempt probes first and sleeps between attempts, so a request arriving
+  during a start is served as soon as the backend answers.
 - **`killBackend()` returns a promise that settles when the child is gone** (SIGTERM, then SIGKILL after 3 s), and
   `index.js` awaits it before `process.exit(0)`; the jail directory is removed only after the child is gone, because it
   is the child's cwd. Exiting right after SIGTERM skipped the escalation, so a backend that ignores SIGTERM outlived
   the gateway that owns it. It also sets `state.shuttingDown`, which every `ensureBackend()` path checks before it
   spawns: an attempt still inside its health probe (or waiting for the previous child) used to spawn `opencode serve`
-  *after* the promise resolved, so a caller that keeps running - an embedder, an in-flight request during teardown -
-  ended up with a backend nobody tracked while it held the backend port. A pending attempt is waited for
+  *after* the promise resolved, leaving a caller that keeps running - an embedder, an in-flight teardown request - with
+  a backend nobody tracked while it held the backend port. A pending attempt is waited for
   (`waitForPendingStart()`, bounded by the largest step it can be inside and the 5 s hard exit in `index.js`), and each
   respawn deletes its predecessor's path from `ownedJailRoots` before replacing it.
 - **Backend lifecycle changes** must keep these properties: `ensureBackend()` trusts a successful probe for
@@ -594,7 +595,7 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   agent runtime that runs model-directed tools, and it authenticates nothing with a key that only guards this gateway.
   Provider credentials the CLI needs live in its own auth store or under their own names, so they stay. The jail
   directory (`<tmp>/opencode-proxy-jail/<salt>`, the child's cwd and its whole `HOME` under `USE_ISOLATED_HOME`) is
-  created with mode `0700`: on a shared `/tmp` the default `0755` let every other local user list and traverse it.
+  created `0700`: on a shared `/tmp` the default `0755` let every other local user list and traverse it.
 - **A cached healthy answer does not fail the request it was wrong about.** `session.create` that throws a connection
   error (the backend died within `OPENCODE_PROXY_HEALTH_CACHE_MS` of the trusted probe) drops that trust, calls
   `ensureBackend()` again and retries the call once; the crash-recovery then happens for the request that hit it
@@ -630,7 +631,7 @@ measured on the machine you measured them on. Completion requests are serialised
 
 Before reporting a change as complete:
 
-1. `pnpm run check` passes (syntax check for every JavaScript file).
+1. `pnpm run check` passes.
 2. `pnpm test` passes; new behaviour that can be asserted belongs in `test/smoke.mjs`.
 3. `pnpm run check:commits <base>..HEAD` passes for the commits the change adds; a subject that is wrong has to be
    fixed before it is published, because rewriting published history rewrites every commit after it.

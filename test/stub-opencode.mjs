@@ -25,6 +25,9 @@ const FAIL_PROVIDERS = process.env.STUB_FAIL_PROVIDERS === '1';
 // Reject POST /session (an incompatible backend, a proxy in front of it) so a test can prove the gateway reports the
 // upstream status and reason instead of a bare 500
 const FAIL_SESSION = process.env.STUB_FAIL_SESSION === '1';
+// Hang on this session creation (1-based) and never answer: a backend that wedges on POST /session, which is
+// what a queued completion used to be granted a second, fresh request budget for
+const HANG_CREATE_AFTER = Number(process.env.STUB_HANG_CREATE_AFTER || 0);
 // Refuse POST /session with a reason that quotes a URL carrying a credential, the way a proxy in front of the backend
 // does when it cannot reach it: the gateway copies that reason into a client-facing 502 body and into its log, so a
 // test can prove both are masked
@@ -75,6 +78,14 @@ const SHRINK_LAST = 'alpha beta';
 // The two halves of the MULTIPART answer, each sent as its own cumulative snapshots by streamTwoParts()
 const MULTIPART_FIRST = 'alpha beta gamma';
 const MULTIPART_SECOND = 'ALPHA BETA GAMMA';
+// The answer the CUTTOOL and OPENTOOL markers carry, and the two points inside its tool block where the stream stops:
+// the first cuts the opening tag in half, the second the closing one. The stored message is the complete answer, so the
+// recovery poll holds the whole text while the client only has `hello `.
+const TOOL_ANSWER = 'hello <function_calls>secret</function_calls> world';
+const TOOL_OPEN_CUT = 'hello <function_ca';
+const TOOL_CLOSE_CUT = 'hello <function_calls>secret</function_cal';
+// The MIXED answer: two increments, each also carrying the part's cumulative text, then a closing update with no delta
+const MIXED_ANSWER = 'Hello world';
 export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub.';
 export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
 
@@ -133,6 +144,36 @@ const buildAssistantMessage = (sessionID, text, reasoning) => ({
         { type: 'text', text }
     ]
 });
+
+// Part updates that carry a `delta` *and* the part's cumulative text, then one closing update for the same part with no
+// delta at all. The SDK's event type allows both fields on one event, so this is a conforming backend (or a version
+// transition): the closing update must add nothing, because the deltas already carried its text.
+async function streamMixedDeltas(sessionID, pieces, delayMs = 1) {
+    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
+    let text = '';
+    for (const piece of pieces) {
+        text += piece;
+        sendEvent({
+            type: 'message.part.updated',
+            properties: { part: { id: 'prt_mixed', sessionID, type: 'text', text }, delta: piece }
+        });
+        await sleep(delayMs);
+    }
+    sendEvent({ type: 'message.part.updated', properties: { part: { id: 'prt_mixed', sessionID, type: 'text', text } } });
+    await sleep(delayMs);
+    sendEvent({
+        type: 'message.updated',
+        properties: {
+            info: {
+                id: `msg_${sessionID}`,
+                sessionID,
+                role: 'assistant',
+                finish: 'stop',
+                time: { created: Date.now(), completed: Date.now() }
+            }
+        }
+    });
+}
 
 // Emit two deltas and then go silent without ever finishing, so a completion can only end through a timeout.
 async function stallAfterTwoDeltas(sessionID) {
@@ -347,6 +388,10 @@ const server = http.createServer(async (req, res) => {
             });
         }
         const id = `ses_smoke_${(sessionSeq += 1)}`;
+        if (HANG_CREATE_AFTER && sessionSeq > HANG_CREATE_AFTER) {
+            // Accepted and never answered: the caller has to give up through its own deadline
+            return;
+        }
         sessions.set(id, { messages: [] });
         return sendJson(res, 200, { id });
     }
@@ -533,6 +578,30 @@ const server = http.createServer(async (req, res) => {
                 });
                 sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
                 streamSnapshots(id, SHRINK_SNAPSHOTS, 1).catch(() => {});
+                return;
+            }
+            if (session.promptText.includes('MIXED')) {
+                // A backend that sends `delta` on the streaming updates and the finished part without one: the part's
+                // snapshot has to be recorded by the delta-bearing events too, or the closing update is diffed against
+                // '' and the client receives the whole answer a second time
+                session.messages.push({
+                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } },
+                    parts: [{ type: 'text', text: MIXED_ANSWER }]
+                });
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                streamMixedDeltas(id, ['Hello', ' world']).catch(() => {});
+                return;
+            }
+            if (session.promptText.includes('CUTTOOL') || session.promptText.includes('OPENTOOL')) {
+                // The answer carries a tool-call block and the stream is cut inside it (CUTTOOL: inside the closing
+                // tag, OPENTOOL: inside the opening one), then every event subscriber is closed. The stored message is
+                // the complete answer, so the recovery poll has all of it: the gateway has to strip the block out and
+                // append what the client is missing, whatever the streaming filter was holding when the stream died.
+                session.messages.push(buildAssistantMessage(id, TOOL_ANSWER, REASONING));
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                const cut = session.promptText.includes('OPENTOOL') ? TOOL_OPEN_CUT : TOOL_CLOSE_CUT;
+                if (!TOOL_ANSWER.startsWith(cut)) throw new Error('the cut point is not a prefix of the answer');
+                cutStreamMidAnswer(id, [cut]).catch(() => {});
                 return;
             }
             const toolTag = session.promptText.includes('TOOLTAG');

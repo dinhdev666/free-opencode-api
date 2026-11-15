@@ -88,7 +88,9 @@ summary, CORS headers, bearer auth) and no plugin-level middleware chain. Additi
 - **A silent backend gap does not truncate the answer** — when the event stream goes quiet for the idle timeout while
   a slow model is still writing, the gateway recovers through polling and appends only the part the client does not
   have. The recovery waits a full idle window of further silence before it accepts a message the backend never marks
-  finished, so a provider that pauses mid-answer is not mistaken for one that is done.
+  finished, so a provider that pauses mid-answer is not mistaken for one that is done. A stream cut while
+  `DISABLE_TOOLS` is filtering is recovered from the unfiltered remainder, so an answer interrupted inside a
+  `<function_calls>` block still arrives with everything that followed it.
 - **Backend health probes are cached and keep-alive** — one probe is shared across a burst of requests
   (`OPENCODE_PROXY_HEALTH_CACHE_MS`, default 2000 ms) over a reused socket; a connection failure invalidates the
   cache immediately. A backend that was already known to be healthy but whose cache window has expired is re-probed
@@ -98,9 +100,10 @@ summary, CORS headers, bearer auth) and no plugin-level middleware chain. Additi
   normal interval, because an answer that lands a few tens of milliseconds after the prompt returned used to wait a
   full 500 ms interval before it was seen. The "the text stopped growing" guard is measured in time (~1.5 s), not in
   poll count, so the shorter early polls cannot make it accept a half-written answer.
-- **One budget per completion** — the prompt, the event stream and the polling fallback share the request budget
-  (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`) instead of each starting a fresh one, so a stalled stream ends within the
-  advertised timeout instead of after roughly twice it.
+- **One budget per completion** — session creation, the prompt, the event stream and the polling fallback share the
+  request budget (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`) instead of each starting a fresh one, so a stalled stream ends
+  within the advertised timeout instead of after roughly twice it, and a request that waited in the queue does not get
+  a full extra budget for its setup.
 - **Startup failures fail fast** — if the OpenCode process exits during startup (missing binary, bad path) the
   readiness wait is aborted instead of burning the full budget, and requests answer in milliseconds for the retry
   cooldown window (`OPENCODE_PROXY_START_RETRY_MS`, default 15000 ms).
@@ -271,7 +274,7 @@ Advanced tuning (environment or `config.json`; the environment wins when both se
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `300000` | Upstream request timeout in milliseconds, shared by every phase of a completion (prompt, event stream, poll fallback). It also bounds how long a request body may take to arrive, up to 30 s (see [Request bodies](#request-bodies)) |
+| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `300000` | Upstream request timeout in milliseconds, shared by every phase of a completion (session creation, prompt, event stream, poll fallback). It also bounds how long a request body may take to arrive, up to 30 s (see [Request bodies](#request-bodies)) |
 | `OPENCODE_PROXY_HEALTH_CACHE_MS` | `2000` | How long a successful backend health probe is trusted before the next one (`0` probes on every request). An expired-but-known-healthy backend is re-probed in the background, so a request after a quiet period does not wait for it |
 | `OPENCODE_PROXY_START_RETRY_MS` | `15000` | Cooldown after a failed backend start attempt; requests fail fast instead of retrying immediately |
 | `OPENCODE_PROXY_MAX_CONCURRENCY` | `1` | Number of chat completions processed in parallel (1..32). `1` keeps the historical serialized behaviour; raise it only if the backend/provider tolerates concurrent sessions |

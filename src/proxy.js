@@ -33,6 +33,12 @@ const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
 const SSE_KEEPALIVE_INTERVAL_MS = 15000;
 const SSE_KEEPALIVE_TICK_MS = 5000;
 
+// Two completions that reach this counter in the same millisecond used to receive the same
+// `chatcmpl-<epoch>` id (a client that keys its messages by id merged two answers); the counter keeps ids distinct
+// without a random source, and the millisecond stamp keeps them roughly sortable.
+let completionIdSeq = 0;
+const newCompletionId = () => `chatcmpl-${Date.now().toString(36)}${String(completionIdSeq++).padStart(3, '0')}`;
+
 // Authentication is mandatory by design: when API_KEY is missing or blank the gateway falls back to this
 // built-in key instead of running without authentication.
 export const DEFAULT_API_KEY = 'sk-dummy-123';
@@ -1374,7 +1380,7 @@ function createApp(config) {
                         raw.setHeader('Content-Type', 'text/event-stream');
                         raw.setHeader('Cache-Control', 'no-cache');
                         raw.setHeader('X-Accel-Buffering', 'no');
-                        const id = `chatcmpl-${Date.now()}`;
+                        const id = newCompletionId();
                         const filterContentDelta = createToolCallFilter();
                         const filterReasoningDelta = createToolCallFilter();
                         let streamedContent = '';
@@ -1645,7 +1651,7 @@ function createApp(config) {
                         const safeReasoning = stripFunctionCalls(reasoning);
 
                         const responsePayload = {
-                            id: `chatcmpl-${Date.now()}`,
+                            id: newCompletionId(),
                             object: 'chat.completion',
                             created: Math.floor(Date.now() / 1000),
                             model: `${pID}/${mID}`,

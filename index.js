@@ -1,4 +1,4 @@
-import { startProxy, DEFAULT_API_KEY, resolveApiKey } from './src/proxy.js';
+import { startProxy, DEFAULT_API_KEY, parseBoolean, resolveApiKey } from './src/proxy.js';
 import { logger } from './src/logger.js';
 import fs from 'fs';
 import path from 'path';
@@ -6,18 +6,6 @@ import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-function parseBool(value, fallback) {
-    if (typeof value === 'boolean') return value;
-    if (typeof value === 'number') return value === 1;
-    if (typeof value === 'string') {
-        const v = value.trim().toLowerCase();
-        if (['1', 'true', 'yes', 'y', 'on'].includes(v)) return true;
-        if (['0', 'false', 'no', 'n', 'off'].includes(v)) return false;
-    }
-    if (value === undefined || value === null) return fallback;
-    return Boolean(value);
-}
 
 // Default configuration
 // LOG_LEVEL has no default declared here: when not explicitly configured, undefined is passed through and
@@ -69,9 +57,9 @@ const finalConfig = {
     BIND_HOST: process.env.BIND_HOST || fileConfig.BIND_HOST || defaultConfig.BIND_HOST,
     // The legacy OPENCODE_-prefixed name keeps working; the bare name matches every other key and the container's
     // `-e DISABLE_TOOLS=...` flag
-    DISABLE_TOOLS: parseBool(
+    DISABLE_TOOLS: parseBoolean(
         process.env.OPENCODE_DISABLE_TOOLS ?? process.env.DISABLE_TOOLS,
-        parseBool(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)
+        parseBoolean(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)
     ),
     // LOG_LEVEL: env takes precedence over config.json; when neither is explicitly set, undefined is passed
     // through and startProxy falls back to the default info while keeping the legacy DEBUG -> debug level interlock

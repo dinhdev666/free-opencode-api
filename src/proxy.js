@@ -37,6 +37,22 @@ export const resolveApiKey = (value) => {
     return key || DEFAULT_API_KEY;
 };
 
+/**
+ * Boolean option parsing shared by the entry point and startProxy, so the two cannot disagree about what
+ * `DISABLE_TOOLS=yes` means. Numbers follow JavaScript truthiness (`1` is on, `0` off); an unrecognised value
+ * returns the fallback instead of being coerced.
+ */
+export function parseBoolean(value, fallback = undefined) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value === 1;
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) return true;
+        if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) return false;
+    }
+    return fallback;
+}
+
 const OPENCODE_BASENAME = 'opencode';
 
 function splitPathEnv() {
@@ -1662,21 +1678,11 @@ async function ensureBackend(config, options = {}) {
  * Starts the OpenCode-to-OpenAI Proxy server.
  */
 export function startProxy(options) {
-    const normalizeBool = (value) => {
-        if (typeof value === 'boolean') return value;
-        if (typeof value === 'number') return value === 1;
-        if (typeof value === 'string') {
-            const v = value.trim().toLowerCase();
-            if (['1', 'true', 'yes', 'y', 'on'].includes(v)) return true;
-            if (['0', 'false', 'no', 'n', 'off'].includes(v)) return false;
-        }
-        return undefined;
-    };
-
     const disableTools =
-        normalizeBool(options.DISABLE_TOOLS) ??
-        normalizeBool(options.disableTools) ??
-        normalizeBool(process.env.OPENCODE_DISABLE_TOOLS) ??
+        parseBoolean(options.DISABLE_TOOLS) ??
+        parseBoolean(options.disableTools) ??
+        parseBoolean(process.env.OPENCODE_DISABLE_TOOLS) ??
+        parseBoolean(process.env.DISABLE_TOOLS) ??
         false;
 
     const config = {

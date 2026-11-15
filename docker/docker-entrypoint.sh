@@ -60,7 +60,14 @@ if [ ! -f "$CONFIG" ]; then
         // src/logger.js - nothing is revealed up to 16 characters, and only the 4-character prefix above that.
         const key = String(cfg.API_KEY);
         const masked = (key.length <= 16 ? "***" : key.slice(0, 4) + "***") + ` (${key.length} chars)`;
-        const shown = Object.assign({}, cfg, { API_KEY: masked });
+        // The backend URL can carry credentials too (`http://user:secret@host:4097`, a proxy in front of the backend),
+        // and this line is collected from `docker logs`: userinfo and credential query values are masked the same way
+        // maskBackendUrl()/maskUrlQuery() in src/logger.js do it, and for the same reason.
+        const maskUrl = (value) => String(value)
+            .replace(/([?&])([^=&#]+)=([^&#]*)/gi,
+                (match, sep, name, v) => /auth|token|secret|cookie|session|passw|api[-_]?key/i.test(name) ? `${sep}${name}=***` : match)
+            .replace(/^(\w[\w+.-]*:\/\/)[^/?#]*@/, "$1***@");
+        const shown = Object.assign({}, cfg, { API_KEY: masked, OPENCODE_SERVER_URL: maskUrl(cfg.OPENCODE_SERVER_URL) });
         console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(shown));
         console.log("[entrypoint] log level (LOG_LEVEL env, higher priority than config.json):", env("LOG_LEVEL", "info"));
     '

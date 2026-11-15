@@ -242,7 +242,7 @@ while the gateway ran the default you thought you had replaced:
 | `PORT` | `8083` | Gateway listen port |
 | `BIND_HOST` | `127.0.0.1` | Gateway bind address; use `0.0.0.0` to expose it on all interfaces |
 | `API_KEY` | `sk-dummy-123` | Bearer token clients must send. Authentication is always on — an empty or blank value falls back to `sk-dummy-123` |
-| `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway; a trailing slash is stripped and a missing scheme is read as `http://` (both are reported in the startup log, *before* the summary, so the `Backend:` line always shows the value the gateway actually uses). Surrounding whitespace is trimmed silently. A credential in the URL (`http://user:secret@host:4097`) is masked wherever the value is logged or returned (`/health`) |
+| `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway; a trailing slash is stripped and a missing scheme is read as `http://` (both are reported in the startup log, *before* the summary, so the `Backend:` line always shows the value the gateway actually uses). Surrounding whitespace is trimmed silently. A credential in the URL (`http://user:secret@host:4097`, a proxy in front of the backend) is sent to the backend as a Basic `Authorization` header — the SDK calls every endpoint through `fetch`, which refuses a URL that carries credentials, so such a URL could not work at all — and it is masked wherever the value is logged or returned (`/health`), including inside an upstream error message |
 | `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend. Keep it on loopback: the backend has no authentication of its own, so publishing it bypasses the gateway's key |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Read as the bind address only when `BIND_HOST` is not set |
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
@@ -340,7 +340,9 @@ curl -X POST http://127.0.0.1:8083/v1/chat/completions \
 Every response carries `X-Request-Id`: the gateway's own `gw-…` id, or the value of an `X-Request-Id` header you send
 (a short token of `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, `-`, up to 64 characters — anything else is replaced). The same id
 ends the request's log line, so a client report can be matched to a log entry, and it is exposed over CORS so browser
-clients can read it.
+clients can read it. Every response also carries `X-Content-Type-Options: nosniff`: the gateway only writes JSON and
+SSE, so a browser must not re-interpret a body its own guess disagrees with (on the CORS paths, on streamed responses
+and on the parser-level rejections alike).
 
 Errors follow the OpenAI error envelope (`{"error": {"message": ..., "type": ...}}`): `400` for an invalid request
 (`type: "invalid_request_error"`, with Fastify's own `code` such as `FST_ERR_CTP_INVALID_JSON_BODY` when the body could
@@ -380,6 +382,17 @@ A part whose `text` field is present but not a string is named by that field
 the part type the gateway does forward. A part that is not a part at all (`42`, `null`, `true`) is refused the same way
 (`messages[0].content[0] must be a string or an object with a text field, found a number`), because dropping it left the
 request failing the "no text at all" check and blaming the client's text.
+
+A `content` that is a **single object instead of an array** follows the same three rules, reported without a part index
+(`messages[0].content uses an unsupported content part type "image_url"; this gateway forwards text only`,
+`messages[0].content.text must be a string, found a number`). Such a message used to be read as empty and dropped in
+silence: a request that also carried text was answered from that text alone (a confidently wrong answer), and a
+`system`/`developer` message written that way lost its instructions instead. A single object with a string `text` is a
+shape some clients send and is still forwarded.
+
+**A message `name` is a label, not prompt text.** It is used as `USER(name): …` only when it is a string, with control
+characters replaced, so a non-string name cannot reach the model as `[object Object]` and a name carrying a newline
+cannot forge a second conversation line.
 
 **A body must arrive.** A request that announces a body (`Content-Length`, `Transfer-Encoding: chunked`) has to
 deliver it within 30 s or the shared request budget, whichever is shorter. On expiry the client receives the `408`

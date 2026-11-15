@@ -432,11 +432,17 @@ All output goes to stdout/stderr with a `[gateway]` prefix:
 | `info` | Default. Startup information plus a one-line summary per request: method, path, model, streaming, status, latency, request id. The model id in that line is normalised (control characters replaced, length capped): it comes from the request body, and a newline in it must not be able to start a second log line. stdout. |
 | `debug` | Inbound request headers (secrets masked), the final payload sent to the backend, and full responses. stdout. |
 
+A request body that carries `__proto__` or `constructor` as a property name is refused with `400` before it reaches
+the handler (Fastify's prototype-poisoning guard); the message names that reason rather than claiming the JSON is
+invalid, because a body with one of those keys parses fine and the fix is to remove the key, not the comma.
+
 Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked before they are logged, and so are
 credential values sent in a query string (`?api_key=…`) and a credential carried by the configured backend URL
 (`http://user:secret@host:4097`, a proxy in front of the backend): the startup summary, the `[Config]` notes and
 `/health` show `http://***@host:4097` instead. The container's first-boot line prints the API key as its length and,
-above 16 characters, a 4-character prefix — `docker logs` is collected as often as not.
+above 16 characters, a 4-character prefix — `docker logs` is collected as often as not. Masking replaces the value of
+a header or key and never drops it: an odd name such as `__proto__` is still shown (masked like any other), because the
+debug dump is what you read to see what a client actually sent.
 
 The startup summary prints the effective port, backend URL, tool filtering, log level and capacity
 (`Concurrency: … completion(s) processed in parallel`, `Wait queue: … waiting completion(s) before 503 queue_full`). The

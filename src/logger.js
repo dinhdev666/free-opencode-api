@@ -63,6 +63,26 @@ function truncateText(text, maxLen) {
 }
 
 /**
+ * Write one key of a copy that is about to be serialised.
+ *
+ * A key named `__proto__` is an ordinary own property on what `JSON.parse` returns (a backend payload logged as a
+ * detail, the object behind a copy), but `target[key] = value` runs the `__proto__` setter instead: the key disappeared
+ * from the dump while nothing else changed, so a debug line silently misreported what had arrived - which is the one
+ * thing that dump is read for. Assigning a non-object through that setter is also a silent no-op, so the value was
+ * lost with no trace at all. `defineProperty` writes it as a data property, and only that one key pays for it.
+ * (A request body cannot reach these helpers with that name: Fastify's poisoning guard refuses it first. Node's own
+ * header parser drops a header named `__proto__`, so `maskHeaders` only ever sees one from a caller that built the
+ * object itself - both are reasons the helpers must not be the thing that loses it.)
+ */
+function setOwnProperty(target, key, value) {
+    if (key === '__proto__') {
+        Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+        return;
+    }
+    target[key] = value;
+}
+
+/**
  * Safe clone: handles circular references, excessive nesting, Error and BigInt so that the following
  * JSON.stringify call never throws (non-JSON values become readable placeholders instead of being dropped)
  */
@@ -95,7 +115,7 @@ function safeClone(value, seen = new WeakSet(), depth = 0) {
         out = {};
         const keys = Object.keys(value).slice(0, MAX_OBJECT_KEYS);
         keys.forEach((key) => {
-            out[key] = safeClone(value[key], seen, depth + 1);
+            setOwnProperty(out, key, safeClone(value[key], seen, depth + 1));
         });
         const hiddenKeys = Object.keys(value).length - keys.length;
         if (hiddenKeys > 0) out['[hiddenKeys]'] = hiddenKeys;
@@ -197,7 +217,7 @@ export function maskHeaders(headers) {
     Object.keys(headers || {}).forEach((name) => {
         const lower = String(name).toLowerCase();
         const value = headers[name];
-        masked[name] = isSensitiveHeader(lower) ? maskSecret(value) : value;
+        setOwnProperty(masked, name, isSensitiveHeader(lower) ? maskSecret(value) : value);
     });
     return masked;
 }

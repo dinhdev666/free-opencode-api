@@ -227,6 +227,21 @@ async function run() {
         bigDetailText.length <= 33 * 1024 && bigDetailMs < 500, `${bigDetailText.length} bytes in ${bigDetailMs} ms`);
     check('the truncation is annotated for the reader', /truncated/i.test(bigDetailText),
         bigDetailText.slice(-80));
+    // A client writes both of these names: a body key and a header name are whatever the request carries, and a plain
+    // `copy[key] = value` assignment runs the `__proto__` setter, which dropped the key from the dump instead of showing
+    // it - the dump is what an operator reads to see what was actually sent, so losing a key there is the worst place
+    // to lose one. The prototype of the copy is left alone either way.
+    const protoBody = JSON.parse('{"messages":[],"__proto__":{"injected":true}}');
+    const protoHeaders = JSON.parse('{"__proto__":"header-value","authorization":"Bearer sk-proto-1234567890"}');
+    const protoDetail = serializeDetail(protoBody);
+    const protoMasked = maskHeaders(protoHeaders);
+    check('a __proto__ key survives into the debug detail instead of vanishing',
+        protoDetail.includes('"__proto__"') && protoDetail.includes('injected') && ({}).injected === undefined,
+        protoDetail);
+    check('a __proto__ header name survives the masked header dump',
+        Object.keys(protoMasked).includes('__proto__') && protoMasked.authorization === 'Bear***(26 chars)' &&
+        ({}).injected === undefined,
+        Object.keys(protoMasked).join(','));
 
     // The logger writes to the process's own streams, so the level filter, the prefix and the stamp are observed
     // through a child process. A detail that cannot be serialised (a cycle, a BigInt, a function) and a non-string
@@ -571,6 +586,24 @@ async function run() {
     check('malformed JSON returns 400', badJson.status === 400, `status ${badJson.status}`);
     check('malformed JSON uses the invalid_request_error type',
         badJsonPayload?.error?.type === 'invalid_request_error', JSON.stringify(badJsonPayload).slice(0, 160));
+
+    // Fastify refuses a body carrying `__proto__`/`constructor` through its prototype-poisoning guard, and it reports
+    // that the same way it reports a syntax error - so a body that parses perfectly was answered "Body is not valid
+    // JSON", which sends the reader looking for a missing comma. Both causes are named instead.
+    const protoPoisoned = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: '{"messages":[{"role":"user","content":"hi"}],"__proto__":{"injected":true}}'
+    });
+    const protoPoisonedPayload = await protoPoisoned.json().catch(() => null);
+    check('a body with a forbidden property name is refused in the usual envelope',
+        protoPoisoned.status === 400 && protoPoisonedPayload?.error?.code === 'FST_ERR_CTP_INVALID_JSON_BODY' &&
+        /forbidden property name/.test(String(protoPoisonedPayload?.error?.message)),
+        `${protoPoisoned.status} ${JSON.stringify(protoPoisonedPayload).slice(0, 160)}`);
+    check('the refusal names both causes instead of blaming valid JSON',
+        /not valid JSON/.test(String(badJsonPayload?.error?.message)) &&
+        /forbidden property name/.test(String(badJsonPayload?.error?.message)),
+        JSON.stringify(badJsonPayload?.error?.message));
 
     const nullBody = await fetch(`${BASE}/v1/chat/completions`, {
         method: 'POST',

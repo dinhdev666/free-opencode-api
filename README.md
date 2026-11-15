@@ -408,6 +408,11 @@ silence: a request that also carried text was answered from that text alone (a c
 `system`/`developer` message written that way lost its instructions instead. A single object with a string `text` is a
 shape some clients send and is still forwarded.
 
+A `content` that is a **bare scalar** (`42`, `true`) is refused the same way
+(`messages[0].content must be a string or an object with a text field, found a number`): it is not text the client
+wrote, and stringifying it sent the model the number as the question — a template that lost a field asked something
+nobody asked and was answered. OpenAI refuses the type as well.
+
 **A message `name` is a label, not prompt text.** It is used as `USER(name): …` only when it is a string, with control
 characters replaced, so a non-string name cannot reach the model as `[object Object]` and a name carrying a newline
 cannot forge a second conversation line.

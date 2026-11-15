@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 317 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 319 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -197,13 +197,14 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **Content parts must be text.** A `content` array may carry strings and parts with a `text` field (`text`, and the
   Responses-API spelling `input_text`). Any other part (`image_url`, `input_audio`, `file`) is refused with a `400`
   naming its position and type (`messages[0].content[1] uses an unsupported content part type "image_url"; this gateway
-  forwards text only`): dropping them answered a question the backend never received, and a request whose only part was
-  an image was reported as `messages must include at least one non-system text message`. Three causes, three messages,
+  forwards text only`): dropping them answered a question the backend never received. Three causes, three messages,
   part check first: an unsupported type (above), a `text` part whose `text` is not a string
   (`messages[0].content[1].text must be a string, found a number`) and a part that is not a part at all (`… must be a
   string or an object with a text field, found a number`, for `42`, `null`, `true`, which were dropped in silence). A
   `content` that is a **single object instead of an array** follows the same three rules without a part index; it used
-  to be read as an empty message, so a request that also carried text got an answer built from that text alone.
+  to be read as an empty message, so a request that also carried text got an answer built from that text alone. A bare
+  scalar `content` (`42`, `true`) is refused the same way, without a part index: stringifying it sent the model the
+  number as the question.
 - **A message `name` is a label, not prompt text.** It is interpolated as `USER(name): …` only when it is a string,
   with control characters replaced and the value cut: a non-string reached the model as `USER([object Object]): …`.
 - **An announced request body has a deadline.** Fastify sets `requestTimeout: 0`, so nothing bounded the wait: a client

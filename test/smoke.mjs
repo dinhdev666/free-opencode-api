@@ -468,7 +468,18 @@ async function run() {
     check('a cold-cache burst costs one provider round trip', burstAfter - burstBefore === 1,
         `provider calls: ${burstAfter - burstBefore}`);
     // The burst above also proves the result was cached: a listing served from the cache must not reach the backend
-    await request('/v1/models');
+    const cachedFirst = await request('/v1/models');
+    // A cached listing is sent as the body built when the cache was filled, so a listing whose bytes changed between
+    // two requests would be a stale body nobody rebuilt - and the shape must survive being sent as a string
+    const cachedSecond = await request('/v1/models');
+    check('a cached listing keeps the documented shape',
+        cachedSecond.response.status === 200 && cachedSecond.json?.object === 'list' &&
+        Array.isArray(cachedSecond.json?.data) &&
+        cachedSecond.json.data.every((m) => typeof m.id === 'string' && typeof m.name === 'string' &&
+            m.object === 'model' && typeof m.owned_by === 'string'),
+        cachedSecond.text.slice(0, 160));
+    check('a cached listing is the same body every time', cachedFirst.text === cachedSecond.text,
+        `${cachedFirst.text.length} vs ${cachedSecond.text.length} bytes`);
     await request('/v1/models');
     const cachedCalls = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
     check('a repeated listing is served from the cache', cachedCalls === burstAfter,

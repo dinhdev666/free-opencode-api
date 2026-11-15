@@ -480,6 +480,14 @@ async function run() {
     const preflight = await fetch(`${BASE}/v1/chat/completions`, { method: 'OPTIONS' });
     check('OPTIONS preflight returns 204', preflight.status === 204, `status ${preflight.status}`);
     check('CORS headers are present on preflight', preflight.headers.get('access-control-allow-origin') === '*');
+    // The allow-list has to advertise every header the gateway reads and every one a client may send: `X-Request-Id`
+    // is echoed as the trace id (log line + response header, asserted below), so a browser client that sets its own
+    // uploaded a preflight the gateway never granted and the browser refused to send the request at all.
+    const allowHeaders = (preflight.headers.get('access-control-allow-headers') || '').toLowerCase();
+    check('the preflight advertises every header the gateway reads, including X-Request-Id',
+        ['content-type', 'authorization', 'x-api-key', 'x-request-id', 'x-requested-with']
+            .every((name) => allowHeaders.split(',').map((part) => part.trim()).includes(name)),
+        allowHeaders);
 
     // A liveness probe must not have to carry the key, whatever form it takes: the router tolerates a trailing
     // slash, and many probes use HEAD

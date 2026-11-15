@@ -1242,6 +1242,20 @@ function createApp(config) {
                             sseChunkCount++;
                         };
 
+                        // Writes a delta the tool-call filter has already released (the held tail at end of stream).
+                        // Sending it through sendDelta() would hold the same tag prefix back again - and this time
+                        // nothing follows, so the fragment would be lost and the answer truncated.
+                        const sendReleasedDelta = async (delta, isReasoning = false) => {
+                            if (!delta || clientGone) return;
+                            if (isReasoning) {
+                                streamedReasoning += delta;
+                            } else {
+                                streamedContent += delta;
+                            }
+                            await writeFrame(`${chunkHead}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(delta)}${chunkTail}`);
+                            sseChunkCount++;
+                        };
+
                         const collectDeferred = collectFromEvents(
                             sessionId,
                             REQUEST_TIMEOUT_MS,
@@ -1322,9 +1336,9 @@ function createApp(config) {
                         // A fragment held back at the very end of the stream turned out not to be a tag
                         if (!clientGone && DISABLE_TOOLS) {
                             const tailContent = filterContentDelta.flush();
-                            if (tailContent) await sendDelta(tailContent, false);
+                            if (tailContent) await sendReleasedDelta(tailContent, false);
                             const tailReasoning = filterReasoningDelta.flush();
-                            if (tailReasoning) await sendDelta(tailReasoning, true);
+                            if (tailReasoning) await sendReleasedDelta(tailReasoning, true);
                         }
 
                         stopKeepAlive();

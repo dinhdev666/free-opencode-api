@@ -19,6 +19,9 @@ import http from 'node:http';
 const PORT = Number(process.env.STUB_PORT || 4199);
 // An answer with a tool-call block whose tags are cut in the middle by the delta boundaries (prompt marker TOOLTAG)
 const TOOL_TAG_ANSWER = 'hello <function_calls>secret</function_calls> world';
+// An answer whose last delta ends with a fragment that looks like the start of a tool-call tag but never becomes
+// one (prompt marker TAILTAG): the gateway holds that fragment back, and must still deliver it when the stream ends
+const TAIL_TAG_ANSWER = 'hello world <function_call';
 const HOST = process.env.STUB_HOST || '127.0.0.1';
 export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub.';
 export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
@@ -236,6 +239,7 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
             const toolTag = session.promptText.includes('TOOLTAG');
+            const tailTag = session.promptText.includes('TAILTAG');
             if (session.promptText.includes('STALL')) {
                 // Nothing for polling to find and no finish event: the caller must time out and close the stream
                 session.messages = [];
@@ -243,7 +247,8 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
                 return;
             }
-            session.messages.push(buildAssistantMessage(id, toolTag ? TOOL_TAG_ANSWER : ANSWER, REASONING));
+            const answerText = toolTag ? TOOL_TAG_ANSWER : tailTag ? TAIL_TAG_ANSWER : ANSWER;
+            session.messages.push(buildAssistantMessage(id, answerText, REASONING));
             sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
             // Fire and forget: the gateway collects the answer from /event (or polling). A prompt containing SLOW
             // is answered over ~2 s so a test can abort mid-stream while the backend is still working.
@@ -256,8 +261,13 @@ const server = http.createServer(async (req, res) => {
                 options.chunks = ['hello ', '<function_ca', 'lls>secret</function_ca', 'lls> world'];
                 options.delayMs = 1;
             }
+            if (tailTag) {
+                // The last delta ends inside a tag prefix: the held fragment is not markup and must still be sent
+                options.chunks = ['hello world ', '<function_call'];
+                options.delayMs = 1;
+            }
             if (completedOnly) options.finish = 'completed-only';
-            streamAssistantReply(id, toolTag ? TOOL_TAG_ANSWER : ANSWER, REASONING, options).catch(() => {});
+            streamAssistantReply(id, answerText, REASONING, options).catch(() => {});
             return;
         }
 

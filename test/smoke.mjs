@@ -670,6 +670,29 @@ async function run() {
     check('the text around a split tag is preserved',
         toolText.includes('hello') && toolText.trim().endsWith('world'), toolText);
 
+    // The same filter holds back a trailing fragment that could still become a tag. When the stream ends that
+    // fragment turns out to be plain text and must be delivered - it used to be dropped, truncating the answer.
+    const tailResponse = await fetch(`${toolUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'TAILTAG please' }], stream: true })
+    }).then((response) => response.text());
+    const tailText = tailResponse
+        .split('\n\n')
+        .filter((frame) => frame.startsWith('data: ') && !frame.includes('[DONE]'))
+        .map((frame) => {
+            try {
+                return JSON.parse(frame.slice(6));
+            } catch {
+                return null;
+            }
+        })
+        .filter(Boolean)
+        .map((frame) => frame.choices?.[0]?.delta?.content || '')
+        .join('');
+    check('a held fragment that is not a tag is delivered at the end of the stream',
+        tailText.trim() === 'hello world <function_call', JSON.stringify(tailText));
+
     // --- a non-ASCII key ----------------------------------------------------------------
     // The bearer check compares bytes: a key with accented characters matching in string length but not in byte
     // length used to make timingSafeEqual throw, answering 500 instead of 401 for a wrong key

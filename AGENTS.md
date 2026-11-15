@@ -64,7 +64,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 91 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 92 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -186,7 +186,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **The wait queue is bounded** (`OPENCODE_PROXY_MAX_QUEUE`, default 64) because every waiting request pins its parsed
   body; overflow answers `503 queue_full` instead of growing memory. The cap counts *waiting* requests, so it is only
   reached while every slot is busy: `0` means "never queue", not "refuse every completion" (a lone request with a free
-  slot is served, which is what makes a `0` configuration safe to try). A request whose client disconnects while it is
+  slot is served, which is what makes a `0` configuration safe to try). A slot is released when its response is
+  complete (`release()` in `runQueuedTask`), not when the task promise settles: the session deletion after the answer
+  is a backend round trip, and holding the slot through it made an immediate follow-up request look like a full
+  gateway. `.finally(release)` stays the safety net, so `release()` is idempotent and every path frees the slot. A request whose client disconnects while it is
   still queued is dropped when its turn comes (`reply.raw` 'close'), so it never spends backend time or delays the
   requests behind it. Do not use `request.raw.destroyed` as the disconnect signal: the request stream is destroyed as
   soon as its body has been read, which is the normal case.

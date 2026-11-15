@@ -228,6 +228,18 @@ let activeTasks = 0;
 function runQueuedTask() {
     const { task, timeout, resolve, reject } = queue.shift();
     activeTasks += 1;
+    // The slot is freed by the handler as soon as the response is complete, not when the task promise settles:
+    // the session cleanup that follows the answer (a backend round trip) used to keep the slot busy after the client
+    // already had its response, so an immediate follow-up request was refused with 503 queue_full on a gateway whose
+    // queue is 0. Idempotent, because .finally() below stays the safety net for every path.
+    let released = false;
+    const release = () => {
+        if (released) return;
+        released = true;
+        activeTasks -= 1;
+        // Drain the queue on the next tick instead of waiting a fixed 100 ms between requests
+        setImmediate(processQueue);
+    };
     let settled = false;
     const timeoutMs = timeout || 120000;
     const timeoutId = setTimeout(() => {
@@ -237,7 +249,7 @@ function runQueuedTask() {
     }, timeoutMs);
 
     Promise.resolve()
-        .then(() => task())
+        .then(() => task(release))
         .then((result) => {
             if (settled) return;
             settled = true;
@@ -250,11 +262,7 @@ function runQueuedTask() {
             clearTimeout(timeoutId);
             reject(err);
         })
-        .finally(() => {
-            activeTasks -= 1;
-            // Drain the queue on the next tick instead of waiting a fixed 100 ms between requests
-            setImmediate(processQueue);
-        });
+        .finally(release);
 }
 
 function processQueue() {
@@ -1019,7 +1027,7 @@ function createApp(config) {
                 clientDisconnected = true;
             });
 
-            await lock(async () => {
+            await lock(async (release) => {
                 // Nothing to answer and no reason to run the completion: it would spend backend time (and tokens) for
                 // nobody while delaying the requests still waiting behind this one.
                 if (clientDisconnected) {
@@ -1367,6 +1375,8 @@ function createApp(config) {
                             await writeFrame('data: [DONE]\n\n');
                             raw.end();
                         }
+                        // The answer has been sent (or the client left): the slot is free as of now
+                        release();
                         // The answer has been sent (or the client left): the session is no longer needed
                         await cleanupSession();
                         if (logger.isEnabled('debug')) {
@@ -1401,6 +1411,7 @@ function createApp(config) {
                                     code: error.name || 'OpenCodeError'
                                 }
                             });
+                            release();
                             await cleanupSession();
                             return reply;
                         }
@@ -1429,6 +1440,7 @@ function createApp(config) {
                         // Send before deleting the session: the client must not wait for a backend round trip that has
                         // nothing to do with its answer (the session is deleted either way)
                         reply.send(responsePayload);
+                        release();
                         await cleanupSession();
                         return reply;
                     }
@@ -1474,6 +1486,7 @@ function createApp(config) {
                         // Frames are already on the wire: answer in-band and terminate the stream
                         failHijackedStream(reply.raw, payload);
                     }
+                    release();
                     // Deletes the session if it was created (and is not already gone); before session creation there
                     // is simply nothing to clean up
                     if (cleanupSession) await cleanupSession();

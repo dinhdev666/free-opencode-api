@@ -587,17 +587,33 @@ async function run() {
     check('a queue of 0 still serves a completion when a slot is free', loneResponse.status === 200,
         `status ${loneResponse.status}`);
 
-    // Two at once with one slot and no waiting room: the second is refused instead of queued
-    const cappedResults = await Promise.all([1, 2].map(() => fetch(`${cappedUrl}/v1/chat/completions`, {
+    // A busy gateway with no waiting room refuses instead of queueing. The slot is held by a streaming SLOW request
+    // (the stub writes it over ~2 s; a non-streaming one returns as soon as the message is stored, which is far too
+    // fast to hold anything), so the check does not depend on which of two simultaneous requests starts first.
+    const cappedRequest = (content) => fetch(`${cappedUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ messages: [{ role: 'user', content: 'SLOW queued behind' }] })
-    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }))));
-    const cappedStatuses = cappedResults.map((result) => result.status).sort((a, b) => a - b);
-    check('a busy queue of 0 is answered with 503', cappedStatuses[1] === 503, JSON.stringify(cappedStatuses));
-    check('the request that held the slot is still served', cappedStatuses[0] === 200, JSON.stringify(cappedStatuses));
-    const cappedJson = cappedResults.find((result) => result.status === 503)?.json;
-    check('503 uses the queue_full envelope', cappedJson?.error?.type === 'queue_full', JSON.stringify(cappedJson));
+        body: JSON.stringify({ messages: [{ role: 'user', content }] })
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
+    // The slot is released when the response is complete, not when the session cleanup round trip finishes: a client
+    // that sends its next request straight after an answer must be served, never told the gateway is full.
+    const sequentialStatuses = [];
+    for (let i = 0; i < 4; i += 1) sequentialStatuses.push((await cappedRequest('hi')).status);
+    check('consecutive completions are served on a queue of 0', sequentialStatuses.every((status) => status === 200),
+        JSON.stringify(sequentialStatuses));
+
+    const cappedHolder = fetch(`${cappedUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'SLOW holder' }], stream: true })
+    }).then(async (response) => ({ status: response.status, text: await response.text() }));
+    await sleep(300);
+    const cappedRefused = await cappedRequest('SLOW queued behind');
+    check('a busy queue of 0 is answered with 503', cappedRefused.status === 503, `status ${cappedRefused.status}`);
+    check('503 uses the queue_full envelope', cappedRefused.json?.error?.type === 'queue_full',
+        JSON.stringify(cappedRefused.json));
+    const cappedHeld = await cappedHolder;
+    check('the request that held the slot is still served', cappedHeld.status === 200, `status ${cappedHeld.status}`);
     const cappedHealth = await fetch(`${cappedUrl}/health`);
     check('rejected requests leave the gateway healthy', cappedHealth.status === 200, `status ${cappedHealth.status}`);
     await cappedHealth.text();

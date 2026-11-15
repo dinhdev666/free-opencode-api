@@ -159,6 +159,6 @@ Before reporting a change as complete:
 
 ## Reporting
 
-Use the repository issue tracker for bugs and proposals: <https://github.com/dinhdev666/free-deepseek-api/issues>.
+Use the repository issue tracker for bugs and proposals: <https://github.com/dinhdev666/free-opencode-api/issues>.
 Security-sensitive reports (auth bypass, key leakage, command injection in backend spawning) should not be filed
 publicly; see `CONTRIBUTING.md`.

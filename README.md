@@ -1,9 +1,9 @@
 # Free OpenCode API
 
-[![CI](https://github.com/dinhdev666/free-deepseek-api/actions/workflows/ci.yml/badge.svg)](https://github.com/dinhdev666/free-deepseek-api/actions/workflows/ci.yml)
+[![CI](https://github.com/dinhdev666/free-opencode-api/actions/workflows/ci.yml/badge.svg)](https://github.com/dinhdev666/free-opencode-api/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
-[![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI%20compatible-412991.svg)]()
+[![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI%20compatible-412991.svg)](#api-reference)
 
 **Free OpenCode API** turns the [OpenCode](https://opencode.ai) CLI into a standard, OpenAI-compatible REST API. It runs as a small Node.js gateway in front of `opencode serve`, so any client that understands the OpenAI protocol — Cursor, Claude Code, the official OpenAI SDKs, or your own scripts — can use free models such as **Kimi k2.5**, **GLM 4.7**, and **MiniMax m2.1** without a paid API key.
 
@@ -21,8 +21,10 @@
 - [Client Examples](#client-examples)
 - [Logging](#logging)
 - [Docker](#docker)
+- [CI and Releases](#ci-and-releases)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
 - [License](#license)
 
 ---
@@ -128,8 +130,8 @@ curl -fsSL https://opencode.ai/install | bash
 ## Quick Start
 
 ```bash
-git clone https://github.com/dinhdev666/free-deepseek-api.git
-cd free-deepseek-api
+git clone https://github.com/dinhdev666/free-opencode-api.git
+cd free-opencode-api
 pnpm install
 cp config.json.example config.json   # optional: edit port, API key, paths
 pnpm start                           # or: node index.js
@@ -290,7 +292,28 @@ docker run -d --restart=always -p 8083:8083 -e API_KEY=sk-your-key dinhdev666/fr
 ```
 
 Docker Hub selects the matching architecture automatically. A new image is published by
-`.github/workflows/docker-publish.yml` whenever a `v*.*.*` tag is pushed.
+`.github/workflows/docker-publish.yml` whenever a `v*.*.*` tag is pushed — see [CI and Releases](#ci-and-releases).
+
+---
+
+## CI and Releases
+
+Two GitHub Actions workflows live in `.github/workflows/`; the CI checks need no secrets at all:
+
+| Workflow | Trigger | What it does |
+| --- | --- | --- |
+| `ci.yml` | every push to `main`, every pull request, manual dispatch | Runs `pnpm run check`, `sh -n docker/docker-entrypoint.sh` and `pnpm test` (the smoke suite in `test/`, which needs no OpenCode CLI or network) on Node 20, 22 and 24; a fourth job builds the Docker image, starts the container and waits for `/health` to answer. |
+| `docker-publish.yml` | pushing a `v*.*.*` tag, or a manual dispatch from a tag | Fails if the tag does not match `version` in `package.json`, then builds `linux/amd64` + `linux/arm64` and pushes `<version>` and `latest` to Docker Hub. Needs the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. |
+
+The four required status checks on `main` are `Test on Node 20`, `Test on Node 22`, `Test on Node 24` and
+`Build the container image`, so renaming those jobs also changes the branch protection rules.
+
+Publishing a release is therefore just a tag:
+
+```bash
+git tag v1.0.1        # must match "version" in package.json
+git push origin v1.0.1
+```
 
 ---
 
@@ -309,7 +332,9 @@ Docker Hub selects the matching architecture automatically. A new image is publi
 ├── test/
 │   ├── stub-opencode.mjs     # Minimal opencode serve stand-in used by the smoke suite
 │   └── smoke.mjs             # Contract checks: boot stub + gateway, assert OpenAI behaviour
-├── .github/workflows/ci.yml  # CI: syntax check, smoke suite (Node 20/22/24), Docker build
+├── .github/workflows/
+│   ├── ci.yml                # CI: syntax check, smoke suite (Node 20/22/24), Docker build
+│   └── docker-publish.yml    # Release: multi-arch image to Docker Hub on a v*.*.* tag
 ├── AGENTS.md                 # Invariants, architecture map and verification rules for coding agents
 ├── CONTRIBUTING.md           # Setup, coding conventions, commit message standard, PR checklist
 └── LICENSE
@@ -347,5 +372,5 @@ Copyright (c) 2026 Phạm Văn Định.
 
 ## Related Links
 
-- Repository: [dinhdev666/free-deepseek-api](https://github.com/dinhdev666/free-deepseek-api)
+- Repository: [dinhdev666/free-opencode-api](https://github.com/dinhdev666/free-opencode-api)
 - OpenCode: [opencode.ai](https://opencode.ai)

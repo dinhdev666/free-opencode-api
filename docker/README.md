@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
 
-Container image of [Free OpenCode API](https://github.com/dinhdev666/free-deepseek-api), an OpenAI-compatible gateway for the OpenCode CLI.
+Container image of [Free OpenCode API](https://github.com/dinhdev666/free-opencode-api), an OpenAI-compatible gateway for the OpenCode CLI.
 
 The image bundles Node.js 22, the project source, and the OpenCode CLI (npm package `opencode-ai`), so nothing needs to be installed on the host. Project dependencies are installed with **pnpm** (enabled through Corepack and pinned by the `packageManager` field in `package.json`) using the committed `pnpm-lock.yaml`. Point any OpenAI client at the published port and start chatting with free models such as Kimi k2.5, GLM 4.7, and MiniMax m2.1.
 
@@ -249,7 +249,7 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 ## Related Links
 
-- Repository: [dinhdev666/free-deepseek-api](https://github.com/dinhdev666/free-deepseek-api)
+- Repository: [dinhdev666/free-opencode-api](https://github.com/dinhdev666/free-opencode-api)
 - Project overview: [README.md](../README.md)
 - OpenCode: [opencode.ai](https://opencode.ai)
 - License: [MIT](../LICENSE)

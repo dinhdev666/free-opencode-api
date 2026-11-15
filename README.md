@@ -337,6 +337,13 @@ prompt) are accepted and **ignored**: the model is served by OpenCode, which own
 settings, so a request that relies on them gets the model's defaults. `n` is ignored too — a completion always
 returns exactly one choice.
 
+A `stream` or `stream_options.include_usage` value that is **present but cannot be read** (`"stream": "ture"`,
+`"stream": {}`, `"include_usage": "ture"`) is refused with a `400` naming the field and what arrived
+(`stream must be a boolean (or one of true/false, yes/no, on/off, 1/0), found an object`). Such a value used to keep the
+non-streaming default in silence, so a typo answered `200 application/json` to a client that was parsing SSE, or
+dropped the usage chunk its SDK was waiting for. A missing, blank or `null` value still means "not streaming", and
+every spelling listed above keeps working; `stream_options` itself must be an object when it is sent.
+
 The request body is JSON, but a JSON body sent under `application/x-www-form-urlencoded` (what `curl -d '{…}'` labels
 it when you omit the header) or `text/plain` is parsed from the string it carries and served all the same. A leading
 UTF-8 BOM is tolerated there as well — PowerShell 5.1 and most Windows editors write one, and it made a valid body

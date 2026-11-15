@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 45 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 46 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -112,6 +112,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (anything else).
 - A client that disconnects mid-stream releases its queue slot immediately: the event subscription is aborted and
   the polling fallbacks are skipped (the backend keeps finishing on its own).
+- Every completion deletes the OpenCode session it created — on the success path, the error path and after a client
+  abort. The backend must never accumulate one session per served request; `test/stub-opencode.mjs` exposes
+  `GET /__sessions` so the smoke suite can assert `live === 0`.
 - CORS headers are set on the raw response for every request, including hijacked streams.
 - Request log format: `METHOD url -> status Xms [reqId] model=… stream=…` (info for `/v1/*`, debug otherwise).
 

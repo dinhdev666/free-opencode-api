@@ -47,7 +47,7 @@
 OpenAI client  ──HTTP──▶  Free OpenCode API (default :8083)  ──▶  opencode serve (default :4097)  ──▶  model providers
 ```
 
-The gateway accepts OpenAI-shaped requests, translates them into OpenCode sessions and prompts, streams the results back as standard SSE chunks or a single JSON body, and hides the lifecycle of the backend process (startup, health checks, teardown).
+The gateway accepts OpenAI-shaped requests, translates them into OpenCode sessions and prompts, streams the results back as standard SSE chunks or a single JSON body, and hides the lifecycle of the backend process (startup, health checks, teardown). Each completion gets its own session, which is deleted as soon as the answer has been delivered, so the backend does not accumulate history.
 
 ---
 

@@ -858,6 +858,8 @@ function createApp(config) {
         try {
             await lock(async () => {
                 let sessionId = null;
+                // Assigned once the session exists; the error path uses it to clean up
+                let cleanupSession = null;
 
                 try {
                     reqId = request.gatewayLog?.reqId || null;
@@ -957,6 +959,20 @@ function createApp(config) {
                     sessionId = sessionRes.data?.id;
                     if (!sessionId) throw new Error('Failed to create OpenCode session');
                     logDebug('Session created', { sessionId });
+
+                    // A session is created per completion, so it must also be deleted per completion: otherwise the
+                    // backend accumulates one session (with its full message history) for every request served.
+                    let sessionCleaned = false;
+                    cleanupSession = async () => {
+                        if (!sessionId || sessionCleaned) return;
+                        sessionCleaned = true;
+                        try {
+                            await client.session.delete({ path: { id: sessionId } });
+                            logDebug('Session deleted', { sessionId });
+                        } catch (e) {
+                            logger.debug('[Proxy] Failed to delete session:', { sessionId, error: e.message });
+                        }
+                    };
 
                     const promptParams = {
                         path: { id: sessionId },
@@ -1151,6 +1167,8 @@ function createApp(config) {
                             await writeFrame('data: [DONE]\n\n');
                             raw.end();
                         }
+                        // The answer has been sent (or the client left): the session is no longer needed
+                        await cleanupSession();
                         if (logger.isEnabled('debug')) {
                             logger.debug('SSE stream summary', {
                                 reqId,
@@ -1198,6 +1216,7 @@ function createApp(config) {
                                 response: responsePayload
                             });
                         }
+                        await cleanupSession();
                         return reply.send(responsePayload);
                     }
                 } catch (error) {
@@ -1237,13 +1256,9 @@ function createApp(config) {
                             reply.code(statusCode).send(payload);
                         }
                     }
-                    if (sessionId) {
-                        try {
-                            await client.session.delete({ path: { id: sessionId } });
-                        } catch (e) {
-                            logger.warn('[Proxy] Failed to cleanup session on error:', { sessionId, error: e.message });
-                        }
-                    }
+                    // Deletes the session if it was created (and is not already gone); before session creation there
+                    // is simply nothing to clean up
+                    if (cleanupSession) await cleanupSession();
                 }
             }, REQUEST_TIMEOUT_MS + 20000);
         } catch (error) {

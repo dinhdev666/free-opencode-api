@@ -439,7 +439,9 @@ likewise names what it refused: `unsupported content type "application/xml"; sen
 `the request has a body but no Content-Type header; send Content-Type: application/json` when the header is missing.
 
 Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked before they are logged, and so are
-credential values sent in a query string (`?api_key=…`) and a credential carried by the configured backend URL
+credential values sent in a query string (`?api_key=…`, and the spellings other clients use for the same secret:
+Google's `?key=…`, an OAuth `?code=…`, an Azure SAS `?sig=`/`?signature=…`) and a credential carried by the configured
+backend URL
 (`http://user:secret@host:4097`, a proxy in front of the backend): the startup summary, the `[Config]` notes and
 `/health` show `http://***@host:4097` instead. The container's first-boot line prints the API key as its length and,
 above 16 characters, a 4-character prefix — `docker logs` is collected as often as not. Masking replaces the value of

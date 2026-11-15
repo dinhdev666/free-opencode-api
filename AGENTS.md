@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 250 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 251 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -355,12 +355,17 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `docker/docker-entrypoint.sh` reports the key it generated as `sk-a***(22 chars)` — nothing but the length up to 16
   characters — because `docker logs` is collected as often as not (`maskHeaders`/`maskSecret` in `src/logger.js` are
   the in-process equivalents, and the two rules are deliberately identical). Header **names** are matched against
-  `SENSITIVE_HEADER_PATTERN` (`auth`, `authorization`, `authentication`, `api-key`/`apikey`, `token`, `secret`,
-  `cookie`, `session`, `passw` as whole name segments) rather than a fixed denylist: a credential forwarded as
+  `SENSITIVE_HEADER_PATTERN`, built from the exported `SENSITIVE_NAME_ALTERNATIVES` (`auth`, `authorization`,
+  `authentication`, `api-key`/`apikey`, `token`, `secret`, `cookie`, `session`, `passw`, `key`, `code`, `sig`,
+  `signature`, `credential`, `bearer` as whole name segments) rather than a fixed denylist: a credential forwarded as
   `x-goog-api-key`, `x-auth-token` or `openai-api-key` used to be logged raw, and the client decides that name, not the
   gateway. **URLs are masked too** (`maskUrlQuery()` before `loggableUrl()` truncates): `?api_key=…`, `?token=…` and
-  `?Authorization=…` are a documented OpenAI-compatible client convention, and they reached the default info line
-  verbatim. A detail object handed to a debug line is **truncated before it is cloned** (`serializeDetail()`): a 50 MB
+  `?Authorization=…` are a documented OpenAI-compatible client convention — and so are the spellings other clients use
+  for the same secret (Google's `?key=…`, an OAuth `?code=…`, an Azure SAS `?sig=`/`?signature=…`), each of which
+  reached the default info line verbatim until the list carried those names. The list is one exported string because
+  `docker/docker-entrypoint.sh` cannot import this module and repeats it for its own first-boot dump; the smoke suite
+  asserts the two copies are identical, the way `CORS_ALLOW_HEADERS` is the one place the CORS list lives.
+  A detail object handed to a debug line is **truncated before it is cloned** (`serializeDetail()`): a 50 MB
   body used to be structured-cloned and re-stringified to produce a 32 KB line (43 ms and +100 MB of heap per line).
   Masking replaces a value and never drops the key: the copy these helpers build is assigned to with
   `setOwnProperty()` (a `defineProperty` for exactly the name `__proto__`) because `copy[key] = value` runs the

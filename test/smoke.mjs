@@ -3078,6 +3078,14 @@ async function run() {
             `${cleanConfig.error} ${JSON.stringify(findUnknownKeys(cleanConfig.config))}`);
         const typoConfig = writeConfig({ PORT: 8083, 'api-key': 'x', openCodePath: '/usr/bin/opencode', extra: 1 });
         const reported = findUnknownKeys(typoConfig.config);
+        // `OPENCODE_PROXY_DEBUG` is the environment name for `DEBUG`, and nothing reads it from the file: listing it
+        // as a known key made a file entry do nothing at all, with no warning - the silent no-op the report exists for
+        const envOnlyConfig = writeConfig({ OPENCODE_PROXY_DEBUG: true });
+        const envOnlyReported = findUnknownKeys(envOnlyConfig.config);
+        check('an environment-only name in config.json is reported as unknown',
+            envOnlyReported.length === 1 && envOnlyReported[0].key === 'OPENCODE_PROXY_DEBUG' &&
+            envOnlyReported[0].suggestion === null,
+            JSON.stringify(envOnlyReported));
         check('a misspelled config.json key is reported with its suggestion',
             reported.length === 3 &&
             reported[0].suggestion === 'API_KEY' && reported[1].suggestion === 'OPENCODE_PATH' &&

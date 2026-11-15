@@ -338,10 +338,11 @@ settings, so a request that relies on them gets the model's defaults. `n` is ign
 returns exactly one choice.
 
 The request body is JSON, but a JSON body sent under `application/x-www-form-urlencoded` (what `curl -d '{…}'` labels
-it when you omit the header) or `text/plain` is parsed from the string it carries and served all the same. An
-unparsable body is a `400` whose message names the content type; an unrelated type (`application/xml`) is a `415`, and
-so is a compressed body (`Content-Encoding: gzip`): the gateway does not decompress, and answering "not valid JSON"
-would blame the one part of the request that was correct.
+it when you omit the header) or `text/plain` is parsed from the string it carries and served all the same. A leading
+UTF-8 BOM is tolerated there as well — PowerShell 5.1 and most Windows editors write one, and it made a valid body
+answer `request body is not valid JSON`. An unparsable body is a `400` whose message names the content type; an
+unrelated type (`application/xml`) is a `415`, and so is a compressed body (`Content-Encoding: gzip`): the gateway does
+not decompress, and answering "not valid JSON" would blame the one part of the request that was correct.
 
 ```bash
 curl -X POST http://127.0.0.1:8083/v1/chat/completions \

@@ -2011,8 +2011,14 @@ function createApp(config) {
                     // Fastify hands over unparsed - parse it here rather than reject a request whose body is fine.
                     let body = {};
                     if (typeof request.body === 'string') {
+                        // A body handed over as text can start with a UTF-8 BOM: PowerShell 5.1, `Out-File` and most
+                        // Windows editors write one, and `JSON.parse` refuses the first character, so a client whose
+                        // body was perfectly good JSON was told "request body is not valid JSON" - the path that
+                        // exists for hand-written clients (`curl -d`, `text/plain`) was the one that failed.
+                        // `config.json` tolerates the same prefix for the same reason.
+                        const text = request.body.charCodeAt(0) === 0xfeff ? request.body.slice(1) : request.body;
                         try {
-                            const parsed = JSON.parse(request.body);
+                            const parsed = JSON.parse(text);
                             body = parsed && typeof parsed === 'object' ? parsed : {};
                         } catch (e) {
                             return reply.code(400).send({

@@ -768,6 +768,27 @@ async function run() {
         textPlainBad.status === 400 && /Content-Type: application\/json/.test(textPlainBadJson?.error?.message || ''),
         `${textPlainBad.status} ${JSON.stringify(textPlainBadJson).slice(0, 160)}`);
 
+    // PowerShell 5.1, `Out-File` and most Windows editors put a UTF-8 BOM in front of the file they write, and this
+    // text path parses the string itself: `JSON.parse` refuses the BOM, so a body that was valid JSON was answered
+    // "request body is not valid JSON" - blaming the one part of the request that was correct. `config.json` already
+    // tolerates the same prefix.
+    const bomBody = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'text/plain' },
+        body: `\uFEFF${JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: false })}`
+    });
+    const bomJson = await bomBody.json().catch(() => null);
+    check('a text body carrying a UTF-8 BOM is still served',
+        bomBody.status === 200 && bomJson?.choices?.[0]?.message?.content === ANSWER,
+        `status ${bomBody.status} ${JSON.stringify(bomJson).slice(0, 120)}`);
+    // The strip is one character: a body that is only a BOM, or that carries two, is still not JSON
+    const bomOnly = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'text/plain' },
+        body: '\uFEFF'
+    });
+    check('a text body that is only a BOM is still refused', bomOnly.status === 400, `status ${bomOnly.status}`);
+
     // `curl -d '{...}'` without `-H 'content-type: application/json'` sends the body as
     // `application/x-www-form-urlencoded`, which Fastify answers with a bare 415: the documented "the content-type
     // header is optional" path failed for the most common hand-written client. The form type is handed to the handler

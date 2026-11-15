@@ -33,8 +33,7 @@ These are product decisions, not implementation details. Do not "improve" them w
    in use; the startup summary states that authentication is enforced.
 3. **OpenAI wire format is the contract.** Success and error bodies, SSE frames, status codes and header names must
    stay compatible with standard OpenAI clients. See "API contract" below. `stream` in particular is read through
-   `parseBoolean()`: a JSON boolean is the normal case, but hand-written clients send `1` or `"yes"`, and a literal
-   `=== true || === 'true'` comparison answered a JSON body to a client that was parsing SSE.
+   `parseBoolean()` (see "Boolean options" below).
 4. **English only.** Code, comments, log messages, documentation and commit messages are written in English. The
    copyright holder remains `Phạm Văn Định` (LICENSE, `package.json`, Docker image labels).
 5. **pnpm for project dependencies.** `package.json` pins `packageManager: pnpm@12.18.0`. `npm` appears only for
@@ -72,7 +71,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 313 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 316 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -101,7 +100,8 @@ a dropped event connection), `MULTIPART` (one message whose two text parts send 
 interleaved), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `MIXED` (part updates
 carrying both a `delta` and the part's cumulative text, then one closing update with neither),
 `CUTTOOL`/`OPENTOOL` (a tool-call answer whose stream is cut inside the closing/opening tag), `TOOLSPAM` (a tool-call
-block repeated by the answer) and `LEAKYFAIL` (a provider error quoting a credential-bearing URL behind a long
+block repeated by the answer), `BADPART` (a text part whose `text` is a number, next to a normal part), `REASONONLY`
+(a message carrying reasoning and no text that is never marked finished) and `LEAKYFAIL` (a provider error quoting a credential-bearing URL behind a long
 message) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
 `POST /session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 502 whose message quotes a
 credential-bearing URL), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
@@ -154,11 +154,10 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either — the one
   exception is `opencode/big-pickle`, answered from `DEFAULT_MODEL` so it keeps its `Big Pickle` name instead of the
   id-derived `big-pickle`. The wildcard route exists because clients send `opencode/big-pickle` unencoded as often as
-  `%2F`-escaped. A **blank** id (`/v1/models//`, `/v1/models/%20`) is a `404` in the usual `not_found` envelope instead
-  of a `200` whose body is `{"id":"","name":""}`: a doubled slash reads as a trailing slash, so those paths reached the
-  by-id route with an empty parameter, and an empty id is not a model. An id whose **last segment** is empty (`/v1/models/%2F` → `/`,
-  `/v1/models/opencode%2F` → `opencode/`) is the same class of non-model and answers `404` too. `/v1/models/`
-  itself still answers the listing.
+  `%2F`-escaped. A **blank** id (`/v1/models//`, `/v1/models/%20`) is a `404` in the usual `not_found` envelope, not a
+  `200` whose body is `{"id":"","name":""}`: a doubled slash reads as a trailing slash, so those paths reached the
+  by-id route with an empty parameter. An id whose **last segment** is empty (`/v1/models/%2F`, `/v1/models/opencode%2F`)
+  is the same class of non-model and answers `404` too; `/v1/models/` itself still answers the listing.
 - `POST /v1/chat/completions` non-streaming → `chat.completion` with
   `choices[0].message.{role,content,reasoning_content}`, `finish_reason:"stop"` and a `usage` block of zeroes
   (upstream does not report token counts). The `id` is `chatcmpl-<base36 stamp><counter>` and is unique per
@@ -227,8 +226,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   decompress, so the compressed bytes reached the JSON parser and were reported as "body is not valid JSON", which
   blames the one part of the request that was correct.
 - A `415` names what it refused and what to send. `FST_ERR_CTP_INVALID_MEDIA_TYPE` used to arrive as Fastify's bare
-  `Unsupported Media Type` for any type the gateway does not parse — including a **body with no `Content-Type` header at
-  all**, the likeliest hand-written mistake there is. The status and the code stay; the message becomes `unsupported content type "application/xml"; send
+  `Unsupported Media Type` for any type the gateway does not parse, including a **body with no `Content-Type` header**.
+  The status and the code stay; the message becomes `unsupported content type "application/xml"; send
   Content-Type: application/json`, or `the request has a body but no Content-Type header; send Content-Type:
   application/json` when the header is missing (the value is client input echoed into a response body, so
   `echoedValue()` replaces control characters and cuts it at 64 characters). Recognised types are unchanged:
@@ -280,12 +279,11 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   the polling fallbacks are skipped (the backend keeps finishing on its own). A reader that stops reading without
   closing the connection (a tab that stops consuming, a buffering proxy, a stalled phone link) is treated the same
   way: a write that does not drain within `SSE_CLIENT_WRITE_TIMEOUT_MS` (30 s) marks the client gone, aborts the
-  collector and destroys the socket - an unbounded `drain` wait parked the task, and with it the only completion slot
-  at the default concurrency of 1, for the rest of the process lifetime while `/health` kept answering 200. The gone
-  flag is set even when someone else already ended the response (the in-band timeout path): the socket is still open
-  then, and the short-circuit left the task writing into an ended stream. A **non-streaming** client that disconnects
-  is handled the same way: the closed socket stops the poll loop, so the slot is free at the next tick instead of
-  being held for the whole answer.
+  collector and destroys the socket - an unbounded `drain` wait parked the task, and with it the only completion slot,
+  for the rest of the process lifetime while `/health` kept answering 200. The gone flag is set even when someone else
+  already ended the response (the in-band timeout path): the socket is still open then, and the short-circuit left the
+  task writing into an ended stream. A **non-streaming** client that disconnects is handled the same way: the closed
+  socket stops the poll loop, so the slot is free at the next tick.
 - An error after the first SSE frame is delivered in-band (`data: {"error":…}` then `data: [DONE]`) and closes the
   stream. A hijacked response must always be terminated: writing a JSON body into a frame stream (or leaving the
   socket open) breaks or hangs the client.
@@ -306,16 +304,15 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   timeout) never reaches a hook, so it is answered by `clientErrorHandler`, registered through the
   `clientErrorHandler` Fastify option: `400` for a parse error, `431` for `HPE_HEADER_OVERFLOW`, `408` for
   `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope (`type: "invalid_request_error"`, the parser's code in `code`
-  when it is a plain `[A-Z_]+` token) with the CORS headers, an `X-Request-Id` and a `warn` log line. Fastify's own
-  handler answered `{"error":"Bad Request","message":"Client Error","statusCode":400}` — no `type`, no CORS, no
-  request id, no log. It writes the envelope, then closes with `socket.end()` (`closeSocketAfterFlush()`), never
-  `socket.destroy()` on the next line: `destroy()` discards buffered writes, so under backpressure the client got a
-  reset instead of the error it was promised.
+  when it is a plain `[A-Z_]+` token) with CORS headers, an `X-Request-Id` and a `warn` log line. Fastify's own
+  handler answered `{"error":"Bad Request",…}` with no `type`, CORS, request id or log line. It writes the envelope,
+  then closes with `socket.end()` (`closeSocketAfterFlush()`), never `socket.destroy()`: `destroy()` discards buffered
+  writes, so under backpressure the client got a reset instead of the error it was promised.
 - A URL the **router** cannot decode (a percent escape that is not valid UTF-8, `GET /v1/models/%E0%A4%A`) never reaches
-  a hook, so Fastify answered its own body — `{"error":"Bad Request","code":"FST_ERR_BAD_URL",…}` with no `type`, no
-  CORS, no `X-Request-Id` and no log line. `routerOptions.onBadUrl` (`badUrlHandler`) writes the usual envelope, with a
-  generated request id and one `warn` line carrying the path truncated by `loggableUrl`. It is handed the raw
-  request/response (`find-my-way` builds no Fastify request for a routable-less path), like `clientErrorHandler`.
+  a hook, so Fastify answered its own body (`{"error":"Bad Request","code":"FST_ERR_BAD_URL",…}`: no `type`, CORS,
+  `X-Request-Id` or log line). `routerOptions.onBadUrl` (`badUrlHandler`) writes the usual envelope, with a generated
+  request id and one `warn` line carrying the path truncated by `loggableUrl`. It is handed the raw request/response
+  (`find-my-way` builds no Fastify request for a routable-less path), like `clientErrorHandler`.
 - Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
   to a log entry. An incoming `X-Request-Id` is echoed when it is a short printable token
   (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a
@@ -374,12 +371,11 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   a 32 KB line (43 ms and +100 MB of heap per line).
   Masking replaces a value and never drops the key: the copy these helpers build is assigned to with
   `setOwnProperty()` (a `defineProperty` for exactly the name `__proto__`) because `copy[key] = value` runs the
-  `__proto__` setter — a key of that name vanished from the masked header dump and from the debug detail while nothing
-  else changed, and the detail is the one place an operator looks to see what arrived. Assigning a non-object through
-  that setter is also a silent no-op, so the value disappeared with no trace. A backend payload reaches these helpers
-  through plain `JSON.parse`, so a provider (or a proxy in front of it) can put that key in a body that is then logged;
-  a request body cannot (Fastify's poisoning guard refuses it first, see the API contract), and Node's header parser
-  drops a header of that name. Neither copy's prototype is touched either way (asserted).
+  `__proto__` setter, so a key of that name vanished from the masked header dump and the debug detail — the one place
+  an operator looks to see what arrived — and assigning a non-object through that setter is a silent no-op. A backend
+  payload reaches these helpers through plain `JSON.parse`, so a provider can put that key in a logged body; a request
+  body cannot (Fastify's poisoning guard refuses it first) and Node's header parser drops it. Neither copy's prototype
+  is touched either way (asserted).
   A **closed reader** on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream
   `error` with no listener is an uncaught exception, and `node index.js | head -3` killed a gateway that was still
   serving. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that line is lost, the process keeps answering. The
@@ -387,9 +383,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
   boundary can fall inside either of them; the held fragment is flushed at end of stream. The filter is one
-  left-to-right scan (`removeToolMarkup`), never a `/<function_calls>[\s\S]*?<\/function_calls>/g` regex: that regex
-  backtracked quadratically from every open tag (64 000 tags in a 1 MB answer took 8.5 s, so one client-supplied body
-  can wedge the only completion slot) and the scan answers the same 15 shapes byte-identically. The flush must write
+  left-to-right scan (`removeToolMarkup`), never a lazy `[\s\S]*?` regex: that one backtracked quadratically from every
+  open tag (64 000 tags in a 1 MB answer took 8.5 s, wedging the only completion slot) and the scan answers the same 15
+  shapes byte-identically. The flush must write
   the frame directly (`sendReleasedDelta`): passing the fragment back through the filter holds the same prefix again,
   and with no further delta to disambiguate it, the tail of the answer disappears. The recovery poll appends the
   **raw** remainder of the stream through that filter (`collected.content` is the text the filter saw), never the
@@ -403,9 +399,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   "off" inside the container); do not add a third. A value that is present but cannot be read is **named with the
   value actually used** (`readFlag()` in `src/proxy.js`, used by `index.js` for `DISABLE_TOOLS`,
   `USE_ISOLATED_HOME` and `DEBUG`): `[Config] DISABLE_TOOLS='maybe' is not a boolean (use true/false, yes/no, on/off
-  or 1/0), using false`. The flags used to fall back in silence, which is the same failure the numeric tuning keys
-  were fixed for — and for `DISABLE_TOOLS` the consequence is the one the switch exists to prevent: a typo leaves the
-  model's `<function_calls>` markup in the answer while the operator believes it is filtered out. `parseBoolean()`
+  or 1/0), using false`. A silent fallback is the failure the numeric tuning keys were fixed for, and
+  for `DISABLE_TOOLS` it is the one the switch exists to prevent: a typo leaves the model's `<function_calls>` markup in
+  the answer while the operator believes it is filtered out. `parseBoolean()`
   stays the only parser (it is also used on request bodies, where a warning would be wrong); `readFlag()` only
   reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable) and the echoed
   value is stripped of control characters and cut at 64, because it lands in a log line.
@@ -415,9 +411,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   reads the environment through `readFlag()`.
 - **Configuration** follows the precedence env > `config.json` > default, and every new key must be added to
   `config.json.example`, the README configuration table and — for container-relevant keys — `docker/docker-entrypoint.sh`.
-  `config.json` is read from the **application directory** (`path.join(__dirname, 'config.json')`), not from the
-  working directory, because the container writes it next to the app. A `config.json` in the cwd used to be ignored in
-  complete silence, which looks exactly like a broken file, so startup now warns
+  `config.json` is read from the **application directory** (`path.join(__dirname, 'config.json')`), not the working
+  directory, because the container writes it next to the app; a `config.json` in the cwd is ignored, so startup warns
   `[Config] config.json is read from …; the file at … is ignored`.
   An environment variable that is present but **blank** counts as unset (`envOrFile()` in `src/config.js`): `PORT` and
   `API_KEY` were read with `??`, where an empty string is a value, so `API_KEY= PORT=` shadowed `config.json` — the
@@ -453,8 +448,14 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   returning the first non-empty message truncated it (`"Hello from t"` for a 41-character answer). A message whose
   text stops growing for `stablePollsRequired * intervalMs` is accepted anyway, so a provider that never marks its
   message finished still gets an answer. That window is measured in **time, not in polls** (`stableWindowMs`): the
-  first polls are much shorter than the interval (`POLL_BACKOFF_MS` = 25/50/100/200 ms), and counting "three identical
-  polls" would have shrunk the documented ~1.5 s of silence to ~75 ms and started serving half-written answers. The
+  first polls are much shorter than the interval (`POLL_BACKOFF_MS` = 25/50/100/200 ms), and counting polls would have shrunk the
+  documented ~1.5 s of silence to ~75 ms and started serving half-written answers. It
+  watches the whole visible answer, `content` **and** `reasoning`, and requires one of them to be non-empty: watching
+  `content` alone left the window at 0 for a reasoning-only message, so a provider that never reports `finish` could
+  not be accepted and the completion answered `504` on its whole budget (measured 4.4 s of a 4 s budget) for an answer
+  the first poll already held. `extractFromParts()` reads a part's `text` only when it is a string, like the streaming
+  collector and the request parser: concatenating whatever arrived served a numeric part as answer text
+  (`parts: [{text: 42}, {text: 'Alpha'}]` answered `"42Alpha"`). The
   first four polls use `min(intervalMs, POLL_BACKOFF_MS[i])`, because an answer landing a few tens of milliseconds after
   the prompt returned used to wait a whole interval (measured p50 507 ms → 90 ms, for a few cheap extra
   `GET …/message` calls). Do not remove the backoff without keeping the time window: the two belong together.
@@ -506,9 +507,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **Every backend call carries a deadline.** `client.session.create`, `client.session.messages`,
   `client.session.delete`, `client.session.prompt`, `client.config.providers` and `client.tool.ids` are all called
   with an `AbortSignal` (`backendDeadline()`), and an expired one answers `504` ("did not answer within …ms") instead
-  of `500`. Node's `fetch` has no default timeout: a wedged backend that still answers `/health` but never answers
-  `/session` left the handler waiting forever, so the client got no response at all and the queue slot was never
-  released — at the default concurrency of 1 that stops the whole gateway. Session cleanup uses its own shorter budget
+  of `500`. Node's `fetch` has no default timeout: a backend that answers `/health` but never `/session` left the
+  handler waiting forever, so the client got nothing and the slot was never released — at concurrency 1 that stops the
+  whole gateway. Session cleanup uses its own shorter budget
   (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client already has its answer, so it must not hold the slot for
   the full request budget. The metadata calls (`/v1/models`, the tool list) are capped separately
   (`METADATA_TIMEOUT_CAP_MS`, never above `REQUEST_TIMEOUT_MS`), because they fall back — a client listing models must
@@ -538,9 +539,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   disconnect signal is not `request.raw.destroyed`: that stream is destroyed once its body is read, the normal case.
   A body over `OPENCODE_PROXY_MAX_BODY_MB` is still refused with `413`, but only after the body has been read to its
   end (`refuseOversizedBody()`, bounded by `BODY_DRAIN_TIMEOUT_MS`): Node ends the socket when a response finishes with
-  the request body unread, the kernel answers the client's remaining bytes with RST, and the client could lose the 413
-  completely - CI on Node 24 aborted the suite with "fetch failed" instead of the envelope. A client that keeps writing
-  is cut off after the drain window rather than holding the socket.
+  the request body unread, and the kernel answers the client's remaining bytes with RST, so the client could lose the
+  413 entirely (CI on Node 24 saw "fetch failed"). A client that keeps writing is cut off after the drain window.
 - **The container runs as the unprivileged `node` user.** `docker/Dockerfile` chowns `/app` and declares
   `USER node` (uid/gid 1000) after the CLI install, so the gateway, the backend it spawns and every tool it runs are
   not UID 0. The entrypoint still writes `/app/config.json` (0600, owned by that user) on first boot, so a bind mount

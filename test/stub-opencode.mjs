@@ -86,6 +86,11 @@ const TOOL_OPEN_CUT = 'hello <function_ca';
 const TOOL_CLOSE_CUT = 'hello <function_calls>secret</function_cal';
 // The MIXED answer: two increments, each also carrying the part's cumulative text, then a closing update with no delta
 const MIXED_ANSWER = 'Hello world';
+// A text part whose `text` is not a string (a changed backend shape): it is not text and must not be stringified into
+// the answer, while the string part next to it is the answer
+const BAD_PART_TEXT = 'Alpha';
+// The reasoning-only answer: a provider that writes reasoning and no text, and never marks the message finished
+const REASON_ONLY_TEXT = 'thinking only';
 export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub.';
 export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
 
@@ -430,6 +435,29 @@ const server = http.createServer(async (req, res) => {
                 // The prompt response already carries the finished message and nothing is stored for polling: an answer
                 // served without a single GET /session/:id/message proves the fast path was used
                 return sendJson(res, 200, buildAssistantMessage(id, ANSWER, REASONING));
+            }
+            if (session.promptText.includes('BADPART')) {
+                // A part carrying a number instead of text, next to a normal one: only the string is answer text
+                return sendJson(res, 200, {
+                    info: {
+                        id: `msg_${id}`,
+                        sessionID: id,
+                        role: 'assistant',
+                        finish: 'stop',
+                        time: { created: Date.now(), completed: Date.now() }
+                    },
+                    parts: [{ type: 'text', text: 42 }, { type: 'text', text: BAD_PART_TEXT }]
+                });
+            }
+            if (session.promptText.includes('REASONONLY')) {
+                // A message that carries reasoning and no text, and is never marked finished: the stall window has to
+                // watch the reasoning too, or the gateways polls until its whole budget and answers 504
+                session.messages.push({
+                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
+                    parts: [{ type: 'reasoning', text: REASON_ONLY_TEXT }]
+                });
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                return;
             }
             if (session.promptText.includes('TOOLSPAM')) {
                 // 64 000 unclosed tags: the strip has to walk the answer once, so this answers in milliseconds and used

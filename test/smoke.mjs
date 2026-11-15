@@ -3420,6 +3420,67 @@ async function run() {
     stop(createStub);
     await waitForExit(createStub);
 
+    // --- a non-string part is not answer text, and reasoning alone can be the answer ----------------------
+    // Both are read by `extractFromParts()`: it stringified any `part.text` (`content += part.text || ''`), so a part
+    // carrying a number was served as assistant text, and its stability window watched `content` only, so a message
+    // with reasoning and no text could never be accepted as finished. Measured on a 4 s budget: 4.4 s and a `504` for
+    // an answer the first poll already held.
+    const partStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(GATEWAY_PORT + 34) }
+    });
+    children.push(partStub);
+    partStub.stdout.on('data', () => {});
+    partStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${GATEWAY_PORT + 34}/health`);
+    const partGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(GATEWAY_PORT + 35),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${GATEWAY_PORT + 34}`,
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '4000',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(partGateway);
+    partGateway.stdout.on('data', () => {});
+    partGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${GATEWAY_PORT + 35}/health`);
+    const partCompletion = async (content) => {
+        const startedAt = Date.now();
+        const response = await fetch(`http://127.0.0.1:${GATEWAY_PORT + 35}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ messages: [{ role: 'user', content }], stream: false }),
+            signal: AbortSignal.timeout(20000)
+        }).catch((error) => ({ status: 0, text: async () => error.message }));
+        const text = await response.text();
+        let body = null;
+        try {
+            body = JSON.parse(text);
+        } catch {
+            body = null;
+        }
+        return { status: response.status, text, body, elapsed: Date.now() - startedAt };
+    };
+    const badPart = await partCompletion('BADPART');
+    check('a part whose text is not a string is not stringified into the answer',
+        badPart.status === 200 && badPart.body?.choices?.[0]?.message?.content === 'Alpha',
+        `status ${badPart.status}, ${JSON.stringify(badPart.body?.choices?.[0]?.message)}`);
+    const reasonOnly = await partCompletion('REASONONLY');
+    check('a reasoning-only answer that is never marked finished is served, not timed out',
+        reasonOnly.status === 200 && reasonOnly.body?.choices?.[0]?.message?.reasoning_content === 'thinking only' &&
+            !reasonOnly.body?.choices?.[0]?.message?.content,
+        `status ${reasonOnly.status}, ${reasonOnly.elapsed}ms, ${JSON.stringify(reasonOnly.body?.choices?.[0]?.message)}`);
+    check('the reasoning-only answer arrives well inside the request budget',
+        reasonOnly.elapsed < 3000, `${reasonOnly.elapsed}ms of a 4000ms budget`);
+    stopGateway(partGateway);
+    await waitForExit(partGateway);
+    stop(partStub);
+    await waitForExit(partStub);
+
     // --- the backend child does not inherit the gateway's key, and its jail is private --------------------
     // The child is an agent runtime that, with tools enabled, executes model-directed work: it must not receive the
     // credential that guards this gateway, and its working directory (its HOME with USE_ISOLATED_HOME) must not be

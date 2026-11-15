@@ -32,6 +32,9 @@ const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
 // connection while the backend is still thinking. The tick is shorter so the silence stays close to the interval.
 const SSE_KEEPALIVE_INTERVAL_MS = 15000;
 const SSE_KEEPALIVE_TICK_MS = 5000;
+// After the idle timeout the gateway polls for the rest of the answer; this is how many identical polls (a full idle
+// window worth) that recovery tolerates before it accepts a message the backend never marks finished.
+const IDLE_RECOVERY_STALL_POLLS = Math.max(3, Math.ceil(DEFAULT_EVENT_IDLE_TIMEOUT_MS / DEFAULT_POLL_INTERVAL_MS));
 
 // Two completions that reach this counter in the same millisecond used to receive the same
 // `chatcmpl-<epoch>` id (a client that keys its messages by id merged two answers); the counter keeps ids distinct
@@ -946,6 +949,13 @@ function createApp(config) {
         // still being generated, which truncated it. A provider that never marks its message finished is still
         // answered once the text stops growing for three consecutive polls.
         const requireDone = Boolean(options.requireDone);
+        // How many identical polls mean "this message will never be marked finished". Three (~1.5 s) is right after a
+        // normal prompt, but not after an idle timeout: the backend has been silent for the whole idle window already,
+        // and giving up 1.5 s into the same silence truncated an answer a slow model was still writing (the client got
+        // `finish_reason: "stop"` for text that stopped mid-sentence). That path asks for a full idle window instead.
+        const stablePollsRequired = Number.isFinite(options.stablePollsRequired) && options.stablePollsRequired >= 1
+            ? Math.floor(options.stablePollsRequired)
+            : 3;
         let lastContent = '';
         let stablePolls = 0;
         // One failed poll used to end the whole completion: a single 5xx or a reset connection while the backend was
@@ -992,7 +1002,7 @@ function createApp(config) {
                         lastContent = content;
                         stablePolls = 0;
                     }
-                    if (done || stablePolls >= 3 || (!requireDone && (content || reasoning))) {
+                    if (done || stablePolls >= stablePollsRequired || (!requireDone && (content || reasoning))) {
                         if (error) {
                             logger.error('[Proxy] OpenCode assistant error:', { sessionId, error });
                         }
@@ -1518,13 +1528,13 @@ function createApp(config) {
 
                         // One place that turns a polled assistant message into deltas. `appendOnly` trims the part that
                         // was already streamed over SSE, so an idle-timeout fallback never repeats itself.
-                        const emitPolled = async (appendOnly) => {
+                        const emitPolled = async (appendOnly, stallPolls = 3) => {
                             const { content, reasoning, error } = await pollForAssistantResponse(
                                 sessionId,
                                 REQUEST_TIMEOUT_MS,
                                 DEFAULT_POLL_INTERVAL_MS,
                                 () => clientGone,
-                                { requireDone: true }
+                                { requireDone: true, stablePollsRequired: stallPolls }
                             );
                             if (clientGone) return;
                             if (error && !content && !reasoning) {
@@ -1561,7 +1571,9 @@ function createApp(config) {
                         } else if (collected && collected.idleTimeout) {
                             logDebug('SSE idle timeout, polling for completion', { sessionId });
                             polled = true;
-                            await emitPolled(true);
+                            // The backend just went silent on us: give it another full idle window before deciding the
+                            // message will never be marked finished
+                            await emitPolled(true, IDLE_RECOVERY_STALL_POLLS);
                         }
 
                         /* When opencode>=1.19 SSE deltas are missing, a fast assistant finish resolves early with empty

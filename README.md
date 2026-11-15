@@ -72,6 +72,10 @@ CORS, auth) and no plugin-level middleware chain. Additional choices that matter
 - **No 4-second stall when the event stream is silent** — the gateway subscribes to OpenCode events and, as soon as
   the prompt call returns without a single delta, it shortens the first-delta wait to ~50 ms and falls back to
   polling (the answer is already available at that point).
+- **A silent backend gap does not truncate the answer** — when the event stream goes quiet for the idle timeout while
+  a slow model is still writing, the gateway recovers through polling and appends only the part the client does not
+  have. The recovery waits a full idle window of further silence before it accepts a message the backend never marks
+  finished, so a provider that pauses mid-answer is not mistaken for one that is done.
 - **Backend health probes are cached and keep-alive** — one probe is shared across a burst of requests
   (`OPENCODE_PROXY_HEALTH_CACHE_MS`, default 2000 ms) over a reused socket; a connection failure invalidates the
   cache immediately.

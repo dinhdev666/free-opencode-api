@@ -68,7 +68,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 143 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 146 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -98,7 +98,8 @@ instead of serving an empty list) and `STUB_FAIL_SESSION=1` (a 405 for `POST /se
 incompatible backend is reported as an upstream error with its status and reason), `STUB_FAIL_MESSAGES=<n>` (the first
 n message polls answer 500) and `STUB_DROP_MESSAGES=<n>` (the first n message polls drop the connection) — both with
 `STUB_ALWAYS_FAIL_MESSAGES=1` to fail every poll, so a test can prove a completion survives a transient poll failure
-and gives up on a persistent one and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
+and gives up on a persistent one, `PAUSE` (an answer that goes silent for 12.5 s - longer than the idle timeout -
+before it finishes, so a test can prove the recovery poll does not truncate it) and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
 backend is killed or the gateway is shutting down), `SLOWFINISH` (an answer that only finishes after 3 s, so a test can
 prove a non-streaming request whose client disconnected stops holding its slot) and `TAILTAG` (an answer whose last delta ends in a tag prefix that
 never becomes a tag, so a test can prove the held fragment is still delivered). Extend that stub and
@@ -240,6 +241,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (`OpenCode backend failed while polling the answer (status 500): …`) in ~2 s instead of burning the whole request
   budget and answering `504`. An empty list is a normal "not written yet" poll, not a failure, and an expired
   deadline still surfaces as the timeout it is.
+- **An idle stream is recovered, not ended.** When the event stream goes silent for `DEFAULT_EVENT_IDLE_TIMEOUT_MS`
+  the gateway polls for the rest of the answer and appends only what the client does not have yet. That recovery poll
+  tolerates a full idle window of further silence (`IDLE_RECOVERY_STALL_POLLS`) before it accepts a message the
+  backend never marks finished: the default allowance of three identical polls (~1.5 s) is right after a normal
+  prompt, but applied to a stream that had already been silent for 8 s it ended the response with
+  `finish_reason: "stop"` on text that stopped mid-sentence, which a slow provider still writing looks exactly like.
 - **A finished message ends the stream, whatever the finish reason.** The collector settles on any non-empty
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.

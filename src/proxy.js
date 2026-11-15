@@ -324,21 +324,31 @@ const isConnectionError = (error) => {
         error?.cause?.code === 'ECONNREFUSED';
 };
 
+// Jail directories this process created. Another gateway (a second instance, or one in a container sharing /tmp)
+// may be using the same parent directory, so the exit hook must never delete a directory it does not own.
+const ownedJailRoots = new Set();
+
 /**
- * Cleanup temporary directories
+ * Removes the jail directories this process created. This runs on process exit, so it cannot rely on
+ * killBackend() having been called.
  */
 function cleanupTempDirs() {
-    // Only cleanup jail directories on non-Windows platforms
-    // On Windows, we don't use isolated jail to avoid path issues
+    // On Windows no jail is used (path issues), so there is nothing to remove
     if (process.platform === 'win32') return;
 
-    const jailRoot = path.join(os.tmpdir(), 'opencode-proxy-jail');
-    try {
-        if (fs.existsSync(jailRoot)) {
+    for (const jailRoot of ownedJailRoots) {
+        try {
             fs.rmSync(jailRoot, { recursive: true, force: true });
+        } catch (e) {
+            logger.error('[Cleanup] Failed to remove temp dirs:', { error: e.message });
         }
+    }
+    ownedJailRoots.clear();
+    // The parent only disappears once the last instance is gone; a leftover one is harmless
+    try {
+        fs.rmdirSync(path.join(os.tmpdir(), 'opencode-proxy-jail'));
     } catch (e) {
-        logger.error('[Cleanup] Failed to remove temp dirs:', { error: e.message });
+        // not empty or already gone: expected when another instance is still running
     }
 }
 
@@ -1593,6 +1603,7 @@ async function ensureBackend(config, options = {}) {
             const salt = Math.random().toString(36).substring(7);
             const jailRoot = path.join(os.tmpdir(), 'opencode-proxy-jail', salt);
             state.jailRoot = jailRoot;
+            ownedJailRoots.add(jailRoot);
             const workspace = path.join(jailRoot, 'empty-workspace');
 
             let envVars;
@@ -1753,8 +1764,8 @@ export function startProxy(options) {
         // called directly, fall back to reading the environment variable
         LOG_LEVEL: options.LOG_LEVEL ?? options.logLevel ?? process.env.LOG_LEVEL ?? null,
         USE_ISOLATED_HOME: parseBoolean(
-            options.USE_ISOLATED_HOME,
-            parseBoolean(process.env.OPENCODE_USE_ISOLATED_HOME, false)
+            options.USE_ISOLATED_HOME ?? options.useIsolatedHome,
+            parseBoolean(process.env.OPENCODE_USE_ISOLATED_HOME ?? process.env.USE_ISOLATED_HOME, false)
         ),
         REQUEST_TIMEOUT_MS: (() => {
             // A malformed value must fall back to the default: Number('abc') is NaN and setTimeout(NaN) fires
@@ -1827,6 +1838,7 @@ export function startProxy(options) {
             if (state && state.jailRoot && process.platform !== 'win32') {
                 try {
                     fs.rmSync(state.jailRoot, { recursive: true, force: true });
+                    ownedJailRoots.delete(state.jailRoot);
                 } catch (e) { }
             }
         }

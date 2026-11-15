@@ -29,7 +29,7 @@ The image bundles Node.js 22, the project source, and the OpenCode CLI (npm pack
 | Tag | Description |
 | --- | --- |
 | `dinhdev666/free-opencode-api:latest` | Newest published release — OpenAI-compatible API gateway for the OpenCode CLI |
-| `dinhdev666/free-opencode-api:2.0.0` | Pinned release tag |
+| `dinhdev666/free-opencode-api:3.0.0` | Pinned release tag |
 
 Both tags are multi-architecture images (`linux/amd64` and `linux/arm64`); Docker pulls the variant that matches the
 host, so no `--platform` flag is needed on Intel servers or Apple Silicon machines.
@@ -39,7 +39,7 @@ host, so no `--platform` flag is needed on Intel servers or Apple Silicon machin
 ## Quick Start
 
 ```bash
-docker pull dinhdev666/free-opencode-api:2.0.0
+docker pull dinhdev666/free-opencode-api:3.0.0
 
 docker run -d \
   --restart=always \
@@ -47,7 +47,7 @@ docker run -d \
   --name free-opencode-api \
   -e API_KEY=your-secret-key \
   -p 8083:8083 \
-  dinhdev666/free-opencode-api:2.0.0
+  dinhdev666/free-opencode-api:3.0.0
 ```
 
 The service is then reachable at `http://<your-ip>:8083`.
@@ -323,7 +323,7 @@ To publish from this machine instead:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -f docker/Dockerfile -t dinhdev666/free-opencode-api:2.0.0 --push .
+  -f docker/Dockerfile -t dinhdev666/free-opencode-api:3.0.0 --push .
 ```
 
 The image installs the OpenCode CLI from npm at build time and pins it with `ARG OPENCODE_VERSION`, defaulting to

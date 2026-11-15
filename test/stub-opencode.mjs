@@ -32,6 +32,10 @@ const HANG_CREATE_AFTER = Number(process.env.STUB_HANG_CREATE_AFTER || 0);
 // does when it cannot reach it: the gateway copies that reason into a client-facing 502 body and into its log, so a
 // test can prove both are masked
 const URL_IN_ERROR = process.env.STUB_URL_IN_ERROR === '1';
+// Refuse POST /session with the authorization header quoted back (a proxy in front of the backend reporting the
+// credential it rejected): the header value is the one the gateway lifted out of OPENCODE_SERVER_URL, so a test can
+// prove the client answer and the log line mask it instead of publishing the credential
+const ECHO_AUTH = process.env.STUB_ECHO_AUTH === '1';
 // Refuse POST /session with a megabyte of JSON in the body (a proxy in front of the backend answering its own error
 // page): the gateway keeps 500 characters of it as a log summary, and used to serialise all of it first
 const BIG_ERROR_BODY = process.env.STUB_BIG_ERROR_BODY === '1';
@@ -390,6 +394,11 @@ const server = http.createServer(async (req, res) => {
         if (URL_IN_ERROR) {
             return sendJson(res, 502, {
                 error: { message: 'cannot reach http://alice:s3cr3t-value@127.0.0.1:4097/proxy?token=abc123 (connection refused)' }
+            });
+        }
+        if (ECHO_AUTH) {
+            return sendJson(res, 401, {
+                error: { message: `the proxy refused the credential: Authorization: ${req.headers.authorization || 'none'}` }
             });
         }
         const id = `ses_smoke_${(sessionSeq += 1)}`;

@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
-import { logger, maskBackendUrl, maskDetail, maskHeaders, maskUrlCredentials, maskUrlQuery, setOwnProperty } from './logger.js';
+import { logger, maskBackendUrl, maskDetail, maskHeaders, maskQuotedCredentials, maskUrlCredentials, maskUrlQuery, setOwnProperty } from './logger.js';
 
 
 // --- Mutex Logic with Timeout ---
@@ -153,7 +153,10 @@ const maskUrlsInText = (text) => {
 };
 export const clientFacingText = (value) => {
     if (typeof value !== 'string' || value === '') return '';
-    const masked = maskUrlsInText(value);
+    // A URL is not the only credential an upstream can quote: a proxy in front of the backend can echo the
+    // `Authorization: Basic …` header it refused, and that token is the credential the gateway lifted out of
+    // `OPENCODE_SERVER_URL`.
+    const masked = maskQuotedCredentials(maskUrlsInText(value));
     return masked.length > MAX_UPSTREAM_TEXT_CHARS
         ? `${masked.slice(0, MAX_UPSTREAM_TEXT_CHARS)}…[truncated ${masked.length - MAX_UPSTREAM_TEXT_CHARS} chars]`
         : masked;
@@ -2899,7 +2902,7 @@ function createApp(config) {
                         message: clientFacingText(error.message),
                         status: upstream.status,
                         // The body is backend-controlled text: it can quote a URL and a log line is collected as often as not
-                        bodySummary: upstream.bodySummary ? maskUrlQuery(maskUrlCredentials(upstream.bodySummary)) : null
+                        bodySummary: clientFacingText(upstream.bodySummary) || null
                     });
                     logger.debug('[Proxy] Error details', { reqId, sessionId, error });
 
@@ -2991,13 +2994,18 @@ function createApp(config) {
             if (timedOut) {
                 logger.warn('[Proxy] Completion timed out:', { message: error.message });
             } else {
-                logger.error('[Proxy] Request Handler Error:', { message: error.message, stack: error.stack });
+                logger.error('[Proxy] Request Handler Error:', { message: handlerMessage, stack: error.stack });
             }
+            // This catch writes the body itself, so the top-level handler's masking never sees it: a 500 here is the
+            // same kind of sentence - written by whatever threw - and gets the same treatment, in the body and in the
+            // log line above.
+            const rawMessage = typeof error?.message === 'string' ? error.message : String(error);
+            const handlerMessage = clientFacingText(rawMessage) || rawMessage;
             const payload = {
                 error: {
                     message: timedOut
                         ? `OpenCode gateway did not finish the completion within ${REQUEST_TIMEOUT_MS}ms`
-                        : error.message,
+                        : handlerMessage,
                     type: 'server_error'
                 }
             };

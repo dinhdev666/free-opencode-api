@@ -250,7 +250,7 @@ while the gateway ran the default you thought you had replaced:
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
 | `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files. Booleans accept `true`/`false` (JSON) or `1`/`0`, `yes`/`no`, `y`/`n`, `on`/`off` (environment or string); a value none of those match is reported in a `[Config]` warning together with the value actually used (`DISABLE_TOOLS='maybe' is not a boolean …, using false`), for `DISABLE_TOOLS`, `USE_ISOLATED_HOME` and `DEBUG` alike |
 | `USE_ISOLATED_HOME` | `false` | Run the backend with a throwaway `HOME` instead of the real one, so it cannot pick up your machine's OpenCode state |
-| `DEBUG` | `false` | Switch logging to `debug` (the environment name for the same switch is `OPENCODE_PROXY_DEBUG`; `LOG_LEVEL=debug` is the preferred way) |
+| `DEBUG` | `false` | Switch logging to `debug` **when no explicit `LOG_LEVEL` is set** (an explicit level wins and the switch is ignored with a `[Config]` warning; the environment name for the same switch is `OPENCODE_PROXY_DEBUG`, and `LOG_LEVEL=debug` is the preferred way) |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (case-insensitive) |
 
 Environment variables:
@@ -277,7 +277,7 @@ Advanced tuning (environment or `config.json`; the environment wins when both se
 | `OPENCODE_PROXY_MAX_CONCURRENCY` | `1` | Number of chat completions processed in parallel (1..32). `1` keeps the historical serialized behaviour; raise it only if the backend/provider tolerates concurrent sessions |
 | `OPENCODE_PROXY_MAX_QUEUE` | `64` | How many completions may wait for a free slot before the gateway answers `503 queue_full` instead of accepting more work (the queue holds request bodies, so it is bounded). Counts waiting requests only: `0` rejects a completion when no slot is free instead of queueing it. A slot frees as soon as its response is written (the session cleanup that follows does not hold it) |
 | `OPENCODE_PROXY_MAX_BODY_MB` | `50` | Largest accepted request body in MiB (1..200). It is the other half of the memory bound: a waiting completion pins its parsed body, so the worst case is this value times `OPENCODE_PROXY_MAX_QUEUE`. Prompts are small, so lowering it is the cheap way to bound a gateway whose clients are not trusted. A larger body is refused with `413` after the upload is drained (bounded to 5 s), so the client reads that error instead of a reset connection |
-| `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` — the **environment name** of the switch (the `config.json` key is `DEBUG`, and the environment variable `DEBUG` has no effect); `LOG_LEVEL=debug` is the preferred way |
+| `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` **when no explicit `LOG_LEVEL` is set** — an explicit level wins and the switch is then ignored with a `[Config]` warning. This is the **environment name** of the switch (the `config.json` key is `DEBUG`, and the environment variable `DEBUG` has no effect); `LOG_LEVEL=debug` is the preferred way |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Fallback bind address when `BIND_HOST` is not set — **environment only**: `config.json` has just `BIND_HOST`, and this name in the file is reported as an unknown key and ignored |
 
 A tuning value that cannot be used (a typo, a negative number) is **reported at startup** —

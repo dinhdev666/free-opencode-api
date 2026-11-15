@@ -5,9 +5,10 @@
 # fallback for settings, not an override: index.js reads environment variables first, so `-e KEY=value` applies on
 # every start even when the file already holds a different value.
 # Supported (written into config.json): PORT API_KEY BIND_HOST OPENCODE_PATH OPENCODE_SERVER_URL OPENCODE_BIND_HOST
-# and the two boolean flags, under both their names. The OPENCODE_-prefixed spelling wins over the bare one in
-# index.js (`process.env.OPENCODE_X ?? process.env.X`), so it wins here too - otherwise the file this script writes
-# and the value the process reads could disagree once the variables are no longer set.
+# and the two boolean flags, under both their names. In index.js the first *non-blank* value wins, with the
+# OPENCODE_-prefixed name first (`flagSource()`/`readFlag()`: a blank `OPENCODE_X=` falls through to `X`), so the
+# prefixed spelling wins here too - otherwise the file this script writes and the value the process reads could
+# disagree once the variables are no longer set.
 # The log level LOG_LEVEL (error/warn/info/debug, case-insensitive) is NOT written into config.json:
 #   the node process reads the environment variable directly, so it takes precedence over the LOG_LEVEL field in
 #   config.json; when unset it defaults to info

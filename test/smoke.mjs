@@ -128,6 +128,14 @@ async function run() {
         (health.response.headers.get('content-type') || '').includes('application/json'),
         health.response.headers.get('content-type'));
 
+    // A model id is looked up in both shapes: the slash escaped and the slash as a path separator
+    const encodedModel = await request('/v1/models/opencode%2Fkimi-k2.5-free');
+    check('GET /v1/models/<id> finds the listed model', encodedModel.response.status === 200 &&
+        encodedModel.json?.id === 'opencode/kimi-k2.5-free', encodedModel.text.slice(0, 160));
+    const unencodedModel = await request('/v1/models/opencode/kimi-k2.5-free');
+    check('GET /v1/models/<id> accepts an unencoded slash', unencodedModel.response.status === 200 &&
+        unencodedModel.json?.id === 'opencode/kimi-k2.5-free', unencodedModel.text.slice(0, 160));
+
     // --- root index -------------------------------------------------------------------------------------
     const root = await request('/', { key: null });
     check('GET / answers without a key', root.response.status === 200, `status ${root.response.status}`);

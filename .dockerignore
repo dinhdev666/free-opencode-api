@@ -12,3 +12,5 @@ config.json
 .DS_Store
 .vscode
 .idea
+# The smoke suite needs a stub backend and a writable port; it is not part of the runtime image
+test

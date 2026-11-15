@@ -549,15 +549,19 @@ function createApp(config) {
 
     // OpenAI clients (and several SDKs) look a model up by id. The gateway does not restrict the model a chat
     // request may use, so an id that is not in the provider list is described here instead of being a 404.
-    app.get('/v1/models/:modelId', { schema: { response: { 200: MODEL_SCHEMA } } }, async (request, reply) => {
-        const requestedId = String(request.params?.modelId || '');
+    const describeModel = async (requestedId) => {
         const known = (await loadModels()).find((m) => m.id === requestedId);
         if (known) return known;
         const slash = requestedId.indexOf('/');
         const provider = slash > 0 ? requestedId.slice(0, slash) : 'opencode';
         const name = slash > 0 ? requestedId.slice(slash + 1) : requestedId;
         return { id: requestedId, name, object: 'model', owned_by: provider };
-    });
+    };
+    const modelByIdSchema = { schema: { response: { 200: MODEL_SCHEMA } } };
+    app.get('/v1/models/:modelId', modelByIdSchema, async (request) => describeModel(String(request.params?.modelId || '')));
+    // Model ids contain slashes (`opencode/kimi-k2.5-free`), and clients send them unencoded as often as escaped:
+    // without the wildcard route the unencoded form hit the 404 handler.
+    app.get('/v1/models/*', modelByIdSchema, async (request) => describeModel(String(request.params?.['*'] || '')));
 
     // Debug logs all go through the logger (visible with LOG_LEVEL=debug; the legacy DEBUG switch is still
     // honoured, startProxy maps DEBUG=true onto the debug level)

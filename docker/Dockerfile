@@ -42,7 +42,10 @@ COPY . .
 # Approach: the official npm package opencode-ai, which bundles linux x64/arm64 binaries for both glibc and musl,
 #           and installs the executable into the npm global bin directory, i.e. /usr/local/bin/opencode
 # (npm is only used here to install this third-party CLI, not for the project's own dependencies)
-RUN npm install -g opencode-ai
+# OPENCODE_VERSION pins it for reproducible builds: docker build --build-arg OPENCODE_VERSION=1.2.3
+ARG OPENCODE_VERSION=latest
+RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" \
+    && npm cache clean --force
 # Alternative (if the npm package installation has problems, use the official install script):
 # RUN curl -fsSL https://opencode.ai/install | bash
 

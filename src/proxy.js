@@ -108,6 +108,20 @@ const loggableUrl = (url) => {
         : masked;
 };
 
+// A client-supplied value on its way into a response body, under one rule.
+//
+// The `415` media-type message already replaced control characters and cut the echoed type; the other sites copied the
+// value through verbatim, so a 4,000-character content-part type produced a 4,000-character error body, and a value
+// carrying a newline put a second line into a body the client reads as one record. The marker matches
+// `loggableUrl()`, so a truncated value reads the same wherever it appears.
+const MAX_ECHOED_VALUE_LENGTH = 64;
+const echoedValue = (value) => {
+    const clean = String(value).replace(CONTROL_CHARS_RE, '?');
+    return clean.length > MAX_ECHOED_VALUE_LENGTH
+        ? `${clean.slice(0, MAX_ECHOED_VALUE_LENGTH)}…[truncated ${clean.length - MAX_ECHOED_VALUE_LENGTH} chars]`
+        : clean;
+};
+
 /**
  * The type of a value from a request body as a word, for an error message that names what arrived. `Array.isArray`
  * comes first because `typeof []` is 'object': the reader of "found an object" would be told the field they sent is
@@ -1025,7 +1039,7 @@ function createApp(config) {
         if (contentEncoding && contentEncoding.toLowerCase() !== 'identity') {
             reply.code(415).send({
                 error: {
-                    message: `Request bodies with Content-Encoding: ${contentEncoding} are not supported; send the body uncompressed (drop that header)`,
+                    message: `Request bodies with Content-Encoding: ${echoedValue(contentEncoding)} are not supported; send the body uncompressed (drop that header)`,
                     type: 'invalid_request_error'
                 }
             });
@@ -1878,7 +1892,7 @@ function createApp(config) {
                     if (!pID || !mID) {
                         return reply.code(400).send({
                             error: {
-                                message: `model "${modelId}" must be a "provider/model" id`,
+                                message: `model "${echoedValue(modelId)}" must be a "provider/model" id`,
                                 type: 'invalid_request_error'
                             }
                         });
@@ -1959,7 +1973,12 @@ function createApp(config) {
                             if (!content) return;
                             if (role === 'user') userContents.push(content);
                             const roleLabel = role.toUpperCase();
-                            const nameSuffix = m?.name ? `(${m.name})` : '';
+                            // `name` is client input and was interpolated raw: a non-string produced
+                            // `USER([object Object]): …` in the prompt, and a name carrying a newline forged another
+                            // conversation line inside the text the model reads. A string is kept - it is a documented
+                            // OpenAI field - sanitised the same way every other value that lands in a prompt line is.
+                            const nameLabel = typeof m?.name === 'string' ? m.name.replace(CONTROL_CHARS_RE, '?').trim() : '';
+                            const nameSuffix = nameLabel ? `(${nameLabel.slice(0, MAX_ECHOED_VALUE_LENGTH)})` : '';
                             parts.push({
                                 type: 'text',
                                 text: `${roleLabel}${nameSuffix}: ${content}`
@@ -2017,7 +2036,7 @@ function createApp(config) {
                             ? `${at}.${unsupported.field} must be a string, found ${unsupported.found}`
                             : unsupported.found
                                 ? `${at} must be a string or an object with a text field, found ${unsupported.found}`
-                                : `${at} uses an unsupported content part type "${unsupported.type}"; this gateway forwards text only`;
+                                : `${at} uses an unsupported content part type "${echoedValue(unsupported.type)}"; this gateway forwards text only`;
                         return reply.code(400).send({
                             error: { message, type: 'invalid_request_error' }
                         });
@@ -2685,8 +2704,7 @@ function createApp(config) {
                 }
                 // Client input reaching a response body: control characters replaced and the value cut, like every
                 // other client-controlled string the gateway echoes back
-                const type = rawType.split(';')[0].trim().replace(/[\u0000-\u001f\u007f]/g, '?').slice(0, 64);
-                return `unsupported content type "${type}"; send Content-Type: application/json`;
+                return `unsupported content type "${echoedValue(rawType.split(';')[0].trim())}"; send Content-Type: application/json`;
             }
             return err.message;
         };

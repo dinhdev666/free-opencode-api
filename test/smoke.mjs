@@ -3177,6 +3177,38 @@ async function run() {
             scalarPart.json?.error?.message === `messages[0].content[0] must be a string or an object with a text field, found ${described}`,
             `${scalarPart.response.status} ${scalarPart.text.slice(0, 200)}`);
     }
+    // Two shapes used to be blamed on the type the gateway does forward: a text part carrying no `text` field was
+    // answered `uses an unsupported content part type "text"`, and an object with no usable `type` `"unknown"` - each
+    // quoting a value the client never sent. The first names the missing field, the second keeps the shape sentence.
+    const textWithoutText = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: [{ type: 'text' }] }] }
+    });
+    check('a text part with no text field names the field, not the type',
+        textWithoutText.response.status === 400 &&
+        textWithoutText.json?.error?.message === 'messages[0].content[0].text is required for a text part',
+        `${textWithoutText.response.status} ${textWithoutText.text.slice(0, 200)}`);
+    for (const [part, described] of [['{}', 'no fields'], ['{"foo":1}', 'a foreign field'], ['{"type":5}', 'a non-string type']]) {
+        const typelessPart = await request('/v1/chat/completions', {
+            method: 'POST',
+            body: { messages: [{ role: 'user', content: [JSON.parse(part)] }] }
+        });
+        check(`a content part with ${described} is refused as an object without text`,
+            typelessPart.response.status === 400 &&
+            typelessPart.json?.error?.message ===
+                'messages[0].content[0] must be a string or an object with a text field, found an object without a text field',
+            `${typelessPart.response.status} ${typelessPart.text.slice(0, 200)}`);
+    }
+    // The same shape as a single `content` object, which has no part index to point at
+    const typelessObject = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: { foo: 1 } }, { role: 'user', content: 'second' }] }
+    });
+    check('a single content object with no type and no text is refused as that',
+        typelessObject.response.status === 400 &&
+        typelessObject.json?.error?.message ===
+            'messages[0].content must be a string or an object with a text field, found an object without a text field',
+        `${typelessObject.response.status} ${typelessObject.text.slice(0, 200)}`);
 
     // The same rule for a `content` that is one object instead of an array: `{"content":{"type":"image_url",…}}` used
     // to be read as an empty message and dropped in silence, so a request that also carried text was answered from the

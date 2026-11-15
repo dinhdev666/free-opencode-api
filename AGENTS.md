@@ -47,7 +47,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | --- | --- |
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved queue limits, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
-| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. A BOM is tolerated. |
+| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. A BOM is tolerated. |
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`) plus `serializeDetail()` (truncate before stringify) for debug logging. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 337 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 342 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -179,16 +179,16 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   received (`GET /__sessions` → `lastSystemPrompt`) so the suite can assert it.
 - **A body that is not a JSON object is named as one.** Whether a string body still needs parsing is decided by the
   **content type**, not by the value: `"hi"` under `application/json` decoded to a string, and reading it as unparsed
-  text answered "not valid JSON" about a body that parses perfectly, while `42`, `true`, `[]` (and a parsed scalar on a
-  text path, which was replaced by `{}`) were answered `messages array is required` about a field never sent. All are
-  `request body must be a JSON object, found …`; no body at all keeps `messages array is required`.
+  text answered "not valid JSON" about a body that parses perfectly, while `42`, `true`, `[]` were answered `messages
+  array is required` about a field never sent. All are `request body must be a JSON object, found …`; no body at all
+  keeps `messages array is required`.
 - **A missing `messages` is not an unusable one.** Three client mistakes used to share a single message: a body with
   no `messages`, a `messages` that is not an array (`"hi"`, `{}`) and an empty array (`[]`) all answered
   `messages array is required`, which sends the reader looking for a field they did send. They are separated now:
   `messages array is required` (absent or `null`), `messages must be an array of message objects, found a string`
   (`jsonTypeName()`, so the message names what arrived — `Array.isArray` first, because `typeof []` is `'object'`) and
-  `messages must contain at least one message`. An **entry** of that array that is not an object (`"hi"`, `42`,
-  `null`, `[]`) is the same class: `m?.role`/`m?.content` read it as an empty user message, so the client was told
+  `messages must contain at least one message`. An **entry** that is not an object (`"hi"`, `42`, `null`, `[]`) is
+  the same class: `m?.role`/`m?.content` read it as an empty user message, so the client was told
   `messages must include at least one non-system text message` about text it never sent; every entry is now named by
   position and type (`messages[0] must be a message object, found a string`).
 - A `messages[].role` that is present but not a string (`5`, `{}`, `[]`, `true`) is a `400`
@@ -201,7 +201,10 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   forwards text only`): dropping them answered a question the backend never received. Three causes, three messages,
   part check first: an unsupported type (above), a `text` part whose `text` is not a string
   (`messages[0].content[1].text must be a string, found a number`) and a part that is not a part at all (`… must be a
-  string or an object with a text field, found a number`, for `42`, `null`, `true`, which were dropped in silence). A
+  string or an object with a text field, found a number`, for `42`, `null`, `true`). Two shapes name themselves: a
+  text part whose `text` is **missing** (`{"type":"text"}`) is `…text is required for a text part`, and an object with
+  no usable `type` (`{}`, `{"type":5}`) takes the shape sentence with `found an object without a text field` - both
+  used to quote `unsupported content part type "text"`/`"unknown"`, a type the client never sent. A
   `content` that is a **single object instead of an array** follows the same three rules without a part index; it used
   to be read as an empty message, so a request that also carried text was answered from that text alone. A bare
   scalar `content` (`42`, `true`) is refused the same way, without a part index: stringifying it sent the model the
@@ -234,7 +237,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   The status and the code stay; the message becomes `unsupported content type "application/xml"; send
   Content-Type: application/json`, or `the request has a body but no Content-Type header; send Content-Type:
   application/json` when the header is missing (the value is client input echoed into a response body, so
-  `echoedValue()` replaces control characters and cuts it at 64 characters). Recognised types are unchanged:
+  `echoedValue()` replaces control characters and cuts it at 64). Recognised types are unchanged:
   `application/json`, `application/x-www-form-urlencoded` and `text/plain` (handed to the handler as text).
 - A body carrying a **forbidden property name** (`__proto__`, `constructor`) is refused by Fastify's
   prototype-poisoning guard before any handler runs, and that refusal arrives as the same
@@ -320,15 +323,15 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `Access-Control-Expose-Headers: X-Request-Id` lets a browser client read it back.
 - **A configured backend URL is masked wherever it is printed.** `OPENCODE_SERVER_URL` can carry a credential
   (`http://user:secret@host:4097` for a proxy in front of the backend); it reached the startup summary, the `[Config]`
-  normalisation notes, the container's first-boot config dump and `/health` verbatim — and `/health` needs no key, so
-  that published the secret to every caller as well as to `docker logs`. `maskBackendUrl()` in `src/logger.js` masks
+  notes, the container's first-boot config dump and `/health` verbatim — and `/health` needs no key, so that published
+  the secret to every caller and to `docker logs`. `maskBackendUrl()` in `src/logger.js` masks
   the userinfo and any credential query value and leaves scheme/host/path readable, which is what those lines are read
   for. The entrypoint repeats the masking for its own log line (it cannot import the module: it writes the file the
   module reads), and the stored `config.json` still holds the real value.
   The same applies to **text**: `resolveBackendAuth()` (`src/proxy.js`) splits the userinfo out of the value the SDK is
   given and `maskUrlCredentials()` masks a `scheme://user:pass@` inside any sentence. Both exist because the documented
   shape could not work at all - Node's `fetch` refuses a URL carrying credentials, so every completion answered `502`
-  quoting `http://user:secret@…/session` at the client and in the error log. The userinfo now travels as a Basic
+  quoting `http://user:secret@…/session`. The userinfo now travels as a Basic
   `Authorization` header (and on `checkHealth()`, which read its `401` as "backend missing"), and every upstream reason
   that reaches a client or a log
   line goes through `clientFacingText()` (`maskUrlCredentials()` + `maskUrlQuery()`, cut at 512 characters): a backend
@@ -463,8 +466,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - **A completion has one budget, not one per phase.** The prompt, the event subscription and the polling fallback all
   take what is left of `REQUEST_TIMEOUT_MS` (`remainingBudget()` in the handler) instead of each starting a fresh
   copy: a streaming request whose event stream timed out spent a second full budget polling, so the client waited
-  about twice the advertised timeout (measured 60 s for a 40 s budget) and the queue timer's message named a budget
-  that had already been exceeded. `remainingBudget()` never goes below 1 ms, so an exhausted budget surfaces as its
+  about twice the advertised timeout (measured 60 s for a 40 s budget) and the queue timer named a budget already
+  exceeded. `remainingBudget()` never goes below 1 ms, so an exhausted budget surfaces as its
   timeout rather than a spinning loop. `client.session.create` takes it too: with a fresh budget there, a
   completion that had queued 3 s answered at 5.7 s with a 4 s budget.
 - **A failed poll does not end the completion.** `pollForAssistantResponse` retries a poll that answers with an error
@@ -477,7 +480,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   that answers **2xx with something that is not a message list** (an envelope that moved, a proxy in front of the
   backend returning its own JSON) is reported by its shape - `… answered with a payload that is not a message list
   (status 200)` - not by the status, which reads like a gateway bug; the payload's type and top-level keys go to the
-  debug line next to it, which is what tells an envelope change from an error body.
+  debug line next to it, which tells an envelope change from an error body.
 - **An idle stream is recovered, not ended.** When the event stream goes silent for `DEFAULT_EVENT_IDLE_TIMEOUT_MS`
   the gateway polls for the rest of the answer and appends only what the client does not have yet. That recovery poll
   tolerates a full idle window of further silence (`IDLE_RECOVERY_STALL_POLLS`) before accepting a message the backend
@@ -573,17 +576,17 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `OPENCODE_PATH` that does not exist is warned about rather than silently replaced by whatever the PATH search finds.
 - **The start attempt is claimed before the probe.** `state.isStarting` is set synchronously, before the
   `checkHealth` call that may suspend, and released in a `finally` on every path: claiming it only after that probe
-  failed let two callers arriving within one probe round trip (the warmup racing the first request, or two
-  completions) both spawn a backend, and the second spawn killed the first one's child and overwrote the tracked
-  process. A caller waiting on someone else's attempt probes first and sleeps between attempts, so a request arriving
+  failed let two callers arriving within one probe round trip both spawn a backend, and the second spawn killed the
+  first one's child and overwrote the tracked process. A caller waiting on someone else's attempt probes first and
+  sleeps between attempts, so a request arriving
   during a start is served as soon as the backend answers.
 - **`killBackend()` returns a promise that settles when the child is gone** (SIGTERM, then SIGKILL after 3 s), and
   `index.js` awaits it before `process.exit(0)`; the jail directory is removed only after the child is gone, because it
   is the child's cwd. Exiting right after SIGTERM skipped the escalation, so a backend that ignores SIGTERM outlived
   the gateway that owns it. It also sets `state.shuttingDown`, which every `ensureBackend()` path checks before it
   spawns: an attempt still inside its health probe (or waiting for the previous child) used to spawn `opencode serve`
-  *after* the promise resolved, leaving a caller that keeps running - an embedder, an in-flight teardown request - with
-  a backend nobody tracked while it held the backend port. A pending attempt is waited for
+  *after* the promise resolved, leaving a running caller - an embedder, an in-flight teardown - with an untracked
+  backend holding the port. A pending attempt is waited for
   (`waitForPendingStart()`, bounded by the largest step it can be inside and the 5 s hard exit in `index.js`), and each
   respawn deletes its predecessor's path from `ownedJailRoots` before replacing it.
 - **Backend lifecycle changes** must keep these properties: `ensureBackend()` trusts a successful probe for
@@ -608,7 +611,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - **A replacement backend starts only after the old child is gone.** The respawn path SIGTERMs the tracked process,
   waits for `exit` (SIGKILL after 3 s) and only then removes the old jail directory and spawns: sending SIGTERM and
   spawning on the next line let the old child hold the port, so the replacement failed to bind ("exited during
-  startup") and tripped the retry cooldown - one wedged backend turned its own recovery into an outage. "Exits" means
+  startup") and tripped the retry cooldown - one wedged backend turned its recovery into an outage. "Exits" means
   `exitCode !== null || signalCode !== null`: a child killed by a signal reports `exitCode === null`, and testing the
   exit code alone let a SIGKILLed backend look alive for the whole startup budget while
   `isStarting` stayed true. A request waiting on someone else's start attempt falls through to its own attempt when

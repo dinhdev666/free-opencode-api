@@ -34,7 +34,11 @@ const FLAG_KEYS = ['DISABLE_TOOLS', 'USE_ISOLATED_HOME', 'DEBUG'];
 // `OPENCODE_PROXY_MAX_CONCURENCY`) used to change nothing at all, and the gateway then ran the default while the
 // operator was sure the value in the file was in force - the same silent fallback the `[Config]` warnings for an
 // unusable limit exist to prevent. Nothing is merged generically, so an unknown key cannot reach the running config.
-const KNOWN_KEYS = new Set([...STRING_OR_NUMBER_KEYS, ...FLAG_KEYS]);
+// Exported for the smoke suite and `config.json.example`: the same list is documented in the README and repeated by
+// docker/docker-entrypoint.sh for the file it writes, and a key that reaches only one of those places is a setting the
+// operator believes is in force while the gateway runs the default. Frozen so a reader cannot edit the running list.
+export const CONFIG_FILE_KEYS = Object.freeze([...STRING_OR_NUMBER_KEYS, ...FLAG_KEYS]);
+const KNOWN_KEYS = new Set(CONFIG_FILE_KEYS);
 
 // Case and separators are what a typo usually gets wrong (`APIKEY`, `api-key`, `openCodePath`), so the suggestion
 // compares the names with everything but the letters and digits removed

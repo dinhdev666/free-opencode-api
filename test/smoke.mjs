@@ -257,6 +257,27 @@ async function run() {
     check('stream chunks carry the requested model',
         chunks.every((chunk) => !chunk?.model || chunk.model === 'opencode/kimi-k2.5-free'));
 
+    // A model id can contain more than one slash; only the first one separates provider from model
+    const multiSlash = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'vendor/family/version', messages: [{ role: 'user', content: 'hi' }], stream: true },
+        stream: true
+    });
+    const multiSlashModels = parseSseFrames(multiSlash.text)
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        })
+        .map((chunk) => chunk?.model)
+        .filter(Boolean);
+    check('a model id with several slashes is echoed intact',
+        multiSlashModels.length > 0 && multiSlashModels.every((name) => name === 'vendor/family/version'),
+        JSON.stringify(multiSlashModels[0]));
+
     // --- no stalled stream requests ---------------------------------------------------------------------
     // Regression guard: a silent event stream used to cost a fixed 4 s wait on every other request
     const durations = [];
@@ -337,6 +358,43 @@ async function run() {
     const cappedHealth = await fetch(`${cappedUrl}/health`);
     check('rejected requests leave the gateway healthy', cappedHealth.status === 200, `status ${cappedHealth.status}`);
     await cappedHealth.text();
+
+    // --- a stalled stream still ends ---------------------------------------------------------------------
+    // A backend that goes silent mid-answer used to leave the SSE connection open with no terminator: the client
+    // waited for a stream that would never finish. The request timeout is shortened so the case stays fast.
+    const stallPort = GATEWAY_PORT + 2;
+    const stallUrl = `http://127.0.0.1:${stallPort}`;
+    const stallGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(stallPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'warn',
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '3000'
+        }
+    });
+    children.push(stallGateway);
+    stallGateway.stdout.on('data', () => {});
+    stallGateway.stderr.on('data', () => {});
+    await waitForOk(`${stallUrl}/health`);
+
+    const stallStartedAt = Date.now();
+    const stallResponse = await Promise.race([
+        fetch(`${stallUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ messages: [{ role: 'user', content: 'STALL please' }], stream: true })
+        }).then((response) => response.text()),
+        sleep(20000).then(() => 'timeout')
+    ]);
+    const stallMs = Date.now() - stallStartedAt;
+    check('a stalled stream is closed instead of hanging', stallResponse !== 'timeout', `${stallMs} ms`);
+    check('the closed stream ends with [DONE]',
+        stallResponse !== 'timeout' && stallResponse.includes('data: [DONE]'), String(stallResponse).slice(0, 200));
+    check('the client sees an error frame', stallResponse !== 'timeout' && stallResponse.includes('"error"'),
+        String(stallResponse).slice(0, 200));
 
     // --- graceful shutdown ------------------------------------------------------------------------------
     const exitCode = await new Promise((resolve) => {

@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 50 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 54 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -76,8 +76,10 @@ Docker Hub.
 
 `pnpm test` covers the whole HTTP contract against the stub shipped in `test/stub-opencode.mjs` (which implements
 `GET /health`, `GET /config/providers`, `POST /session`, `POST /session/:id/message`, `GET /session/:id/message`,
-`DELETE /session/:id` and an SSE `GET /event`). Extend that stub and `test/smoke.mjs` when you add behaviour worth
-protecting.
+`DELETE /session/:id` and an SSE `GET /event`, plus three test-only hooks: `GET /__sessions` (created/deleted/live
+counts) and the prompt markers `SLOW` (a ~2 s answer, so a test can abort mid-stream) and `STALL` (two deltas and
+then silence, so a test can prove a stalled stream still ends). Extend that stub and `test/smoke.mjs` when you add
+behaviour worth protecting.
 
 For exploratory work, start the stub (or a throwaway one in `/tmp`) on a spare port and point the gateway at it:
 
@@ -113,6 +115,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (anything else). Every error body carries a `type`.
 - A client that disconnects mid-stream releases its queue slot immediately: the event subscription is aborted and
   the polling fallbacks are skipped (the backend keeps finishing on its own).
+- An error after the first SSE frame is delivered in-band (`data: {"error":…}` then `data: [DONE]`) and closes the
+  stream. A hijacked response must always be terminated: writing a JSON body into a frame stream (or leaving the
+  socket open) breaks or hangs the client.
 - Every completion deletes the OpenCode session it created — on the success path, the error path and after a client
   abort. The backend must never accumulate one session per served request; `test/stub-opencode.mjs` exposes
   `GET /__sessions` so the smoke suite can assert `live === 0`.

@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 356 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 359 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -130,7 +130,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - `GET /health` → `200 {"status":"ok","backend":"<OPENCODE_SERVER_URL>"}` with any credentials in it masked
   (`maskBackendUrl()`: `http://***@host:4097`, `?token=***`), never touches the backend. It is open
   without a key in every form a probe uses it — HEAD, and a trailing slash (`ignoreTrailingSlash` routes `/health/`
-  to the same handler, so the open-route test must match it too, otherwise a liveness probe answers 401).
+  to the same handler, so the open-route test must match it too, or a liveness probe answers 401).
 - `GET /v1/models` → `200 {"object":"list","data":[{id,name,object,owned_by}, …]}`; 5 s cache, and a cold-cache burst
   shares one provider round trip (`modelsInFlight`) instead of one per request; failures — including a provider call
   that runs into its deadline, because a silent backend would otherwise never answer the listing at all — fall back to
@@ -180,7 +180,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   text answered "not valid JSON" about a body that parses perfectly, while `42`, `true`, `[]`, `null` were answered `messages
   array is required` about a field never sent. All are `request body must be a JSON object, found …`; no body at all
   keeps `messages array is required`, and an **empty** body (a retry that lost its payload) names the fix (`request body is empty; send a JSON object with a messages array`, code kept) whatever the content type,
-  not Fastify's sentence about the header the client set correctly.
+  not Fastify's sentence about a header the client set correctly.
 - **A missing `messages` is not an unusable one.** Three client mistakes used to share a single message: a body with
   no `messages`, a `messages` that is not an array (`"hi"`, `{}`) and an empty array (`[]`) all answered
   `messages array is required`, which sends the reader looking for a field they did send. They are separated now:
@@ -250,11 +250,13 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   Fastify's `code` when it rejected the body), `401` (auth, `type: "invalid_request_error"`,
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error, with a
   `code`: `ProviderError`, `backend_unreachable` or `upstream_error`), `503`
-  (`type: "queue_full"`, the wait queue is full, with `Retry-After: 1` so an OpenAI SDK backs off and retries instead
-  of failing the request), `504` (timeout), `500` (anything else). Every error body carries a
-  `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name. A backend that
-  disappears in the middle of a request is an upstream failure (`502`), not a gateway bug (`500`): the client is told
-  the upstream is gone, and the next request starts the backend again.
+  (`type: "queue_full"`, the wait queue is full, with `Retry-After: 1` so an OpenAI SDK backs off instead of failing
+  the request), `504` (timeout), `500` (anything else). Every error body carries a
+  `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name, and its message is
+  masked and bounded (`clientFacingText()`): a 5xx sentence comes from whatever threw, and a thrown `fetch`/SDK error can
+  quote its URL. A backend that disappears mid-request
+  is an upstream failure (`502`), not a bug (`500`): the client is told the upstream is gone and the next request
+  restarts it.
 - A backend that rejects `POST /session` (a version whose API moved, a proxy in front of it, an error body) is an
   upstream failure too: `502` with the upstream status and reason in the message
   (`OpenCode backend rejected session creation (status 405): …`), not a bare `500`
@@ -324,17 +326,15 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   (`http://user:secret@host:4097` for a proxy in front of the backend); it reached the startup summary, the `[Config]`
   notes, the container's first-boot config dump and `/health` verbatim — and `/health` needs no key, so that published
   the secret to every caller and to `docker logs`. `maskBackendUrl()` in `src/logger.js` masks
-  the userinfo and any credential query value and leaves scheme/host/path readable, which is what those lines are read
-  for. The entrypoint repeats the masking for its own log line (it cannot import the module: it writes the file the
-  module reads), and the stored `config.json` still holds the real value.
+  the userinfo and any credential query value and leaves scheme/host/path readable, which is what they are read for. The entrypoint repeats the masking for its own log line (it cannot import the module: it writes the file the
+  module reads); the stored `config.json` keeps the real value.
   The same applies to **text**: `resolveBackendAuth()` (`src/proxy.js`) splits the userinfo out of the value the SDK is
   given and `maskUrlCredentials()` masks a `scheme://user:pass@` inside any sentence. Both exist because the documented
-  shape could not work at all - Node's `fetch` refuses a URL carrying credentials, so every completion answered `502`
+  shape could not work - Node's `fetch` refuses a URL with credentials, so every completion answered `502`
   quoting `http://user:secret@…/session`. The userinfo now travels as a Basic
-  `Authorization` header (and on `checkHealth()`, which read its `401` as "backend missing"), and every upstream reason
-  that reaches a client or a log
-  line goes through `clientFacingText()` (`maskUrlCredentials()` + `maskUrlQuery()`, cut at 512 characters): a backend
-  or a proxy in front of it can quote a URL in its own error payload.
+  `Authorization` header (and on `checkHealth()`, which read its `401` as "backend missing"), and every upstream reason that reaches a client or a log line
+  goes through `clientFacingText()` (URLs masked, cut at 512 characters): a backend or a proxy in front of it can quote
+  a URL in its own error payload.
 - Request log format: `METHOD url -> status Xms [reqId] model=… stream=…` (info for `/v1/*`, debug otherwise).
   The `model` value and the URL are client-controlled, so both are normalised before they are logged
   (`loggableModelId()`: control characters replaced, 128 characters max; a URL over 512 characters is cut with a
@@ -381,9 +381,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   payload reaches these helpers through plain `JSON.parse`, so a provider can put that key in a logged body; a request
   body cannot (Fastify's poisoning guard refuses it first) and Node's header parser drops it. Neither copy's prototype
   is touched either way (asserted).
-  A **closed reader** on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream
-  `error` with no listener is an uncaught exception, and `node index.js | head -3` killed a gateway that was still
-  serving. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that line is lost, the process keeps answering. The suite asserts it.
+  A **closed reader** on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream `error` with no
+  listener is an uncaught exception: `node index.js | head -3` killed a gateway that was still serving. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that line is lost, the process keeps answering (asserted).
 - **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
   boundary can fall inside either of them; the held fragment is flushed at end of stream. The filter is one
@@ -538,13 +537,12 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   a full gateway. `.finally(release)` stays the safety net, so `release()` is idempotent. A request whose client
   disconnects while queued is dropped when its turn comes (`reply.raw` 'close'), so it never spends backend time. The
   disconnect signal is not `request.raw.destroyed`: that stream is destroyed once its body is read.
-  A body over `OPENCODE_PROXY_MAX_BODY_MB` is still refused with `413`, but only after the body has been read to its
-  end (`refuseOversizedBody()`, bounded by `BODY_DRAIN_TIMEOUT_MS`): Node ends the socket when a response finishes with
+  A body over `OPENCODE_PROXY_MAX_BODY_MB` is still refused with `413`, but only after it has been read to its end (`refuseOversizedBody()`, bounded by `BODY_DRAIN_TIMEOUT_MS`): Node ends the socket when a response finishes with
   the request body unread, and the kernel answers the client's remaining bytes with RST, so the client could lose the
   413 entirely. A client that keeps writing is cut off after the drain window. The message names the limit in force
   (`request body is too large (limit 50 MiB); send a smaller body or raise OPENCODE_PROXY_MAX_BODY_MB`) instead of
   Fastify's bare sentence: the fix depends on a number only the gateway knows, and it comes from the value
-  `createApp()` was built with (`bodyLimitMb`), so it cannot disagree with the parser.
+  `createApp()` was built with (`bodyLimitMb`), so it cannot disagree.
 - **The container runs as the unprivileged `node` user.** `docker/Dockerfile` chowns `/app` and declares
   `USER node` (uid/gid 1000) after the CLI install, so the gateway, the backend it spawns and every tool it runs are
   not UID 0. The entrypoint still writes `/app/config.json` (0600, owned by that user) on first boot, so a bind mount

@@ -356,6 +356,12 @@ A body that parses but is **not a JSON object** (`"hi"`, `42`, `true`, `[]`) is 
 be read as unparsed text and answered "request body is not valid JSON" about a body that parses perfectly, while a
 scalar or an array carried by a `text/plain` request was replaced by an empty object and blamed on `messages`.
 
+A body that is **not there at all** is not invalid JSON either: an empty body (a retry that lost its payload) answers
+`request body is empty; send a JSON object with a messages array` — under `Content-Type: application/json`, where the
+parser refuses it first and the `FST_ERR_CTP_EMPTY_JSON_BODY` code is kept, and under the text types, where an empty
+(whitespace-only included) string used to be reported as a syntax error about nothing — instead of telling the reader
+about the content type it had set correctly.
+
 ```bash
 curl -X POST http://127.0.0.1:8083/v1/chat/completions \
   -H "Content-Type: application/json" \

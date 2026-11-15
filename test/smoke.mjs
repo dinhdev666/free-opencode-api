@@ -746,6 +746,43 @@ async function run() {
     check('a JSON null body returns 400', nullBody.status === 400, `status ${nullBody.status}`);
     check('400 for a null body keeps the envelope', typeof nullBodyJson?.error?.message === 'string', JSON.stringify(nullBodyJson));
 
+    // An empty body under `application/json` is what a retry whose payload went missing sends, and Fastify's own
+    // sentence blamed the content type the client had just set: the envelope names the emptiness and the fix instead.
+    const emptyJsonBody = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: ''
+    });
+    const emptyJsonPayload = await emptyJsonBody.json().catch(() => null);
+    check('an empty JSON body is refused with a sentence naming the fix',
+        emptyJsonBody.status === 400 &&
+        emptyJsonPayload?.error?.message === 'request body is empty; send a JSON object with a messages array' &&
+        emptyJsonPayload?.error?.code === 'FST_ERR_CTP_EMPTY_JSON_BODY',
+        `${emptyJsonBody.status} ${JSON.stringify(emptyJsonPayload).slice(0, 160)}`);
+    // A whitespace-only body is not JSON either, and it takes the parse path rather than the empty one
+    const blankJsonBody = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: '   '
+    });
+    const blankJsonPayload = await blankJsonBody.json().catch(() => null);
+    check('a whitespace-only JSON body is still reported as unparsable',
+        blankJsonBody.status === 400 &&
+        blankJsonPayload?.error?.code === 'FST_ERR_CTP_INVALID_JSON_BODY',
+        `${blankJsonBody.status} ${JSON.stringify(blankJsonPayload).slice(0, 160)}`);
+    // The text paths see an empty body as an empty string, where `JSON.parse('')` answered a syntax error about
+    // nothing: the same mistake keeps the same sentence whatever the Content-Type says.
+    const emptyTextBody = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'text/plain' },
+        body: ''
+    });
+    const emptyTextPayload = await emptyTextBody.json().catch(() => null);
+    check('an empty text body is named as empty, not as unparsable',
+        emptyTextBody.status === 400 &&
+        emptyTextPayload?.error?.message === 'request body is empty; send a JSON object with a messages array',
+        `${emptyTextBody.status} ${JSON.stringify(emptyTextPayload).slice(0, 160)}`);
+
     // A body that is valid JSON but not an object is named by its type. `"hi"` under application/json decodes to a
     // string, and reading that string as unparsed text answered "request body is not valid JSON" about a body that
     // parses perfectly; `42`, `true` and `[]` were answered "messages array is required" about a field never sent.

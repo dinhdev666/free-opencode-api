@@ -23,6 +23,10 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
+// A stream that has written nothing for this long gets a comment line, so a proxy or client does not drop the
+// connection while the backend is still thinking. The tick is shorter so the silence stays close to the interval.
+const SSE_KEEPALIVE_INTERVAL_MS = 15000;
+const SSE_KEEPALIVE_TICK_MS = 5000;
 
 // Authentication is mandatory by design: when API_KEY is missing or blank the gateway falls back to this
 // built-in key instead of running without authentication.
@@ -355,24 +359,25 @@ const HEALTH_SCHEMA = {
     }
 };
 
+const MODEL_ITEM_SCHEMA = {
+    type: 'object',
+    properties: {
+        id: { type: 'string' },
+        name: { type: 'string' },
+        object: { type: 'string' },
+        owned_by: { type: 'string' }
+    }
+};
+
 const MODELS_SCHEMA = {
     type: 'object',
     properties: {
         object: { type: 'string' },
-        data: {
-            type: 'array',
-            items: {
-                type: 'object',
-                properties: {
-                    id: { type: 'string' },
-                    name: { type: 'string' },
-                    object: { type: 'string' },
-                    owned_by: { type: 'string' }
-                }
-            }
-        }
+        data: { type: 'array', items: MODEL_ITEM_SCHEMA }
     }
 };
+
+const MODEL_SCHEMA = MODEL_ITEM_SCHEMA;
 
 // Compiled once by fast-json-stringify: the non-streaming reply is serialized by schema instead of JSON.stringify,
 // and the shape can no longer drift from the documented OpenAI contract.
@@ -486,10 +491,11 @@ function createApp(config) {
     let modelsCache = null;
     let modelsCacheAt = 0;
 
-    app.get('/v1/models', { schema: { response: { 200: MODELS_SCHEMA } } }, async (request, reply) => {
+    // Shared by /v1/models and /v1/models/:modelId so both answer from the same cache
+    const loadModels = async () => {
         const now = Date.now();
         if (modelsCache && now - modelsCacheAt < MODELS_CACHE_TTL_MS) {
-            return modelsCache;
+            return modelsCache.data;
         }
         try {
             const providersRes = await client.config.providers();
@@ -513,11 +519,28 @@ function createApp(config) {
             });
             modelsCache = { object: 'list', data: models };
             modelsCacheAt = now;
-            return modelsCache;
+            return models;
         } catch (error) {
             logger.error('[Proxy] Model Fetch Error:', { error: error.message, status: error.status, body: error.response?.data || error.responseBody || null });
-            return { object: 'list', data: [{ id: 'opencode/kimi-k2.5-free', object: 'model' }] };
+            // Same item shape as a provider-served model, and not cached: the next request probes the backend again
+            return [{ id: 'opencode/kimi-k2.5-free', name: 'Kimi K2.5 Free', object: 'model', owned_by: 'opencode' }];
         }
+    };
+
+    app.get('/v1/models', { schema: { response: { 200: MODELS_SCHEMA } } }, async (request, reply) => {
+        return { object: 'list', data: await loadModels() };
+    });
+
+    // OpenAI clients (and several SDKs) look a model up by id. The gateway does not restrict the model a chat
+    // request may use, so an id that is not in the provider list is described here instead of being a 404.
+    app.get('/v1/models/:modelId', { schema: { response: { 200: MODEL_SCHEMA } } }, async (request, reply) => {
+        const requestedId = String(request.params?.modelId || '');
+        const known = (await loadModels()).find((m) => m.id === requestedId);
+        if (known) return known;
+        const slash = requestedId.indexOf('/');
+        const provider = slash > 0 ? requestedId.slice(0, slash) : 'opencode';
+        const name = slash > 0 ? requestedId.slice(slash + 1) : requestedId;
+        return { id: requestedId, name, object: 'model', owned_by: provider };
     });
 
     // Debug logs all go through the logger (visible with LOG_LEVEL=debug; the legacy DEBUG switch is still
@@ -947,12 +970,14 @@ function createApp(config) {
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                         promptParams.body.tools = toolOverrides;
                     }
-                    logger.debug('Upstream payload (final request body to opencode serve)', {
-                        reqId,
-                        sessionId,
-                        model: `${pID}/${mID}`,
-                        payload: promptParams
-                    });
+                    if (logger.isEnabled('debug')) {
+                        logger.debug('Upstream payload (final request body to opencode serve)', {
+                            reqId,
+                            sessionId,
+                            model: `${pID}/${mID}`,
+                            payload: promptParams
+                        });
+                    }
 
                     if (wantsStream) {
                         // Take over the raw socket: Fastify must not send its own reply for SSE
@@ -981,7 +1006,15 @@ function createApp(config) {
                         // timeout: note the disconnect and abort the collector so the slot is released immediately.
                         let clientGone = false;
                         let collectorHandle = null;
+                        let keepAliveTimer = null;
+                        const stopKeepAlive = () => {
+                            if (keepAliveTimer) {
+                                clearInterval(keepAliveTimer);
+                                keepAliveTimer = null;
+                            }
+                        };
                         const noteClientGone = () => {
+                            stopKeepAlive();
                             if (raw.writableEnded) return;
                             clientGone = true;
                             if (collectorHandle) collectorHandle.abort();
@@ -989,9 +1022,25 @@ function createApp(config) {
                         raw.on('close', noteClientGone);
                         raw.on('error', noteClientGone);
 
+                        // A free model can think for a long time between deltas (the polling fallback waits on the
+                        // backend too), and proxies/browsers drop a connection that stays silent. SSE comment lines
+                        // are ignored by every OpenAI client, so they keep the socket warm without touching the payload.
+                        let lastWriteAt = Date.now();
+                        keepAliveTimer = setInterval(() => {
+                            if (clientGone || raw.writableEnded) {
+                                stopKeepAlive();
+                                return;
+                            }
+                            if (Date.now() - lastWriteAt < SSE_KEEPALIVE_INTERVAL_MS) return;
+                            lastWriteAt = Date.now();
+                            raw.write(': keep-alive\n\n');
+                        }, SSE_KEEPALIVE_TICK_MS);
+                        keepAliveTimer.unref();
+
                         // Respect write backpressure so a slow reader cannot force the whole answer into memory
                         const writeFrame = async (frame) => {
                             if (clientGone) return;
+                            lastWriteAt = Date.now();
                             if (raw.write(frame)) return;
                             await new Promise((resolve) => {
                                 const settleDrain = () => {
@@ -1095,6 +1144,7 @@ function createApp(config) {
                             await emitPolled(false);
                         }
 
+                        stopKeepAlive();
                         if (!clientGone) {
                             await writeFrame(stopFrame);
                             sseChunkCount++;
@@ -1141,11 +1191,13 @@ function createApp(config) {
                             }],
                             usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
                         };
-                        logger.debug('Upstream response (non-stream full JSON)', {
-                            reqId,
-                            sessionId,
-                            response: responsePayload
-                        });
+                        if (logger.isEnabled('debug')) {
+                            logger.debug('Upstream response (non-stream full JSON)', {
+                                reqId,
+                                sessionId,
+                                response: responsePayload
+                            });
+                        }
                         return reply.send(responsePayload);
                     }
                 } catch (error) {

@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 322 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 323 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -341,7 +341,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   attacker-written line (`FORGED [INFO] …`) while a 2 MB id produced a 2 MB line. The backend still receives the id
   verbatim - the contract does not restrict model ids, only what is logged is normalised, and an **operator** value
   quoted in a startup line goes through `loggableConfigValue()` for the same reason: `config.json` and the environment
-  are text a script can write.
+  are text a script can write. It covers every `[Config]` note naming a value it could not use, and
+  `docker/docker-entrypoint.sh` repeats the rule for its log-level line (`tr '[:cntrl:]' '?'`, cut at 128).
 
 ## Working rules for code changes
 
@@ -355,7 +356,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **Logging** goes through `src/logger.js` (`logger.info`, `logger.warn`, `logger.error`, `logger.debug`). No
   `console.log` in `src/` or `index.js`. Never log an unmasked `authorization` header, and never print the API key:
   `docker/docker-entrypoint.sh` reports the key it generated as `sk-a***(22 chars)` — nothing but the length up to 16
-  characters — because `docker logs` is collected (`maskHeaders`/`maskSecret` in `src/logger.js`). Header **names** are matched against
+  characters — because `docker logs` is collected (`maskHeaders`/`maskSecret`). Header **names** are matched against
   `SENSITIVE_HEADER_PATTERN`, built from the exported `SENSITIVE_NAME_ALTERNATIVES` (`auth`, `authorization`,
   `authentication`, `api-key`/`apikey`, `token`, `secret`, `cookie`, `session`, `passw`, `key`, `code`, `sig`,
   `signature`, `credential`, `bearer` as whole name segments) rather than a fixed denylist: `x-goog-api-key`,

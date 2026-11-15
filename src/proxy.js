@@ -18,6 +18,16 @@ const STARTUP_WAIT_INTERVAL_MS = 2000;
 const STARTING_WAIT_ITERATIONS = 120;
 const STARTING_WAIT_INTERVAL_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
+/**
+ * The message for a phase that ran into its deadline.
+ * `remainingBudget()` floors what is left at 1 ms so a timer never gets 0 or a negative value, and interpolating that
+ * floor into the message told a client and the log that a 1 500 ms request budget had timed out "after 1ms": an
+ * operator reading `docker logs` could not tell a 1.5 s timeout from a 300 s one. A phase that is handed the floor was
+ * given nothing to wait with, so the message says that instead of reporting the floor as if it were the budget.
+ */
+export const timeoutMessage = (timeoutMs) => (timeoutMs <= 1
+    ? 'Request timeout: the request budget was used up'
+    : `Request timeout after ${timeoutMs}ms`);
 // Deleting the OpenCode session that a completion created is cleanup: it must finish quickly or not at all, because the
 // client already has its answer and a wedged delete would otherwise hold a queue slot for the full request budget.
 const SESSION_CLEANUP_TIMEOUT_MS = 10000;
@@ -410,7 +420,7 @@ function runQueuedTask() {
     const timeoutId = setTimeout(() => {
         if (settled) return;
         settled = true;
-        reject(new Error(`Request timeout after ${timeoutMs}ms`));
+        reject(new Error(timeoutMessage(timeoutMs)));
     }, timeoutMs);
 
     Promise.resolve()
@@ -1293,6 +1303,28 @@ function createApp(config) {
         return out + text.slice(keep);
     };
 
+    /**
+     * The text a part's snapshot added since the snapshot already seen.
+     * opencode >= 1.19 sends no delta: `part.text` is the part's current full text, so the increment is that text
+     * minus the previous snapshot of the same part. Two details matter. The snapshot is tracked **per part**: it used
+     * to be diffed against the accumulated answer of the whole message, so a message with more than one text part (a
+     * model that writes, calls a tool, then keeps writing) never matched and every event re-sent its part in full.
+     * And the append is checked by length plus a bounded head/tail comparison instead of comparing the whole prefix,
+     * which made each event cost O(answer): the fallback below still serves the whole snapshot when a backend rewrote
+     * earlier text rather than appending.
+     */
+    const SNAPSHOT_EDGE_CHARS = 32;
+    const snapshotDelta = (previous, text) => {
+        if (!previous) return text;
+        if (text.length <= previous.length) return text === previous ? '' : text;
+        const edge = Math.min(previous.length, SNAPSHOT_EDGE_CHARS);
+        const tailAt = previous.length - edge;
+        if (text.startsWith(previous.slice(0, edge)) && text.startsWith(previous.slice(tailAt), tailAt)) {
+            return text.slice(previous.length);
+        }
+        return text;
+    };
+
     const stripFunctionCalls = (text, trim = true) => {
         if (!DISABLE_TOOLS || !text) return text;
         const cleaned = removeToolMarkup(text);
@@ -1418,7 +1450,7 @@ function createApp(config) {
     async function promptWithTimeout(promptParams, timeoutMs) {
         let timer = null;
         const timeoutPromise = new Promise((_, reject) => {
-            timer = setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
+            timer = setTimeout(() => reject(new Error(timeoutMessage(timeoutMs))), timeoutMs);
         });
         // The promise that loses a race keeps running. A rejection that arrives after the timeout - a backend that
         // dies, or the aborted fetch from the deadline below - used to reach nothing and become an unhandled
@@ -1575,7 +1607,8 @@ function createApp(config) {
         // `requireDone` waits for the finished message instead of answering with whatever the first poll saw. Without
         // it a non-streaming request returned the text written so far: the poll loop can start while the answer is
         // still being generated, which truncated it. A provider that never marks its message finished is still
-        // answered once the text stops growing for three consecutive polls.
+        // answered once the text has not grown for `stablePollsRequired` intervals (~1.5 s, measured as time - see
+        // `stableWindowMs` below, not as a count of polls).
         const requireDone = Boolean(options.requireDone);
         // How long an unchanged message means "this message will never be marked finished". Three intervals (~1.5 s)
         // is right after a normal prompt, but not after an idle timeout: the backend has been silent for the whole
@@ -1697,7 +1730,7 @@ function createApp(config) {
             await sleep(waitMs);
         }
         logDebug('Polling timeout', { sessionId, ms: Date.now() - pollStart });
-        throw new Error(`Request timeout after ${timeoutMs}ms`);
+        throw new Error(timeoutMessage(timeoutMs));
     }
 
     /**
@@ -1724,6 +1757,8 @@ function createApp(config) {
         let reasoning = '';
         let receivedDelta = false;
         let deltaChars = 0;
+        // Last snapshot seen per part, so an incremental event is diffed against its own part (see snapshotDelta)
+        const partTexts = new Map();
         let firstDeltaAt = null;
         let firstDeltaTimer = null;
         let idleTimer = null;
@@ -1778,7 +1813,7 @@ function createApp(config) {
                 if (finished) return;
                 finished = true;
                 controller.abort();
-                reject(new Error(`Request timeout after ${timeoutMs}ms`));
+                reject(new Error(timeoutMessage(timeoutMs)));
             }, timeoutMs);
 
             scheduleFirstDeltaTimer(firstDeltaTimeoutMs);
@@ -1795,11 +1830,12 @@ function createApp(config) {
                             // An event that only names the session (no part payload) carries nothing to add: reading
                             // part.type here would throw and abort a subscription that is still usable
                             if (!part) continue;
-                            /* opencode>=1.19 events carry no delta field: part.text is the part's current full text, so derive the increment by diffing against what has already been accumulated */
+                            /* opencode>=1.19 events carry no delta field: part.text is that part's current full text, so the increment is its previous snapshot diffed away (snapshotDelta) */
                             let delta = props.delta;
                             if (!delta && (part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
-                                const acc = part.type === 'reasoning' ? reasoning : content;
-                                delta = part.text.startsWith(acc) ? part.text.slice(acc.length) : part.text;
+                                const partKey = part.id || part.type;
+                                delta = snapshotDelta(partTexts.get(partKey) || '', part.text);
+                                partTexts.set(partKey, part.text);
                             }
                             if (delta) {
                                 receivedDelta = true;
@@ -3355,6 +3391,13 @@ export function startProxy(options) {
         // the resolved object claimed the operator had set LOG_LEVEL, which is not where `debug` came from.
         logger.setLevel('debug');
         levelSource = 'legacy DEBUG flag';
+    } else if (config.DEBUG) {
+        // The switch is set and loses to an explicit level, which used to happen in complete silence: an operator who
+        // raised the detail with the documented switch got a `warn`-only log, and the summary line looked as if the
+        // switch had never been needed. Same rule as every other knob that loses to a stronger source - and the
+        // summary's source is annotated too, because a warning is itself invisible below the `warn` level.
+        levelSource = `LOG_LEVEL (OPENCODE_PROXY_DEBUG is ignored)`;
+        logger.warn(`[Config] OPENCODE_PROXY_DEBUG is set, but LOG_LEVEL='${logger.level}' selects the level explicitly - the switch is ignored (unset LOG_LEVEL to let it promote logging to debug)`);
     }
     backendUrl.notes.forEach((note) => logger.warn(`[Config] ${note}`));
     config.LOG_LEVEL = logger.level;

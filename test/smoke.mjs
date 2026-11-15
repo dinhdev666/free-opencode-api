@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
-import { parseBoolean, resolveBackendAuth } from '../src/proxy.js';
+import { parseBoolean, resolveBackendAuth, timeoutMessage } from '../src/proxy.js';
 import { readConfigFile, findUnknownKeys } from '../src/config.js';
 import {
     createLogger, maskBackendUrl, maskHeaders, maskSecret, maskUrlCredentials, maskUrlQuery, serializeDetail,
@@ -162,6 +162,15 @@ async function run() {
         booleanResults.every(([, actual, expected]) => actual === expected), JSON.stringify(booleanResults));
     check('parseBoolean returns the fallback for an unknown value',
         parseBoolean('maybe', 'fallback') === 'fallback' && parseBoolean(undefined, 'fallback') === 'fallback');
+
+    // A phase handed the 1 ms floor of `remainingBudget()` has no budget left to wait with: the message must say that
+    // instead of reporting the floor as if it were the budget ("Request timeout after 1ms" told a client and the log
+    // that a 1 500 ms request budget was 1 ms long). The floor is reachable only when the preceding phase spent the
+    // whole budget, which no fixed test request can time reliably, so the two branches are asserted directly.
+    check('an exhausted budget is not reported as a 1 ms timeout',
+        timeoutMessage(1) === 'Request timeout: the request budget was used up'
+        && timeoutMessage(1500) === 'Request timeout after 1500ms',
+        `${timeoutMessage(1)} | ${timeoutMessage(1500)}`);
 
     // --- log hygiene ---------------------------------------------------------------------------------------
     // A credential sent in the query string (`?api_key=…`, an OpenAI-compatible convention some clients still use)
@@ -1018,6 +1027,56 @@ async function run() {
         `${endOnlyElapsed} ms`);
     check('the answer of a non-"stop" finish is complete', endOnlyContent === ANSWER, JSON.stringify(endOnlyContent));
 
+    // Two text parts in one message, interleaved and each sending its own cumulative snapshots: the increment belongs
+    // to the part it came from. Diffing against the accumulated answer of the whole message never matched a second
+    // part, so every event re-sent its part and the client received each half once per event.
+    const multiPart = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'MULTIPART' }], stream: true },
+        stream: true
+    });
+    const multiPartContent = parseSseFrames(multiPart.text)
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        })
+        .filter((chunk) => chunk?.choices?.[0]?.delta?.content)
+        .map((chunk) => chunk.choices[0].delta.content)
+        .join('');
+    // The parts interleave, so the answer arrives interleaved; what matters is that each piece appears once. Diffing
+    // against the accumulated message re-sent every part on every event, so the client saw "alpha alpha beta ...".
+    const multiPartExpected = 'alpha ALPHA beta BETA gamma GAMMA';
+    check('a message with two interleaved text parts delivers each part exactly once',
+        multiPartContent.trim() === multiPartExpected,
+        JSON.stringify(multiPartContent));
+
+    // A part the backend rewrote (a snapshot shorter than the previous one) is not an extension of it: the whole text
+    // has to be forwarded, so the client sees it instead of the collector swallowing the correction.
+    const shrink = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'SHRINK please' }], stream: true },
+        stream: true
+    });
+    const shrinkContent = parseSseFrames(shrink.text)
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        })
+        .filter((chunk) => chunk?.choices?.[0]?.delta?.content)
+        .map((chunk) => chunk.choices[0].delta.content)
+        .join('');
+    check('a rewritten (shorter) part snapshot is forwarded, not swallowed',
+        shrinkContent.startsWith('alpha beta gamma') && shrinkContent.endsWith('alpha beta'),
+        JSON.stringify(shrinkContent));
+
     // --- no stalled stream requests ---------------------------------------------------------------------
     // Regression guard: a silent event stream used to cost a fixed 4 s wait on every other request
     const durations = [];
@@ -1375,6 +1434,59 @@ async function run() {
     check('a direct startProxy() caller is told about an unusable flag too',
         /\[Config\] DISABLE_TOOLS='definitely' is not a boolean .*using false/.test(embedOutput),
         JSON.stringify(embedOutput.slice(0, 240)));
+
+    // The legacy debug switch loses to an explicit LOG_LEVEL. That used to happen in complete silence: an operator who
+    // raised the detail with the documented switch got a warn-only log and a summary line that looked as if the switch
+    // had never been needed. Both directions are asserted, so the promotion cannot be dropped either.
+    const ignoredDebugPort = GATEWAY_PORT + 66;
+    const ignoredDebugUrl = `http://127.0.0.1:${ignoredDebugPort}`;
+    const ignoredDebugGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(ignoredDebugPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'info',
+            OPENCODE_PROXY_DEBUG: '1'
+        }
+    });
+    children.push(ignoredDebugGateway);
+    let ignoredDebugOutput = '';
+    ignoredDebugGateway.stdout.on('data', (chunk) => { ignoredDebugOutput += chunk; });
+    ignoredDebugGateway.stderr.on('data', (chunk) => { ignoredDebugOutput += chunk; });
+    await waitForOk(`${ignoredDebugUrl}/health`);
+    check('a debug switch that loses to an explicit LOG_LEVEL is named',
+        /\[Config\] OPENCODE_PROXY_DEBUG is set, but LOG_LEVEL='info' selects the level explicitly/.test(ignoredDebugOutput),
+        JSON.stringify(ignoredDebugOutput.slice(0, 240)));
+    // The warning is a `warn` line, so it is invisible below that level: the summary's source is annotated too, and
+    // this is the line an operator reads to see which switch is in force.
+    check('the log level line does not claim the ignored switch was applied',
+        ignoredDebugOutput.includes('Log level: info (source: LOG_LEVEL (OPENCODE_PROXY_DEBUG is ignored))'),
+        JSON.stringify(ignoredDebugOutput.split('\n').filter((line) => line.includes('Log level:')).join(' | ')));
+
+    const promotedDebugPort = GATEWAY_PORT + 67;
+    const promotedDebugUrl = `http://127.0.0.1:${promotedDebugPort}`;
+    const promotedDebugGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(promotedDebugPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: '',
+            OPENCODE_PROXY_DEBUG: '1'
+        }
+    });
+    children.push(promotedDebugGateway);
+    let promotedDebugOutput = '';
+    promotedDebugGateway.stdout.on('data', (chunk) => { promotedDebugOutput += chunk; });
+    promotedDebugGateway.stderr.on('data', (chunk) => { promotedDebugOutput += chunk; });
+    await waitForOk(`${promotedDebugUrl}/health`);
+    check('the debug switch still promotes logging when no level is set',
+        promotedDebugOutput.includes('Log level: debug (source: legacy DEBUG flag)')
+        && !promotedDebugOutput.includes('OPENCODE_PROXY_DEBUG is set, but LOG_LEVEL'),
+        JSON.stringify(promotedDebugOutput.split('\n').filter((line) => line.includes('Log level:')).join(' | ')));
 
     // --- bounded queue -----------------------------------------------------------------------------------
     // OPENCODE_PROXY_MAX_QUEUE=0 removes every waiting slot: a completion is refused only when every slot is busy,

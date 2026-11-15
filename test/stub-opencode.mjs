@@ -68,6 +68,13 @@ const HOST = process.env.STUB_HOST || '127.0.0.1';
 // but not its probe reads the backend as missing and starts a second one.
 const BASIC_AUTH = process.env.STUB_BASIC_AUTH || '';
 const BASIC_HEADER = BASIC_AUTH ? `Basic ${Buffer.from(BASIC_AUTH, 'utf8').toString('base64')}` : '';
+
+// The snapshots the SHRINK marker sends: the second one is shorter, so it carries no derivable increment
+const SHRINK_SNAPSHOTS = ['alpha beta gamma', 'alpha beta'];
+const SHRINK_LAST = 'alpha beta';
+// The two halves of the MULTIPART answer, each sent as its own cumulative snapshots by streamTwoParts()
+const MULTIPART_FIRST = 'alpha beta gamma';
+const MULTIPART_SECOND = 'ALPHA BETA GAMMA';
 export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub.';
 export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
 
@@ -149,6 +156,56 @@ async function cutStreamMidAnswer(sessionID, snapshots) {
         client.end();
         eventClients.delete(client);
     }
+}
+
+// One text part whose snapshots are exactly what a backend that rewrote its part sends: the second snapshot is
+// shorter than the first, so there is no increment to derive and the whole text has to be forwarded.
+async function streamSnapshots(sessionID, snapshots, delayMs) {
+    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
+    for (const text of snapshots) {
+        sendEvent({ type: 'message.part.updated', properties: { part: { id: 'prt_text', sessionID, type: 'text', text } } });
+        await sleep(delayMs);
+    }
+    sendEvent({
+        type: 'message.updated',
+        properties: {
+            info: {
+                id: `msg_${sessionID}`,
+                sessionID,
+                role: 'assistant',
+                finish: 'stop',
+                time: { created: Date.now(), completed: Date.now() }
+            }
+        }
+    });
+}
+
+// Two text parts in one message, each sending its own cumulative snapshots, interleaved: what a backend does when the
+// model writes, calls a tool and keeps writing. Each part's text is the part's own full text, never the whole answer.
+async function streamTwoParts(sessionID, pieces, delayMs) {
+    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
+    let first = '';
+    let second = '';
+    for (const piece of pieces) {
+        first += piece;
+        sendEvent({ type: 'message.part.updated', properties: { part: { id: 'prt_first', sessionID, type: 'text', text: first } } });
+        await sleep(delayMs);
+        second += piece.toUpperCase();
+        sendEvent({ type: 'message.part.updated', properties: { part: { id: 'prt_second', sessionID, type: 'text', text: second } } });
+        await sleep(delayMs);
+    }
+    sendEvent({
+        type: 'message.updated',
+        properties: {
+            info: {
+                id: `msg_${sessionID}`,
+                sessionID,
+                role: 'assistant',
+                finish: 'stop',
+                time: { created: Date.now(), completed: Date.now() }
+            }
+        }
+    });
 }
 
 // Wait (briefly) for the gateway to be subscribed before emitting, then replay the answer as incremental updates.
@@ -454,6 +511,28 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
                 const cut = Math.ceil(ANSWER.length / 2);
                 cutStreamMidAnswer(id, [ANSWER.slice(0, Math.ceil(cut / 2)), ANSWER.slice(0, cut)]).catch(() => {});
+                return;
+            }
+            if (session.promptText.includes('MULTIPART')) {
+                // The same answer as two interleaved cumulative text parts, so a diff taken against the whole message
+                // instead of against the part re-sends each part on every event and the client sees it three times
+                session.messages.push({
+                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } },
+                    parts: [{ type: 'text', text: MULTIPART_FIRST }, { type: 'text', text: MULTIPART_SECOND }]
+                });
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                streamTwoParts(id, ['alpha ', 'beta ', 'gamma '], 1).catch(() => {});
+                return;
+            }
+            if (session.promptText.includes('SHRINK')) {
+                // A part that gets shorter (the backend rewrote what it had written): the snapshot is not an
+                // extension of the previous one, so the collector must forward it instead of swallowing it
+                session.messages.push({
+                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } },
+                    parts: [{ type: 'text', text: SHRINK_LAST }]
+                });
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                streamSnapshots(id, SHRINK_SNAPSHOTS, 1).catch(() => {});
                 return;
             }
             const toolTag = session.promptText.includes('TOOLTAG');

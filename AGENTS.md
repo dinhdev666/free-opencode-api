@@ -72,7 +72,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
 pnpm run check:commits           # commit subjects in the last commits against CONTRIBUTING.md (test/check-commit-messages.mjs)
-pnpm test                        # smoke suite: stub backend + gateway, 302 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 308 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -97,8 +97,10 @@ prompt), `PAUSE` (silence longer than the idle timeout), `HOLD` (finishes after 
 flight while the backend is killed or the gateway shuts down), `SLOWFINISH` (finishes after 3 s), `TAILTAG` (a last
 delta ending in a tag prefix that never becomes a tag), `REJECTPROMPT` (a 500 for `POST /session/:id/message`),
 `PROMPTDONE` (the prompt response already carries the finished message), `CUTSTREAM` (two cumulative snapshots then
-a dropped event connection), `TOOLSPAM` (a tool-call block repeated by the answer) and `LEAKYFAIL` (a provider error
-quoting a credential-bearing URL behind a long message) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
+a dropped event connection), `MULTIPART` (one message whose two text parts send their own cumulative snapshots,
+interleaved), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `TOOLSPAM` (a tool-call
+block repeated by the answer) and `LEAKYFAIL` (a provider error quoting a credential-bearing URL behind a long
+message) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
 `POST /session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 502 whose message quotes a
 credential-bearing URL), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_EMPTY_PROVIDERS=1` (both shapes of an
@@ -207,8 +209,7 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   message, so a request that also carried text got an answer built from that text alone. A single object with a string
   `text` is still forwarded.
 - **A message `name` is a label, not prompt text.** It is interpolated as `USER(name): …` only when it is a string,
-  with control characters replaced and the value cut: a non-string reached the model as `USER([object Object]): …`, and
-  a newline in a name forged a second conversation line.
+  with control characters replaced and the value cut: a non-string reached the model as `USER([object Object]): …`.
 - **An announced request body has a deadline.** Fastify sets `requestTimeout: 0`, so nothing bounded the wait: a client
   that sent `Content-Length: 4096` and four bytes held the socket for as long as it liked (measured 20 s with no
   answer), with no credential needed, because the `401` is written from the headers while Node keeps the connection
@@ -407,8 +408,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   were fixed for — and for `DISABLE_TOOLS` the consequence is the one the switch exists to prevent: a typo leaves the
   model's `<function_calls>` markup in the answer while the operator believes it is filtered out. `parseBoolean()`
   stays the only parser (it is also used on request bodies, where a warning would be wrong); `readFlag()` only
-  reports. The label repeats the name the operator used — an environment variable or `config.json DISABLE_TOOLS` —
-  and the echoed value is stripped of control characters and cut at 64, because it lands in a log line.
+  reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable) and the echoed
+  value is stripped of control characters and cut at 64, because it lands in a log line.
   `startProxy()` applies the same rule to its own fallbacks (`flagOption()`), for an embedder that calls it directly
   with no entry point to resolve the option first: an option the caller passed is taken as given — `index.js` already
   reported it, and a second line for one value reads like two different settings — while an option that is absent
@@ -432,14 +433,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   credential), and nothing is merged generically, so an unknown key (including `__proto__`) cannot reach the running
   config. `OPENCODE_PROXY_DEBUG` is an environment name only — the file key is `DEBUG`, so a file entry under the
   former is reported as an unknown key instead of doing nothing.
-  `OPENCODE_SERVER_URL` is normalised at startup (`normalizeBackendUrl`): surrounding whitespace is trimmed, a
-  trailing slash is stripped and a missing scheme is read as `http://`, the last two with a `[Config]` warning. A
-  trailing slash made every SDK path `//session`, which the backend answers with 404 — the gateway then reported
-  "backend exited during startup", which points nowhere near the real cause. The entry point normalises the value
-  **before** it prints the summary and emits the notes there (the function is exported for that), because the summary
-  is where an operator copies the value from and it used to show the raw form — `http://host:4097/`, or a value with a
-  trailing space — while a note two lines later said it had been corrected. `startProxy()` normalises what it is handed
-  once more: a no-op for an already-normalised value, and still correct for an embedder that calls it directly.
+  `OPENCODE_SERVER_URL` is normalised at startup (`normalizeBackendUrl`): whitespace is trimmed, a trailing slash is
+  stripped and a missing scheme is read as `http://`, the last two with a `[Config]` warning. A trailing slash made
+  every SDK path `//session`, which the backend answers with 404 — the gateway then reported "backend exited during
+  startup". The entry point normalises the value **before** printing the summary and emits the notes there (the
+  function is exported for that), because the summary is where an operator copies the value from. `startProxy()`
+  normalises what it is handed once more: a no-op for an already-normalised value, still correct for an embedder.
 - **Every tuning key follows the same precedence.** `OPENCODE_PROXY_MAX_CONCURRENCY`, `OPENCODE_PROXY_MAX_QUEUE`,
   `OPENCODE_PROXY_MAX_BODY_MB`, `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_HEALTH_CACHE_MS` and
   `OPENCODE_PROXY_START_RETRY_MS` are read through `readLimit()` / `readMilliseconds()`, which take the `config.json`
@@ -473,24 +472,32 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   consecutive failures give up, and they report an upstream error with the status and reason
   (`OpenCode backend failed while polling the answer (status 500): …`, or `… : the backend is not reachable
   (fetch failed)` for a connection failure - the runtime's own wording names no cause) in ~2 s instead of burning the
-  whole request budget and answering `504`. An empty list is a normal "not written yet" poll, not a failure, and an
-  expired deadline still surfaces as the timeout it is. A poll that answers **2xx with something that is not a message list**
-  (an envelope that moved, a proxy in front of the backend that returns its own JSON) is reported by its shape -
-  `… answered with a payload that is not a message list (status 200)` - and not by the status: `failed … (status 200)`
-  reads like a gateway bug and sends the reader looking in the wrong place. The payload's type and top-level keys go
-  to the debug line next to it, which is what tells an envelope change from an error body.
+  whole request budget and answering `504`. An empty list is a normal "not written yet" poll, not a failure. A poll
+  that answers **2xx with something that is not a message list** (an envelope that moved, a proxy in front of the
+  backend returning its own JSON) is reported by its shape - `… answered with a payload that is not a message list
+  (status 200)` - not by the status, which reads like a gateway bug; the payload's type and top-level keys go to the
+  debug line next to it, which is what tells an envelope change from an error body.
 - **An idle stream is recovered, not ended.** When the event stream goes silent for `DEFAULT_EVENT_IDLE_TIMEOUT_MS`
   the gateway polls for the rest of the answer and appends only what the client does not have yet. That recovery poll
   tolerates a full idle window of further silence (`IDLE_RECOVERY_STALL_POLLS`) before it accepts a message the
-  backend never marks finished: the default allowance of three identical polls (~1.5 s) is right after a normal
-  prompt, but applied to a stream that had already been silent for 8 s it ended the response with
-  `finish_reason: "stop"` on text that stopped mid-sentence, which a slow provider still writing looks exactly like.
+  backend never marks finished: the default allowance of three intervals of no growth (~1.5 s, measured as time
+  rather than as a count of polls) is right after a normal prompt, but applied to a stream already silent for 8 s it
+  ended the response with `finish_reason: "stop"` on text that stopped mid-sentence.
 - **A stream that ends without a finish event is recovered, not timed out.** When the event stream is closed
   mid-answer (backend restart, a proxy dropping idle SSE connections) the collector settles with
   `streamEnded: true` and the streaming path polls for the rest of the answer, appending only what the client does not
   have yet — exactly like the idle-timeout path. Before that it stayed silent until the whole request budget ran out
-  and then ended the response with an in-band error (`5992 ms` of a `6000 ms` budget for an answer the backend had
-  already finished), which is the one case where a truncation-free answer was available and not served.
+  and then wrote an in-band error (`5992 ms` of a `6000 ms` budget for an answer the backend had already finished).
+- **A cumulative part snapshot is diffed against that part, not against the answer.** opencode ≥ 1.19 sends no
+  `delta`: `part.text` is the part's current full text, so the gateway derives the increment. It belongs to the part
+  it came from (`partTexts` in `collectFromEvents`): measuring it against the accumulated `content` never matched a
+  second part, so a multi-part answer repeated each part once per event (`alpha beta gamma ALPHA BETA GAMMA` arrived
+  as `alpha alpha beta alpha beta gamma …`). The compare is also O(1) per event (`snapshotDelta()`: a length check
+  plus a 32-character head and tail window against the part's *previous* snapshot, `SNAPSHOT_EDGE_CHARS`), where
+  `startsWith` against the whole answer forced a rope flatten and a full compare per event — measured 299 ms of
+  gateway CPU for a 200 KB answer, 823 ms for 400 KB, 31–34 % of the collector's whole cost, growing quadratically.
+  A snapshot that is not an extension of the previous one is forwarded whole; the 32-character window is the
+  deliberate limit, so a rewrite *inside* it reads as a continuation.
 - **A finished message ends the stream, whatever the finish reason.** The collector settles on any non-empty
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.
@@ -502,8 +509,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   released — at the default concurrency of 1 that stops the whole gateway. Session cleanup uses its own shorter budget
   (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client already has its answer, so it must not hold the slot for
   the full request budget. The metadata calls (`/v1/models`, the tool list) are capped separately
-  (`METADATA_TIMEOUT_CAP_MS`, and never above `REQUEST_TIMEOUT_MS`), because they fall back — a client listing models
-  must get the static fallback quickly instead of waiting a whole completion budget for a silent provider.
+  (`METADATA_TIMEOUT_CAP_MS`, never above `REQUEST_TIMEOUT_MS`), because they fall back — a client listing models must
+  get the static fallback quickly instead of waiting a completion budget for a silent provider.
 - **A promise that loses a race needs a handler.** `promptWithTimeout` races the prompt against its own timer, and the
   losing promise keeps running: a rejection that arrives afterwards (the backend dies, or the deadline aborts the
   fetch) reached nothing and became an unhandled rejection, which terminates the process by default — one slow
@@ -587,8 +594,7 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   agent runtime that runs model-directed tools, and it authenticates nothing with a key that only guards this gateway.
   Provider credentials the CLI needs live in its own auth store or under their own names, so they stay. The jail
   directory (`<tmp>/opencode-proxy-jail/<salt>`, the child's cwd and its whole `HOME` under `USE_ISOLATED_HOME`) is
-  created with mode `0700`: on a shared `/tmp` the default `0755` let every other local user list and traverse it,
-  which is the isolation the option is for.
+  created with mode `0700`: on a shared `/tmp` the default `0755` let every other local user list and traverse it.
 - **A cached healthy answer does not fail the request it was wrong about.** `session.create` that throws a connection
   error (the backend died within `OPENCODE_PROXY_HEALTH_CACHE_MS` of the trusted probe) drops that trust, calls
   `ensureBackend()` again and retries the call once; the crash-recovery then happens for the request that hit it
@@ -600,9 +606,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   startup") and tripped the retry cooldown - one wedged backend turned its own recovery into an outage. "Exits" means
   `exitCode !== null || signalCode !== null`: a child killed by a signal reports `exitCode === null`, and testing the
   exit code alone let a SIGKILLed backend look alive for the whole 60-iteration startup budget while
-  `isStarting` stayed true — every request in that window waited instead of answering. A request waiting on someone
-  else's start attempt falls through to its own attempt when that attempt ends without a reachable backend (the retry
-  cooldown still applies), because the first request after a crash should restart the backend, not report it gone.
+  `isStarting` stayed true. A request waiting on someone else's start attempt falls through to its own attempt when
+  that attempt ends without a reachable backend (the retry cooldown still applies): the first request after a crash
+  should restart the backend, not report it gone.
 
 ## Performance guardrails
 

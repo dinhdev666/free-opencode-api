@@ -1838,11 +1838,20 @@ function createApp(config) {
                                     continue;
                                 }
                                 // A part that carries neither a string nor a text field is data the gateway would have
-                                // to drop: name it, with the position the client sent it at
+                                // to drop: name it, with the position the client sent it at. A part that *is* text
+                                // (`type: "text"`, or any object with the field) but whose `text` is not a string is
+                                // named by that field instead: reporting `uses an unsupported content part type "text"`
+                                // blames the one part type the gateway does forward.
                                 if (part && typeof part === 'object') {
+                                    if ('text' in part && typeof part.text !== 'string') {
+                                        return { text, unsupported: { index: i, field: 'text', found: jsonTypeName(part.text) } };
+                                    }
                                     return { text, unsupported: { index: i, type: typeof part.type === 'string' ? part.type : 'unknown' } };
                                 }
-                                // null/number/boolean parts carry no content at all
+                                // null/number/boolean parts carry no content either, and dropping them in silence ended
+                                // the request at "messages must include at least one non-system text message" - about
+                                // text nobody wrote, for a part the client did send
+                                return { text, unsupported: { index: i, found: jsonTypeName(part) } };
                             }
                             return { text };
                         }
@@ -1861,7 +1870,13 @@ function createApp(config) {
                             const role = (m?.role || 'user').toLowerCase();
                             const parsed = normalizeMessageContent(m?.content);
                             if (!unsupported && parsed.unsupported) {
-                                unsupported = { messageIndex, partIndex: parsed.unsupported.index, type: parsed.unsupported.type };
+                                unsupported = {
+                                    messageIndex,
+                                    partIndex: parsed.unsupported.index,
+                                    type: parsed.unsupported.type,
+                                    field: parsed.unsupported.field,
+                                    found: parsed.unsupported.found
+                                };
                             }
                             const content = parsed.text;
                             // `developer` is OpenAI's newer name for the system role: a client that sends it means the
@@ -1922,11 +1937,19 @@ function createApp(config) {
                     // Named before the "no text at all" check: a request whose only part is an image must say that the
                     // gateway cannot carry images, not that the client forgot to write any text
                     if (unsupported) {
+                        const at = `messages[${unsupported.messageIndex}].content[${unsupported.partIndex}]`;
+                        // Three causes, three messages: a part of a type the gateway cannot forward (an image), a text
+                        // part whose `text` is not a string, and a part that is not a part at all (`42`, `null`). One
+                        // message for all three used to call a `text` part unsupported - naming the only part type the
+                        // gateway does forward - and dropped a scalar part in silence, so the request ended at
+                        // "messages must include at least one non-system text message" instead.
+                        const message = unsupported.field
+                            ? `${at}.${unsupported.field} must be a string, found ${unsupported.found}`
+                            : unsupported.found
+                                ? `${at} must be a string or an object with a text field, found ${unsupported.found}`
+                                : `${at} uses an unsupported content part type "${unsupported.type}"; this gateway forwards text only`;
                         return reply.code(400).send({
-                            error: {
-                                message: `messages[${unsupported.messageIndex}].content[${unsupported.partIndex}] uses an unsupported content part type "${unsupported.type}"; this gateway forwards text only`,
-                                type: 'invalid_request_error'
-                            }
+                            error: { message, type: 'invalid_request_error' }
                         });
                     }
                     const systemWithGuard = applyToolGuard(systemMsg);

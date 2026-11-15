@@ -59,7 +59,8 @@ CORS, auth) and no plugin-level middleware chain. Additional choices that matter
 - **Precompiled response schemas** — `/health` and `/v1/models` are serialized through `fast-json-stringify`
   schemas compiled at startup instead of the generic `JSON.stringify` path.
 - **Short model-list cache** — `/v1/models` results are cached for 5 s, so client startup probes do not hit the
-  backend every time (failures are never cached).
+  backend every time (failures are never cached), and a burst that arrives with a cold cache shares a single
+  provider round trip instead of one per request.
 - **No hidden allocations on the hot path** — header masking for debug logs is only built when `LOG_LEVEL=debug`,
   the bearer token string is precomputed once, and request paths are parsed once per request.
 - **SSE written straight to the socket** — streaming replies hijack the response and write `data:` frames directly
@@ -82,20 +83,28 @@ CORS, auth) and no plugin-level middleware chain. Additional choices that matter
   can be raised to run independent sessions in parallel.
 
 Local benchmarks, `autocannon`, same machine (Node.js 26, macOS, loopback), against the smoke-test stub
-(`test/stub-opencode.mjs`). The stub answers instantly, so these numbers measure the HTTP layer — not a model:
+(`test/stub-opencode.mjs`). The stub answers in ~1 ms and streams its answer with deliberate 5 ms gaps, so these
+numbers measure this gateway plus the stub — never a model:
 
 | Scenario | Throughput | Avg latency |
 | --- | --- | --- |
-| `GET /health`, `-c 100 -d 10` | ~105,000 req/s | 0.2 ms |
-| `POST /v1/chat/completions` non-stream, `-c 10 -d 8` | ~10,300 req/s | 0.3 ms |
-| `POST /v1/chat/completions` non-stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | ~10,200 req/s | 0.3 ms |
-| `POST /v1/chat/completions` stream, `-c 10 -d 8` | ~9,700 req/s | 0.4 ms |
+| `GET /health`, `-c 100 -d 10` | ~98,700 req/s | 0.3 ms |
+| `GET /` (service index), `-c 100 -d 10` | ~104,800 req/s | 0.2 ms |
+| `GET /v1/models` (5 s cache), `-c 100 -d 10` | ~63,700 req/s | 1.1 ms |
+| `POST /v1/chat/completions` non-stream, `-c 10 -d 8` | ~2,100 req/s | 4.3 ms |
+| `POST /v1/chat/completions` non-stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | ~4,500 req/s | 1.7 ms |
+| `POST /v1/chat/completions` stream, `-c 1 -d 6` | ~28 req/s | 35 ms |
+| `POST /v1/chat/completions` stream, `-c 10 -d 8` | ~28 req/s | 350 ms (mostly queue wait) |
+| `POST /v1/chat/completions` stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | ~122 req/s | 81 ms |
 
-Numbers from a stub that answers instantly say little about the queue and nothing about the model: with real
-latency the completion rate is bounded by the OpenCode backend, which is why `OPENCODE_PROXY_MAX_CONCURRENCY`
-(default `1`) matters far more than raw HTTP throughput. For reference, the Express implementation this gateway
-replaced measured ~74,000 req/s on `/health` and ~1,900 req/s on non-streaming completions in the same harness at
-the time.
+Read the chat rows as "one completion pipeline", not as HTTP overhead: a completion is a session create, a prompt,
+the answer and a session delete, and the queue admits one at a time by default, so throughput is `1 / ≈35 ms` while
+the HTTP layer's own share is about 1 ms. The stub's 5 ms gaps make the streamed answer take ~20 ms on its own, which
+is where most of the 35 ms goes. Raise `OPENCODE_PROXY_MAX_CONCURRENCY` only if your provider tolerates concurrent
+sessions. Numbers move with machine load; re-measure before drawing conclusions.
+
+For reference, the Express implementation this gateway replaced measured ~74,000 req/s on `/health` in the same
+harness at the time; the Fastify rewrite answers ~99,000 req/s on the same endpoint.
 
 ---
 

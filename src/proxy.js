@@ -1339,6 +1339,19 @@ function createApp(config) {
         return reply;
     });
 
+    // The root is open (see the auth hook) and answers a small service index instead of a bare 404, so a browser or
+    // a container probe that hits the base URL learns what this process is without a key.
+    const indexBody = JSON.stringify({
+        service: 'free-opencode-api',
+        status: 'ok',
+        endpoints: {
+            health: '/health',
+            models: '/v1/models',
+            chat_completions: '/v1/chat/completions'
+        }
+    });
+    app.get('/', (request, reply) => reply.type('application/json; charset=utf-8').send(indexBody));
+
     // Health check. The body never changes for the lifetime of the process, so it is serialized once and sent as a
     // ready-made string instead of going through a serializer on every probe.
     const healthBody = JSON.stringify({ status: 'ok', backend: OPENCODE_SERVER_URL });

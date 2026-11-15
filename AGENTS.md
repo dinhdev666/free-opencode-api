@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 55 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 57 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -96,6 +96,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 
 ## API contract (must not drift)
 
+- `GET /` → `200 {"service":"free-opencode-api","status":"ok","endpoints":{"health":"/health","models":"/v1/models","chat_completions":"/v1/chat/completions"}}`
+  without a key: the auth hook leaves it open, so it must answer instead of falling through to the 404 handler.
 - `GET /health` → `200 {"status":"ok","backend":"<OPENCODE_SERVER_URL>"}`, never touches the backend.
 - `GET /v1/models` → `200 {"object":"list","data":[{id,name,object,owned_by}, …]}`; 5 s cache; failures fall back to a
   single static model and are not cached.

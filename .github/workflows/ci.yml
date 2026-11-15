@@ -113,10 +113,10 @@ jobs:
             docker logs gateway-ci-env
             exit 1
           fi
-          code=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8084/v1/models)
+          code=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8084/v1/models)
           echo "GET /v1/models with the built-in key -> $code (expected 401: -e API_KEY won)"
           test "$code" = "401"
-          code=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-from-env' http://127.0.0.1:8084/v1/models)
+          code=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-from-env' http://127.0.0.1:8084/v1/models)
           echo "GET /v1/models with the -e key -> $code"
           test "$code" = "200"
           mode=$(docker exec gateway-ci-env stat -c '%a' /app/config.json)
@@ -132,7 +132,9 @@ jobs:
       # container's HOME means sharing its backend state for no reason.
       # Every curl here carries its own timeout: a CLI that accepts the connection and never answers (a wedged
       # `opencode serve`) parked the retry loop on a request with no deadline, so the step sat until the job's 20
-      # minute timeout and the retry budget it exists for never ran.
+      # minute timeout and the retry budget it exists for never ran. The deadline has to be *larger* than the one the
+      # gateway itself runs on: `/v1/models` gives up after `METADATA_TIMEOUT_CAP_MS` (10 s) and falls back to the
+      # static model, so a 10 s curl timeout raced it and failed with exit 28 on a container that was about to answer.
       - name: Bundled CLI exposes the session API
         run: |
           docker run -d --name cli-session-check -p 4599:4599 --entrypoint opencode \
@@ -155,12 +157,12 @@ jobs:
       # is authenticated with the built-in key
       - name: Container enforces authentication
         run: |
-          root=$(curl -fsS --max-time 10 http://127.0.0.1:8083/)
+          root=$(curl -fsS --max-time 30 http://127.0.0.1:8083/)
           echo "GET / -> $root"
           echo "$root" | grep -q 'free-opencode-api'
-          code=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8083/v1/models)
+          code=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' http://127.0.0.1:8083/v1/models)
           echo "GET /v1/models without a key -> $code"
           test "$code" = "401"
-          code=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8083/v1/models)
+          code=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8083/v1/models)
           echo "GET /v1/models with the default key -> $code"
           test "$code" = "200"

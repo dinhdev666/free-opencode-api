@@ -69,7 +69,7 @@ const portIsValid = /^\d{1,5}$/.test(rawPort) && Number(rawPort) > 0 && Number(r
 const parsedPort = portIsValid ? Number(rawPort) : defaultConfig.PORT;
 // Warn only when a value was actually configured: a blank variable is "not configured", so there is nothing to report
 if (!portIsValid && rawPort !== '') {
-    logger.warn(`[Config] PORT '${rawPort}' is not a valid TCP port (1-65535), falling back to ${defaultConfig.PORT}`);
+    logger.warn(`[Config] PORT '${loggableConfigValue(rawPort)}' is not a valid TCP port (1-65535), falling back to ${defaultConfig.PORT}`);
 }
 
 // The raw value of each flag has to survive until it is read: `parseBoolean()` collapses an unusable value into the

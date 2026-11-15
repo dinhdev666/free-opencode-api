@@ -15,7 +15,10 @@
 set -eu
 
 CONFIG=/app/config.json
-LOG_LEVEL_DISPLAY="${LOG_LEVEL:-info}"
+# The level is operator text and this line is a `docker logs` record, so it is normalised before it is printed - the
+# same rule `loggableConfigValue()` applies to the gateway's own lines (control characters become '?', the value is
+# capped at 128 characters). This script cannot import that helper, so the rule is repeated here.
+LOG_LEVEL_DISPLAY=$(printf '%s' "${LOG_LEVEL:-info}" | tr '[:cntrl:]' '?' | cut -c1-128)
 
 if [ -d "$CONFIG" ]; then
     # `-v /some/host/path:/app/config.json` creates a *directory* at that path when the host path does not exist, and
@@ -74,7 +77,9 @@ if [ ! -f "$CONFIG" ]; then
             .replace(/^(\w[\w+.-]*:\/\/)[^/?#]*@/, "$1***@");
         const shown = Object.assign({}, cfg, { API_KEY: masked, OPENCODE_SERVER_URL: maskUrl(cfg.OPENCODE_SERVER_URL) });
         console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(shown));
-        console.log("[entrypoint] log level (LOG_LEVEL env, higher priority than config.json):", env("LOG_LEVEL", "info"));
+        // Normalised like the shell branch below, and like loggableConfigValue() in src/proxy.js: one log record.
+        const levelShown = String(env("LOG_LEVEL", "info")).replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 128);
+        console.log("[entrypoint] log level (LOG_LEVEL env, higher priority than config.json):", levelShown);
     '
 else
     echo "[entrypoint] /app/config.json exists, keeping it (environment variables still win over the file)"

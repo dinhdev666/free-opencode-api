@@ -388,7 +388,7 @@ function readLimit(name, { min, max, fallback }, fileValue) {
     if (raw === undefined || raw === null || String(raw).trim() === '') return { value: fallback, note: null };
     const parsed = Number(raw);
     if (!Number.isFinite(parsed)) {
-        return { value: fallback, note: `${name}='${raw}' is not a number, using ${fallback}` };
+        return { value: fallback, note: `${name}='${loggableConfigValue(raw)}' is not a number, using ${fallback}` };
     }
     const floored = Math.floor(parsed);
     if (floored < min) return { value: min, note: `${name}=${floored} is below the minimum ${min}, using ${min}` };
@@ -3419,7 +3419,7 @@ export function startProxy(options) {
             if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
             const blank = requested === undefined || requested === null || String(requested).trim() === '';
             if (!blank) {
-                logger.warn(`[Config] OPENCODE_PROXY_REQUEST_TIMEOUT_MS='${String(requested).trim()}' is not a positive number, using ${DEFAULT_REQUEST_TIMEOUT_MS}`);
+                logger.warn(`[Config] OPENCODE_PROXY_REQUEST_TIMEOUT_MS='${loggableConfigValue(String(requested).trim())}' is not a positive number, using ${DEFAULT_REQUEST_TIMEOUT_MS}`);
             }
             return DEFAULT_REQUEST_TIMEOUT_MS;
         })(),
@@ -3449,7 +3449,7 @@ export function startProxy(options) {
         options.OPENCODE_PROXY_HEALTH_CACHE_MS
     );
     if (isUnusableMilliseconds(options.OPENCODE_PROXY_HEALTH_CACHE_MS ?? process.env.OPENCODE_PROXY_HEALTH_CACHE_MS)) {
-        logger.warn(`[Config] OPENCODE_PROXY_HEALTH_CACHE_MS='${String(options.OPENCODE_PROXY_HEALTH_CACHE_MS ?? process.env.OPENCODE_PROXY_HEALTH_CACHE_MS).trim()}' is not a number, using ${BACKEND_HEALTH_CACHE_MS}`);
+        logger.warn(`[Config] OPENCODE_PROXY_HEALTH_CACHE_MS='${loggableConfigValue(String(options.OPENCODE_PROXY_HEALTH_CACHE_MS ?? process.env.OPENCODE_PROXY_HEALTH_CACHE_MS).trim())}' is not a number, using ${BACKEND_HEALTH_CACHE_MS}`);
     }
     BACKEND_START_RETRY_COOLDOWN_MS = readMilliseconds(
         'OPENCODE_PROXY_START_RETRY_MS',
@@ -3457,7 +3457,7 @@ export function startProxy(options) {
         options.OPENCODE_PROXY_START_RETRY_MS
     );
     if (isUnusableMilliseconds(options.OPENCODE_PROXY_START_RETRY_MS ?? process.env.OPENCODE_PROXY_START_RETRY_MS)) {
-        logger.warn(`[Config] OPENCODE_PROXY_START_RETRY_MS='${String(options.OPENCODE_PROXY_START_RETRY_MS ?? process.env.OPENCODE_PROXY_START_RETRY_MS).trim()}' is not a number, using ${BACKEND_START_RETRY_COOLDOWN_MS}`);
+        logger.warn(`[Config] OPENCODE_PROXY_START_RETRY_MS='${loggableConfigValue(String(options.OPENCODE_PROXY_START_RETRY_MS ?? process.env.OPENCODE_PROXY_START_RETRY_MS).trim())}' is not a number, using ${BACKEND_START_RETRY_COOLDOWN_MS}`);
     }
 
     // Log level resolution (calibrated at startup; all later log output follows this level):

@@ -1538,6 +1538,39 @@ async function run() {
             forgedConfigLines.every((line) => line.includes('/nonexistent/forged?[Shutdown]')),
         JSON.stringify(forgedConfigLines));
 
+    // The same rule reaches the values `[Config]` names: `readLimit()` builds its note out of the operator's text, and
+    // the port and the three timing knobs interpolated the raw value, so a newline in any of them forged a record too.
+    // An unusable port is what this child is for: it falls back to the default one, which is announced on the line
+    // under test.
+    const forgedKnobGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: '8083x\n[Shutdown] Not really shutting down',
+            BIND_HOST: '127.0.0.1',
+            // The suite's stub is already healthy, so no backend is spawned and the test costs one process
+            OPENCODE_SERVER_URL: STUB_URL,
+            OPENCODE_PROXY_MAX_CONCURRENCY: 'abc\n[Shutdown] Not really shutting down',
+            OPENCODE_PROXY_MAX_QUEUE: 'abc\n[Shutdown] Not really shutting down',
+            OPENCODE_PROXY_MAX_BODY_MB: 'abc\n[Shutdown] Not really shutting down',
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: 'abc\n[Shutdown] Not really shutting down',
+            OPENCODE_PROXY_HEALTH_CACHE_MS: 'abc\n[Shutdown] Not really shutting down',
+            OPENCODE_PROXY_START_RETRY_MS: 'abc\n[Shutdown] Not really shutting down',
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(forgedKnobGateway);
+    let forgedKnobOutput = '';
+    forgedKnobGateway.stdout.on('data', (chunk) => { forgedKnobOutput += chunk; });
+    forgedKnobGateway.stderr.on('data', (chunk) => { forgedKnobOutput += chunk; });
+    for (let i = 0; i < 60 && !forgedKnobOutput.includes('START_RETRY_MS'); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const forgedKnobLines = forgedKnobOutput.split('\n').filter((line) => line.includes('Not really shutting down'));
+    check('a newline in a tuning value cannot forge a second log record',
+        forgedKnobLines.length >= 6 && forgedKnobLines.every((line) => line.includes('abc?[Shutdown]') || line.includes('8083x?[Shutdown]')),
+        JSON.stringify(forgedKnobLines));
+
     // The legacy debug switch loses to an explicit LOG_LEVEL. That used to happen in complete silence: an operator who
     // raised the detail with the documented switch got a warn-only log and a summary line that looked as if the switch
     // had never been needed. Both directions are asserted, so the promotion cannot be dropped either.

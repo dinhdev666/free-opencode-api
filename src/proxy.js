@@ -663,6 +663,13 @@ function createApp(config) {
     // contract documents as unconditional. The status and the reason stay what Node reported (400, 431 for an
     // oversized header block, 408 for a request timeout), but the body is the OpenAI envelope and the response carries
     // the same headers every other response does, so a browser client behind a proxy sees a usable error.
+    // One copy of the CORS header set. It used to be written three times (this handler, the bad-URL handler and the
+    // onRequest hook), which is three chances to advertise a different list - and the list disagreed with the gateway
+    // itself: an incoming `X-Request-Id` is read and echoed (it is the id in the log line and in the response), so a
+    // browser client that sets its own trace id sent a header its own preflight did not allow, and the browser refused
+    // the request before it left the page. `X-Requested-With` stays for jQuery-era clients that send it unasked.
+    const CORS_ALLOW_HEADERS = 'Content-Type, Authorization, X-Api-Key, X-Request-Id, X-Requested-With';
+
     const CLIENT_ERROR_STATUS = {
         ERR_HTTP_REQUEST_TIMEOUT: { status: 408, reason: 'Request timeout' },
         HPE_HEADER_OVERFLOW: { status: 431, reason: 'Exceeded maximum allowed HTTP header size' }
@@ -686,7 +693,7 @@ function createApp(config) {
                 `Content-Length: ${Buffer.byteLength(body)}\r\n` +
                 'Access-Control-Allow-Origin: *\r\n' +
                 'Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n' +
-                'Access-Control-Allow-Headers: Content-Type, Authorization, X-Api-Key, X-Requested-With\r\n' +
+                `Access-Control-Allow-Headers: ${CORS_ALLOW_HEADERS}\r\n` +
                 'Access-Control-Max-Age: 600\r\n' +
                 'Access-Control-Expose-Headers: X-Request-Id\r\n' +
                 `X-Request-Id: ${reqId}\r\n` +
@@ -720,7 +727,7 @@ function createApp(config) {
             'Content-Length': Buffer.byteLength(body),
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key, X-Requested-With',
+            'Access-Control-Allow-Headers': CORS_ALLOW_HEADERS,
             'Access-Control-Max-Age': '600',
             'Access-Control-Expose-Headers': 'X-Request-Id',
             'X-Request-Id': reqId
@@ -883,7 +890,7 @@ function createApp(config) {
         // preflight would break those clients before they ever reach the auth check.
         reply.raw.setHeader('Access-Control-Allow-Origin', '*');
         reply.raw.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        reply.raw.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Api-Key, X-Requested-With');
+        reply.raw.setHeader('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS);
         // Cache the preflight so a browser client does not pay a round trip before every request
         reply.raw.setHeader('Access-Control-Max-Age', '600');
         // Without this a browser client cannot read the trace id back (CORS hides it from script)

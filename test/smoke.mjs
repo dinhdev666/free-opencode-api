@@ -440,6 +440,19 @@ async function run() {
         statsAfter.prompts === statsBefore.prompts + 1,
         `prompts ${statsBefore.prompts} -> ${statsAfter.prompts} (only the holder should have run)`);
 
+    // --- a provider failure in non-streaming mode ---------------------------------------------------------
+    const failed = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'FAIL' }], stream: false }
+    });
+    check('a non-streaming provider error answers 502', failed.response.status === 502, `status ${failed.response.status}`);
+    check('a 502 carries the server_error envelope with the provider error code',
+        failed.json?.error?.type === 'server_error' && failed.json?.error?.code === 'ProviderError',
+        failed.text.slice(0, 160));
+    const afterFailure = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    check('a failed completion still deletes its session',
+        afterFailure && afterFailure.live === 0, JSON.stringify(afterFailure));
+
     // --- session lifecycle -------------------------------------------------------------------------------
     // One session is created and must be deleted per completion; a leak would grow the backend without bound
     const stubStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);

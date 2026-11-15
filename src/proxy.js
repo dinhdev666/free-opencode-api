@@ -1315,12 +1315,16 @@ function createApp(config) {
                         logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
                         const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
                         if (error && !content && !reasoning) {
-                            return reply.code(502).send({
+                            // The session exists by now and must be deleted even though the answer failed
+                            reply.code(502).send({
                                 error: {
                                     message: error.data?.message || error.message || 'OpenCode provider error',
-                                    type: error.name || 'OpenCodeError'
+                                    type: 'server_error',
+                                    code: error.name || 'OpenCodeError'
                                 }
                             });
+                            await cleanupSession();
+                            return reply;
                         }
                         const safeContent = stripFunctionCalls(content);
                         const safeReasoning = stripFunctionCalls(reasoning);
@@ -1344,8 +1348,11 @@ function createApp(config) {
                                 response: responsePayload
                             });
                         }
+                        // Send before deleting the session: the client must not wait for a backend round trip that has
+                        // nothing to do with its answer (the session is deleted either way)
+                        reply.send(responsePayload);
                         await cleanupSession();
-                        return reply.send(responsePayload);
+                        return reply;
                     }
                 } catch (error) {
                     // Upstream (opencode serve) call chain failed: always emitted at error level with status code and

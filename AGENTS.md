@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 69 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 72 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -78,8 +78,9 @@ Docker Hub.
 `GET /health`, `GET /config/providers`, `POST /session`, `POST /session/:id/message`, `GET /session/:id/message`,
 `DELETE /session/:id` and an SSE `GET /event`, plus three test-only hooks: `GET /__sessions` (created/deleted/live
 counts) and the prompt markers `SLOW` (a ~2 s answer, so a test can abort mid-stream), `STALL` (two deltas and
-then silence, so a test can prove a stalled stream still ends) and `TOOLTAG` (an answer whose tool-call block is cut
-in the middle of both of its tags, so a test can prove the markup never leaks). Extend that stub and
+then silence, so a test can prove a stalled stream still ends), `TOOLTAG` (an answer whose tool-call block is cut
+in the middle of both of its tags, so a test can prove the markup never leaks) and `FAIL` (a provider error with no
+content, so a test can prove the failure path cleans up after itself). Extend that stub and
 `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
 already taken (a stale process would answer with someone else's build) and SIGKILLs any child that ignores SIGTERM.
 

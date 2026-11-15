@@ -2889,6 +2889,12 @@ async function run() {
     check('the built-in key is announced at startup',
         /\[Security\]/.test(gatewayOutput) && /built-in/.test(securityLine || ''),
         securityLine || 'no [Security] line');
+    // The key is public and the CORS set allows any origin, so the warning names the consequence and the address it
+    // applies to: an operator reading `docker logs` saw "set API_KEY" and a bind host on separate lines
+    check('the built-in key warning names the browser exposure and the bind address',
+        /any web page/.test(securityLine || '') &&
+        securityLine.includes(`127.0.0.1:${GATEWAY_PORT}`),
+        securityLine || 'no [Security] line');
 
     // The URL is part of the request log line, so a key sent in the query string used to be written into it verbatim
     const queryKeyAnswer = await request('/v1/models?api_key=sk-in-the-query-string-123456');

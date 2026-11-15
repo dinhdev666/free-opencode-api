@@ -1077,12 +1077,23 @@ function createApp(config) {
         // is accepted as an alias because the preflight above advertises it and clients configured with an api-key
         // header send it. Presence decides, not a parsed token: an `Authorization` header that is present always
         // wins, so a wrong one - or one a proxy injected with another scheme - is never overridden by the alias.
-        const presented = Object.prototype.hasOwnProperty.call(request.headers, 'authorization')
+        const hasAuthorization = Object.prototype.hasOwnProperty.call(request.headers, 'authorization');
+        const hasApiKeyHeader = Object.prototype.hasOwnProperty.call(request.headers, 'x-api-key');
+        const presented = hasAuthorization
             ? authorizationToken(request.headers.authorization)
             : apiKeyHeaderToken(request.headers['x-api-key']);
 
         if (!matchesToken(presented)) {
-            reply.code(401).send({ error: { message: 'Unauthorized', type: 'invalid_request_error', code: 'invalid_api_key' } });
+            // The message names the cause the client can act on - which header carried a key that did not match, or
+            // that none did - and never the value it sent or the key it should have sent. `Unauthorized` alone left a
+            // reader unable to tell a missing header from a wrong one, and a proxy-injected `Authorization: Basic …`
+            // reads as "wrong key" while the fix is to drop that header.
+            const message = hasAuthorization
+                ? 'the Authorization header does not carry the gateway API key; send Authorization: Bearer <API_KEY>'
+                : hasApiKeyHeader
+                    ? 'the X-Api-Key header does not carry the gateway API key; send Authorization: Bearer <API_KEY>'
+                    : 'the request carries no API key; send Authorization: Bearer <API_KEY>';
+            reply.code(401).send({ error: { message, type: 'invalid_request_error', code: 'invalid_api_key' } });
             return;
         }
 

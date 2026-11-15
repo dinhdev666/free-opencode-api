@@ -640,6 +640,8 @@ function createApp(config) {
     // Models endpoint. The provider list changes rarely, so a short TTL cache avoids hitting the backend
     // on every client startup/probe; failures are never cached so a recovering backend is picked up immediately.
     const MODELS_CACHE_TTL_MS = 5000;
+    // What a client sees when the provider list cannot be read: a single model, never an empty list
+    const STATIC_FALLBACK_MODELS = [{ id: 'opencode/kimi-k2.5-free', name: 'Kimi K2.5 Free', object: 'model', owned_by: 'opencode' }];
     const MODELS_TIMEOUT_MS = Math.min(REQUEST_TIMEOUT_MS, METADATA_TIMEOUT_CAP_MS);
     const TOOL_IDS_TIMEOUT_MS = MODELS_TIMEOUT_MS;
     let modelsCache = null;
@@ -673,6 +675,13 @@ function createApp(config) {
             const list = Array.isArray(providersRaw)
                 ? providersRaw
                 : Object.entries(providersRaw).map(([id, info]) => ({ ...info, id }));
+            if (list.length === 0) {
+                // A backend whose provider payload the gateway cannot read (a changed shape, a version that reports
+                // nothing) answered 200 with no models. Serving `{"data":[]}` is as useless to a client as an error -
+                // clients show no models at all - so an empty list takes the same fallback path and is not cached.
+                logger.warn('[Proxy] The backend reported no models, using the static fallback');
+                return STATIC_FALLBACK_MODELS;
+            }
 
             list.forEach((p) => {
                 if (p.models) {
@@ -692,7 +701,7 @@ function createApp(config) {
         } catch (error) {
             logger.error('[Proxy] Model Fetch Error:', { error: error.message, status: error.status, body: error.response?.data || error.responseBody || null });
             // Same item shape as a provider-served model, and not cached: the next request probes the backend again
-            return [{ id: 'opencode/kimi-k2.5-free', name: 'Kimi K2.5 Free', object: 'model', owned_by: 'opencode' }];
+            return STATIC_FALLBACK_MODELS;
         }
     };
 

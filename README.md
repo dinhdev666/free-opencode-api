@@ -236,7 +236,8 @@ Every response carries an `X-Request-Id` header, and the same id appears in the 
 | `/v1/chat/completions` | POST | Chat completions; supports `stream: true` for SSE. Every frame is a `chat.completion.chunk` with the same `id`/`object`/`created`/`model` envelope, the last one carrying `finish_reason: "stop"` before `data: [DONE]`. Comment-line keep-alives are sent while a stream is open but has not produced its first token, so proxies do not drop the connection. If the backend fails after frames were sent, the error arrives as a `data: {"error":…}` frame and the stream is closed with `data: [DONE]` — a stream always terminates |
 
 A provider call that stops answering is bounded by its own deadline (10 s at most, and never longer than the request
-budget), so `/v1/models` still answers — with the single static fallback model — instead of hanging.
+budget), so `/v1/models` still answers — with the single static fallback model — instead of hanging. The same fallback
+covers a backend that reports no models at all: an empty list would leave a client with nothing to choose from.
 
 **Chat completions** accepts the usual OpenAI fields; model IDs use the `opencode/<model>` form (for example `opencode/kimi-k2.5-free`).
 

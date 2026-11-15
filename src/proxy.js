@@ -491,6 +491,16 @@ function createApp(config) {
     // Preflight for every path
     app.options('/*', (request, reply) => reply.code(204).send());
 
+    // A hijacked response that already sent SSE frames cannot carry a JSON error body: the client is parsing frames,
+    // so the error goes in as one final frame and the stream is closed. Before this the connection simply stayed
+    // open - no terminator, no end() - and the client waited for a stream that would never finish.
+    const failHijackedStream = (raw, payload) => {
+        if (raw.writableEnded) return;
+        raw.write(`data: ${JSON.stringify(payload)}\n\n`);
+        raw.write('data: [DONE]\n\n');
+        raw.end();
+    };
+
     // Models endpoint. The provider list changes rarely, so a short TTL cache avoids hitting the backend
     // on every client startup/probe; failures are never cached so a recovering backend is picked up immediately.
     const MODELS_CACHE_TTL_MS = 5000;
@@ -908,8 +918,12 @@ function createApp(config) {
                     // `stream` may arrive as a boolean or as the strings "true"/"false"
                     const wantsStream = stream === true || stream === 'true';
 
-                    let [pID, mID] = ((model || '').trim() || 'opencode/kimi-k2.5-free').split('/');
-                    if (!mID) { mID = pID; pID = 'opencode'; }
+                    // Split on the first slash only: a model id may itself contain slashes
+                    // (`vendor/family/version`), and `split('/')` used to drop everything after the second one
+                    const modelId = (model || '').trim() || 'opencode/kimi-k2.5-free';
+                    const modelSlash = modelId.indexOf('/');
+                    const pID = modelSlash === -1 ? 'opencode' : modelId.slice(0, modelSlash);
+                    const mID = modelSlash === -1 ? modelId : modelId.slice(modelSlash + 1);
                     if (request.gatewayLog) {
                         request.gatewayLog.model = `${pID}/${mID}`;
                         request.gatewayLog.stream = wantsStream;
@@ -1260,22 +1274,25 @@ function createApp(config) {
                         if (backend) backend.healthyAt = 0;
                     }
 
+                    let errorMessage = error.message;
+                    let statusCode = 500;
+                    if (error.message && error.message.includes('Request timeout')) {
+                        statusCode = 504;
+                    }
+                    if (error.message && error.message.includes('ENOENT')) {
+                        errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
+                    }
+                    const payload = { error: { message: errorMessage, type: error.constructor.name } };
                     if (!reply.raw.headersSent) {
-                        let errorMessage = error.message;
-                        let statusCode = 500;
-                        if (error.message && error.message.includes('Request timeout')) {
-                            statusCode = 504;
-                        }
-                        if (error.message && error.message.includes('ENOENT')) {
-                            errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
-                        }
-                        const payload = { error: { message: errorMessage, type: error.constructor.name } };
                         if (hijacked) {
                             reply.raw.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
                             reply.raw.end(JSON.stringify(payload));
                         } else {
                             reply.code(statusCode).send(payload);
                         }
+                    } else if (hijacked) {
+                        // Frames are already on the wire: answer in-band and terminate the stream
+                        failHijackedStream(reply.raw, payload);
                     }
                     // Deletes the session if it was created (and is not already gone); before session creation there
                     // is simply nothing to clean up
@@ -1292,14 +1309,16 @@ function createApp(config) {
                 return reply;
             }
             logger.error('[Proxy] Request Handler Error:', { message: error.message, stack: error.stack });
+            const payload = { error: { message: error.message, type: error.constructor.name } };
             if (!reply.raw.headersSent) {
-                const payload = { error: { message: error.message, type: error.constructor.name } };
                 if (hijacked) {
                     reply.raw.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
                     reply.raw.end(JSON.stringify(payload));
                 } else {
                     reply.code(500).send(payload);
                 }
+            } else if (hijacked) {
+                failHijackedStream(reply.raw, payload);
             }
         }
         return reply;

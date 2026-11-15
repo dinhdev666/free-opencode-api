@@ -68,6 +68,14 @@ const buildAssistantMessage = (sessionID, text, reasoning) => ({
     ]
 });
 
+// Emit two deltas and then go silent without ever finishing, so a completion can only end through a timeout.
+async function stallAfterTwoDeltas(sessionID) {
+    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
+    sendEvent(partUpdate(sessionID, { type: 'text', text: 'partial answer that never ends' }));
+    await sleep(10);
+    sendEvent(partUpdate(sessionID, { type: 'text', text: 'partial answer that never ends, still going' }));
+}
+
 // Wait (briefly) for the gateway to be subscribed before emitting, then replay the answer as incremental updates.
 // `pieces`/`delayMs` let a test ask for a deliberately slow answer (a prompt containing SLOW) so it can abort a
 // stream while the backend is still working.
@@ -160,6 +168,13 @@ const server = http.createServer(async (req, res) => {
                 session.promptText = '';
             }
             session.prompted = true;
+            if (session.promptText.includes('STALL')) {
+                // Nothing for polling to find and no finish event: the caller must time out and close the stream
+                session.messages = [];
+                stallAfterTwoDeltas(id).catch(() => {});
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                return;
+            }
             session.messages.push(buildAssistantMessage(id, ANSWER, REASONING));
             sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
             // Fire and forget: the gateway collects the answer from /event (or polling). A prompt containing SLOW

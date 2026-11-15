@@ -215,7 +215,7 @@ Every response carries an `X-Request-Id` header, and the same id appears in the 
 | `/health` | GET | Liveness probe; returns gateway status and the configured backend URL |
 | `/v1/models` | GET | OpenAI-style model list |
 | `/v1/models/{id}` | GET | Single model; an id the provider list does not contain is still described (the gateway does not restrict models) |
-| `/v1/chat/completions` | POST | Chat completions; supports `stream: true` for SSE (comment-line keep-alives are sent while a stream is open but has not produced its first token, so proxies do not drop the connection) |
+| `/v1/chat/completions` | POST | Chat completions; supports `stream: true` for SSE (comment-line keep-alives are sent while a stream is open but has not produced its first token, so proxies do not drop the connection). If the backend fails after frames were sent, the error arrives as a `data: {"error":…}` frame and the stream is closed with `data: [DONE]` — a stream always terminates |
 
 **Chat completions** accepts the usual OpenAI fields; model IDs use the `opencode/<model>` form (for example `opencode/kimi-k2.5-free`).
 

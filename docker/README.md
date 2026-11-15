@@ -115,7 +115,11 @@ curl -X POST http://127.0.0.1:8083/v1/chat/completions \
 
 ## Configuration
 
-Configuration is no longer baked in at build time. On the container's **first boot** (no `/app/config.json` inside the container), the entrypoint `docker-entrypoint.sh` generates `/app/config.json` from the `docker run -e` variables; every subsequent start reuses the existing file as-is.
+Configuration is not baked in at build time. The gateway reads its settings from **environment variables first, then
+`/app/config.json`, then the built-in defaults**, so `docker run -e KEY=value` always applies. On the container's
+**first boot** (no `/app/config.json` inside the container) the entrypoint `docker-entrypoint.sh` also writes the `-e`
+values into `/app/config.json`, so the container carries a readable record of what it was started with and keeps
+working if it is later started without them.
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -125,7 +129,7 @@ Configuration is no longer baked in at build time. On the container's **first bo
 | `DISABLE_TOOLS` | `true` | Disables OpenCode tool calls so the model cannot run commands or modify files in the container (`1`, `true`, `yes`, `on` turn it on; `0`, `false`, `no`, `off` turn it off) |
 | `OPENCODE_PATH` | empty (auto-detect) | Path to the `opencode` executable; when empty it is resolved through `PATH` (npm global install puts it at `/usr/local/bin/opencode`), and the program also probes `~/.opencode/bin` and the npm/pnpm global directories |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend the gateway launches internally; rarely needs changing |
-| `OPENCODE_USE_ISOLATED_HOME` | unset | Runs the backend with a throwaway `HOME` inside the container (the container is already isolated, so this is rarely needed) |
+| `OPENCODE_USE_ISOLATED_HOME` (or `USE_ISOLATED_HOME`) | unset | Runs the backend with a throwaway `HOME` inside the container (the container is already isolated, so this is rarely needed) |
 | `OPENCODE_BIND_HOST` | `0.0.0.0` | Listen address of the OpenCode backend (4097), `0.0.0.0` by default inside the container; the program default is `127.0.0.1` (non-container behavior unchanged). See [Exposing the 4097 Backend Port](#exposing-the-4097-backend-port) |
 | `LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug` (case-insensitive; invalid values fall back to `info` with a warning). **Exception: never written into `config.json` — the Node process reads the environment directly, so it takes precedence over the `LOG_LEVEL` field there.** See [Logging](#logging) |
 
@@ -143,10 +147,17 @@ docker run -d --restart=always --network common-all --name free-opencode-api --p
 
 ### Precedence rules
 
-- `-e` values are read **only on the first boot**, when `config.json` is generated. If `/app/config.json` already exists it is used as-is and **not overwritten by `-e`** (for example a config persisted with a `-v` mount wins over `-e`).
-- **`LOG_LEVEL` is the exception**: it is never written into `config.json`; the Node process reads it from the environment, so `docker run -e LOG_LEVEL=...` applies on every start (env > the `LOG_LEVEL` field in `config.json` > default `info`).
-- To regenerate from new `-e` values, delete the mounted `config.json` (or drop the `-v` mount) and recreate the container.
-- At runtime settings are read as **`config.json` > built-in `OPENCODE_`-prefixed environment variables (e.g. `OPENCODE_DISABLE_TOOLS`) > built-in defaults**, so the generated `config.json` is the effective configuration (`LOG_LEVEL` excepted, see above).
+- **Environment > `config.json` > built-in defaults**, for every key. `-e KEY=value` therefore applies on **every**
+  start, including when a `config.json` exists (a mounted one included): the file is the fallback, never an override.
+- The entrypoint writes the `-e` values into `/app/config.json` **only when that file is missing**. On later starts the
+  stored file is left untouched, so after changing `-e` values the file can disagree with the running gateway. Delete
+  it (or drop the `-v` mount) and recreate the container if you want the stored copy to match again.
+- **`LOG_LEVEL` is the exception on the write path**: it is never written into `config.json`, so it can only come from
+  the environment (default `info`).
+- A `config.json` that exists but is invalid stops the container with a clear error instead of silently falling back to
+  the defaults — otherwise it would run with the built-in `sk-dummy-123` instead of your key.
+- The image's own defaults (used when generating `config.json`) differ from the program defaults for the container:
+  `BIND_HOST=0.0.0.0`, `OPENCODE_BIND_HOST=0.0.0.0` and `DISABLE_TOOLS=true`.
 
 ---
 
@@ -217,7 +228,9 @@ Notes:
 - `OPENCODE_BIND_HOST` only controls the OpenCode backend (4097); the gateway's own listen address (8083) is controlled by `BIND_HOST` — the two are independent.
 - The gateway always reaches the backend through `OPENCODE_SERVER_URL` (default `http://127.0.0.1:4097`); `OPENCODE_BIND_HOST=0.0.0.0` does not affect gateway-to-backend traffic inside the container, since `0.0.0.0` also covers loopback.
 - To return to container-only access, set `OPENCODE_BIND_HOST=127.0.0.1`.
-- Gotcha: `-e` is only read when `/app/config.json` is generated on the **first boot**. If the file already exists (e.g. from a `-v` mount), `-e` has no effect — edit the mounted `config.json` (set `OPENCODE_BIND_HOST` to `0.0.0.0`) or delete it and recreate the container.
+- `-e OPENCODE_BIND_HOST=...` works on an existing container as well (environment beats `config.json`, see
+  [Precedence rules](#precedence-rules)); the mounted `config.json` only decides what happens when the variable is
+  absent, so set `OPENCODE_BIND_HOST` there too if you want it to survive a start without the flag.
 
 ---
 

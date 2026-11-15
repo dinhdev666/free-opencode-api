@@ -1,8 +1,9 @@
 #!/bin/sh
 # Free OpenCode API container entrypoint
 # On first boot (no /app/config.json inside the container) the config is generated from `docker run -e`
-# environment variables; an existing config.json (e.g. persisted via -v mount) is used as-is and is not
-# overwritten by -e
+# environment variables; an existing config.json (e.g. persisted via -v mount) is left untouched. The file is the
+# fallback for settings, not an override: index.js reads environment variables first, so `-e KEY=value` applies on
+# every start even when the file already holds a different value.
 # Supported (written into config.json): PORT API_KEY BIND_HOST OPENCODE_PATH OPENCODE_SERVER_URL OPENCODE_BIND_HOST
 # and the two boolean flags, under both their names (DISABLE_TOOLS / OPENCODE_DISABLE_TOOLS,
 # USE_ISOLATED_HOME / OPENCODE_USE_ISOLATED_HOME)
@@ -43,7 +44,7 @@ if [ ! -f "$CONFIG" ]; then
         console.log("[entrypoint] log level (LOG_LEVEL env, higher priority than config.json):", env("LOG_LEVEL", "info"));
     '
 else
-    echo "[entrypoint] /app/config.json exists, use it as-is (recreate container without the volume to re-apply -e)"
+    echo "[entrypoint] /app/config.json exists, keeping it (environment variables still win over the file)"
     echo "[entrypoint] log level (LOG_LEVEL env, higher priority than config.json): $LOG_LEVEL_DISPLAY"
 fi
 

@@ -463,10 +463,16 @@ function createApp(config) {
         reply.raw.once('finish', logSummary);
         reply.raw.once('close', logSummary);
 
-        // CORS headers are written on the raw response so they are present for streamed (hijacked) replies as well
+        // CORS headers are written on the raw response so they are present for streamed (hijacked) replies as well.
+        // x-api-key is not read by the gateway, but browsers send it on behalf of clients that do, and a rejected
+        // preflight would break those clients before they ever reach the auth check.
         reply.raw.setHeader('Access-Control-Allow-Origin', '*');
         reply.raw.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        reply.raw.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        reply.raw.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Api-Key, X-Requested-With');
+        // Cache the preflight so a browser client does not pay a round trip before every request
+        reply.raw.setHeader('Access-Control-Max-Age', '600');
+        // The same id the request log carries, so a client-side report can be traced back to a log line
+        reply.raw.setHeader('X-Request-Id', meta.reqId);
 
         if (request.method === 'OPTIONS') return done();
         // /health and / stay open; every other route always requires the bearer token
@@ -476,7 +482,7 @@ function createApp(config) {
         // Constant-time comparison (the length check is required because timingSafeEqual throws on size mismatch)
         if (provided === undefined || provided.length !== bearerToken.length ||
             !timingSafeEqual(Buffer.from(provided), bearerTokenBuffer)) {
-            reply.code(401).send({ error: { message: 'Unauthorized' } });
+            reply.code(401).send({ error: { message: 'Unauthorized', type: 'invalid_request_error', code: 'invalid_api_key' } });
             return;
         }
         done();
@@ -595,12 +601,17 @@ function createApp(config) {
     };
 
     const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
+    // A failed lookup must not be retried on every request: without this a broken /tool/ids endpoint adds one failed
+    // round trip to every completion
+    const TOOL_IDS_FAILURE_TTL_MS = 60 * 1000;
     let cachedToolOverrides = null;
     let cachedToolAt = 0;
+    let cachedToolError = false;
 
     const getToolOverrides = async () => {
         if (!DISABLE_TOOLS) return null;
-        if (cachedToolOverrides && Date.now() - cachedToolAt < TOOL_IDS_CACHE_MS) {
+        const cachedTtl = cachedToolError ? TOOL_IDS_FAILURE_TTL_MS : TOOL_IDS_CACHE_MS;
+        if (Date.now() - cachedToolAt < cachedTtl) {
             return cachedToolOverrides;
         }
         try {
@@ -617,9 +628,15 @@ function createApp(config) {
             });
             cachedToolOverrides = overrides;
             cachedToolAt = Date.now();
+            cachedToolError = false;
             logDebug('Tool overrides loaded', { count: ids.length });
             return overrides;
         } catch (e) {
+            // Remember the failure for a short while (the cache stays empty, so no tools are sent) instead of asking
+            // the backend again on the next request
+            cachedToolOverrides = null;
+            cachedToolAt = Date.now();
+            cachedToolError = true;
             logDebug('Tool override fetch failed', { error: e.message });
             return null;
         }
@@ -775,10 +792,14 @@ function createApp(config) {
             (async () => {
                 try {
                     for await (const event of eventStream) {
-                        if (event.type === 'message.part.updated' && ((event.properties.part && event.properties.part.sessionID) || event.properties.sessionID) === sessionId) {
-                            const { part } = event.properties;
+                        // Not every event carries properties; reading one that does not would throw here and abort a
+                        // subscription that is still perfectly usable
+                        const props = event?.properties;
+                        if (!props) continue;
+                        if (event.type === 'message.part.updated' && ((props.part && props.part.sessionID) || props.sessionID) === sessionId) {
+                            const { part } = props;
                             /* opencode>=1.19 events carry no delta field: part.text is the part's current full text, so derive the increment by diffing against what has already been accumulated */
-                            let delta = event.properties.delta;
+                            let delta = props.delta;
                             if (!delta && (part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
                                 const acc = part.type === 'reasoning' ? reasoning : content;
                                 delta = part.text.startsWith(acc) ? part.text.slice(acc.length) : part.text;
@@ -806,8 +827,8 @@ function createApp(config) {
                             }
                         }
                         if (event.type === 'message.updated' &&
-                            event.properties.info.sessionID === sessionId &&
-                            event.properties.info.finish === 'stop') {
+                            props.info?.sessionID === sessionId &&
+                            props.info?.finish === 'stop') {
                             logDebug('SSE completed', {
                                 sessionId,
                                 ms: Date.now() - startedAt,
@@ -878,10 +899,10 @@ function createApp(config) {
                     const body = request.body && typeof request.body === 'object' ? request.body : {};
                     const { messages, model, stream } = body;
                     if (!messages || !Array.isArray(messages) || messages.length === 0) {
-                        return reply.code(400).send({ error: { message: 'messages array is required' } });
+                        return reply.code(400).send({ error: { message: 'messages array is required', type: 'invalid_request_error' } });
                     }
                     if (typeof model !== 'undefined' && typeof model !== 'string') {
-                        return reply.code(400).send({ error: { message: 'model must be a string' } });
+                        return reply.code(400).send({ error: { message: 'model must be a string', type: 'invalid_request_error' } });
                     }
 
                     // `stream` may arrive as a boolean or as the strings "true"/"false"
@@ -939,7 +960,7 @@ function createApp(config) {
                     const { parts, system: systemMsg, lastUserMsg } = buildPromptParts(messages);
                     const systemWithGuard = applyToolGuard(systemMsg);
                     if (!parts.length) {
-                        return reply.code(400).send({ error: { message: 'messages must include at least one non-system text message' } });
+                        return reply.code(400).send({ error: { message: 'messages must include at least one non-system text message', type: 'invalid_request_error' } });
                     }
                     logDebug('Request start', {
                         model: `${pID}/${mID}`,

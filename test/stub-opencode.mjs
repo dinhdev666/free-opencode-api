@@ -74,12 +74,17 @@ const buildAssistantMessage = (sessionID, text, reasoning) => ({
 async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, delayMs = 5 } = {}) {
     for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
 
+    // opencode interleaves events that have no `properties` at all; the gateway must ignore them instead of
+    // treating the subscription as broken
+    sendEvent({ type: 'server.heartbeat' });
     sendEvent(partUpdate(sessionID, { type: 'reasoning', text: reasoning }));
     await sleep(delayMs);
 
     const step = Math.max(1, Math.ceil(text.length / pieces));
     for (let end = step; end < text.length; end += step) {
         sendEvent(partUpdate(sessionID, { type: 'text', text: text.slice(0, end) }));
+        // A message.updated for something the gateway does not care about, with no `info` at all
+        sendEvent({ type: 'message.updated', properties: {} });
         await sleep(delayMs);
     }
     sendEvent(partUpdate(sessionID, { type: 'text', text }));

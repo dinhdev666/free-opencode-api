@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 46 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 50 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -107,15 +107,20 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   a final frame with `"finish_reason":"stop"`, then `data: [DONE]\n\n`. Reasoning deltas use `reasoning_content`.
   Before the first delta, a `: keep-alive` comment line is written every 15 s (ignored by OpenAI clients, keeps idle
   proxies from dropping the connection); it stops as soon as real frames flow.
-- Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request), `401` (auth), `404` (unknown route),
-  `502` (upstream/provider error), `503` (`type: "queue_full"`, the wait queue is full), `504` (timeout), `500`
-  (anything else).
+- Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request, `type: "invalid_request_error"`), `401`
+  (auth, `type: "invalid_request_error"`, `code: "invalid_api_key"`), `404` (unknown route), `502`
+  (upstream/provider error), `503` (`type: "queue_full"`, the wait queue is full), `504` (timeout), `500`
+  (anything else). Every error body carries a `type`.
 - A client that disconnects mid-stream releases its queue slot immediately: the event subscription is aborted and
   the polling fallbacks are skipped (the backend keeps finishing on its own).
 - Every completion deletes the OpenCode session it created — on the success path, the error path and after a client
   abort. The backend must never accumulate one session per served request; `test/stub-opencode.mjs` exposes
   `GET /__sessions` so the smoke suite can assert `live === 0`.
-- CORS headers are set on the raw response for every request, including hijacked streams.
+- CORS headers are set on the raw response for every request, including hijacked streams:
+  `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, OPTIONS`, `Allow-Headers: Content-Type,
+  Authorization, X-Api-Key, X-Requested-With`, `Max-Age: 600`.
+- Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
+  to a log entry.
 - Request log format: `METHOD url -> status Xms [reqId] model=… stream=…` (info for `/v1/*`, debug otherwise).
 
 ## Working rules for code changes

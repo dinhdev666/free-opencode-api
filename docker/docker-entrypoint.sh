@@ -18,7 +18,9 @@ if [ ! -f "$CONFIG" ]; then
     node -e '
         const fs = require("fs");
         const env = (k, d) => { const v = process.env[k]; return (v === undefined || v === "") ? d : v; };
-        const flag = (k, d) => { const v = env(k, d); return v === "true" || v === "1"; };
+        // Same truthy values as parseBool in index.js, so `-e DISABLE_TOOLS=yes` means the same inside and outside
+        // the container
+        const flag = (k, d) => ["1", "true", "yes", "y", "on"].includes(String(env(k, d)).trim().toLowerCase());
         const cfg = {
             PORT: parseInt(env("PORT", "8083"), 10),
             API_KEY: env("API_KEY", "sk-dummy-123"),

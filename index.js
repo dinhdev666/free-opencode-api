@@ -50,10 +50,13 @@ if (fs.existsSync(configPath)) {
 // Merge configs: env > file > default
 // Note: by design LOG_LEVEL takes env over the config.json logLevel field (same merge direction as the other keys
 // below, where env comes first)
-const parsedPort = Number.parseInt(process.env.PORT ?? fileConfig.PORT ?? '', 10);
-const portIsValid = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort < 65536;
+// A port must be digits only: parseInt('8083abc') is 8083, so a typo used to be accepted silently while the operator
+// believed the gateway listened where they asked
+const rawPort = String(process.env.PORT ?? fileConfig.PORT ?? '').trim();
+const portIsValid = /^\d{1,5}$/.test(rawPort) && Number(rawPort) > 0 && Number(rawPort) < 65536;
+const parsedPort = portIsValid ? Number(rawPort) : defaultConfig.PORT;
 if (!portIsValid && (process.env.PORT !== undefined || fileConfig.PORT !== undefined)) {
-    logger.warn(`[Config] PORT is not a valid TCP port (1-65535), falling back to ${defaultConfig.PORT}`);
+    logger.warn(`[Config] PORT '${rawPort}' is not a valid TCP port (1-65535), falling back to ${defaultConfig.PORT}`);
 }
 
 const finalConfig = {

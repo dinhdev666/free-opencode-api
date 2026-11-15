@@ -122,7 +122,7 @@ Configuration is no longer baked in at build time. On the container's **first bo
 | `PORT` | `8083` | Gateway listen port |
 | `API_KEY` | `sk-dummy-123` | Gateway auth key; mandatory — an empty value falls back to the default key instead of disabling authentication |
 | `BIND_HOST` | `0.0.0.0` | Must listen on `0.0.0.0` inside the container for port mapping to work (the program default is `127.0.0.1`; the entrypoint overrides it) |
-| `DISABLE_TOOLS` | `true` | Disables OpenCode tool calls so the model cannot run commands or modify files in the container |
+| `DISABLE_TOOLS` | `true` | Disables OpenCode tool calls so the model cannot run commands or modify files in the container (`1`, `true`, `yes`, `on` turn it on; `0`, `false`, `no`, `off` turn it off) |
 | `OPENCODE_PATH` | empty (auto-detect) | Path to the `opencode` executable; when empty it is resolved through `PATH` (npm global install puts it at `/usr/local/bin/opencode`), and the program also probes `~/.opencode/bin` and the npm/pnpm global directories |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend the gateway launches internally; rarely needs changing |
 | `OPENCODE_BIND_HOST` | `0.0.0.0` | Listen address of the OpenCode backend (4097), `0.0.0.0` by default inside the container; the program default is `127.0.0.1` (non-container behavior unchanged). See [Exposing the 4097 Backend Port](#exposing-the-4097-backend-port) |

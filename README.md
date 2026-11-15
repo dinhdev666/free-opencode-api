@@ -41,6 +41,9 @@
 - **Zero extra infrastructure** — one Node.js process; the OpenCode backend is launched and supervised automatically.
 - **Mandatory authentication** — every request needs `Authorization: Bearer <key>` (the scheme is case-insensitive, and `X-Api-Key: <key>` works as an alias). The default key is `sk-dummy-123`, and authentication cannot be disabled: a blank `API_KEY` simply falls back to that default.
 - **Tool guard** — `DISABLE_TOOLS=true` keeps models from running commands or touching files on the host.
+- **The backend never sees the gateway key** — the `opencode serve` child is spawned without `API_KEY` in its
+  environment (it authenticates nothing with it), and its throwaway working directory is created with mode `0700`, so
+  neither the credential nor the backend's sandbox is exposed to other local users.
 - **Structured logging** — `error` / `warn` / `info` / `debug` levels, one-line request summaries, secrets masked.
 - **Production friendly** — configurable bind host, request timeouts, graceful shutdown, Docker image available.
 - **Fast HTTP stack** — built on Fastify 5 with precompiled response schemas and no per-request middleware chain.
@@ -84,7 +87,16 @@ summary, CORS headers, bearer auth) and no plugin-level middleware chain. Additi
   finished, so a provider that pauses mid-answer is not mistaken for one that is done.
 - **Backend health probes are cached and keep-alive** — one probe is shared across a burst of requests
   (`OPENCODE_PROXY_HEALTH_CACHE_MS`, default 2000 ms) over a reused socket; a connection failure invalidates the
-  cache immediately.
+  cache immediately. A backend that was already known to be healthy but whose cache window has expired is re-probed
+  **in the background**, so the request that arrives after a quiet period does not pay for the health round trip
+  before its own work starts (a backend that died in the meantime is still recovered by the request that hits it).
+- **Polling starts fast, then settles** — the first polls of a completion run at 25/50/100/200 ms and then at the
+  normal interval, because an answer that lands a few tens of milliseconds after the prompt returned used to wait a
+  full 500 ms interval before it was seen. The "the text stopped growing" guard is measured in time (~1.5 s), not in
+  poll count, so the shorter early polls cannot make it accept a half-written answer.
+- **One budget per completion** — the prompt, the event stream and the polling fallback share the request budget
+  (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`) instead of each starting a fresh one, so a stalled stream ends within the
+  advertised timeout instead of after roughly twice it.
 - **Startup failures fail fast** — if the OpenCode process exits during startup (missing binary, bad path) the
   readiness wait is aborted instead of burning the full budget, and requests answer in milliseconds for the retry
   cooldown window (`OPENCODE_PROXY_START_RETRY_MS`, default 15000 ms).
@@ -238,8 +250,8 @@ Advanced tuning (environment or `config.json`; the environment wins when both se
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `300000` | Upstream request timeout in milliseconds |
-| `OPENCODE_PROXY_HEALTH_CACHE_MS` | `2000` | How long a successful backend health probe is trusted before the next one (`0` probes on every request) |
+| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `300000` | Upstream request timeout in milliseconds, shared by every phase of a completion (prompt, event stream, poll fallback) |
+| `OPENCODE_PROXY_HEALTH_CACHE_MS` | `2000` | How long a successful backend health probe is trusted before the next one (`0` probes on every request). An expired-but-known-healthy backend is re-probed in the background, so a request after a quiet period does not wait for it |
 | `OPENCODE_PROXY_START_RETRY_MS` | `15000` | Cooldown after a failed backend start attempt; requests fail fast instead of retrying immediately |
 | `OPENCODE_PROXY_MAX_CONCURRENCY` | `1` | Number of chat completions processed in parallel (1..32). `1` keeps the historical serialized behaviour; raise it only if the backend/provider tolerates concurrent sessions |
 | `OPENCODE_PROXY_MAX_QUEUE` | `64` | How many completions may wait for a free slot before the gateway answers `503 queue_full` instead of accepting more work (the queue holds request bodies, so it is bounded). Counts waiting requests only: `0` rejects a completion when no slot is free instead of queueing it. A slot frees as soon as its response is written (the session cleanup that follows does not hold it) |
@@ -247,6 +259,10 @@ Advanced tuning (environment or `config.json`; the environment wins when both se
 | `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` (legacy alias; prefer `LOG_LEVEL=debug`) |
 | `DEBUG` | `false` | The same switch as `config.json` spells it (`OPENCODE_PROXY_DEBUG` is the environment name); `LOG_LEVEL=debug` is still the preferred way |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Fallback bind address when `BIND_HOST` is not set |
+
+A tuning value that cannot be used (a typo, a negative number) is **reported at startup** —
+`[Config] OPENCODE_PROXY_REQUEST_TIMEOUT_MS='abc' is not a positive number, using 300000` — instead of being replaced
+by the default in silence, so the log always says which value is actually in force.
 
 > `LOG_LEVEL` is read directly from the environment by the Node process, so it always wins over the `LOG_LEVEL` field in `config.json`.
 
@@ -310,7 +326,9 @@ clients can read it.
 Errors follow the OpenAI error envelope (`{"error": {"message": ..., "type": ...}}`): `400` for an invalid request
 (`type: "invalid_request_error"`, with Fastify's own `code` such as `FST_ERR_CTP_INVALID_JSON_BODY` when the body could
 not be parsed), `401` for a missing or wrong key (`type: "invalid_request_error"`, `code: "invalid_api_key"`), `404` for
-an unknown route (`type: "not_found"`), `413` for a body over `OPENCODE_PROXY_MAX_BODY_MB` (50 MiB by default),
+an unknown route (`type: "not_found"`), `408`/`431` for a request the HTTP parser rejected (a timeout, an oversized
+header block; ordinary parse errors are `400`) — those also answer the envelope, with CORS headers and an
+`X-Request-Id`, `413` for a body over `OPENCODE_PROXY_MAX_BODY_MB` (50 MiB by default),
 `415` for a content type or content encoding the
 gateway cannot read, `502` for an upstream/provider failure (streaming requests included: a
 provider failure that arrives before the first token is an HTTP error, not an empty answer, and a backend that dies
@@ -371,7 +389,7 @@ All output goes to stdout/stderr with a `[gateway]` prefix:
 | --- | --- |
 | `error` | Upstream failures (with status code and error-body summary) and fatal startup problems. Always emitted, stderr. |
 | `warn` | Invalid configuration fallbacks and self-recoverable anomalies. stderr. |
-| `info` | Default. Startup information plus a one-line summary per request: method, path, model, streaming, status, latency, request id. stdout. |
+| `info` | Default. Startup information plus a one-line summary per request: method, path, model, streaming, status, latency, request id. The model id in that line is normalised (control characters replaced, length capped): it comes from the request body, and a newline in it must not be able to start a second log line. stdout. |
 | `debug` | Inbound request headers (secrets masked), the final payload sent to the backend, and full responses. stdout. |
 
 Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked before they are logged.
@@ -397,7 +415,9 @@ docker pull dinhdev666/free-opencode-api:2.0.0
 docker run -d --restart=always -p 8083:8083 -e API_KEY=sk-your-key dinhdev666/free-opencode-api:2.0.0
 ```
 
-Docker Hub selects the matching architecture automatically. A new image is published by
+Docker Hub selects the matching architecture automatically. The image runs as the unprivileged `node` user
+(uid/gid 1000), not as root: a bind-mounted `config.json` or credential directory has to be readable by that user (see
+[the container README](docker/README.md#running-as-a-non-root-user)). A new image is published by
 `.github/workflows/docker-publish.yml` whenever a `v*.*.*` tag is pushed — see [CI and Releases](#ci-and-releases).
 
 ---

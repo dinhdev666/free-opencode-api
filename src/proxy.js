@@ -22,6 +22,12 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
 // client already has its answer and a wedged delete would otherwise hold a queue slot for the full request budget.
 const SESSION_CLEANUP_TIMEOUT_MS = 10000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
+// The first polls come back quickly. An answer that lands 30-80 ms after the prompt returned - the shape a backend
+// that is already writing produces - used to wait a whole 500 ms interval before the next poll saw it: measured p50
+// for that shape was 507 ms with a fixed interval and 90 ms with this schedule (a few extra cheap `GET …/message`
+// calls are the cost). Each entry only ever shortens the caller's interval, and the schedule stops at the fourth
+// poll, so a backend that is genuinely slow is still polled twice a second.
+const POLL_BACKOFF_MS = [25, 50, 100, 200];
 // How many polls in a row may fail before a completion is reported as an upstream error
 const MAX_POLL_FAILURES = 5;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
@@ -45,6 +51,19 @@ const IDLE_RECOVERY_STALL_POLLS = Math.max(3, Math.ceil(DEFAULT_EVENT_IDLE_TIMEO
 // without a random source, and the millisecond stamp keeps them roughly sortable.
 let completionIdSeq = 0;
 const newCompletionId = () => `chatcmpl-${Date.now().toString(36)}${String(completionIdSeq++).padStart(3, '0')}`;
+
+// One log line is one record. A client-controlled value carrying a newline would be read as a *second* record (a
+// forged request summary, a fake `[Security]` or `[Shutdown]` line), an ANSI escape would reach the operator's
+// terminal and the log shipper, and an unbounded value would turn one request body into an arbitrarily large log
+// record - a 2 MB model id produced a 2 MB info line. The values are normalised for logging only; the backend still
+// receives the id verbatim, because the contract does not restrict model ids.
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
+const MAX_LOGGED_MODEL_LENGTH = 128;
+const MAX_LOGGED_URL_LENGTH = 512;
+const loggableModelId = (id) => {
+    const clean = String(id).replace(CONTROL_CHARS_RE, '?');
+    return clean.length > MAX_LOGGED_MODEL_LENGTH ? `${clean.slice(0, MAX_LOGGED_MODEL_LENGTH)}…` : clean;
+};
 
 // Authentication is mandatory by design: when API_KEY is missing or blank the gateway falls back to this
 // built-in key instead of running without authentication.
@@ -408,12 +427,22 @@ function checkHealth(serverUrl) {
 // How long a successful health probe is trusted before the next one (0 disables the cache). Resolved again by
 // startProxy() from the merged configuration, so a value in config.json is honoured and not silently ignored - the
 // README documents every tuning key as env > config.json > default.
+// A value that cannot be used is reported by the caller (startProxy logs it): silently running with the default is the
+// failure mode readLimit() was written to end for the queue knobs - an operator who typo'd the request budget had
+// nothing to notice while the gateway kept using 300000 ms.
 const readMilliseconds = (name, fallback, fileValue) => {
     const fromEnv = process.env[name];
     const raw = (fromEnv === undefined || String(fromEnv).trim() === '') ? fileValue : fromEnv;
     if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
     const parsed = Number(raw);
     return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+};
+
+// True when a configured millisecond value is present but unusable (so startProxy can name it and the value it used)
+const isUnusableMilliseconds = (value) => {
+    if (value === undefined || value === null || String(value).trim() === '') return false;
+    const parsed = Number(value);
+    return !Number.isFinite(parsed) || parsed < 0;
 };
 
 let BACKEND_HEALTH_CACHE_MS = readMilliseconds('OPENCODE_PROXY_HEALTH_CACHE_MS', 2000);
@@ -583,6 +612,46 @@ function createApp(config) {
     // DEBUG no longer controls output directly (startProxy maps it onto the debug log level), so it is not destructured here
     const { API_KEY, OPENCODE_SERVER_URL, REQUEST_TIMEOUT_MS, DISABLE_TOOLS } = config;
 
+    // A request line or header the HTTP parser rejects never reaches the onRequest hook (hooks run after routing), so
+    // it used to be answered by Fastify's own handler with `{"error":"Bad Request","message":"Client Error",
+    // "statusCode":400}`: no `type`, no CORS headers, no X-Request-Id and no log line, all four of which the API
+    // contract documents as unconditional. The status and the reason stay what Node reported (400, 431 for an
+    // oversized header block, 408 for a request timeout), but the body is the OpenAI envelope and the response carries
+    // the same headers every other response does, so a browser client behind a proxy sees a usable error.
+    const CLIENT_ERROR_STATUS = {
+        ERR_HTTP_REQUEST_TIMEOUT: { status: 408, reason: 'Request timeout' },
+        HPE_HEADER_OVERFLOW: { status: 431, reason: 'Exceeded maximum allowed HTTP header size' }
+    };
+    const clientErrorHandler = (error, socket) => {
+        // Node reports a reset connection with a socket that is already gone: there is nothing to answer
+        if (error?.code === 'ECONNRESET' || socket.destroyed) return;
+        const mapped = CLIENT_ERROR_STATUS[error?.code];
+        const status = mapped ? mapped.status : 400;
+        const reason = mapped ? mapped.reason : 'Malformed HTTP request';
+        // The error code is the useful part for support; the message can carry raw bytes from the request, so it is
+        // not logged (a log line is one record and must not be forgeable by a malformed client)
+        const code = typeof error?.code === 'string' && /^[A-Z_]{1,64}$/.test(error.code) ? error.code : undefined;
+        const reqId = `gw-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        logger.warn(`[Proxy] Rejected malformed request: ${error?.code || 'parse error'}`);
+        const body = JSON.stringify({ error: { message: reason, type: 'invalid_request_error', ...(code ? { code } : {}) } });
+        if (socket.writable) {
+            socket.write(
+                `HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\n` +
+                'Content-Type: application/json; charset=utf-8\r\n' +
+                `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+                'Access-Control-Allow-Origin: *\r\n' +
+                'Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n' +
+                'Access-Control-Allow-Headers: Content-Type, Authorization, X-Api-Key, X-Requested-With\r\n' +
+                'Access-Control-Max-Age: 600\r\n' +
+                'Access-Control-Expose-Headers: X-Request-Id\r\n' +
+                `X-Request-Id: ${reqId}\r\n` +
+                'Connection: close\r\n\r\n' +
+                body
+            );
+        }
+        socket.destroy();
+    };
+
     // Performance-oriented setup: no built-in logger (we log ourselves, so Fastify's automatic request logging has
     // nothing to write to anyway), 50 MB JSON body limit, and trailing-slash tolerance matching the previous behavior.
     const app = Fastify({
@@ -591,7 +660,9 @@ function createApp(config) {
         // parsed body, so this is the other half of the gateway's memory bound
         bodyLimit: MAX_BODY_MB * 1024 * 1024,
         routerOptions: { ignoreTrailingSlash: true },
-        trustProxy: false
+        trustProxy: false,
+        // Replaces Fastify's default handler for requests the HTTP parser rejects (see clientErrorHandler)
+        clientErrorHandler
     });
 
     // Fastify parses `application/json` (and `text/plain` as an opaque string the handler reads as JSON), but a body
@@ -660,9 +731,16 @@ function createApp(config) {
             if (logged) return;
             logged = true;
             if (!summaryEnabled) return;
+            // `meta.model` is client input (the model id from the request body) and `request.url` is bounded only by
+            // the HTTP parser's header limit: the model id is normalised where it is stored, and a pathological URL
+            // is cut here, so neither can forge a second log line or turn one request into an arbitrarily large log
+            // record. Both are logged, never echoed to the client, so truncation loses nothing a reader needs.
             const model = meta.model || '-';
+            const url = request.url.length > MAX_LOGGED_URL_LENGTH
+                ? `${request.url.slice(0, MAX_LOGGED_URL_LENGTH)}…[truncated ${request.url.length - MAX_LOGGED_URL_LENGTH} chars]`
+                : request.url;
             const streamText = typeof meta.stream === 'boolean' ? String(meta.stream) : '-';
-            const line = `${request.method} ${request.url} -> ${reply.raw.statusCode} ${Date.now() - startedAt}ms [${meta.reqId}] model=${model} stream=${streamText}`;
+            const line = `${request.method} ${url} -> ${reply.raw.statusCode} ${Date.now() - startedAt}ms [${meta.reqId}] model=${model} stream=${streamText}`;
             if (isApiPath) logger.info(line);
             else logger.debug(line);
         };
@@ -771,7 +849,6 @@ function createApp(config) {
     };
 
     const fetchModels = async () => {
-        const now = Date.now();
         try {
             const providersRes = await client.config.providers(backendDeadline(MODELS_TIMEOUT_MS));
             const providersRaw = providersRes.data?.providers || [];
@@ -807,7 +884,10 @@ function createApp(config) {
                 return STATIC_FALLBACK_MODELS;
             }
             modelsCache = { object: 'list', data: models };
-            modelsCacheAt = now;
+            // Stamped when the answer arrives, not when the round trip started: the TTL used to be measured from the
+            // moment the provider call began, so a call slower than the TTL cached an entry that was already expired
+            // and every listing paid a full round trip (a 6 s provider against the 5 s TTL never hit the cache).
+            modelsCacheAt = Date.now();
             return models;
         } catch (error) {
             logger.error('[Proxy] Model Fetch Error:', { error: error.message, status: error.status, body: error.response?.data || error.responseBody || null });
@@ -1124,15 +1204,21 @@ function createApp(config) {
         // still being generated, which truncated it. A provider that never marks its message finished is still
         // answered once the text stops growing for three consecutive polls.
         const requireDone = Boolean(options.requireDone);
-        // How many identical polls mean "this message will never be marked finished". Three (~1.5 s) is right after a
-        // normal prompt, but not after an idle timeout: the backend has been silent for the whole idle window already,
-        // and giving up 1.5 s into the same silence truncated an answer a slow model was still writing (the client got
-        // `finish_reason: "stop"` for text that stopped mid-sentence). That path asks for a full idle window instead.
+        // How long an unchanged message means "this message will never be marked finished". Three intervals (~1.5 s)
+        // is right after a normal prompt, but not after an idle timeout: the backend has been silent for the whole
+        // idle window already, and giving up 1.5 s into the same silence truncated an answer a slow model was still
+        // writing (the client got `finish_reason: "stop"` for text that stopped mid-sentence). That path asks for a
+        // full idle window instead.
         const stablePollsRequired = Number.isFinite(options.stablePollsRequired) && options.stablePollsRequired >= 1
             ? Math.floor(options.stablePollsRequired)
             : 3;
+        // Measured as time, not as polls. The first polls are far shorter than an interval (POLL_BACKOFF_MS), so
+        // counting "three identical polls" would have meant 75 ms of silence instead of 1.5 s and started accepting
+        // half-written answers; a window keeps the documented behaviour whatever the poll cadence is.
+        const stableWindowMs = stablePollsRequired * intervalMs;
         let lastContent = '';
-        let stablePolls = 0;
+        let lastContentAt = 0;
+        let pollIndex = 0;
         // One failed poll used to end the whole completion: a single 5xx or a reset connection while the backend was
         // busy threw out of the loop, so the client got an error although the answer was one poll away. Polls are
         // retried instead, and only a run of consecutive failures (the backend really is gone) is reported.
@@ -1196,12 +1282,14 @@ function createApp(config) {
                     const { content, reasoning } = extractFromParts(entry?.parts || []);
                     const error = info?.error || null;
                     const done = Boolean(info.finish || info.time?.completed || error);
-                    if (content && content === lastContent) stablePolls += 1;
-                    else {
+                    let stableFor = 0;
+                    if (content && content === lastContent) {
+                        stableFor = Date.now() - lastContentAt;
+                    } else {
                         lastContent = content;
-                        stablePolls = 0;
+                        lastContentAt = Date.now();
                     }
-                    if (done || stablePolls >= stablePollsRequired || (!requireDone && (content || reasoning))) {
+                    if (done || stableFor >= stableWindowMs || (!requireDone && (content || reasoning))) {
                         if (error) {
                             logger.error('[Proxy] OpenCode assistant error:', { sessionId, error });
                         }
@@ -1222,7 +1310,12 @@ function createApp(config) {
                 // An empty list is a normal "not written yet" poll, not a failure
                 consecutiveFailures = 0;
             }
-            await sleep(intervalMs);
+            // The first polls are short (see POLL_BACKOFF_MS), then the caller's interval applies
+            const waitMs = pollIndex < POLL_BACKOFF_MS.length
+                ? Math.min(intervalMs, POLL_BACKOFF_MS[pollIndex])
+                : intervalMs;
+            pollIndex += 1;
+            await sleep(waitMs);
         }
         logDebug('Polling timeout', { sessionId, ms: Date.now() - pollStart });
         throw new Error(`Request timeout after ${timeoutMs}ms`);
@@ -1405,6 +1498,13 @@ function createApp(config) {
     // Chat completions endpoint
     app.post('/v1/chat/completions', { schema: { response: { 200: CHAT_COMPLETION_SCHEMA } } }, async (request, reply) => {
         let hijacked = false;
+        // Every phase of a completion (prompt, event subscription, poll fallback) shares one budget: the phases used to
+        // each start a fresh REQUEST_TIMEOUT_MS, so a streaming request whose event stream timed out spent a second
+        // full budget polling and the queue timer (REQUEST_TIMEOUT_MS + 20 s) answered with a message naming a budget
+        // that had already been exceeded. A phase now receives what is left, so the queue timer is the backstop the
+        // documentation describes instead of the normal path.
+        const requestStartedAt = Date.now();
+        const remainingBudget = () => Math.max(1, REQUEST_TIMEOUT_MS - (Date.now() - requestStartedAt));
         // Declared here (not inside the try) so the error paths can log the request id even when the body
         // handling itself throws
         let reqId = null;
@@ -1499,7 +1599,8 @@ function createApp(config) {
                         });
                     }
                     if (request.gatewayLog) {
-                        request.gatewayLog.model = `${pID}/${mID}`;
+                        // Logged copy only (see loggableModelId): the request log line is one record per request
+                        request.gatewayLog.model = loggableModelId(`${pID}/${mID}`);
                         request.gatewayLog.stream = wantsStream;
                     }
 
@@ -1547,6 +1648,22 @@ function createApp(config) {
                             lastUserMsg: userContents[userContents.length - 1] || ''
                         };
                     };
+
+                    // A role is client input, and `(role || 'user').toLowerCase()` threw on a truthy non-string
+                    // (`5`, `{}`, `[]`, `true`): the client's bad field was answered 500 and the message carried the
+                    // internal expression (`((intermediate value) || "user").toLowerCase is not a function`). A missing
+                    // or null role keeps its documented lenient default; anything that is not a string is a 400.
+                    for (let i = 0; i < messages.length; i++) {
+                        const role = messages[i]?.role;
+                        if (role !== undefined && role !== null && typeof role !== 'string') {
+                            return reply.code(400).send({
+                                error: {
+                                    message: `messages[${i}].role must be a string`,
+                                    type: 'invalid_request_error'
+                                }
+                            });
+                        }
+                    }
 
                     const { parts, system: systemMsg, lastUserMsg } = buildPromptParts(messages);
                     const systemWithGuard = applyToolGuard(systemMsg);
@@ -1808,7 +1925,10 @@ function createApp(config) {
 
                         const collectDeferred = collectFromEvents(
                             sessionId,
-                            REQUEST_TIMEOUT_MS,
+                            // The collector shares the request budget too: when it runs out, the fallback below has
+                            // nothing left to spend and the client is told the completion timed out - instead of the
+                            // two phases each buying a full budget
+                            remainingBudget(),
                             sendDelta,
                             DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
                             DEFAULT_EVENT_IDLE_TIMEOUT_MS
@@ -1830,7 +1950,7 @@ function createApp(config) {
                             })
                             .catch((err) => ({ __error: err }));
                         const promptStart = Date.now();
-                        const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                        const promptResult = await promptWithTimeout(promptParams, remainingBudget());
                         logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
                         // A prompt the backend rejected is an upstream failure, not a slow answer: waiting for an
                         // assistant message that will never exist held the slot until the whole budget expired.
@@ -1845,7 +1965,7 @@ function createApp(config) {
                         const emitPolled = async (appendOnly, stallPolls = 3) => {
                             const { content, reasoning, error } = await pollForAssistantResponse(
                                 sessionId,
-                                REQUEST_TIMEOUT_MS,
+                                remainingBudget(),
                                 DEFAULT_POLL_INTERVAL_MS,
                                 () => clientGone,
                                 { requireDone: true, stablePollsRequired: stallPolls }
@@ -1943,7 +2063,7 @@ function createApp(config) {
                             clientGone = true;
                         });
                         const promptStart = Date.now();
-                        const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                        const promptResult = await promptWithTimeout(promptParams, remainingBudget());
                         logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
                         // A prompt the backend rejected is an upstream failure, not a slow answer: polling would never
                         // find a message and the client got a 504 after the whole request budget.
@@ -1955,7 +2075,7 @@ function createApp(config) {
                         if (fromPrompt) logDebug('Polling skipped (prompt carried the finished message)', { sessionId });
                         const { content, reasoning, error } = fromPrompt || await pollForAssistantResponse(
                             sessionId,
-                            REQUEST_TIMEOUT_MS,
+                            remainingBudget(),
                             DEFAULT_POLL_INTERVAL_MS,
                             () => clientGone,
                             { requireDone: true }
@@ -2233,6 +2353,27 @@ async function waitForPendingStart(state) {
     }
 }
 
+// At most one background health probe per backend at a time: a burst of completions that all arrive after the trust
+// window must not each spend a probe.
+const healthRefreshInFlight = new Set();
+function refreshBackendHealthInBackground(state, serverUrl) {
+    if (healthRefreshInFlight.has(state)) return;
+    healthRefreshInFlight.add(state);
+    checkHealth(serverUrl)
+        .then(() => {
+            state.healthyAt = Date.now();
+            state.lastStartFailureAt = 0;
+        })
+        .catch(() => {
+            // A connection failure clears the trust exactly like the request path does, so the next completion takes
+            // the blocking path (probe, retry cooldown, start) instead of believing a backend that is gone.
+            state.healthyAt = 0;
+        })
+        .finally(() => {
+            healthRefreshInFlight.delete(state);
+        });
+}
+
 /**
  * Backend Lifecycle Management
  */
@@ -2262,6 +2403,18 @@ async function ensureBackend(config, options = {}) {
     // A recent successful probe is trusted for BACKEND_HEALTH_CACHE_MS so a burst of chat requests shares one
     // health round trip instead of one per request; connection failures reset the timestamp (see chat error path)
     if (options.force !== true && BACKEND_HEALTH_CACHE_MS > 0 && state.healthyAt && Date.now() - state.healthyAt < BACKEND_HEALTH_CACHE_MS) {
+        return;
+    }
+
+    // A known-good backend whose trust window has expired is refreshed in the background instead of being probed on
+    // the request path. With the default 2 s window and MAX_CONCURRENCY=1, essentially every interactive completion
+    // arrived after the window and paid a serial /health round trip before session.create: +3.2 ms on loopback
+    // (+82 % of the local happy path, measured) and one full RTT against a networked backend. Nothing is lost: a
+    // backend that died is still recovered by the request that hits it - session.create fails on the connection error,
+    // clears healthyAt and calls ensureBackend() again - and a backend that has never answered still takes the
+    // blocking path below. `OPENCODE_PROXY_HEALTH_CACHE_MS=0` keeps its documented meaning (a probe per request).
+    if (options.force !== true && BACKEND_HEALTH_CACHE_MS > 0 && state.healthyAt) {
+        refreshBackendHealthInBackground(state, OPENCODE_SERVER_URL);
         return;
     }
 
@@ -2362,7 +2515,13 @@ async function ensureBackend(config, options = {}) {
             // On Windows, don't use isolated fake-home to avoid path issues
             // On Unix-like systems, use jail for isolation
             const salt = Math.random().toString(36).substring(7);
-            const jailRoot = path.join(os.tmpdir(), 'opencode-proxy-jail', salt);
+            // 0700: this tree is the backend's working directory and, with USE_ISOLATED_HOME, its entire HOME. The
+            // default mode (0755) let any other local user on a shared /tmp traverse and list it, which defeats the
+            // isolation the option exists for. mkdir's mode is masked by the umask, so 0700 is the strictest that
+            // survives.
+            const jailParent = path.join(os.tmpdir(), 'opencode-proxy-jail');
+            fs.mkdirSync(jailParent, { recursive: true, mode: 0o700 });
+            const jailRoot = path.join(jailParent, salt);
             state.jailRoot = jailRoot;
             ownedJailRoots.add(jailRoot);
             const workspace = path.join(jailRoot, 'empty-workspace');
@@ -2380,7 +2539,7 @@ async function ensureBackend(config, options = {}) {
                 };
                 logger.info('[Proxy] Running on Windows, using standard user home directory');
             } else {
-                fs.mkdirSync(workspace, { recursive: true });
+                fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
                 cwd = workspace;
 
                 if (useIsolatedHome) {
@@ -2394,7 +2553,7 @@ async function ensureBackend(config, options = {}) {
                     const sessionDir = path.join(storageDir, 'session');
 
                     [fakeHome, opencodeDir, storageDir, messageDir, sessionDir].forEach(d => {
-                        if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+                        if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
                     });
 
                     envVars = {
@@ -2412,6 +2571,13 @@ async function ensureBackend(config, options = {}) {
                     logger.info('[Proxy] Using real HOME for OpenCode (isolation disabled)');
                 }
             }
+
+            // The gateway's own credential and its private plumbing are not the backend's business: the child is
+            // an agent runtime that, with tools enabled, executes model-directed work, so it must not inherit the key
+            // that guards this gateway (it only guards this gateway - `opencode serve` authenticates nothing with it).
+            // Provider credentials the CLI needs live in its own auth store or under their own names and stay.
+            delete envVars.API_KEY;
+            delete envVars.OPENCODE_PROXY_DEBUG;
 
             let port = '4097';
             try {
@@ -2541,13 +2707,19 @@ export function startProxy(options) {
         ),
         REQUEST_TIMEOUT_MS: (() => {
             // A malformed value must fall back to the default: Number('abc') is NaN and setTimeout(NaN) fires
-            // immediately, which would turn every completion into a 504
-            const raw = Number(
-                options.REQUEST_TIMEOUT_MS ??
+            // immediately, which would turn every completion into a 504. The fallback is named, like the queue and
+            // body knobs: a typo used to be invisible, so the gateway ran with 300000 ms while the operator believed
+            // a shorter budget was in force.
+            const requested = options.REQUEST_TIMEOUT_MS ??
                 process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS ??
-                options.OPENCODE_PROXY_REQUEST_TIMEOUT_MS
-            );
-            return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_REQUEST_TIMEOUT_MS;
+                options.OPENCODE_PROXY_REQUEST_TIMEOUT_MS;
+            const raw = Number(requested);
+            if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+            const blank = requested === undefined || requested === null || String(requested).trim() === '';
+            if (!blank) {
+                logger.warn(`[Config] OPENCODE_PROXY_REQUEST_TIMEOUT_MS='${String(requested).trim()}' is not a positive number, using ${DEFAULT_REQUEST_TIMEOUT_MS}`);
+            }
+            return DEFAULT_REQUEST_TIMEOUT_MS;
         })(),
         DISABLE_TOOLS: disableTools,
         DEBUG: parseBoolean(options.DEBUG, parseBoolean(process.env.OPENCODE_PROXY_DEBUG, false))
@@ -2568,17 +2740,23 @@ export function startProxy(options) {
     );
     MAX_BODY_MB = resolvedBodyLimit.value;
     if (resolvedBodyLimit.note) logger.warn(`[Config] ${resolvedBodyLimit.note}`);
-    // The two backend timings follow the same precedence
+    // The two backend timings follow the same precedence, and an unusable value is named for the same reason
     BACKEND_HEALTH_CACHE_MS = readMilliseconds(
         'OPENCODE_PROXY_HEALTH_CACHE_MS',
         2000,
         options.OPENCODE_PROXY_HEALTH_CACHE_MS
     );
+    if (isUnusableMilliseconds(options.OPENCODE_PROXY_HEALTH_CACHE_MS ?? process.env.OPENCODE_PROXY_HEALTH_CACHE_MS)) {
+        logger.warn(`[Config] OPENCODE_PROXY_HEALTH_CACHE_MS='${String(options.OPENCODE_PROXY_HEALTH_CACHE_MS ?? process.env.OPENCODE_PROXY_HEALTH_CACHE_MS).trim()}' is not a number, using ${BACKEND_HEALTH_CACHE_MS}`);
+    }
     BACKEND_START_RETRY_COOLDOWN_MS = readMilliseconds(
         'OPENCODE_PROXY_START_RETRY_MS',
         15000,
         options.OPENCODE_PROXY_START_RETRY_MS
     );
+    if (isUnusableMilliseconds(options.OPENCODE_PROXY_START_RETRY_MS ?? process.env.OPENCODE_PROXY_START_RETRY_MS)) {
+        logger.warn(`[Config] OPENCODE_PROXY_START_RETRY_MS='${String(options.OPENCODE_PROXY_START_RETRY_MS ?? process.env.OPENCODE_PROXY_START_RETRY_MS).trim()}' is not a number, using ${BACKEND_START_RETRY_COOLDOWN_MS}`);
+    }
 
     // Log level resolution (calibrated at startup; all later log output follows this level):
     // 1) LOG_LEVEL (options/env, case-insensitive) 2) when not explicitly set but the legacy DEBUG switch is on,

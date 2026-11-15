@@ -1840,6 +1840,81 @@ async function run() {
     await new Promise((resolve) => wedgedBackend.close(resolve));
     if (typeof wedgedBackend.closeAllConnections === 'function') wedgedBackend.closeAllConnections();
 
+    // --- client input that must not become a 500, a forged log line, or a bare parser error --------------
+    // A role is client input: a truthy non-string threw inside the prompt builder and answered 500 with the internal
+    // expression in the message (`((intermediate value) || "user").toLowerCase is not a function`).
+    const badRole = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 5, content: 'hi' }] }
+    });
+    check('a non-string message role is a client error, not a gateway crash',
+        badRole.response.status === 400 && badRole.json?.error?.type === 'invalid_request_error',
+        `${badRole.response.status} ${badRole.text.slice(0, 160)}`);
+    check('the rejected role names the field and leaks nothing internal',
+        /messages\[0\]\.role must be a string/.test(badRole.json?.error?.message || '') && !/toLowerCase/.test(badRole.text),
+        badRole.text.slice(0, 160));
+
+    // The model id is client input that lands in the request log line: a newline in it used to start a second,
+    // attacker-written line (`FORGED [INFO] …`), and an unbounded id turned one request body into that many bytes of
+    // log. The backend still receives the id verbatim; only the logged copy is normalised.
+    const forgedModel = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/big-pickle\n[Security] FORGED', messages: [{ role: 'user', content: 'hi' }] }
+    });
+    const longModelAnswer = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: `opencode/${'x'.repeat(2000)}`, messages: [{ role: 'user', content: 'hi' }] }
+    });
+    await sleep(200);
+    const forgedLines = gatewayOutput.split('\n').filter((line) => line.includes('FORGED'));
+    check('a model id carrying a newline cannot start a second log line',
+        forgedModel.response.status === 200 && forgedLines.length > 0 &&
+        forgedLines.every((line) => /model=opencode\/big-pickle\?\[Security\] FORGED/.test(line)),
+        JSON.stringify(forgedLines.slice(0, 2)));
+    const longModelLine = gatewayOutput.split('\n').find((line) => line.includes('xxxxxxxxxx'));
+    check('a very long model id is truncated in the request log line',
+        longModelAnswer.response.status === 200 && Boolean(longModelLine) && longModelLine.length < 400,
+        `${longModelLine ? longModelLine.length : 0} chars`);
+
+    // A request the HTTP parser rejects never reaches a hook (hooks run after routing), so Fastify's own handler used
+    // to answer `{"error":"Bad Request","message":"Client Error","statusCode":400}`: no type, no CORS headers, no
+    // X-Request-Id and no log line, all four of which the contract documents as unconditional.
+    const rawReply = await new Promise((resolve) => {
+        let data = '';
+        let settled = false;
+        const done = () => {
+            if (settled) return;
+            settled = true;
+            resolve(data);
+        };
+        const socket = net.connect(GATEWAY_PORT, '127.0.0.1', () => {
+            // A space in a header name is not a valid token: the parser rejects the request with HPE_INVALID_HEADER_TOKEN
+            socket.write('GET /v1/models HTTP/1.1\r\nHost: localhost\r\nBad Header: y\r\n\r\n');
+        });
+        socket.on('data', (chunk) => { data += chunk.toString('latin1'); });
+        socket.on('close', done);
+        socket.on('error', done);
+        setTimeout(() => {
+            socket.destroy();
+            done();
+        }, 4000);
+    });
+    const rawHeaderBlock = rawReply.split('\r\n\r\n')[0] || '';
+    const rawBody = rawReply.slice(rawHeaderBlock.length + 4);
+    let rawJson = null;
+    try {
+        rawJson = JSON.parse(rawBody);
+    } catch {
+        rawJson = null;
+    }
+    check('a request the HTTP parser rejects answers the documented error envelope',
+        /^HTTP\/1\.1 400 /.test(rawReply) && rawJson?.error?.type === 'invalid_request_error' &&
+        typeof rawJson?.error?.message === 'string',
+        JSON.stringify(rawReply.slice(0, 200)));
+    check('a parser-level rejection still carries CORS and a request id',
+        /access-control-allow-origin: \*/i.test(rawHeaderBlock) && /x-request-id: gw-/i.test(rawHeaderBlock),
+        rawHeaderBlock.slice(0, 240));
+
     // --- graceful shutdown ------------------------------------------------------------------------------
     // The same property on the long-running gateway, whose backend is external and therefore untouched
     const heldLongLived = fetch(`${BASE}/v1/chat/completions`, {
@@ -1860,6 +1935,166 @@ async function run() {
     check('SIGINT shuts the gateway down cleanly', longLivedExit === 0, `exit ${longLivedExit}`);
     check('the shutdown leaves no truncated answer behind', heldLongLivedAnswer.status === 200,
         `status ${heldLongLivedAnswer.status}`);
+
+    // --- a tuning value that cannot be used is named, not silently replaced -------------------------------
+    // These three keys fell back to their default without a word, so an operator who typo'd the request budget ran a
+    // gateway with 300000 ms while believing a shorter one was in force. The queue and body knobs already worked this
+    // way; now all of them do.
+    const invalidConfigPort = GATEWAY_PORT + 26;
+    const invalidConfigGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(invalidConfigPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '0',
+            OPENCODE_PROXY_HEALTH_CACHE_MS: 'abc',
+            OPENCODE_PROXY_START_RETRY_MS: 'soon',
+            LOG_LEVEL: 'info'
+        }
+    });
+    children.push(invalidConfigGateway);
+    let invalidConfigOutput = '';
+    invalidConfigGateway.stdout.on('data', (chunk) => { invalidConfigOutput += chunk.toString(); });
+    invalidConfigGateway.stderr.on('data', (chunk) => { invalidConfigOutput += chunk.toString(); });
+    await waitForOk(`http://127.0.0.1:${invalidConfigPort}/health`);
+    check('a malformed request timeout is reported with the value actually used',
+        /OPENCODE_PROXY_REQUEST_TIMEOUT_MS='0' is not a positive number, using 300000/.test(invalidConfigOutput),
+        invalidConfigOutput.split('\n').filter((line) => line.includes('REQUEST_TIMEOUT')).join(' | ').slice(0, 200));
+    check('malformed backend timings are reported instead of silently ignored',
+        /OPENCODE_PROXY_HEALTH_CACHE_MS='abc' is not a number, using 2000/.test(invalidConfigOutput) &&
+        /OPENCODE_PROXY_START_RETRY_MS='soon' is not a number, using 15000/.test(invalidConfigOutput),
+        invalidConfigOutput.split('\n').filter((line) => /HEALTH_CACHE|START_RETRY/.test(line)).join(' | ').slice(0, 240));
+    stopGateway(invalidConfigGateway);
+    await waitForExit(invalidConfigGateway);
+
+    // --- the poll fallback shares the request budget instead of buying a second one -----------------------
+    // A streaming request whose event stream stalls spent the whole budget waiting for events and then a fresh, full
+    // budget polling for an answer nobody had written: the client waited about twice the advertised timeout.
+    const budgetStubPort = GATEWAY_PORT + 24;
+    const budgetStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(budgetStubPort) }
+    });
+    children.push(budgetStub);
+    budgetStub.stdout.on('data', () => {});
+    budgetStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${budgetStubPort}/health`);
+    const budgetGatewayPort = GATEWAY_PORT + 25;
+    const budgetGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(budgetGatewayPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${budgetStubPort}`,
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '3000',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(budgetGateway);
+    budgetGateway.stdout.on('data', () => {});
+    budgetGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${budgetGatewayPort}/health`);
+    const budgetStartedAt = Date.now();
+    const budgetStream = await fetch(`http://127.0.0.1:${budgetGatewayPort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'STALL please' }], stream: true }),
+        signal: AbortSignal.timeout(20000)
+    }).then(async (response) => ({ status: response.status, text: await response.text() }))
+        .catch((error) => ({ status: 0, text: error.message }));
+    const budgetElapsed = Date.now() - budgetStartedAt;
+    check('a stalled stream is closed within the request budget, not twice it',
+        budgetStream.status === 200 && budgetElapsed < 5000,
+        `${budgetElapsed}ms, status ${budgetStream.status}`);
+    check('the exhausted budget is reported to the client instead of a truncated answer',
+        /"error"/.test(budgetStream.text), budgetStream.text.slice(-160));
+    stopGateway(budgetGateway);
+    await waitForExit(budgetGateway);
+    stop(budgetStub);
+    await waitForExit(budgetStub);
+
+    // --- the backend child does not inherit the gateway's key, and its jail is private --------------------
+    // The child is an agent runtime that, with tools enabled, executes model-directed work: it must not receive the
+    // credential that guards this gateway, and its working directory (its HOME with USE_ISOLATED_HOME) must not be
+    // readable by other local users on a shared /tmp.
+    if (process.platform !== 'win32') {
+        const childEnvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-childenv-'));
+        const childDumpFile = path.join(childEnvDir, 'dump.json');
+        const childCli = path.join(childEnvDir, 'opencode');
+        fs.writeFileSync(childCli, [
+            '#!/usr/bin/env node',
+            "if (process.argv.includes('--version')) { process.stdout.write('1.19.5\\n'); process.exit(0); }",
+            "const fs = require('node:fs');",
+            `fs.writeFileSync(${JSON.stringify(childDumpFile)}, JSON.stringify({` +
+                ' apiKey: process.env.API_KEY ?? null,' +
+                ' mode: (fs.statSync(process.cwd()).mode & 0o777).toString(8),' +
+                ' cwd: process.cwd() }));',
+            'setInterval(() => {}, 1000);',
+            ''
+        ].join('\n'));
+        fs.chmodSync(childCli, 0o755);
+        // Accepts the probe and never answers, so the gateway has to spawn the CLI to get a backend
+        const silentBackend = http.createServer(() => { });
+        await new Promise((resolve) => silentBackend.listen(GATEWAY_PORT + 28, '127.0.0.1', resolve));
+        const childEnvDriverPort = GATEWAY_PORT + 27;
+        const childEnvDriver = spawn(process.execPath, ['--input-type=module', '-e', [
+            "import { startProxy } from './src/proxy.js';",
+            `const proxy = startProxy({ PORT: ${childEnvDriverPort}, API_KEY: 'sk-inherited-only',` +
+                ` OPENCODE_SERVER_URL: 'http://127.0.0.1:${GATEWAY_PORT + 28}',` +
+                ` OPENCODE_PATH: ${JSON.stringify(childCli)}, LOG_LEVEL: 'error' });`,
+            'const fs = await import(\'node:fs\');',
+            // The CLI writes its dump as soon as it is spawned, which happens after the health probe gives up (2 s):
+            // poll for it instead of guessing a delay
+            `const dumpPath = ${JSON.stringify(childDumpFile)};`,
+            "let dumped = 'missing';",
+            'for (let i = 0; i < 100; i += 1) {',
+            '    if (fs.existsSync(dumpPath)) { dumped = fs.readFileSync(dumpPath, \'utf8\'); break; }',
+            '    await new Promise((r) => setTimeout(r, 100));',
+            '}',
+            "process.stdout.write('DUMP:' + dumped + '\\n');",
+            'await proxy.killBackend();',
+            'process.exit(0);',
+            ''
+        ].join('\n')], {
+            cwd: ROOT,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env: { ...process.env, API_KEY: 'sk-inherited-only' }
+        });
+        children.push(childEnvDriver);
+        let childEnvOut = '';
+        let childEnvErr = '';
+        childEnvDriver.stdout.on('data', (chunk) => { childEnvOut += chunk; });
+        childEnvDriver.stderr.on('data', (chunk) => { childEnvErr += chunk; });
+        // Not waitForExit(): that helper SIGKILLs after 3 s, and this driver has to wait for a health probe to time out
+        // (2 s) before the backend is spawned at all.
+        const childEnvExit = await new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                childEnvDriver.kill('SIGKILL');
+                resolve('timeout');
+            }, 20000);
+            childEnvDriver.once('exit', (code) => {
+                clearTimeout(timer);
+                resolve(code);
+            });
+        });
+        await new Promise((resolve) => silentBackend.close(resolve));
+        const dumpLine = childEnvOut.split('\n').find((line) => line.startsWith('DUMP:')) || '';
+        let dump = null;
+        try {
+            dump = JSON.parse(dumpLine.slice('DUMP:'.length));
+        } catch {
+            dump = null;
+        }
+        check('the spawned backend does not inherit the gateway API key',
+            dump !== null && dump.apiKey === null,
+            `${dumpLine.slice(0, 160)} | exit ${childEnvExit} | ${childEnvErr.slice(0, 200)}`);
+        check('the backend jail directory is not readable by other users',
+            dump !== null && dump.mode === '700', `${dump ? dump.mode : 'no dump'} (${dump ? dump.cwd : ''})`);
+        fs.rmSync(childEnvDir, { recursive: true, force: true });
+    }
 }
 
 // --- a stop request leaves no backend behind ---------------------------------------------------------------

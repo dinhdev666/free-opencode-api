@@ -67,7 +67,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 126 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 128 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -93,7 +93,8 @@ content, so a test can prove both modes report it as an error and the failure pa
 without waiting for the idle timeout) and
 `GROW` (an answer that is still being written when the prompt returns, so a test can prove the polled answer is never
 truncated), `STUB_EMPTY_PROVIDERS=1` (a provider list with no models, so a test can prove the model listing falls back
-instead of serving an empty list) and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
+instead of serving an empty list) and `STUB_FAIL_SESSION=1` (a 405 for `POST /session`, so a test can prove an
+incompatible backend is reported as an upstream error with its status and reason) and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
 backend is killed or the gateway is shutting down) and `TAILTAG` (an answer whose last delta ends in a tag prefix that
 never becomes a tag, so a test can prove the held fragment is still delivered). Extend that stub and
 `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
@@ -152,6 +153,11 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name. A backend that
   disappears in the middle of a request is an upstream failure (`502`), not a gateway bug (`500`): the client is told
   the upstream is gone, and the next request starts the backend again.
+- A backend that rejects `POST /session` (a version whose API moved, a proxy in front of it, an error body) is an
+  upstream failure too: `502` with the upstream status and reason in the message
+  (`OpenCode backend rejected session creation (status 405): …`), not a bare `500 "Failed to create OpenCode session"`
+  that blames the gateway and explains nothing. The SDK hands back the parsed body as-is, so the extraction handles
+  `{error:{message}}`, `{message}` and a plain string, and never prints `[object Object]`.
 - A provider failure is an upstream error in both modes. Non-streaming answers `502`; a streaming request whose
   provider failed before the first frame answers the same `502` envelope (the stream never started), and one that
   fails after frames are on the wire ends with the in-band error frame. It must never be streamed as assistant text:

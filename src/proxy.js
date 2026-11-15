@@ -880,9 +880,10 @@ function createApp(config) {
     // raise it so the stream can be terminated with an in-band error frame, exactly like any other post-header
     // failure: the alternative is a successful-looking stream whose only "answer" is an error message.
     class ProviderError extends Error {
-        constructor(message) {
+        constructor(message, status) {
             super(message);
             this.name = 'ProviderError';
+            if (status !== undefined) this.status = status;
         }
     }
 
@@ -1261,7 +1262,24 @@ function createApp(config) {
                     // Create session
                     const sessionRes = await client.session.create(backendDeadline(REQUEST_TIMEOUT_MS));
                     sessionId = sessionRes.data?.id;
-                    if (!sessionId) throw new Error('Failed to create OpenCode session');
+                    if (!sessionId) {
+                        // A backend that answers /health but rejects POST /session (a version whose API moved, a proxy
+                        // in front of it, an error body) used to surface as a bare 500 "Failed to create OpenCode
+                        // session": no status, no reason, and it blamed the gateway for an upstream failure.
+                        const upstreamStatus = sessionRes?.response?.status;
+                        const upstreamError = sessionRes?.error;
+                        // The SDK hands back the parsed body as-is: `{error:{message}}`, `{message}` or a plain
+                        // string. Taking the first non-string object would print "[object Object]" in the answer.
+                        const rawMessage = typeof upstreamError === 'string'
+                            ? upstreamError
+                            : (upstreamError?.data?.message ?? upstreamError?.message ??
+                                (typeof upstreamError?.error === 'string' ? upstreamError.error : upstreamError?.error?.message));
+                        const upstreamMessage = typeof rawMessage === 'string' ? rawMessage : '';
+                        throw new ProviderError(
+                            `OpenCode backend rejected session creation${upstreamStatus ? ` (status ${upstreamStatus})` : ''}${upstreamMessage ? `: ${upstreamMessage}` : ''}`,
+                            upstreamStatus
+                        );
+                    }
                     logDebug('Session created', { sessionId });
 
                     // A session is created per completion, so it must also be deleted per completion: otherwise the

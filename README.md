@@ -276,7 +276,8 @@ Errors follow the OpenAI error envelope (`{"error": {"message": ..., "type": ...
 not be parsed), `401` for a missing or wrong key (`type: "invalid_request_error"`, `code: "invalid_api_key"`), `404` for
 an unknown route (`type: "not_found"`), `502` for an upstream/provider failure (streaming requests included: a
 provider failure that arrives before the first token is an HTTP error, not an empty answer, and a backend that dies
-mid-request is an upstream failure rather than a `500` — the next request starts it again), `503` when the completion
+mid-request is an upstream failure rather than a `500` — the next request starts it again, and a backend that refuses
+to create a session reports its status and reason in the message instead of a bare `500`), `503` when the completion
 queue is full (`type: "queue_full"`), `504` on timeout — including a backend that accepts the connection and then
 never answers the request (it is reported as a gateway timeout with the budget that was exceeded instead of leaving the
 client without a response). Everything the gateway or the backend failed at carries

@@ -1058,6 +1058,52 @@ async function run() {
     try { fs.unlinkSync(fakeBin); } catch { /* best effort */ }
     try { fs.unlinkSync(fakePidFile); } catch { /* best effort */ }
 
+    // --- a backend that rejects session creation --------------------------------------------------------
+    // An incompatible backend (a version whose API moved, a proxy in front of it) answers /health but refuses
+    // POST /session. That is an upstream failure, so it answers 502 with the upstream status and reason instead of a
+    // bare 500 that blames the gateway and explains nothing.
+    const rejectStubPort = GATEWAY_PORT + 13;
+    const rejectStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(rejectStubPort), STUB_FAIL_SESSION: '1' }
+    });
+    children.push(rejectStub);
+    rejectStub.stdout.on('data', () => {});
+    rejectStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${rejectStubPort}/health`);
+    const rejectGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(rejectStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${rejectStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(rejectGateway);
+    rejectGateway.stdout.on('data', () => {});
+    rejectGateway.stderr.on('data', () => {});
+    const rejectUrl = `http://127.0.0.1:${rejectStubPort + 1}`;
+    await waitForOk(`${rejectUrl}/health`);
+    const rejected = await fetch(`${rejectUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(15000)
+    }).then((r) => r.json().then((json) => ({ status: r.status, json })))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    check('a backend that rejects session creation is an upstream error',
+        rejected.status === 502 && rejected.json?.error?.type === 'server_error',
+        `status ${rejected.status} ${JSON.stringify(rejected.json)?.slice(0, 160)}`);
+    check('the rejection names the upstream status and reason',
+        /status 405/.test(String(rejected.json?.error?.message)) && /not supported by this build/.test(String(rejected.json?.error?.message)),
+        JSON.stringify(rejected.json?.error?.message)?.slice(0, 160));
+    stopGateway(rejectGateway);
+    await waitForExit(rejectGateway);
+    stop(rejectStub);
+    await waitForExit(rejectStub);
+
     // --- a backend that reports no models ---------------------------------------------------------------
     // A provider payload the gateway cannot read (a changed shape, a version that reports nothing) answers 200 with an
     // empty list. Serving {"data":[]} leaves a client with no model to choose, so the gateway falls back to its single

@@ -3,7 +3,8 @@
 # On first boot (no /app/config.json inside the container) the config is generated from `docker run -e`
 # environment variables; an existing config.json (e.g. persisted via -v mount) is used as-is and is not
 # overwritten by -e
-# Supported (written into config.json): PORT API_KEY BIND_HOST DISABLE_TOOLS OPENCODE_PATH OPENCODE_SERVER_URL OPENCODE_BIND_HOST
+# Supported (written into config.json): PORT API_KEY BIND_HOST DISABLE_TOOLS OPENCODE_PATH OPENCODE_SERVER_URL
+# OPENCODE_BIND_HOST USE_ISOLATED_HOME (from OPENCODE_USE_ISOLATED_HOME)
 # The log level LOG_LEVEL (error/warn/info/debug, case-insensitive) is NOT written into config.json:
 #   the node process reads the environment variable directly, so it takes precedence over the LOG_LEVEL field in
 #   config.json; when unset it defaults to info
@@ -28,7 +29,8 @@ if [ ! -f "$CONFIG" ]; then
             DISABLE_TOOLS: flag("DISABLE_TOOLS", "true"),
             OPENCODE_PATH: env("OPENCODE_PATH", ""),
             OPENCODE_SERVER_URL: env("OPENCODE_SERVER_URL", "http://127.0.0.1:4097"),
-            OPENCODE_BIND_HOST: env("OPENCODE_BIND_HOST", "0.0.0.0")
+            OPENCODE_BIND_HOST: env("OPENCODE_BIND_HOST", "0.0.0.0"),
+            USE_ISOLATED_HOME: flag("OPENCODE_USE_ISOLATED_HOME", "false")
         };
         fs.writeFileSync("/app/config.json", JSON.stringify(cfg, null, 4));
         console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(cfg));

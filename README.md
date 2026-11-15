@@ -174,6 +174,7 @@ Settings are resolved in this order: **environment variables â†’ `config.json` â
 | `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend |
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
 | `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files |
+| `USE_ISOLATED_HOME` | `false` | Run the backend with a throwaway `HOME` instead of the real one, so it cannot pick up your machine's OpenCode state |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (case-insensitive) |
 
 Environment variables:
@@ -188,6 +189,7 @@ Environment variables:
 | `OPENCODE_PATH` | `OPENCODE_PATH` |
 | `DISABLE_TOOLS` | `DISABLE_TOOLS` (`OPENCODE_DISABLE_TOOLS` is still read as an alias, for setups that predate the rename) |
 | `LOG_LEVEL` | `LOG_LEVEL` |
+| `OPENCODE_USE_ISOLATED_HOME` | `USE_ISOLATED_HOME` (`USE_ISOLATED_HOME` is read as an alias) |
 
 Advanced tuning (environment only):
 
@@ -199,7 +201,6 @@ Advanced tuning (environment only):
 | `OPENCODE_PROXY_MAX_CONCURRENCY` | `1` | Number of chat completions processed in parallel (1..32). `1` keeps the historical serialized behaviour; raise it only if the backend/provider tolerates concurrent sessions |
 | `OPENCODE_PROXY_MAX_QUEUE` | `64` | How many completions may wait for a free slot before the gateway answers `503 queue_full` instead of accepting more work (the queue holds request bodies, so it is bounded) |
 | `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` (legacy alias; prefer `LOG_LEVEL=debug`) |
-| `OPENCODE_USE_ISOLATED_HOME` | unset | Run the backend with an isolated HOME directory |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Fallback bind address when `BIND_HOST` is not set |
 
 > `LOG_LEVEL` is read directly from the environment by the Node process, so it always wins over the `LOG_LEVEL` field in `config.json`.

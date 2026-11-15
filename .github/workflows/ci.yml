@@ -94,6 +94,35 @@ jobs:
           docker logs gateway-ci
           exit 1
 
+      # The entrypoint writes -e values into /app/config.json, but the environment must still beat the stored file
+      # (docker/README.md: environment > config.json > defaults). This also proves the stored file, which carries the
+      # API key, is not world readable.
+      - name: Container honours -e and protects the stored config
+        run: |
+          docker run -d --name gateway-ci-env -p 8084:8084 -e PORT=8084 -e API_KEY=sk-from-env free-opencode-api:ci
+          healthy=0
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8084/health >/dev/null; then
+              echo "gateway answered /health after ${attempt}s"
+              healthy=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$healthy" != "1" ]; then
+            docker logs gateway-ci-env
+            exit 1
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8084/v1/models)
+          echo "GET /v1/models with the built-in key -> $code (expected 401: -e API_KEY won)"
+          test "$code" = "401"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-from-env' http://127.0.0.1:8084/v1/models)
+          echo "GET /v1/models with the -e key -> $code"
+          test "$code" = "200"
+          mode=$(docker exec gateway-ci-env stat -c '%a' /app/config.json)
+          echo "mode of /app/config.json inside the container -> $mode"
+          test "$mode" = "600"
+
       # The image must behave like the source tree: the root index answers without a key and everything else
       # is authenticated with the built-in key
       - name: Container enforces authentication

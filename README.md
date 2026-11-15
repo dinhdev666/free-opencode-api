@@ -67,10 +67,13 @@ The HTTP layer is Fastify 5 with a deliberately thin lifecycle: a single `onRequ
 summary, CORS headers, bearer auth) and no plugin-level middleware chain. Additional choices that matter under load:
 
 - **Precompiled response schemas** — `/health` and `/v1/models` are serialized through `fast-json-stringify`
-  schemas compiled at startup instead of the generic `JSON.stringify` path.
+  schemas compiled at startup instead of the generic `JSON.stringify` path, and a cached model listing is a body built
+  once when the cache was filled: re-running the serializer for bytes that cannot have changed measured +2.7 % on the
+  route (100.1k → 102.8k req/s).
 - **Short model-list cache** — `/v1/models` results are cached for 5 s, so client startup probes do not hit the
-  backend every time (failures are never cached), and a burst that arrives with a cold cache shares a single
-  provider round trip instead of one per request.
+  backend every time, and a burst that arrives with a cold cache shares a single provider round trip instead of one
+  per request. A failure is not cached either, but it is held for 1 s, so a provider that answers 500 is not asked
+  once per listing (measured 72.4k → 101.2k req/s on the route, +40 %).
 - **No hidden allocations on the hot path** — header masking for debug logs is only built when `LOG_LEVEL=debug`,
   the bearer token string is precomputed once, and request paths are parsed once per request.
 - **SSE written straight to the socket** — streaming replies hijack the response and write `data:` frames directly
@@ -186,8 +189,8 @@ cp config.json.example config.json   # optional: edit port, API key, paths
 pnpm start                           # or: node index.js
 ```
 
-Verify the gateway is up (`/health` is the only unauthenticated route besides `/`), and list the models it can serve
-right now:
+Verify the gateway is up (`OPTIONS`, `/health` and `/` are the only unauthenticated routes), and list the models it can
+serve right now:
 
 ```bash
 curl http://127.0.0.1:8083/health
@@ -244,10 +247,10 @@ while the gateway ran the default you thought you had replaced:
 | `API_KEY` | `sk-dummy-123` | Bearer token clients must send. Authentication is always on — an empty or blank value falls back to `sk-dummy-123` |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway; a trailing slash is stripped and a missing scheme is read as `http://` (both are reported in the startup log, *before* the summary, so the `Backend:` line always shows the value the gateway actually uses). Surrounding whitespace is trimmed silently. A credential in the URL (`http://user:secret@host:4097`, a proxy in front of the backend) is sent to the backend as a Basic `Authorization` header — the SDK calls every endpoint through `fetch`, which refuses a URL that carries credentials, so such a URL could not work at all — and it is masked wherever the value is logged or returned (`/health`), including inside an upstream error message |
 | `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend. Keep it on loopback: the backend has no authentication of its own, so publishing it bypasses the gateway's key |
-| `OPENCODE_PROXY_BIND_HOST` | unset | Read as the bind address only when `BIND_HOST` is not set |
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
 | `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files. Booleans accept `true`/`false` (JSON) or `1`/`0`, `yes`/`no`, `y`/`n`, `on`/`off` (environment or string); a value none of those match is reported in a `[Config]` warning together with the value actually used (`DISABLE_TOOLS='maybe' is not a boolean …, using false`), for `DISABLE_TOOLS`, `USE_ISOLATED_HOME` and `DEBUG` alike |
 | `USE_ISOLATED_HOME` | `false` | Run the backend with a throwaway `HOME` instead of the real one, so it cannot pick up your machine's OpenCode state |
+| `DEBUG` | `false` | Switch logging to `debug` (the environment name for the same switch is `OPENCODE_PROXY_DEBUG`; `LOG_LEVEL=debug` is the preferred way) |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (case-insensitive) |
 
 Environment variables:
@@ -274,9 +277,8 @@ Advanced tuning (environment or `config.json`; the environment wins when both se
 | `OPENCODE_PROXY_MAX_CONCURRENCY` | `1` | Number of chat completions processed in parallel (1..32). `1` keeps the historical serialized behaviour; raise it only if the backend/provider tolerates concurrent sessions |
 | `OPENCODE_PROXY_MAX_QUEUE` | `64` | How many completions may wait for a free slot before the gateway answers `503 queue_full` instead of accepting more work (the queue holds request bodies, so it is bounded). Counts waiting requests only: `0` rejects a completion when no slot is free instead of queueing it. A slot frees as soon as its response is written (the session cleanup that follows does not hold it) |
 | `OPENCODE_PROXY_MAX_BODY_MB` | `50` | Largest accepted request body in MiB (1..200). It is the other half of the memory bound: a waiting completion pins its parsed body, so the worst case is this value times `OPENCODE_PROXY_MAX_QUEUE`. Prompts are small, so lowering it is the cheap way to bound a gateway whose clients are not trusted. A larger body is refused with `413` after the upload is drained (bounded to 5 s), so the client reads that error instead of a reset connection |
-| `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` (legacy alias; prefer `LOG_LEVEL=debug`) |
-| `DEBUG` | `false` | The same switch as `config.json` spells it (`OPENCODE_PROXY_DEBUG` is the environment name); `LOG_LEVEL=debug` is still the preferred way |
-| `OPENCODE_PROXY_BIND_HOST` | unset | Fallback bind address when `BIND_HOST` is not set |
+| `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` — the **environment name** of the switch (the `config.json` key is `DEBUG`, and the environment variable `DEBUG` has no effect); `LOG_LEVEL=debug` is the preferred way |
+| `OPENCODE_PROXY_BIND_HOST` | unset | Fallback bind address when `BIND_HOST` is not set — **environment only**: `config.json` has just `BIND_HOST`, and this name in the file is reported as an unknown key and ignored |
 
 A tuning value that cannot be used (a typo, a negative number) is **reported at startup** —
 `[Config] OPENCODE_PROXY_REQUEST_TIMEOUT_MS='abc' is not a positive number, using 300000` — instead of being replaced
@@ -288,7 +290,7 @@ by the default in silence, so the log always says which value is actually in for
 
 ## API Reference
 
-Base URL: `http://<host>:<port>/v1` (for example `http://127.0.0.1:8083/v1`). Every `/v1` request needs `Authorization: Bearer <API_KEY>` — the scheme is case-insensitive (`bearer`, `Bearer   <key>` both work) and `X-Api-Key: <API_KEY>` is accepted as an alias for clients configured with an api-key header; when both are present the `Authorization` header decides. The default key is `sk-dummy-123` and authentication cannot be turned off. Only `/health` and `/` are unauthenticated.
+Base URL: `http://<host>:<port>/v1` (for example `http://127.0.0.1:8083/v1`). Every `/v1` request needs `Authorization: Bearer <API_KEY>` — the scheme is case-insensitive (`bearer`, `Bearer   <key>` both work) and `X-Api-Key: <API_KEY>` is accepted as an alias for clients configured with an api-key header; when both are present the `Authorization` header decides. The default key is `sk-dummy-123` and authentication cannot be turned off. Only `OPTIONS` (a preflight cannot carry credentials), `/health` and `/` are unauthenticated.
 
 Every response carries an `X-Request-Id` header, and the same id appears in the gateway's request log line, so a client-side failure can be matched to a log entry.
 
@@ -298,11 +300,14 @@ Every response carries an `X-Request-Id` header, and the same id appears in the 
 | `/health` | GET | Liveness probe; returns gateway status and the configured backend URL, with any credentials in it masked (`http://***@host:4097`). The endpoint needs no key, so it must not be a way to read one |
 | `/v1/models` | GET | OpenAI-style model list |
 | `/v1/models/{id}` | GET | Single model; an id the provider list does not contain is still described (the gateway does not restrict models). The slash in `opencode/<model>` may be sent raw or as `%2F`. A blank id (`/v1/models//`) is a `404` |
-| `/v1/chat/completions` | POST | Chat completions; supports `stream: true` for SSE. Every frame is a `chat.completion.chunk` with the same `id`/`object`/`created`/`model` envelope, the first one carrying `delta.role: "assistant"` like OpenAI's, the last one carrying `finish_reason: "stop"` before `data: [DONE]`. Comment-line keep-alives are sent while a stream is open but has not produced its first token, so proxies do not drop the connection. If the backend fails after frames were sent, the error arrives as a `data: {"error":…}` frame and the stream is closed with `data: [DONE]` — a stream always terminates |
+| `/v1/chat/completions` | POST | Chat completions; supports `stream: true` for SSE. Every frame is a `chat.completion.chunk` with the same `id`/`object`/`created`/`model` envelope, the first one carrying `delta.role: "assistant"` like OpenAI's, the last one carrying `finish_reason: "stop"` before `data: [DONE]`. Comment-line keep-alives are sent whenever a stream has been silent for 15 s — before the first token and between deltas — so a proxy does not drop a connection while the model is still thinking. If the backend fails after frames were sent, the error arrives as a `data: {"error":…}` frame and the stream is closed with `data: [DONE]` — a stream always terminates |
 
 A provider call that stops answering is bounded by its own deadline (10 s at most, and never longer than the request
 budget), so `/v1/models` still answers — with the single static fallback model — instead of hanging. The same fallback
 covers a backend that reports no models at all: an empty list would leave a client with nothing to choose from.
+A fallback answer is held for **1 s**: the failing provider is not asked again for every listing that arrives in that
+window (it used to cost one backend round trip per request, which is most of the route's throughput), and a backend
+that recovers is still picked up within the second — not pinned by the 5 s cache a real listing gets.
 
 **Chat completions** accepts the usual OpenAI fields; model IDs use the `opencode/<model>` form. `opencode/big-pickle`
 is a stable alias that OpenCode routes to the model it currently serves (the target is not published), and it is the
@@ -314,9 +319,10 @@ Fields the gateway respects: `messages` (string content, or an array of parts wh
 `stream` (a boolean, or one of `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off` — hand-written clients stringify it, and a
 misread `stream` used to answer JSON to a client that was parsing SSE), `stream_options.include_usage` (adds the
 OpenAI usage chunk — `choices: []` plus a zeroed `usage` block — as the last frame before `data: [DONE]`; the counts
-are zero for the same reason the non-streaming `usage` is) and `user`/`name` as prompt labels. Sampling
+are zero for the same reason the non-streaming `usage` is) and `messages[].name` as a prompt label. Sampling
 knobs (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `presence_penalty`, `frequency_penalty`,
-`response_format`, tools) are accepted and **ignored**: the model is served by OpenCode, which owns its own sampling
+`response_format`, tools) and the request-level `user` (OpenAI's abuse-tracking field, which is not forwarded into the
+prompt) are accepted and **ignored**: the model is served by OpenCode, which owns its own sampling
 settings, so a request that relies on them gets the model's defaults. `n` is ignored too — a completion always
 returns exactly one choice.
 
@@ -360,8 +366,9 @@ budget), `503` when the completion
 queue is full (`type: "queue_full"`, with a `Retry-After: 1` header so SDKs retry instead of failing), `504` on timeout — including a backend that accepts the connection and then
 never answers the request (it is reported as a gateway timeout with the budget that was exceeded instead of leaving the
 client without a response). Everything the gateway or the backend failed at carries
-`type: "server_error"` and the upstream message (`code` keeps the upstream error name for a `502`); an internal
-exception's class name is never exposed. Once a stream has started, errors are delivered in-band
+`type: "server_error"` and the upstream message (`502` carries a `code` too: `ProviderError` when the provider
+reported the failure, `backend_unreachable` when the backend could not be reached, `upstream_error` otherwise); an
+internal exception's class name is never exposed. Once a stream has started, errors are delivered in-band
 (`data: {"error": …}` then `data: [DONE]`) — never as assistant text.
 
 ### Request bodies
@@ -448,8 +455,8 @@ All output goes to stdout/stderr with a `[gateway]` prefix:
 | --- | --- |
 | `error` | Upstream failures (with status code and error-body summary) and fatal startup problems. Always emitted, stderr. |
 | `warn` | Invalid configuration fallbacks and self-recoverable anomalies. stderr. |
-| `info` | Default. Startup information plus a one-line summary per request: method, path, model, streaming, status, latency, request id. The model id in that line is normalised (control characters replaced, length capped): it comes from the request body, and a newline in it must not be able to start a second log line. stdout. |
-| `debug` | Inbound request headers (secrets masked), the final payload sent to the backend, and full responses. stdout. |
+| `info` | Default. Startup information plus a one-line summary for every `/v1/*` request: method, path, model, streaming, status, latency, request id. Other paths (a health probe, the index page) are summarised at `debug`, so a probe loop cannot flood the log. The model id in that line is normalised (control characters replaced, length capped): it comes from the request body, and a newline in it must not be able to start a second log line. stdout. |
+| `debug` | Inbound request headers and body (credential-shaped values masked), the final payload sent to the backend, and full responses. stdout. |
 
 A request body that carries `__proto__` or `constructor` as a property name is refused with `400` before it reaches
 the handler (Fastify's prototype-poisoning guard); the message names that reason rather than claiming the JSON is

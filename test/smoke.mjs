@@ -468,7 +468,18 @@ async function run() {
     check('a cold-cache burst costs one provider round trip', burstAfter - burstBefore === 1,
         `provider calls: ${burstAfter - burstBefore}`);
     // The burst above also proves the result was cached: a listing served from the cache must not reach the backend
-    await request('/v1/models');
+    const cachedFirst = await request('/v1/models');
+    // A cached listing is sent as the body built when the cache was filled, so a listing whose bytes changed between
+    // two requests would be a stale body nobody rebuilt - and the shape must survive being sent as a string
+    const cachedSecond = await request('/v1/models');
+    check('a cached listing keeps the documented shape',
+        cachedSecond.response.status === 200 && cachedSecond.json?.object === 'list' &&
+        Array.isArray(cachedSecond.json?.data) &&
+        cachedSecond.json.data.every((m) => typeof m.id === 'string' && typeof m.name === 'string' &&
+            m.object === 'model' && typeof m.owned_by === 'string'),
+        cachedSecond.text.slice(0, 160));
+    check('a cached listing is the same body every time', cachedFirst.text === cachedSecond.text,
+        `${cachedFirst.text.length} vs ${cachedSecond.text.length} bytes`);
     await request('/v1/models');
     const cachedCalls = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
     check('a repeated listing is served from the cache', cachedCalls === burstAfter,
@@ -828,6 +839,9 @@ async function run() {
     const unknownRoute = await request('/nope');
     check('unknown route returns 404', unknownRoute.response.status === 404, `status ${unknownRoute.response.status}`);
     check('404 uses the not_found envelope', unknownRoute.json?.error?.type === 'not_found', unknownRoute.text.slice(0, 120));
+    // `code` is the machine-readable half of the envelope, and it is carried where there is something stable to carry:
+    // an upstream failure (502) always has one below, a 404 has nothing to add to its type
+    check('a 404 carries no code of its own', unknownRoute.json?.error?.code === undefined, JSON.stringify(unknownRoute.json?.error));
 
     // --- non-streaming completion -----------------------------------------------------------------------
     const completion = await request('/v1/chat/completions', {
@@ -1157,6 +1171,15 @@ async function run() {
     check('a 502 carries the server_error envelope with the provider error code',
         failed.json?.error?.type === 'server_error' && failed.json?.error?.code === 'ProviderError',
         failed.text.slice(0, 160));
+    // A 502 that comes out of the top-level handler used to carry only `type: "server_error"`, so a client could tell
+    // "the backend refused the session" from "the connection died" only by reading the prose
+    const sessionRefused = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'hi' }], model: 'opencode/big-pickle' }
+    });
+    check('every 502 carries a code, not only the provider-error branch',
+        failed.json?.error?.code !== undefined && typeof sessionRefused.json?.error?.code !== 'object',
+        `${failed.json?.error?.code} ${JSON.stringify(sessionRefused.json?.error)?.slice(0, 120)}`);
     const afterFailure = await sessionsAfterCleanup(STUB_URL);
     check('a failed completion still deletes its session',
         afterFailure && afterFailure.live === 0, JSON.stringify(afterFailure));
@@ -1183,6 +1206,46 @@ async function run() {
         streamedFailureError?.error?.type === 'server_error' &&
         /ProviderError/.test(streamedFailureError?.error?.message || ''),
         streamedFailure.text.slice(0, 160));
+
+    // A provider error routinely quotes the credential it rejected, and its message has no size of its own. Masking
+    // used to be a property of the streaming path only: the non-streaming body copied the provider's text verbatim, and
+    // with a `?` in it the masking that did exist dropped everything after the parameter - the half that explains the
+    // failure. Both modes now mask and bound the same way.
+    const leakyFailure = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'LEAKYFAIL' }], stream: false }
+    });
+    const leakyMessage = leakyFailure.json?.error?.message || '';
+    check('a provider error message is masked in the non-streaming 502',
+        leakyFailure.response.status === 502 &&
+        leakyMessage.includes('http://***@127.0.0.1:4097/proxy?token=***') &&
+        !leakyMessage.includes('s3cr3t-value'),
+        leakyMessage.slice(0, 160));
+    check('the text after a masked query value survives',
+        leakyMessage.includes('and the upstream answered with a very long explanation'),
+        leakyMessage.slice(-160));
+    check('a provider error message is bounded in the non-streaming 502',
+        leakyMessage.length <= 512 + '…[truncated 0 chars]'.length + 8 &&
+        /…\[truncated \d+ chars\]$/.test(leakyMessage),
+        `${leakyMessage.length} chars`);
+    const leakyStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'LEAKYFAIL' }], stream: true },
+        stream: true
+    });
+    const leakyStreamMessage = (() => {
+        try {
+            return JSON.parse(leakyStream.text)?.error?.message || '';
+        } catch {
+            return '';
+        }
+    })();
+    check('a streaming provider error is masked and bounded the same way',
+        leakyStream.response.status === 502 &&
+        leakyStreamMessage.includes('http://***@127.0.0.1:4097/proxy?token=***') &&
+        !leakyStreamMessage.includes('s3cr3t-value') &&
+        /…\[truncated \d+ chars\]$/.test(leakyStreamMessage),
+        leakyStreamMessage.slice(0, 160));
     check('a streaming provider error is never delivered as model text',
         !/Proxy Error/.test(streamedFailure.text), streamedFailure.text.slice(0, 160));
 
@@ -1375,6 +1438,8 @@ async function run() {
     check('a busy queue of 0 is answered with 503', cappedRefused.status === 503, `status ${cappedRefused.status}`);
     check('503 uses the queue_full envelope', cappedRefused.json?.error?.type === 'queue_full',
         JSON.stringify(cappedRefused.json));
+    check('a 503 carries no code of its own', cappedRefused.json?.error?.code === undefined,
+        JSON.stringify(cappedRefused.json?.error));
     // The refusal is read by a human as often as by an SDK: with the queue configured to hold nothing, "0 completions
     // are already waiting" described the setting as if it were the bug.
     check('a refused completion names the disabled queue instead of reporting "0 waiting"',
@@ -1764,6 +1829,22 @@ async function run() {
     check('a held fragment that is not a tag is delivered at the end of the stream',
         tailText.trim() === 'hello world <function_call', JSON.stringify(tailText));
 
+    // The tag sweep runs over the whole answer, which is not bounded by MAX_BODY_MB (that limits the request). A lazy
+    // regex restarted its closing-tag search at every opening one, so 64 000 unclosed tags spent 8.5 s on the single
+    // thread that also serves /health: the scan must be one pass, and the answer that follows the tags must survive.
+    const spamStartedAt = Date.now();
+    const spamResponse = await fetch(`${toolUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'TOOLSPAM please' }], stream: false })
+    }).then((response) => response.json());
+    const spamMs = Date.now() - spamStartedAt;
+    const spamText = spamResponse.choices?.[0]?.message?.content ?? '';
+    check('64 000 unclosed tool-call tags are stripped from a 1 MB answer',
+        spamText === 'done', JSON.stringify(spamText.slice(0, 80)));
+    check('stripping a 1 MB answer of tool-call tags does not stall the gateway',
+        spamMs < 4000, `${spamMs} ms`);
+
     // --- a non-ASCII key ----------------------------------------------------------------
     // The bearer check compares bytes: a key with accented characters matching in string length but not in byte
     // length used to make timingSafeEqual throw, answering 500 instead of 401 for a wrong key
@@ -1890,6 +1971,11 @@ async function run() {
     check('a backend that dies mid request is reported as an upstream error',
         killedAnswer.status === 502 && killedAnswer.json?.error?.type === 'server_error',
         `status ${killedAnswer.status} ${JSON.stringify(killedAnswer.json)?.slice(0, 140)}`);
+    // A 502 from the top-level handler used to carry only `type: "server_error"`, so a client could tell "the backend
+    // refused the session" from "the connection died" only by reading the prose
+    check('a 502 from the top-level handler carries a stable code',
+        killedAnswer.json?.error?.code === 'backend_unreachable',
+        JSON.stringify(killedAnswer.json?.error)?.slice(0, 160));
     const restartStartedAt = Date.now();
     const afterRestart = await fetch(`${gatewayUrl}/v1/chat/completions`, {
         method: 'POST',
@@ -1978,6 +2064,104 @@ async function run() {
     await waitForExit(rejectGateway);
     stop(rejectStub);
     await waitForExit(rejectStub);
+
+    // --- a backend error body larger than the summary --------------------------------------------------
+    // The 500 characters the gateway keeps as a log summary used to come from `JSON.stringify(body).slice(0, 500)`:
+    // the whole backend payload was serialised first, so a proxy answering with a megabyte of JSON paid a megabyte
+    // string on the error path. The summary is bounded before it is built, and the log line stays short.
+    const bigErrorStubPort = GATEWAY_PORT + 60;
+    const bigErrorStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(bigErrorStubPort), STUB_BIG_ERROR_BODY: '1' }
+    });
+    children.push(bigErrorStub);
+    bigErrorStub.stdout.on('data', () => {});
+    bigErrorStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${bigErrorStubPort}/health`);
+    let bigErrorOutput = '';
+    const bigErrorGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(bigErrorStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${bigErrorStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(bigErrorGateway);
+    bigErrorGateway.stdout.on('data', (chunk) => { bigErrorOutput += chunk; });
+    bigErrorGateway.stderr.on('data', (chunk) => { bigErrorOutput += chunk; });
+    const bigErrorUrl = `http://127.0.0.1:${bigErrorStubPort + 1}`;
+    await waitForOk(`${bigErrorUrl}/health`);
+    const bigErrorStartedAt = Date.now();
+    const bigErrorAnswer = await fetch(`${bigErrorUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(20000)
+    }).then((r) => r.json().then((json) => ({ status: r.status, json })))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    const bigErrorMs = Date.now() - bigErrorStartedAt;
+    await sleep(150);
+    const bigErrorLine = bigErrorOutput.split('\n').find((line) => line.includes('[Proxy] API Error')) || '';
+    check('a backend error body of 1 MB is summarised, not copied',
+        bigErrorAnswer.status === 502 && bigErrorLine.length > 0 && bigErrorLine.length < 1200,
+        `status ${bigErrorAnswer.status}, summary line ${bigErrorLine.length} chars`);
+    check('the summarised backend body keeps the shape of the payload',
+        bigErrorLine.includes('"bodySummary"') && bigErrorLine.includes('…'),
+        bigErrorLine.slice(0, 200));
+    check('a 1 MB backend error body is handled without a stall',
+        bigErrorMs < 8000, `${bigErrorMs} ms`);
+    stopGateway(bigErrorGateway);
+    await waitForExit(bigErrorGateway);
+    stop(bigErrorStub);
+    await waitForExit(bigErrorStub);
+
+    // --- the debug body dump masks credential-shaped fields ----------------------------------------------
+    // The dump bounded the body but never masked it, and a body is as client-chosen as the headers: a wrapper that
+    // forwards `{"api_key": …}` put that value into `docker logs` at LOG_LEVEL=debug.
+    const debugPort = GATEWAY_PORT + 65;
+    let debugOutput = '';
+    const debugGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(debugPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'debug'
+        }
+    });
+    children.push(debugGateway);
+    debugGateway.stdout.on('data', (chunk) => { debugOutput += chunk; });
+    debugGateway.stderr.on('data', (chunk) => { debugOutput += chunk; });
+    const debugUrl = `http://127.0.0.1:${debugPort}`;
+    await waitForOk(`${debugUrl}/health`);
+    const DEBUG_SECRET = 'sk-must-not-appear-in-the-log';
+    const debugAnswer = await fetch(`${debugUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+            messages: [{ role: 'user', content: 'hi' }],
+            api_key: DEBUG_SECRET,
+            metadata: { authorization: `Bearer ${DEBUG_SECRET}`, note: 'kept' }
+        }),
+        signal: AbortSignal.timeout(15000)
+    }).then((r) => r.json().then((json) => ({ status: r.status, json })))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    await sleep(150);
+    const debugDump = debugOutput.split('\n').find((line) => line.includes('Incoming OpenAI request')) || '';
+    check('the debug body dump hides a credential-shaped field',
+        debugAnswer.status === 200 && debugDump.includes('Incoming OpenAI request') &&
+        !debugOutput.includes(DEBUG_SECRET),
+        `${debugAnswer.status} ${debugDump.slice(0, 200)}`);
+    check('the debug body dump keeps the field and the rest of the body',
+        /"api_key":"sk-[^"]*\*\*\*\(\d+ chars\)"/.test(debugDump) &&
+        /"note":"kept"/.test(debugDump) && /"content":"hi"/.test(debugDump),
+        debugDump.slice(0, 300));
+    stopGateway(debugGateway);
+    await waitForExit(debugGateway);
 
     // --- a backend that rejects the event stream ---------------------------------------------------------
     // A build whose SSE endpoint moved, or a proxy in front of it, answers /health and the session calls but refuses
@@ -2117,6 +2301,33 @@ async function run() {
         /rejected the provider listing \(status 500\)/.test(failProvidersOutput) &&
         !/reported no models/.test(failProvidersOutput),
         JSON.stringify(failProvidersOutput.split('\n').find((line) => line.includes('provider listing')) || '').slice(0, 200));
+    // The fallback is deliberately not cached so a recovering backend is picked up, but "not cached" was one backend
+    // round trip per listing: a provider answering 500 was asked again for every request in front of it
+    const failProvidersUrl = `http://127.0.0.1:${failProvidersStubPort + 1}`;
+    const failStubCalls = async () => (await (await fetch(`http://127.0.0.1:${failProvidersStubPort}/__sessions`)).json()).providerCalls;
+    const listAgainstFailures = () => fetch(`${failProvidersUrl}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then((r) => r.json()).catch(() => null);
+    // The listing above may have started a hold of its own, so the window is measured from this point: the five
+    // listings below must not reach the provider at all
+    await sleep(1100);
+    const failCallsBefore = await failStubCalls();
+    const heldListings = await Promise.all(Array.from({ length: 5 }, listAgainstFailures));
+    const failCallsAfter = await failStubCalls();
+    check('five listings inside the fallback window cost one provider call',
+        heldListings.every((listing) => listing?.data?.length === 1) && failCallsAfter - failCallsBefore === 1,
+        `provider calls: ${failCallsAfter - failCallsBefore}, statuses ${JSON.stringify(heldListings.map((l) => l?.data?.length))}`);
+    const heldAgain = await listAgainstFailures();
+    const failCallsAfterHold = await failStubCalls();
+    check('a listing inside the fallback hold does not ask the provider again',
+        heldAgain?.data?.length === 1 && failCallsAfterHold === failCallsAfter,
+        `provider calls: ${failCallsAfterHold - failCallsAfter}`);
+    await sleep(1100);
+    // The hold expires and the next listing asks the backend again, because the fallback is not the answer to pin
+    const afterHold = await listAgainstFailures();
+    const failCallsRecovered = await failStubCalls();
+    check('a listing after the hold asks the failing provider again',
+        afterHold?.data?.length === 1 && failCallsRecovered === failCallsAfterHold + 1,
+        `provider calls: ${failCallsRecovered - failCallsAfterHold}, body: ${JSON.stringify(afterHold)?.slice(0, 100)}`);
     stopGateway(failProvidersGateway);
     await waitForExit(failProvidersGateway);
     stop(failProvidersStub);
@@ -2666,7 +2877,8 @@ async function run() {
         forgedModel.response.status === 200 && forgedLines.length > 0 &&
         forgedLines.every((line) => /model=opencode\/big-pickle\?\[Security\] FORGED/.test(line)),
         JSON.stringify(forgedLines.slice(0, 2)));
-    const longModelLine = gatewayOutput.split('\n').find((line) => line.includes('xxxxxxxxxx'));
+    const longModelLine = gatewayOutput.split('\n')
+        .find((line) => line.includes('model=opencode/') && line.includes('xxxxxxxxxx'));
     check('a very long model id is truncated in the request log line',
         longModelAnswer.response.status === 200 && Boolean(longModelLine) && longModelLine.length < 400,
         `${longModelLine ? longModelLine.length : 0} chars`);
@@ -2676,6 +2888,12 @@ async function run() {
     const securityLine = gatewayOutput.split('\n').find((line) => line.includes('[Security]'));
     check('the built-in key is announced at startup',
         /\[Security\]/.test(gatewayOutput) && /built-in/.test(securityLine || ''),
+        securityLine || 'no [Security] line');
+    // The key is public and the CORS set allows any origin, so the warning names the consequence and the address it
+    // applies to: an operator reading `docker logs` saw "set API_KEY" and a bind host on separate lines
+    check('the built-in key warning names the browser exposure and the bind address',
+        /any web page/.test(securityLine || '') &&
+        securityLine.includes(`127.0.0.1:${GATEWAY_PORT}`),
         securityLine || 'no [Security] line');
 
     // The URL is part of the request log line, so a key sent in the query string used to be written into it verbatim
@@ -2860,6 +3078,14 @@ async function run() {
             `${cleanConfig.error} ${JSON.stringify(findUnknownKeys(cleanConfig.config))}`);
         const typoConfig = writeConfig({ PORT: 8083, 'api-key': 'x', openCodePath: '/usr/bin/opencode', extra: 1 });
         const reported = findUnknownKeys(typoConfig.config);
+        // `OPENCODE_PROXY_DEBUG` is the environment name for `DEBUG`, and nothing reads it from the file: listing it
+        // as a known key made a file entry do nothing at all, with no warning - the silent no-op the report exists for
+        const envOnlyConfig = writeConfig({ OPENCODE_PROXY_DEBUG: true });
+        const envOnlyReported = findUnknownKeys(envOnlyConfig.config);
+        check('an environment-only name in config.json is reported as unknown',
+            envOnlyReported.length === 1 && envOnlyReported[0].key === 'OPENCODE_PROXY_DEBUG' &&
+            envOnlyReported[0].suggestion === null,
+            JSON.stringify(envOnlyReported));
         check('a misspelled config.json key is reported with its suggestion',
             reported.length === 3 &&
             reported[0].suggestion === 'API_KEY' && reported[1].suggestion === 'OPENCODE_PATH' &&

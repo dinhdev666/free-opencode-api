@@ -24,8 +24,11 @@ const STRING_OR_NUMBER_KEYS = [
     'OPENCODE_PROXY_HEALTH_CACHE_MS',
     'OPENCODE_PROXY_START_RETRY_MS'
 ];
-// Flags are parsed by parseBoolean(), which accepts booleans as well as their string/number spellings
-const FLAG_KEYS = ['DISABLE_TOOLS', 'USE_ISOLATED_HOME', 'DEBUG', 'OPENCODE_PROXY_DEBUG'];
+// Flags are parsed by parseBoolean(), which accepts booleans as well as their string/number spellings.
+// `OPENCODE_PROXY_DEBUG` is deliberately absent: it is an environment name (the file key is `DEBUG`) and nothing reads
+// it from the file, so listing it here made a file entry a known key that did nothing at all - exactly the silent
+// no-op the unknown-key check exists to prevent.
+const FLAG_KEYS = ['DISABLE_TOOLS', 'USE_ISOLATED_HOME', 'DEBUG'];
 
 // Every key the entry point reads. A key outside this list is reported and ignored: a typo (`APIKEY`,
 // `OPENCODE_PROXY_MAX_CONCURENCY`) used to change nothing at all, and the gateway then ran the default while the

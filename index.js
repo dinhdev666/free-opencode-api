@@ -144,7 +144,15 @@ if (configPathLoaded) {
 }
 
 if (finalConfig.API_KEY === DEFAULT_API_KEY) {
-    logger.warn(`[Security] API_KEY is not configured, using the built-in default '${DEFAULT_API_KEY}'. Set API_KEY for production use.`);
+    // The default key is public, and the CORS set is `Access-Control-Allow-Origin: *` with no Origin check by
+    // contract, so any page the browser loads - or a DNS-rebinding host - can preflight, send that key and read the
+    // answers of the local agent. The bind address is the other half of that exposure and was printed on its own
+    // line, so neither line named the combination. One line an operator can act on.
+    logger.warn(
+        `[Security] API_KEY is not configured, using the built-in default '${DEFAULT_API_KEY}'. Set API_KEY for production use. ` +
+        `The built-in key is public and the CORS headers allow any origin, so any web page can use this gateway; ` +
+        `it listens on ${finalConfig.BIND_HOST}:${finalConfig.PORT} - keep that on 127.0.0.1 or set a real key.`
+    );
 }
 
 // Validate required configuration

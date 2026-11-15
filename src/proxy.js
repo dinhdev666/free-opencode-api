@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
-import { logger, maskBackendUrl, maskHeaders, maskUrlCredentials, maskUrlQuery } from './logger.js';
+import { logger, maskBackendUrl, maskDetail, maskHeaders, maskUrlCredentials, maskUrlQuery, setOwnProperty } from './logger.js';
 
 
 // --- Mutex Logic with Timeout ---
@@ -652,12 +652,27 @@ process.on('exit', cleanupTempDirs);
 function extractUpstreamError(error) {
     const status = error?.response?.status ?? error?.status ?? error?.statusCode ?? null;
     const body = error?.response?.data ?? error?.responseBody ?? error?.data ?? error?.body ?? null;
+    // Bounded *before* it is serialised. This used to be `JSON.stringify(body).slice(0, 500)`, which built the whole
+    // string - a proxy in front of the backend answering a megabyte of JSON paid a full serialisation and a megabyte
+    // string on the completion's error path - to keep 500 characters of it. The summary is a log line either way.
+    const MAX_SUMMARY_STRING_CHARS = 200;
+    const boundedCopy = (value, depth = 0) => {
+        if (typeof value === 'string') {
+            return value.length > MAX_SUMMARY_STRING_CHARS ? `${value.slice(0, MAX_SUMMARY_STRING_CHARS)}…` : value;
+        }
+        if (value === null || typeof value !== 'object') return value;
+        if (depth >= 4) return '[…]';
+        if (Array.isArray(value)) return value.slice(0, 32).map((entry) => boundedCopy(entry, depth + 1));
+        const copy = {};
+        for (const key of Object.keys(value).slice(0, 32)) setOwnProperty(copy, key, boundedCopy(value[key], depth + 1));
+        return copy;
+    };
     let bodySummary = null;
     if (typeof body === 'string') {
         bodySummary = body.slice(0, 500) || null;
     } else if (body !== null && body !== undefined) {
         try {
-            bodySummary = JSON.stringify(body).slice(0, 500);
+            bodySummary = JSON.stringify(boundedCopy(body)).slice(0, 500);
         } catch (e) {
             // Never fail silently on serialization: record the reason in the summary
             bodySummary = `[unserializable: ${e?.message || 'unknown error'}]`;
@@ -997,8 +1012,8 @@ function createApp(config) {
         reply.raw.once('close', logSummary);
 
         // CORS headers are written on the raw response so they are present for streamed (hijacked) replies as well.
-        // x-api-key is not read by the gateway, but browsers send it on behalf of clients that do, and a rejected
-        // preflight would break those clients before they ever reach the auth check.
+        // `X-Api-Key` is accepted as an alias for the bearer token below, and a browser only sends it when the
+        // preflight advertises it: a rejected preflight breaks those clients before they ever reach the auth check.
         reply.raw.setHeader('X-Content-Type-Options', NO_SNIFF);
         reply.raw.setHeader('Access-Control-Allow-Origin', '*');
         reply.raw.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -1074,10 +1089,27 @@ function createApp(config) {
     const MODELS_CACHE_TTL_MS = 5000;
     // What a client sees when the provider list cannot be read: a single model, never an empty list
     const STATIC_FALLBACK_MODELS = [DEFAULT_MODEL];
+    // A failing provider is not asked again for a second. The fallback is deliberately not cached - a recovering
+    // backend must be picked up - but "not cached" became "one backend round trip per listing": with a provider that
+    // answers 500, five listings produced five provider calls and the route measured 58.6k req/s against a 93.1k
+    // warm-cache baseline (-37 %), all of it spent producing a constant. The hold keeps the recovery intent and states
+    // its bound.
+    const FALLBACK_HOLD_MS = 1000;
+    let modelsFallbackAt = 0;
+    const serveFallback = () => {
+        modelsFallbackAt = Date.now();
+        return STATIC_FALLBACK_MODELS;
+    };
     const MODELS_TIMEOUT_MS = Math.min(REQUEST_TIMEOUT_MS, METADATA_TIMEOUT_CAP_MS);
     const TOOL_IDS_TIMEOUT_MS = MODELS_TIMEOUT_MS;
     let modelsCache = null;
     let modelsCacheAt = 0;
+    // The listing is serialised once per cache fill instead of once per request: `/v1/models` is the hot read route (a
+    // client lists models on every startup and several SDKs re-list per connection), the bytes cannot have changed
+    // while the cache is fresh, and re-running the response serializer for them cost ~1.8 % of a 516k-request CPU
+    // profile. `modelsById` is a by-product, so the by-id routes stop scanning the list.
+    let modelsCacheBody = '';
+    let modelsById = null;
 
     // Shared by /v1/models and /v1/models/:modelId so both answer from the same cache
     let modelsInFlight = null;
@@ -1089,6 +1121,7 @@ function createApp(config) {
         // A cold cache under a burst (an autoscaler probe, a client retrying a startup listing) would otherwise put
         // one provider round trip behind every request in that burst; the first caller does the work and the rest
         // await the same promise
+        if (modelsFallbackAt && now - modelsFallbackAt < FALLBACK_HOLD_MS) return STATIC_FALLBACK_MODELS;
         if (modelsInFlight) return modelsInFlight;
         modelsInFlight = fetchModels();
         try {
@@ -1109,7 +1142,7 @@ function createApp(config) {
                 logger.warn(
                     `[Proxy] The backend rejected the provider listing${status ? ` (status ${status})` : ''}${reason}, using the static fallback`
                 );
-                return STATIC_FALLBACK_MODELS;
+                return serveFallback();
             }
             const providersRaw = providersRes.data?.providers || [];
             const models = [];
@@ -1121,7 +1154,7 @@ function createApp(config) {
                 // nothing) answered 200 with no models. Serving `{"data":[]}` is as useless to a client as an error -
                 // clients show no models at all - so an empty list takes the same fallback path and is not cached.
                 logger.warn('[Proxy] The backend reported no models, using the static fallback');
-                return STATIC_FALLBACK_MODELS;
+                return serveFallback();
             }
 
             list.forEach((p) => {
@@ -1141,9 +1174,12 @@ function createApp(config) {
                 // answer 200 with nothing to choose from: that takes the same fallback path as an empty provider
                 // list, and - unlike a real listing - is not cached.
                 logger.warn('[Proxy] The backend reported no models, using the static fallback');
-                return STATIC_FALLBACK_MODELS;
+                return serveFallback();
             }
             modelsCache = { object: 'list', data: models };
+            modelsFallbackAt = 0;
+            modelsCacheBody = JSON.stringify(modelsCache);
+            modelsById = new Map(models.map((model) => [model.id, model]));
             // Stamped when the answer arrives, not when the round trip started: the TTL used to be measured from the
             // moment the provider call began, so a call slower than the TTL cached an entry that was already expired
             // and every listing paid a full round trip (a 6 s provider against the 5 s TTL never hit the cache).
@@ -1152,18 +1188,27 @@ function createApp(config) {
         } catch (error) {
             logger.error('[Proxy] Model Fetch Error:', { error: error.message, status: error.status, body: error.response?.data || error.responseBody || null });
             // Same item shape as a provider-served model, and not cached: the next request probes the backend again
-            return STATIC_FALLBACK_MODELS;
+            return serveFallback();
         }
     };
 
     app.get('/v1/models', { schema: { response: { 200: MODELS_SCHEMA } } }, async (request, reply) => {
+        // A fresh cache answers with the body built when it was filled (Fastify sends a string payload as it is, the
+        // way `/health` and `/` do); a cold cache takes the object path, which is also what the fallback uses
+        if (modelsCache && Date.now() - modelsCacheAt < MODELS_CACHE_TTL_MS) {
+            return reply.type('application/json; charset=utf-8').send(modelsCacheBody);
+        }
         return { object: 'list', data: await loadModels() };
     });
 
     // OpenAI clients (and several SDKs) look a model up by id. The gateway does not restrict the model a chat
     // request may use, so an id that is not in the provider list is described here instead of being a 404.
     const describeModel = async (requestedId) => {
-        const known = (await loadModels()).find((m) => m.id === requestedId);
+        // The map is only as fresh as the cache it was built with, so a by-id request that finds the cache expired
+        // reloads the listing (one backend round trip, like the listing route) instead of answering from a stale map
+        const known = modelsCache && modelsById && Date.now() - modelsCacheAt < MODELS_CACHE_TTL_MS
+            ? modelsById.get(requestedId)
+            : (await loadModels()).find((m) => m.id === requestedId);
         if (known) return known;
         // The default model answers with its own name even when a healthy backend lists other models: it is the id a
         // request that omits `model` is sent to, so it should not be described as the bare id-derived `big-pickle`.
@@ -1210,11 +1255,47 @@ function createApp(config) {
         return TOOL_GUARD_MESSAGE;
     };
 
+    // Removes every `<function_calls>…</function_calls>` block and every stray tag of either kind, in one left-to-right
+    // pass. It used to be `/<function_calls>[\s\S]*?<\/function_calls>/g`, whose lazy quantifier restarts a search for
+    // the closing tag at every opening one: an answer carrying many *unclosed* tags (a model that renders its tool
+    // attempts as text emits exactly that) cost O(tags x length) - 32 000 tags in 512 KB measured 2.2 s, 64 000 in
+    // 1 MB measured 8.5 s - on the thread that serves `/health` and holds the only completion slot. This is linear
+    // (1.6 ms and 3.1 ms for the same two inputs) and produces the identical string: `lastClose` rules out a closing
+    // tag once and for all, so an unclosed opener is dropped without rescanning the rest of the answer.
+    const TOOL_OPEN_TAG = '<function_calls>';
+    const TOOL_CLOSE_TAG = '</function_calls>';
+    const removeToolMarkup = (text) => {
+        const lastClose = text.lastIndexOf(TOOL_CLOSE_TAG);
+        let out = '';
+        let keep = 0;   // start of the text not yet copied to `out`
+        let scanAt = 0; // candidate tag position
+        while (scanAt < text.length) {
+            const at = text.indexOf('<', scanAt);
+            if (at === -1) break;
+            if (text.startsWith(TOOL_OPEN_TAG, at)) {
+                if (at + TOOL_OPEN_TAG.length <= lastClose) {
+                    const end = text.indexOf(TOOL_CLOSE_TAG, at + TOOL_OPEN_TAG.length);
+                    out += text.slice(keep, at);
+                    keep = scanAt = end + TOOL_CLOSE_TAG.length;
+                } else {
+                    out += text.slice(keep, at);
+                    keep = scanAt = at + TOOL_OPEN_TAG.length;
+                }
+                continue;
+            }
+            if (text.startsWith(TOOL_CLOSE_TAG, at)) {
+                out += text.slice(keep, at);
+                keep = scanAt = at + TOOL_CLOSE_TAG.length;
+                continue;
+            }
+            scanAt = at + 1; // an unrelated '<' stays in the answer
+        }
+        return out + text.slice(keep);
+    };
+
     const stripFunctionCalls = (text, trim = true) => {
         if (!DISABLE_TOOLS || !text) return text;
-        const cleaned = text
-            .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
-            .replace(/<\/?function_calls>/g, '');
+        const cleaned = removeToolMarkup(text);
         return trim ? cleaned.trim() : cleaned;
     };
 
@@ -1379,9 +1460,24 @@ function createApp(config) {
     // log verbatim. The query string is masked for the same reason it is masked on a request URL, and the length is
     // bounded so a backend cannot answer a client with a reason the size of the request body limit.
     const MAX_UPSTREAM_TEXT_CHARS = 512;
+    // Only the URL-shaped words of the text are masked. `maskUrlQuery()` is written for a URL: given a sentence it
+    // read everything after the first `?` as that parameter's value, so `…?x=1: connection refused` answered
+    // `…?x=***` and lost the half of the reason that explains the failure.
+    //
+    // The words are found by splitting on whitespace rather than with `/\S+:\/\/\S+/`, which backtracked over a
+    // million-character token with no `://` in it one character at a time: a provider error of 1 MB parked the request
+    // for longer than its whole budget. `includes('://')` decides per token, and a token is at most a word.
+    const maskUrlsInText = (text) => {
+        const value = String(text);
+        if (!value.includes('://')) return value;
+        return value
+            .split(/(\s+)/)
+            .map((token) => (token.includes('://') ? maskUrlQuery(maskUrlCredentials(token)) : token))
+            .join('');
+    };
     const clientFacingText = (value) => {
         if (typeof value !== 'string' || value === '') return '';
-        const masked = maskUrlQuery(maskUrlCredentials(value));
+        const masked = maskUrlsInText(value);
         return masked.length > MAX_UPSTREAM_TEXT_CHARS
             ? `${masked.slice(0, MAX_UPSTREAM_TEXT_CHARS)}…[truncated ${masked.length - MAX_UPSTREAM_TEXT_CHARS} chars]`
             : masked;
@@ -1568,7 +1664,13 @@ function createApp(config) {
                     }
                     if (done || stableFor >= stableWindowMs || (!requireDone && (content || reasoning))) {
                         if (error) {
-                            logger.error('[Proxy] OpenCode assistant error:', { sessionId, error });
+                            // The provider's own text: masked and bounded like every other upstream reason, because a
+                            // provider error can quote the credential it rejected and its message has no size (100 KB
+                            // of padding became a 32 KB log line, and hid the request-log assertion behind it)
+                            logger.error('[Proxy] OpenCode assistant error:', {
+                                sessionId,
+                                error: { name: error.name || null, message: clientFacingText(error.data?.message || error.message) }
+                            });
                         }
                         if (logger.isEnabled('debug')) {
                             logger.debug('Polling completed', {
@@ -1834,7 +1936,10 @@ function createApp(config) {
                             method: request.method,
                             path: loggableUrl(request.url),
                             headers: maskHeaders(request.headers),
-                            body: request.body
+                            // The body is as client-chosen as the headers: a wrapper that forwards
+                            // `{"api_key": …}` or `{"metadata":{"authorization":…}}` wrote a credential into
+                            // `docker logs`, and bounding the dump never addressed that
+                            body: maskDetail(request.body)
                         });
                     }
                     // A body like `null` or `"text"` is valid JSON but not a completion request: answer 400 instead of
@@ -2495,7 +2600,11 @@ function createApp(config) {
                             // The session exists by now and must be deleted even though the answer failed
                             reply.code(502).send({
                                 error: {
-                                    message: error.data?.message || error.message || 'OpenCode provider error',
+                                    // The provider's own text, masked and bounded like every other upstream reason: a
+                                    // provider error routinely quotes the credential it rejected, and the streaming
+                                    // path already ran this through clientFacingText(), so the two modes disagreed
+                                    // about the same payload in size and in masking.
+                                    message: clientFacingText(error.data?.message || error.message) || 'OpenCode provider error',
                                     type: 'server_error',
                                     code: error.name || 'OpenCodeError'
                                 }
@@ -2587,6 +2696,18 @@ function createApp(config) {
                     // OpenAI clients branch on the type: a gateway/upstream failure is a server_error, and the
                     // constructor name of an internal exception is not part of any contract
                     const payload = { error: { message: errorMessage, type: 'server_error' } };
+                    // A 502 is an upstream failure, and which one is what every other error in this API carries in
+                    // `code`: a client could only tell "the backend refused the session" from "the connection died"
+                    // by parsing the prose. Three stable values, not `error.name` - a connection failure is a
+                    // TypeError, and an internal class name is not part of any contract.
+                    if (statusCode === 502) {
+                        // The connection case is tested first: a backend that dies mid-request surfaces as a
+                        // ProviderError whose message carries `fetch failed`, and `backend_unreachable` is the answer
+                        // a client can act on
+                        payload.error.code = isConnectionError(error)
+                            ? 'backend_unreachable'
+                            : (error.name === 'ProviderError' ? 'ProviderError' : 'upstream_error');
+                    }
                     if (!reply.raw.headersSent) {
                         if (hijacked) {
                             reply.raw.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });

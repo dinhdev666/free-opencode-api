@@ -167,8 +167,8 @@ working if it is later started without them.
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend the gateway launches internally; rarely needs changing (a trailing slash is stripped) |
 | `OPENCODE_USE_ISOLATED_HOME` (or `USE_ISOLATED_HOME`) | unset | Runs the backend with a throwaway `HOME` inside the container (the container is already isolated, so this is rarely needed) |
 | `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend (4097). Loopback by default, because the backend has no authentication of its own: publishing it would bypass the gateway's key. Set `0.0.0.0` to serve it outside the container — see [Exposing the 4097 Backend Port](#exposing-the-4097-backend-port) |
-| `OPENCODE_PROXY_BIND_HOST` | unset | Alias for `BIND_HOST`, read only when `BIND_HOST` is not set (the program's own default is `127.0.0.1`) |
-| `DEBUG` (or `OPENCODE_PROXY_DEBUG`) | unset | Legacy alias that turns on debug logging; `LOG_LEVEL=debug` is the documented way |
+| `OPENCODE_PROXY_BIND_HOST` | unset | Alias for `BIND_HOST`, read only when `BIND_HOST` is not set (the program's own default is `127.0.0.1`); environment only — in `config.json` only `BIND_HOST` exists |
+| `OPENCODE_PROXY_DEBUG` | unset | Turns on debug logging — this is the **environment** name (in `config.json` the same switch is `DEBUG`, and the environment variable `DEBUG` has no effect); `LOG_LEVEL=debug` is the documented way |
 | `LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug` (case-insensitive; invalid values fall back to `info` with a warning). **Exception: never written into `config.json` — it follows the usual precedence (environment first, then the `LOG_LEVEL` field in `config.json`, then `info`), but the entrypoint does not copy it into the generated file.** See [Logging](#logging) |
 
 Example with a custom API key (authentication is always on; omitting `API_KEY` uses `sk-dummy-123`):

@@ -29,6 +29,9 @@ const FAIL_SESSION = process.env.STUB_FAIL_SESSION === '1';
 // does when it cannot reach it: the gateway copies that reason into a client-facing 502 body and into its log, so a
 // test can prove both are masked
 const URL_IN_ERROR = process.env.STUB_URL_IN_ERROR === '1';
+// Refuse POST /session with a megabyte of JSON in the body (a proxy in front of the backend answering its own error
+// page): the gateway keeps 500 characters of it as a log summary, and used to serialise all of it first
+const BIG_ERROR_BODY = process.env.STUB_BIG_ERROR_BODY === '1';
 // Reject GET /event with a 500 (a build whose event stream moved, a proxy in front of it) so a test can prove a
 // streaming request still answers from the polling fallback instead of failing
 const FAIL_EVENTS = process.env.STUB_FAIL_EVENTS === '1';
@@ -50,6 +53,14 @@ const TOOL_TAG_ANSWER = 'hello <function_calls>secret</function_calls> world';
 // An answer whose last delta ends with a fragment that looks like the start of a tool-call tag but never becomes
 // one (prompt marker TAILTAG): the gateway holds that fragment back, and must still deliver it when the stream ends
 const TAIL_TAG_ANSWER = 'hello world <function_call';
+// An answer made of 64 000 *unclosed* tool-call tags plus one word (prompt marker TOOLSPAM), the input a model that
+// renders its tool attempts as text produces: the gateway must strip them in one pass. A lazy regex restarted a
+// closing-tag search at every opener and spent 8.5 s on this 1 MB answer, stalling everything else in the process.
+const TOOL_SPAM_ANSWER = `${'<function_calls>'.repeat(64000)}done`;
+// A provider error whose own message quotes a credential-bearing URL and 2 KB of trailing text (prompt marker
+// LEAKYFAIL): a provider says exactly this when it rejects a key, and both answer modes have to mask and bound it
+// before the text becomes a client-facing body or log line.
+const LEAKY_ERROR_TEXT = `provider rejected http://alice:s3cr3t-value@127.0.0.1:4097/proxy?token=abc123 and the upstream answered with a very long explanation ${'y'.repeat(2000)}`;
 const HOST = process.env.STUB_HOST || '127.0.0.1';
 // Refuse every route without the Basic credential the gateway is configured with (STUB_BASIC_AUTH=user:pass), the way
 // a proxy in front of the backend does: a gateway that hands the userinfo to the SDK as a URL cannot reach it at all,
@@ -269,6 +280,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === '/session' && req.method === 'POST') {
+        if (BIG_ERROR_BODY) {
+            return sendJson(res, 502, { error: { message: 'x'.repeat(1000000), detail: { nested: ['y'.repeat(200000)] } } });
+        }
         if (FAIL_SESSION) return sendJson(res, 405, { error: { message: 'session creation is not supported by this build' } });
         if (URL_IN_ERROR) {
             return sendJson(res, 502, {
@@ -314,6 +328,27 @@ const server = http.createServer(async (req, res) => {
                 // The prompt response already carries the finished message and nothing is stored for polling: an answer
                 // served without a single GET /session/:id/message proves the fast path was used
                 return sendJson(res, 200, buildAssistantMessage(id, ANSWER, REASONING));
+            }
+            if (session.promptText.includes('TOOLSPAM')) {
+                // 64 000 unclosed tags: the strip has to walk the answer once, so this answers in milliseconds and used
+                // to spend seconds inside the regular expression before the client saw anything
+                return sendJson(res, 200, buildAssistantMessage(id, TOOL_SPAM_ANSWER, ''));
+            }
+            if (session.promptText.includes('LEAKYFAIL')) {
+                // The provider error carries a credential-bearing URL and 2 KB of text. Checked before FAIL, whose
+                // marker is a substring of this one.
+                session.messages.push({
+                    info: {
+                        id: `msg_${id}`,
+                        sessionID: id,
+                        role: 'assistant',
+                        error: { name: 'ProviderError', data: { message: LEAKY_ERROR_TEXT } },
+                        time: { created: Date.now(), completed: Date.now() }
+                    },
+                    parts: []
+                });
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                return;
             }
             if (session.promptText.includes('FAIL')) {
                 // A provider failure: the assistant message carries an error and no content, so a non-streaming

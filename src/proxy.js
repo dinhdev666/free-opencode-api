@@ -2128,7 +2128,13 @@ function createApp(config) {
                             return { text: '', unsupported: { type: typeof content.type === 'string' ? content.type : 'unknown' } };
                         }
                         if (content === null || content === undefined) return { text: '' };
-                        if (typeof content === 'number' || typeof content === 'boolean') return { text: String(content) };
+                        // A scalar `content` (`42`, `true`) is not text the client wrote: stringifying it sent the model
+                        // the number as the question, so a template that lost a field asked something nobody asked and
+                        // was answered. OpenAI refuses the type too, and this is the same refusal every other
+                        // non-text content gets - named by the value that arrived, without a part index to blame.
+                        if (typeof content === 'number' || typeof content === 'boolean') {
+                            return { text: '', unsupported: { found: jsonTypeName(content) } };
+                        }
                         return { text: '' };
                     };
 

@@ -2978,6 +2978,29 @@ async function run() {
         objectSystemContent.response.status === 400 &&
         objectSystemContent.json?.error?.message === 'messages[0].content.text must be a string, found a number',
         `${objectSystemContent.response.status} ${objectSystemContent.text.slice(0, 200)}`);
+    // A `content` that is a bare scalar (`42`, `true`) is not text the client wrote either, and stringifying it sent the
+    // model the number as the question: a template that lost a field asked something nobody asked and was answered.
+    // OpenAI refuses the type, so the gateway names it instead of forwarding the value.
+    const scalarContent = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 42 }] }
+    });
+    check('a scalar content is refused instead of sent as the question',
+        scalarContent.response.status === 400 &&
+        scalarContent.json?.error?.message ===
+            'messages[0].content must be a string or an object with a text field, found a number',
+        `${scalarContent.response.status} ${scalarContent.text.slice(0, 200)}`);
+    // The same field on a `system` message: the instructions would otherwise have been replaced by the value
+    const scalarSystemContent = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'system', content: true }, { role: 'user', content: 'hi' }] }
+    });
+    check('a scalar system content is refused, not turned into an instruction',
+        scalarSystemContent.response.status === 400 &&
+        scalarSystemContent.json?.error?.message ===
+            'messages[0].content must be a string or an object with a text field, found a boolean',
+        `${scalarSystemContent.response.status} ${scalarSystemContent.text.slice(0, 200)}`);
+
     // A single part object with a string text is a shape some clients send, and it still reaches the backend
     const singlePartObject = await request('/v1/chat/completions', {
         method: 'POST',

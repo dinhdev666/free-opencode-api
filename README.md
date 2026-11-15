@@ -283,7 +283,7 @@ mid-request is an upstream failure rather than a `500` — the next request star
 to create a session reports its status and reason in the message instead of a bare `500`, and a backend that keeps
 failing while the answer is polled gives up after 5 consecutive failures instead of waiting out the whole request
 budget), `503` when the completion
-queue is full (`type: "queue_full"`), `504` on timeout — including a backend that accepts the connection and then
+queue is full (`type: "queue_full"`, with a `Retry-After: 1` header so SDKs retry instead of failing), `504` on timeout — including a backend that accepts the connection and then
 never answers the request (it is reported as a gateway timeout with the budget that was exceeded instead of leaving the
 client without a response). Everything the gateway or the backend failed at carries
 `type: "server_error"` and the upstream message (`code` keeps the upstream error name for a `502`); an internal

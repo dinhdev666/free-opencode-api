@@ -68,7 +68,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 136 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 137 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -156,7 +156,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request, `type: "invalid_request_error"`, plus
   Fastify's `code` when it rejected the body), `401` (auth, `type: "invalid_request_error"`,
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error), `503`
-  (`type: "queue_full"`, the wait queue is full), `504` (timeout), `500` (anything else). Every error body carries a
+  (`type: "queue_full"`, the wait queue is full, with `Retry-After: 1` so an OpenAI SDK backs off and retries instead
+  of failing the request), `504` (timeout), `500` (anything else). Every error body carries a
   `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name. A backend that
   disappears in the middle of a request is an upstream failure (`502`), not a gateway bug (`500`): the client is told
   the upstream is gone, and the next request starts the backend again.

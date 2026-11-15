@@ -62,7 +62,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 85 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 86 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -86,7 +86,8 @@ in the middle of both of its tags, so a test can prove the markup never leaks) `
 content, so a test can prove the failure path cleans up after itself) and `ENDONLY` (an answer whose finish event
 carries only `time.completed`, so a test can prove the stream still ends without waiting for the idle timeout) and
 `GROW` (an answer that is still being written when the prompt returns, so a test can prove the polled answer is never
-truncated). Extend that stub and
+truncated) and `TAILTAG` (an answer whose last delta ends in a tag prefix that never becomes a tag, so a test can
+prove the held fragment is still delivered). Extend that stub and
 `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
 already taken (a stale process would answer with someone else's build) and SIGKILLs any child that ignores SIGTERM.
 
@@ -157,7 +158,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `console.log` in `src/` or `index.js`. Never log an unmasked `authorization` header.
 - **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
-  boundary can fall inside either of them; the held fragment is flushed at end of stream. `DISABLE_TOOLS` is read
+  boundary can fall inside either of them; the held fragment is flushed at end of stream. The flush must write the
+  frame directly (`sendReleasedDelta`): passing the fragment back through the filter holds the same prefix again and,
+  with no further delta to disambiguate it, the tail of the answer disappears. `DISABLE_TOOLS` is read
   from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`.
 - **Boolean options go through `parseBoolean()`** (exported from `src/proxy.js`), the single parser used by
   `index.js` and `startProxy()`. Two implementations of that rule drifted once already (`-e DISABLE_TOOLS=yes` meant

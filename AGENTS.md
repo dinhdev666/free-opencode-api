@@ -27,7 +27,9 @@ These are product decisions, not implementation details. Do not "improve" them w
 2. **The default key stays visible and warned about.** `index.js` logs a `[Security]` warning when the built-in key is
    in use; the startup summary states that authentication is enforced.
 3. **OpenAI wire format is the contract.** Success and error bodies, SSE frames, status codes and header names must
-   stay compatible with standard OpenAI clients. See "API contract" below.
+   stay compatible with standard OpenAI clients. See "API contract" below. `stream` in particular is read through
+   `parseBoolean()`: a JSON boolean is the normal case, but hand-written clients send `1` or `"yes"`, and a literal
+   `=== true || === 'true'` comparison answered a JSON body to a client that was parsing SSE.
 4. **English only.** Code, comments, log messages, documentation and commit messages are written in English. The
    copyright holder remains `Phạm Văn Định` (LICENSE, `package.json`, Docker image labels).
 5. **pnpm for project dependencies.** `package.json` pins `packageManager: pnpm@12.18.0`. `npm` appears only for
@@ -62,7 +64,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 86 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 89 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 

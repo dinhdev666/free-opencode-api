@@ -96,3 +96,16 @@ export function readConfigFile(configPath) {
 
     return { config: parsed, error: null };
 }
+
+// An environment variable that is present but blank means "not configured", the way an unset variable does: a unit
+// file's `Environment=API_KEY=`, an empty Helm value or `API_KEY= npm start` in a shell. `PORT` and `API_KEY` were the
+// two keys read with `??`, so a blank value shadowed config.json - the gateway listened on the default port and
+// authenticated with the built-in public key while the file named a different port and a real secret (it warned about
+// the key, but it had already stopped honouring the file). Every other key reads the environment with `||` or through
+// a parser that ignores blanks; this is the one helper for the two that cannot.
+export function envOrFile(env, name, fileValue) {
+    const fromEnv = env?.[name];
+    if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv;
+    if (typeof fromEnv === 'number') return fromEnv;
+    return fileValue === undefined || fileValue === null ? undefined : fileValue;
+}

@@ -371,6 +371,10 @@ const BACKEND_START_RETRY_COOLDOWN_MS = (() => {
 // the queue slot was never released (at the default concurrency of 1 that stops the whole gateway). Every SDK call
 // now carries a deadline, and an expired one is reported as a gateway timeout.
 const backendDeadline = (timeoutMs) => ({ signal: AbortSignal.timeout(timeoutMs) });
+// Metadata calls (the model list, the tool list) are cheap round trips, so their budget is capped well below the
+// request budget: a client listing models should get the static fallback quickly instead of waiting for a whole
+// completion to time out.
+const METADATA_TIMEOUT_CAP_MS = 10000;
 const isTimeoutError = (error) => error?.name === 'TimeoutError' || error?.name === 'AbortError' ||
     error?.code === 'ETIMEDOUT';
 
@@ -636,6 +640,8 @@ function createApp(config) {
     // Models endpoint. The provider list changes rarely, so a short TTL cache avoids hitting the backend
     // on every client startup/probe; failures are never cached so a recovering backend is picked up immediately.
     const MODELS_CACHE_TTL_MS = 5000;
+    const MODELS_TIMEOUT_MS = Math.min(REQUEST_TIMEOUT_MS, METADATA_TIMEOUT_CAP_MS);
+    const TOOL_IDS_TIMEOUT_MS = MODELS_TIMEOUT_MS;
     let modelsCache = null;
     let modelsCacheAt = 0;
 
@@ -661,7 +667,7 @@ function createApp(config) {
     const fetchModels = async () => {
         const now = Date.now();
         try {
-            const providersRes = await client.config.providers();
+            const providersRes = await client.config.providers(backendDeadline(MODELS_TIMEOUT_MS));
             const providersRaw = providersRes.data?.providers || [];
             const models = [];
             const list = Array.isArray(providersRaw)
@@ -808,7 +814,7 @@ function createApp(config) {
             return cachedToolOverrides;
         }
         try {
-            const idsRes = await client.tool.ids();
+            const idsRes = await client.tool.ids(backendDeadline(TOOL_IDS_TIMEOUT_MS));
             const ids = Array.isArray(idsRes?.data)
                 ? idsRes.data
                 : Array.isArray(idsRes)
@@ -840,8 +846,13 @@ function createApp(config) {
         const timeoutPromise = new Promise((_, reject) => {
             timer = setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
         });
+        // The promise that loses a race keeps running. A rejection that arrives after the timeout - a backend that
+        // dies, or the aborted fetch from the deadline below - used to reach nothing and become an unhandled
+        // rejection, which ends the process by default: one slow completion could take the whole gateway down.
+        const promptPromise = client.session.prompt({ ...promptParams, ...backendDeadline(timeoutMs) });
+        promptPromise.catch(() => { });
         try {
-            return await Promise.race([client.session.prompt(promptParams), timeoutPromise]);
+            return await Promise.race([promptPromise, timeoutPromise]);
         } finally {
             // Without this the pending timer keeps the event loop (and the process) alive for up to 5 minutes
             // after the answer has already been sent

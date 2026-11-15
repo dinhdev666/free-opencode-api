@@ -7,6 +7,7 @@
  * locally and in CI.
  */
 import { spawn } from 'node:child_process';
+import { parseBoolean } from '../src/proxy.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -122,6 +123,18 @@ function parseSseFrames(body) {
 
 async function run() {
     // 1. stub backend first: the gateway trusts a fresh health probe, so the stub must be listening already
+    // The same parser is used by the entry point and by startProxy; a value that means "on" in one place must mean
+    // "on" in the other (`-e DISABLE_TOOLS=yes` used to be read differently in the container and outside it)
+    const booleanCases = [
+        ['1', true], ['true', true], ['TRUE', true], ['yes', true], [' on ', true], [1, true], [true, true],
+        ['0', false], ['false', false], ['no', false], ['off', false], [0, false], [false, false]
+    ];
+    const booleanResults = booleanCases.map(([input, expected]) => [input, parseBoolean(input, null), expected]);
+    check('parseBoolean treats on/off spellings consistently',
+        booleanResults.every(([, actual, expected]) => actual === expected), JSON.stringify(booleanResults));
+    check('parseBoolean returns the fallback for an unknown value',
+        parseBoolean('maybe', 'fallback') === 'fallback' && parseBoolean(undefined, 'fallback') === 'fallback');
+
     await assertPortFree(STUB_PORT, 'stub');
     await assertPortFree(GATEWAY_PORT, 'gateway');
 

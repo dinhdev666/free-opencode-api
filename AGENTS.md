@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 64 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 66 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -149,6 +149,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
   boundary can fall inside either of them; the held fragment is flushed at end of stream. `DISABLE_TOOLS` is read
   from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`.
+- **Boolean options go through `parseBoolean()`** (exported from `src/proxy.js`), the single parser used by
+  `index.js` and `startProxy()`. Two implementations of that rule drifted once already (`-e DISABLE_TOOLS=yes` meant
+  "off" inside the container); do not add a third.
 - **Configuration** follows the precedence env > `config.json` > default, and every new key must be added to
   `config.json.example`, the README configuration table and — for container-relevant keys — `docker/docker-entrypoint.sh`.
 - **Timeouts and fallbacks are behavioural contracts.** The polling fallback, the shortened first-delta wait, the

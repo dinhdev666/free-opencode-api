@@ -132,6 +132,10 @@ async function run() {
     const noAuth = await request('/v1/models', { key: null });
     check('unauthenticated /v1/models is rejected', noAuth.response.status === 401, `status ${noAuth.response.status}`);
     check('401 uses the OpenAI error envelope', noAuth.json?.error?.message === 'Unauthorized', noAuth.text.slice(0, 120));
+    check('401 carries a type and code', noAuth.json?.error?.type === 'invalid_request_error' &&
+        noAuth.json?.error?.code === 'invalid_api_key', noAuth.text.slice(0, 160));
+    check('the response echoes the request id used in the log line', /^gw-[a-z0-9]+$/.test(
+        noAuth.response.headers.get('x-request-id') || ''), noAuth.response.headers.get('x-request-id'));
 
     const wrongKey = await request('/v1/models', { key: 'sk-wrong' });
     check('a wrong bearer token is rejected', wrongKey.response.status === 401, `status ${wrongKey.response.status}`);
@@ -159,6 +163,8 @@ async function run() {
     const invalid = await request('/v1/chat/completions', { method: 'POST', body: {} });
     check('missing messages array returns 400', invalid.response.status === 400, `status ${invalid.response.status}`);
     check('400 uses the OpenAI error envelope', typeof invalid.json?.error?.message === 'string', invalid.text.slice(0, 120));
+    check('400 carries the invalid_request_error type', invalid.json?.error?.type === 'invalid_request_error',
+        invalid.text.slice(0, 120));
 
     const nullBody = await fetch(`${BASE}/v1/chat/completions`, {
         method: 'POST',
@@ -233,6 +239,11 @@ async function run() {
         .map((chunk) => chunk.choices[0].delta.content)
         .join('');
     check('streamed content matches the stubbed answer', contentDeltas === ANSWER, JSON.stringify(contentDeltas));
+    // The stub interleaves events that carry no properties; a subscription that gave up on them would deliver the
+    // answer in one polled frame instead of the stub's incremental ones
+    const contentFrameCount = chunks.filter((chunk) => chunk?.choices?.[0]?.delta?.content).length;
+    check('property-less backend events do not break the stream', contentFrameCount >= 2,
+        `${contentFrameCount} content frame(s)`);
 
     const reasoningDeltas = chunks
         .filter((chunk) => chunk?.choices?.[0]?.delta?.reasoning_content)

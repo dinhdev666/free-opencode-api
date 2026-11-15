@@ -208,6 +208,8 @@ Advanced tuning (environment only):
 
 Base URL: `http://<host>:<port>/v1` (for example `http://127.0.0.1:8083/v1`). Every `/v1` request needs `Authorization: Bearer <API_KEY>`; the default key is `sk-dummy-123` and authentication cannot be turned off. Only `/health` and `/` are unauthenticated.
 
+Every response carries an `X-Request-Id` header, and the same id appears in the gateway's request log line, so a client-side failure can be matched to a log entry.
+
 | Endpoint | Method | Description |
 | --- | --- | --- |
 | `/health` | GET | Liveness probe; returns gateway status and the configured backend URL |

@@ -754,9 +754,16 @@ function createApp(config) {
         return { content, reasoning };
     }
 
-    async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS, shouldAbort = null) {
+    async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS, shouldAbort = null, options = {}) {
         const pollStart = Date.now();
         const startedAt = Date.now();
+        // `requireDone` waits for the finished message instead of answering with whatever the first poll saw. Without
+        // it a non-streaming request returned the text written so far: the poll loop can start while the answer is
+        // still being generated, which truncated it. A provider that never marks its message finished is still
+        // answered once the text stops growing for three consecutive polls.
+        const requireDone = Boolean(options.requireDone);
+        let lastContent = '';
+        let stablePolls = 0;
         while (Date.now() - startedAt < timeoutMs) {
             // A disconnected client must not keep the completion queue busy while polling for an answer nobody reads
             if (shouldAbort && shouldAbort()) {
@@ -773,7 +780,12 @@ function createApp(config) {
                     const { content, reasoning } = extractFromParts(entry?.parts || []);
                     const error = info?.error || null;
                     const done = Boolean(info.finish || info.time?.completed || error);
-                    if (done || content || reasoning) {
+                    if (content && content === lastContent) stablePolls += 1;
+                    else {
+                        lastContent = content;
+                        stablePolls = 0;
+                    }
+                    if (done || stablePolls >= 3 || (!requireDone && (content || reasoning))) {
                         if (error) {
                             logger.error('[Proxy] OpenCode assistant error:', { sessionId, error });
                         }
@@ -1237,7 +1249,8 @@ function createApp(config) {
                                 sessionId,
                                 REQUEST_TIMEOUT_MS,
                                 DEFAULT_POLL_INTERVAL_MS,
-                                () => clientGone
+                                () => clientGone,
+                                { requireDone: true }
                             );
                             if (clientGone) return;
                             if (error && !content && !reasoning) {
@@ -1316,7 +1329,13 @@ function createApp(config) {
                         const promptStart = Date.now();
                         await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                         logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
-                        const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                        const { content, reasoning, error } = await pollForAssistantResponse(
+                            sessionId,
+                            REQUEST_TIMEOUT_MS,
+                            DEFAULT_POLL_INTERVAL_MS,
+                            null,
+                            { requireDone: true }
+                        );
                         if (error && !content && !reasoning) {
                             // The session exists by now and must be deleted even though the answer failed
                             reply.code(502).send({

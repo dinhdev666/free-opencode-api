@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 74 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 75 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -81,7 +81,9 @@ counts) and the prompt markers `SLOW` (a ~2 s answer, so a test can abort mid-st
 then silence, so a test can prove a stalled stream still ends), `TOOLTAG` (an answer whose tool-call block is cut
 in the middle of both of its tags, so a test can prove the markup never leaks) `FAIL` (a provider error with no
 content, so a test can prove the failure path cleans up after itself) and `ENDONLY` (an answer whose finish event
-carries only `time.completed`, so a test can prove the stream still ends without waiting for the idle timeout). Extend that stub and
+carries only `time.completed`, so a test can prove the stream still ends without waiting for the idle timeout) and
+`GROW` (an answer that is still being written when the prompt returns, so a test can prove the polled answer is never
+truncated). Extend that stub and
 `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
 already taken (a stale process would answer with someone else's build) and SIGKILLs any child that ignores SIGTERM.
 
@@ -157,6 +159,11 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   "off" inside the container); do not add a third.
 - **Configuration** follows the precedence env > `config.json` > default, and every new key must be added to
   `config.json.example`, the README configuration table and — for container-relevant keys — `docker/docker-entrypoint.sh`.
+- **Polling answers with the finished message.** `pollForAssistantResponse` is called with `requireDone: true` on
+  every path that emits the final answer: the poll loop can start while the answer is still being written, and
+  returning the first non-empty message truncated it (`"Hello from t"` for a 41-character answer). A message whose
+  text stops growing for three consecutive polls is accepted anyway, so a provider that never marks its message
+  finished still gets an answer.
 - **A finished message ends the stream, whatever the finish reason.** The collector settles on any non-empty
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.

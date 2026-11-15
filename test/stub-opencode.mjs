@@ -219,6 +219,22 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
                 return;
             }
+            if (session.promptText.includes('GROW')) {
+                // The answer is still growing when the prompt returns and only marks itself finished later: a poller
+                // that answers with the first poll would truncate it
+                const message = {
+                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
+                    parts: [{ type: 'text', text: ANSWER.slice(0, 12) }]
+                };
+                session.messages.push(message);
+                sendJson(res, 200, { info: message.info, parts: [] });
+                setTimeout(() => {
+                    message.parts[0].text = ANSWER;
+                    message.info.finish = 'stop';
+                    message.info.time = { created: Date.now(), completed: Date.now() };
+                }, 150);
+                return;
+            }
             const toolTag = session.promptText.includes('TOOLTAG');
             if (session.promptText.includes('STALL')) {
                 // Nothing for polling to find and no finish event: the caller must time out and close the stream

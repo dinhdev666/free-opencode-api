@@ -465,6 +465,16 @@ async function run() {
         statsAfter.prompts === statsBefore.prompts + 1,
         `prompts ${statsBefore.prompts} -> ${statsAfter.prompts} (only the holder should have run)`);
 
+    // --- a non-streaming answer must be complete -----------------------------------------------------------
+    // The prompt returns while the answer is still being written; the first poll therefore sees a fragment
+    const growing = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'GROW' }], stream: false }
+    });
+    check('a non-streaming completion waits for the finished message',
+        growing.json?.choices?.[0]?.message?.content === ANSWER,
+        JSON.stringify(growing.json?.choices?.[0]?.message?.content));
+
     // --- a provider failure in non-streaming mode ---------------------------------------------------------
     const failed = await request('/v1/chat/completions', {
         method: 'POST',

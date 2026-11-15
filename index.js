@@ -1,4 +1,11 @@
-import { startProxy, DEFAULT_API_KEY, parseBoolean, resolveApiKey, getQueueLimits } from './src/proxy.js';
+import {
+    startProxy,
+    DEFAULT_API_KEY,
+    parseBoolean,
+    resolveApiKey,
+    getQueueLimits,
+    normalizeBackendUrl
+} from './src/proxy.js';
 import { readConfigFile, envOrFile, findUnknownKeys } from './src/config.js';
 import { logger, maskBackendUrl } from './src/logger.js';
 import fs from 'fs';
@@ -139,6 +146,16 @@ if (!finalConfig.OPENCODE_PATH) {
 // bound - a wrapper script that waits for input, a cold npm shim - and during that window the process had not
 // installed its signal handlers yet, so Ctrl-C killed it abruptly instead of shutting it down. execFile (no shell)
 // keeps a path with quotes or spaces intact and cannot be turned into a shell command.
+
+// The backend URL is normalised before the summary is printed, and its correction notes are emitted here rather than
+// from startProxy(): the summary is where an operator copies the value from (a `/health` check, a container inspect,
+// a bug report), and it printed the raw form - `http://host:4097/` or a value with a trailing space - while the
+// gateway used the trimmed, slash-free one. A note that contradicts the line above it is worse than no note, and the
+// trailing slash is exactly the `//session` 404 the normalisation exists to prevent. startProxy() normalises what it
+// is handed once more, which is a no-op for an already-normalised value and keeps it correct for an embedder.
+const normalisedBackendUrl = normalizeBackendUrl(finalConfig.OPENCODE_SERVER_URL);
+finalConfig.OPENCODE_SERVER_URL = normalisedBackendUrl.url;
+normalisedBackendUrl.notes.forEach((note) => logger.warn(`[Config] ${note}`));
 
 logger.info('[Config] Starting with configuration:');
 logger.info(`  - Port: ${finalConfig.PORT}`);

@@ -174,6 +174,21 @@ async function run() {
         (health.response.headers.get('content-type') || '').includes('application/json'),
         health.response.headers.get('content-type'));
 
+    // Cold cache under a burst: ten simultaneous listings must cost the backend a single provider round trip, not ten
+    const burstBefore = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
+    const burst = await Promise.all(Array.from({ length: 10 }, () => request('/v1/models')));
+    const burstAfter = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
+    check('a cold-cache burst answers every request', burst.every((r) => r.response.status === 200),
+        JSON.stringify(burst.map((r) => r.response.status)));
+    check('a cold-cache burst costs one provider round trip', burstAfter - burstBefore === 1,
+        `provider calls: ${burstAfter - burstBefore}`);
+    // The burst above also proves the result was cached: a listing served from the cache must not reach the backend
+    await request('/v1/models');
+    await request('/v1/models');
+    const cachedCalls = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
+    check('a repeated listing is served from the cache', cachedCalls === burstAfter,
+        `provider calls: ${cachedCalls - burstAfter} extra`);
+
     // A model id is looked up in both shapes: the slash escaped and the slash as a path separator
     const encodedModel = await request('/v1/models/opencode%2Fkimi-k2.5-free');
     check('GET /v1/models/<id> finds the listed model', encodedModel.response.status === 200 &&
@@ -210,7 +225,9 @@ async function run() {
     const models = await request('/v1/models');
     check('GET /v1/models returns 200', models.response.status === 200, `status ${models.response.status}`);
     const modelIds = Array.isArray(models.json?.data) ? models.json.data.map((m) => m.id) : [];
-    check('GET /v1/models lists provider/model ids', modelIds.includes('opencode/kimi-k2.5-free'), JSON.stringify(modelIds));
+    check('GET /v1/models lists provider/model ids',
+        modelIds.includes('opencode/kimi-k2.5-free') && modelIds.includes('opencode/gpt-5-mini-free'),
+        JSON.stringify(modelIds));
 
     const knownModel = await request('/v1/models/opencode%2Fkimi-k2.5-free');
     check('GET /v1/models/:id returns the listed model', knownModel.response.status === 200 &&

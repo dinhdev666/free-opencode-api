@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 218 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 225 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -195,6 +195,21 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (`messages[0].role must be a string`): `(role || 'user').toLowerCase()` threw on a truthy non-string, so a client's
   bad field was answered `500` with the internal expression in the message. A missing or `null` role keeps its lenient
   `user` default.
+- **Content parts must be text.** A `content` array may carry strings and parts with a `text` field (`text`, and the
+  Responses-API spelling `input_text`). Any other part (`image_url`, `input_audio`, `file`) is refused with a `400`
+  naming its position and type (`messages[0].content[1] uses an unsupported content part type "image_url"; this gateway
+  forwards text only`). Dropping them instead answered a question the backend never received — a confidently wrong
+  answer, which is the hardest kind to notice — and a request whose only part was an image was reported as
+  `messages must include at least one non-system text message`, blaming a field the client had sent. The check runs
+  before the "no text at all" one for that reason.
+- **An announced request body has a deadline.** Fastify sets `requestTimeout: 0`, so nothing bounded the wait: a client
+  that sent `Content-Length: 4096` and four bytes held the socket for as long as it liked (measured 20 s with no
+  answer), with no credential needed, because the `401` is written from the headers while Node keeps the connection
+  alive to drain a body it will never read. `armBodyDeadline()` in the `onRequest` hook (armed before auth, only when
+  the request announces a body, cleared on `end`/`close`/`error`) closes it after `min(30 s, REQUEST_TIMEOUT_MS)`,
+  answering the `408` envelope when nothing has been sent. It closes the **request's** socket, not `reply.raw`: a
+  keep-alive response is detached from the connection once it ends (measured: `reply.raw.destroyed` true,
+  `reply.raw.socket` null, client still connected), so destroying the response closed nothing.
 - A `model` id whose provider or model half is empty (`"opencode/"`, `"/big-pickle"`) is a `400` in the
   `invalid_request_error` envelope naming the value: `/v1/models` answers `404` for the same ids, and sending them to
   the backend only produced an opaque upstream error. An absent or blank `model` still means `DEFAULT_MODEL`.
@@ -269,7 +284,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope (`type: "invalid_request_error"`, the parser's code in `code`
   when it is a plain `[A-Z_]+` token) with the CORS headers, an `X-Request-Id` and a `warn` log line. Fastify's own
   handler answered `{"error":"Bad Request","message":"Client Error","statusCode":400}` — no `type`, no CORS, no
-  request id, no log — for a class of requests that the contract above covers like any other.
+  request id, no log — for a class of requests that the contract above covers like any other. The handler writes the
+  envelope and then closes with `socket.end()` (`closeSocketAfterFlush()`), never `socket.destroy()` on the next line:
+  `destroy()` discards userland buffered writes, so under backpressure the client got a reset instead of the error it was
+  promised.
 - Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
   to a log entry. An incoming `X-Request-Id` is echoed when it is a short printable token
   (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a

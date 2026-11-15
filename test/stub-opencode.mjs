@@ -25,6 +25,10 @@ const FAIL_PROVIDERS = process.env.STUB_FAIL_PROVIDERS === '1';
 // Reject POST /session (an incompatible backend, a proxy in front of it) so a test can prove the gateway reports the
 // upstream status and reason instead of a bare 500
 const FAIL_SESSION = process.env.STUB_FAIL_SESSION === '1';
+// Refuse POST /session with a reason that quotes a URL carrying a credential, the way a proxy in front of the backend
+// does when it cannot reach it: the gateway copies that reason into a client-facing 502 body and into its log, so a
+// test can prove both are masked
+const URL_IN_ERROR = process.env.STUB_URL_IN_ERROR === '1';
 // Reject GET /event with a 500 (a build whose event stream moved, a proxy in front of it) so a test can prove a
 // streaming request still answers from the polling fallback instead of failing
 const FAIL_EVENTS = process.env.STUB_FAIL_EVENTS === '1';
@@ -47,6 +51,12 @@ const TOOL_TAG_ANSWER = 'hello <function_calls>secret</function_calls> world';
 // one (prompt marker TAILTAG): the gateway holds that fragment back, and must still deliver it when the stream ends
 const TAIL_TAG_ANSWER = 'hello world <function_call';
 const HOST = process.env.STUB_HOST || '127.0.0.1';
+// Refuse every route without the Basic credential the gateway is configured with (STUB_BASIC_AUTH=user:pass), the way
+// a proxy in front of the backend does: a gateway that hands the userinfo to the SDK as a URL cannot reach it at all,
+// and one that sends it as a header does. The `/health` probe is covered too - a gateway that authenticates its calls
+// but not its probe reads the backend as missing and starts a second one.
+const BASIC_AUTH = process.env.STUB_BASIC_AUTH || '';
+const BASIC_HEADER = BASIC_AUTH ? `Basic ${Buffer.from(BASIC_AUTH, 'utf8').toString('base64')}` : '';
 export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub.';
 export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
 
@@ -62,6 +72,9 @@ let providerCalls = 0;
 // The system prompt of the most recent prompt body: the gateway folds `system`/`developer` messages into it, so a
 // test can prove they never reach the conversation parts
 let lastSystemPrompt = '';
+// The conversation text of the most recent prompt body, exactly as the model would read it: a test can prove how a
+// message is labelled (`USER(name): …`) and that a client-supplied value did not reach it raw
+let lastPromptText = '';
 
 const sendJson = (res, statusCode, body) => {
     const payload = JSON.stringify(body);
@@ -209,6 +222,12 @@ const server = http.createServer(async (req, res) => {
     }
     const path = url.pathname;
 
+    // Test-only: the same gate a credential-requiring proxy puts in front of the backend
+    if (BASIC_HEADER && req.headers.authorization !== BASIC_HEADER) {
+        res.setHeader('www-authenticate', 'Basic realm="stub"');
+        return sendJson(res, 401, { error: { message: 'stub: credentials required' } });
+    }
+
     if (path === '/health') return sendJson(res, 200, { healthy: true });
 
     // Test-only introspection (not part of the OpenCode API): proves the gateway deletes the session it created
@@ -220,7 +239,8 @@ const server = http.createServer(async (req, res) => {
             prompts: promptedSessions,
             providerCalls,
             messagePolls,
-            lastSystemPrompt
+            lastSystemPrompt,
+            lastPromptText
         });
     }
 
@@ -250,6 +270,11 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/session' && req.method === 'POST') {
         if (FAIL_SESSION) return sendJson(res, 405, { error: { message: 'session creation is not supported by this build' } });
+        if (URL_IN_ERROR) {
+            return sendJson(res, 502, {
+                error: { message: 'cannot reach http://alice:s3cr3t-value@127.0.0.1:4097/proxy?token=abc123 (connection refused)' }
+            });
+        }
         const id = `ses_smoke_${(sessionSeq += 1)}`;
         sessions.set(id, { messages: [] });
         return sendJson(res, 200, { id });
@@ -273,6 +298,7 @@ const server = http.createServer(async (req, res) => {
                 const parsed = JSON.parse((await readBody(req)) || '{}');
                 session.promptText = (parsed.parts || []).map((part) => part?.text || '').join(' ');
                 lastSystemPrompt = typeof parsed.system === 'string' ? parsed.system : '';
+                lastPromptText = (parsed.parts || []).map((part) => (part?.type === 'text' ? String(part.text || '') : '')).join('\n');
             } catch {
                 session.promptText = '';
                 lastSystemPrompt = '';

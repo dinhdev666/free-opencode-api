@@ -221,6 +221,14 @@ async function run() {
     check('OPTIONS preflight returns 204', preflight.status === 204, `status ${preflight.status}`);
     check('CORS headers are present on preflight', preflight.headers.get('access-control-allow-origin') === '*');
 
+    // A liveness probe must not have to carry the key, whatever form it takes: the router tolerates a trailing
+    // slash, and many probes use HEAD
+    const healthSlash = await fetch(`${BASE}/health/`);
+    check('a trailing slash does not turn /health into a 401', healthSlash.status === 200, `status ${healthSlash.status}`);
+    await healthSlash.text();
+    const healthHead = await fetch(`${BASE}/health`, { method: 'HEAD' });
+    check('HEAD /health answers without a key', healthHead.status === 200, `status ${healthHead.status}`);
+
     // --- models -----------------------------------------------------------------------------------------
     const models = await request('/v1/models');
     check('GET /v1/models returns 200', models.response.status === 200, `status ${models.response.status}`);

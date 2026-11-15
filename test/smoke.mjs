@@ -663,7 +663,51 @@ async function run() {
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/xml' },
         body: '<a/>'
     });
-    check('an unrelated content type still reports the media type (415)', xmlBody.status === 415, `status ${xmlBody.status}`);
+    const xmlJson = await xmlBody.json().catch(() => null);
+    // "Unsupported Media Type" named neither the type that arrived nor what to send, so the client had nothing to act
+    // on: the 415 keeps its status and Fastify's code, and the message names both.
+    check('an unrelated content type names the type it refused',
+        xmlBody.status === 415 && xmlJson?.error?.code === 'FST_ERR_CTP_INVALID_MEDIA_TYPE' &&
+        /application\/xml/.test(String(xmlJson?.error?.message)) &&
+        /Content-Type: application\/json/.test(String(xmlJson?.error?.message)),
+        `${xmlBody.status} ${JSON.stringify(xmlJson).slice(0, 160)}`);
+    // A body with no Content-Type header at all is the likeliest hand-written mistake, and it took the same message
+    // path - so the answer named neither the missing header nor the fix. `fetch` always labels a string body
+    // (`text/plain;charset=UTF-8`), so the header-free request is written on a socket by hand.
+    const rawNoTypeReply = await new Promise((resolve) => {
+        let data = '';
+        let settled = false;
+        const done = () => {
+            if (settled) return;
+            settled = true;
+            resolve(data);
+        };
+        const payload = JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] });
+        const socket = net.connect(GATEWAY_PORT, '127.0.0.1', () => {
+            socket.write('POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n'
+                + `Authorization: Bearer ${API_KEY}\r\nContent-Length: ${Buffer.byteLength(payload)}\r\n`
+                + `Connection: close\r\n\r\n${payload}`);
+        });
+        socket.on('data', (chunk) => { data += chunk.toString('utf8'); });
+        socket.on('close', done);
+        socket.on('error', done);
+        setTimeout(() => {
+            socket.destroy();
+            done();
+        }, 4000);
+    });
+    const rawNoTypeBody = rawNoTypeReply.slice((rawNoTypeReply.split('\r\n\r\n')[0] || '').length + 4);
+    let rawNoTypeJson = null;
+    try {
+        rawNoTypeJson = JSON.parse(rawNoTypeBody);
+    } catch {
+        rawNoTypeJson = null;
+    }
+    check('a body sent without a Content-Type header is told to send one',
+        /^HTTP\/1\.1 415/.test(rawNoTypeReply) &&
+        /no Content-Type header/.test(String(rawNoTypeJson?.error?.message)) &&
+        /Content-Type: application\/json/.test(String(rawNoTypeJson?.error?.message)),
+        `${rawNoTypeReply.split('\r\n')[0]} ${JSON.stringify(rawNoTypeJson).slice(0, 160)}`);
     // The gateway does not decompress request bodies, so a gzipped one used to reach the JSON parser and be reported
     // as "body is not valid JSON" - blaming the payload for an unsupported encoding.
     const gzipped = await fetch(`${BASE}/v1/chat/completions`, {

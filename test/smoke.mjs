@@ -2073,6 +2073,45 @@ async function run() {
         /messages\[0\]\.role must be a string/.test(badRole.json?.error?.message || '') && !/toLowerCase/.test(badRole.text),
         badRole.text.slice(0, 160));
 
+    // A content part the gateway cannot forward used to be dropped in silence: a multimodal request was answered from
+    // the text alone, and one that carried only an image was answered with "messages must include at least one
+    // non-system text message", which blames the client's text instead of the part it actually sent.
+    const imageOnly = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: {
+            messages: [{
+                role: 'user',
+                content: [{ type: 'image_url', image_url: { url: 'https://example.com/cat.png' } }]
+            }]
+        }
+    });
+    check('a request whose only content part is an image is refused by name',
+        imageOnly.response.status === 400 &&
+        /messages\[0\]\.content\[0\] uses an unsupported content part type "image_url"/.test(imageOnly.json?.error?.message || ''),
+        `${imageOnly.response.status} ${imageOnly.text.slice(0, 200)}`);
+    check('the refused part is not reported as missing text',
+        !/non-system text message/.test(imageOnly.text), imageOnly.text.slice(0, 200));
+    const textPlusImage = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: {
+            messages: [
+                { role: 'system', content: 'be brief' },
+                { role: 'user', content: [{ type: 'text', text: 'describe this' }, { type: 'input_audio', input_audio: { data: 'AA==', format: 'wav' } }] }
+            ]
+        }
+    });
+    check('a mixed request is refused instead of answered from its text alone',
+        textPlusImage.response.status === 400 &&
+        /messages\[1\]\.content\[1\] uses an unsupported content part type "input_audio"/.test(textPlusImage.json?.error?.message || ''),
+        `${textPlusImage.response.status} ${textPlusImage.text.slice(0, 200)}`);
+    // The Responses-API spelling of a text part carries the same field, and a plain string part is still text
+    const textParts = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: [{ type: 'input_text', text: 'plain' }, ' '] }, { role: 'user', content: 'string part' }] }
+    });
+    check('text parts of either spelling still reach the backend', textParts.response.status === 200,
+        `${textParts.response.status} ${textParts.text.slice(0, 160)}`);
+
     // The model id is client input that lands in the request log line: a newline in it used to start a second,
     // attacker-written line (`FORGED [INFO] …`), and an unbounded id turned one request body into that many bytes of
     // log. The backend still receives the id verbatim; only the logged copy is normalised.
@@ -2149,6 +2188,66 @@ async function run() {
     check('a parser-level rejection still carries CORS and a request id',
         /access-control-allow-origin: \*/i.test(rawHeaderBlock) && /x-request-id: gw-/i.test(rawHeaderBlock),
         rawHeaderBlock.slice(0, 240));
+    // ...and the envelope has to arrive whole: the handler wrote it and called socket.destroy() on the next line, which
+    // discards buffered writes, so under backpressure the client saw a reset instead of the error it was promised
+    const declaredLength = Number((/content-length: (\d+)/i.exec(rawHeaderBlock) || [])[1]);
+    check('a parser-level rejection delivers its whole body instead of a reset',
+        Number.isFinite(declaredLength) && Buffer.byteLength(rawBody, 'latin1') === declaredLength,
+        `declared ${declaredLength}, received ${Buffer.byteLength(rawBody, 'latin1')}`);
+
+    // --- a body that never arrives must not hold a connection --------------------------------------------
+    // Fastify sets `requestTimeout: 0`, so nothing bounded the wait for an announced body: a client that sent a
+    // Content-Length and then stopped held the socket for as long as it liked - measured 20 s with no answer - and it
+    // needed no credential, because the 401 is written from the headers while Node keeps the connection alive to drain
+    // a body it will never read. The budget is what bounds the deadline, so a short one makes this cheap to assert.
+    const deadlinePort = GATEWAY_PORT + 30;
+    const deadlineGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(deadlinePort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '1200',
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(deadlineGateway);
+    deadlineGateway.stdout.on('data', () => {});
+    deadlineGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${deadlinePort}/health`);
+    const stalledBody = (headers) => new Promise((resolve) => {
+        const startedAt = Date.now();
+        let data = '';
+        let settled = false;
+        const finish = (closedBy) => {
+            if (settled) return;
+            settled = true;
+            resolve({ closedBy, ms: Date.now() - startedAt, raw: data });
+        };
+        const socket = net.connect(deadlinePort, '127.0.0.1', () => {
+            socket.write('POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n' +
+                'Content-Type: application/json\r\nContent-Length: 4096\r\n' + headers + '\r\n{"messages":[');
+        });
+        socket.on('data', (chunk) => { data += chunk.toString('latin1'); });
+        socket.on('close', () => finish('gateway'));
+        socket.on('error', () => finish('gateway'));
+        setTimeout(() => {
+            socket.destroy();
+            finish('client');
+        }, 6000);
+    });
+    const stalledKeyed = await stalledBody(`Authorization: Bearer ${API_KEY}\r\n`);
+    check('an unfinished request body is answered with a timeout instead of being held open',
+        stalledKeyed.closedBy === 'gateway' && stalledKeyed.ms < 5000 && /^HTTP\/1\.1 408 /.test(stalledKeyed.raw) &&
+        /Request body was not received within 1200ms/.test(stalledKeyed.raw),
+        `${stalledKeyed.closedBy} after ${stalledKeyed.ms}ms ${JSON.stringify(stalledKeyed.raw.slice(0, 160))}`);
+    const stalledAnon = await stalledBody('');
+    check('the same deadline closes a body sent without a key',
+        stalledAnon.closedBy === 'gateway' && stalledAnon.ms < 5000 && /^HTTP\/1\.1 401 /.test(stalledAnon.raw),
+        `${stalledAnon.closedBy} after ${stalledAnon.ms}ms ${JSON.stringify(stalledAnon.raw.slice(0, 160))}`);
+    stopGateway(deadlineGateway);
+    await waitForExit(deadlineGateway);
 
     // --- graceful shutdown ------------------------------------------------------------------------------
     // The same property on the long-running gateway, whose backend is external and therefore untouched

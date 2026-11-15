@@ -375,6 +375,12 @@ that names its position and type, because the gateway forwards text to a CLI ses
 Dropping those parts instead (the previous behaviour) answered a question the backend never received, and a request
 whose only part was an image was reported as missing text it had never been asked for.
 
+A part whose `text` field is present but not a string is named by that field
+(`messages[0].content[1].text must be a string, found a number`) instead of being called an unsupported type — `text` is
+the part type the gateway does forward. A part that is not a part at all (`42`, `null`, `true`) is refused the same way
+(`messages[0].content[0] must be a string or an object with a text field, found a number`), because dropping it left the
+request failing the "no text at all" check and blaming the client's text.
+
 **A body must arrive.** A request that announces a body (`Content-Length`, `Transfer-Encoding: chunked`) has to
 deliver it within 30 s or the shared request budget, whichever is shorter. On expiry the client receives the `408`
 envelope (`Request body was not received within …ms`) and the connection is closed; a request that was already refused

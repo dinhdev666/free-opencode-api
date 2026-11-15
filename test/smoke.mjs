@@ -2370,6 +2370,28 @@ async function run() {
         textPlusImage.response.status === 400 &&
         /messages\[1\]\.content\[1\] uses an unsupported content part type "input_audio"/.test(textPlusImage.json?.error?.message || ''),
         `${textPlusImage.response.status} ${textPlusImage.text.slice(0, 200)}`);
+    // A `text` part whose `text` field is not a string names that field: reporting `uses an unsupported content part
+    // type "text"` called the one part type the gateway does forward an unsupported one.
+    const nonStringText = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: ['ok', { type: 'text', text: 5 }] }] }
+    });
+    check('a text part with a non-string text field names the field',
+        nonStringText.response.status === 400 &&
+        nonStringText.json?.error?.message === 'messages[0].content[1].text must be a string, found a number',
+        `${nonStringText.response.status} ${nonStringText.text.slice(0, 200)}`);
+    // A part that is not a part at all (`42`, `null`, `true`) used to be dropped, so the request ended at "messages
+    // must include at least one non-system text message" - about text the client never wrote
+    for (const [part, described] of [['42', 'a number'], ['null', 'null'], ['true', 'a boolean']]) {
+        const scalarPart = await request('/v1/chat/completions', {
+            method: 'POST',
+            body: { messages: [{ role: 'user', content: [JSON.parse(part)] }] }
+        });
+        check(`a content part that is a scalar is named: ${described}`,
+            scalarPart.response.status === 400 &&
+            scalarPart.json?.error?.message === `messages[0].content[0] must be a string or an object with a text field, found ${described}`,
+            `${scalarPart.response.status} ${scalarPart.text.slice(0, 200)}`);
+    }
     // The Responses-API spelling of a text part carries the same field, and a plain string part is still text
     const textParts = await request('/v1/chat/completions', {
         method: 'POST',

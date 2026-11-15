@@ -175,7 +175,10 @@ Settings are resolved in this order: **environment variables → `config.json` �
 
 A `config.json` that exists but cannot be used stops the gateway (`exit 1`) with the reason logged: falling back to
 the defaults would ignore the port and the key you wrote and serve traffic with the built-in `sk-dummy-123`. A
-missing file is normal and simply means "defaults plus environment".
+missing file is normal and simply means "defaults plus environment". The file is read from the **application
+directory** — next to `index.js` (in the container, `/app/config.json`) — not from the directory you start the process
+in; if a `config.json` sits in that working directory instead, startup says so:
+`[Config] config.json is read from …; the file at … is ignored`.
 
 `config.json` (see [config.json.example](config.json.example)):
 

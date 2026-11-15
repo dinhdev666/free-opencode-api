@@ -34,6 +34,13 @@ if (configError) {
 }
 if (fs.existsSync(configPath)) {
     logger.info('[Config] Loaded from config.json');
+} else {
+    // The file is read from the application directory, not from the working directory: a `config.json` written next to
+    // the shell's cwd is silently ignored, and the startup summary (port, key) is the only hint that it was not read.
+    const cwdConfigPath = path.join(process.cwd(), 'config.json');
+    if (path.resolve(cwdConfigPath) !== path.resolve(configPath) && fs.existsSync(cwdConfigPath)) {
+        logger.warn(`[Config] config.json is read from ${configPath}; the file at ${cwdConfigPath} is ignored`);
+    }
 }
 
 // Merge configs: env > file > default

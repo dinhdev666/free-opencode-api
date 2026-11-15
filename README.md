@@ -265,7 +265,8 @@ Errors follow the OpenAI error envelope (`{"error": {"message": ..., "type": ...
 (`type: "invalid_request_error"`, with Fastify's own `code` such as `FST_ERR_CTP_INVALID_JSON_BODY` when the body could
 not be parsed), `401` for a missing or wrong key (`type: "invalid_request_error"`, `code: "invalid_api_key"`), `404` for
 an unknown route (`type: "not_found"`), `502` for an upstream/provider failure (streaming requests included: a
-provider failure that arrives before the first token is an HTTP error, not an empty answer), `503` when the completion
+provider failure that arrives before the first token is an HTTP error, not an empty answer, and a backend that dies
+mid-request is an upstream failure rather than a `500` — the next request starts it again), `503` when the completion
 queue is full (`type: "queue_full"`), `504` on timeout. Everything the gateway or the backend failed at carries
 `type: "server_error"` and the upstream message (`code` keeps the upstream error name for a `502`); an internal
 exception's class name is never exposed. Once a stream has started, errors are delivered in-band

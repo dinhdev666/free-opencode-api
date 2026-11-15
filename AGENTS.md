@@ -49,7 +49,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | --- | --- |
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved concurrency/queue capacity and any clamp, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
-| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because silently continuing would run with the built-in key instead of the configured one or with a value nobody wrote. A UTF-8 BOM is tolerated. |
+| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because silently continuing would run with the built-in key instead of the configured one or with a value nobody wrote. A key the gateway does not read is returned by `findUnknownKeys()` so the entry point can name it (with the key a case/separator typo probably meant) and ignore it. A UTF-8 BOM is tolerated. |
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`) plus `serializeDetail()` (bounded, truncate-before-stringify) used by debug logging. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 232 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 236 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -361,6 +361,13 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `config.json` — the gateway listened on the default port and authenticated with the built-in public key while the
   file named a different port and a real secret. Every other key falls through on a blank value (`||` or a parser
   that ignores blanks); keep it that way.
+  A **key nobody reads** is named at startup and ignored (`[Config] config.json has an unknown key 'APIKEY' (did you
+  mean 'API_KEY'?) - it is ignored`, via `findUnknownKeys()`): a misspelled key changed nothing at all in complete
+  silence, so the gateway ran the default while the operator was sure the value in the file was in force. A
+  suggestion is only made for a case/separator difference — a real misspelling (`…MAX_CONCURENCY`) cannot be guessed
+  without sending the reader to the wrong key — the value is never printed (a mistyped `API_KEY` is still a
+  credential), and nothing is merged generically, so an unknown key (including `__proto__`) cannot reach the running
+  config.
   `OPENCODE_SERVER_URL` is normalised at startup (`normalizeBackendUrl`): a trailing slash is stripped and a missing
   scheme is read as `http://`, both with a `[Config]` warning. A trailing slash made every SDK path `//session`, which
   the backend answers with 404 — the gateway then reported "backend exited during startup", which points nowhere near

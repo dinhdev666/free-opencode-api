@@ -12,7 +12,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import { parseBoolean } from '../src/proxy.js';
-import { readConfigFile } from '../src/config.js';
+import { readConfigFile, findUnknownKeys } from '../src/config.js';
 import { createLogger, maskBackendUrl, maskHeaders, maskSecret, maskUrlQuery, serializeDetail } from '../src/logger.js';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -2371,6 +2371,30 @@ async function run() {
     // `Environment=API_KEY=`, an empty Helm value, a shell that exports unconditionally) shadowed config.json, so the
     // gateway listened on the default port and authenticated with the built-in public key while the file named a
     // different port and a real secret. Every other key falls through on a blank value; these two now do too.
+    // The unknown-key report reads the file itself, so it is asserted without a gateway too: a known-only file reports
+    // nothing (every legitimate config must stay silent), and the suggestion only fires for a case/separator typo.
+    const unknownKeyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'free-opencode-api-unknown-keys-'));
+    try {
+        const writeConfig = (value) => {
+            const file = path.join(unknownKeyDir, 'config.json');
+            fs.writeFileSync(file, JSON.stringify(value));
+            return readConfigFile(file);
+        };
+        const cleanConfig = writeConfig({ PORT: 8083, API_KEY: 'sk-clean' });
+        check('a config.json with only known keys reports no unknown key',
+            cleanConfig.error === null && findUnknownKeys(cleanConfig.config).length === 0,
+            `${cleanConfig.error} ${JSON.stringify(findUnknownKeys(cleanConfig.config))}`);
+        const typoConfig = writeConfig({ PORT: 8083, 'api-key': 'x', openCodePath: '/usr/bin/opencode', extra: 1 });
+        const reported = findUnknownKeys(typoConfig.config);
+        check('a misspelled config.json key is reported with its suggestion',
+            reported.length === 3 &&
+            reported[0].suggestion === 'API_KEY' && reported[1].suggestion === 'OPENCODE_PATH' &&
+            reported[2].suggestion === null,
+            JSON.stringify(reported));
+    } finally {
+        fs.rmSync(unknownKeyDir, { recursive: true, force: true });
+    }
+
     const blankEnvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'free-opencode-api-blank-env-'));
     try {
         fs.copyFileSync(path.join(ROOT, 'index.js'), path.join(blankEnvDir, 'index.js'));
@@ -2381,19 +2405,29 @@ async function run() {
             process.platform === 'win32' ? 'junction' : 'dir');
         const blankEnvPort = GATEWAY_PORT + 31;
         const blankEnvKey = 'sk-from-file-blank-env';
-        fs.writeFileSync(path.join(blankEnvDir, 'config.json'), JSON.stringify({
+        // A misspelled key used to change nothing at all, in complete silence: the gateway ran the default while the
+        // operator was sure the value in the file was in force. `__proto__` and a nested object are here for the same
+        // reason a hostile file is: they must be reported, never merged. `__proto__` is spliced into the text because a
+        // `__proto__` in a JavaScript object literal sets the prototype and never reaches JSON.stringify.
+        const blankEnvConfig = JSON.stringify({
             PORT: blankEnvPort,
             BIND_HOST: '127.0.0.1',
             API_KEY: blankEnvKey,
-            OPENCODE_SERVER_URL: STUB_URL
-        }));
+            OPENCODE_SERVER_URL: STUB_URL,
+            APIKEY: 'sk-typo',
+            OPENCODE_PROXY_MAX_CONCURENCY: 4,
+            deep: { x: 1 }
+        });
+        fs.writeFileSync(path.join(blankEnvDir, 'config.json'),
+            `${blankEnvConfig.slice(0, -1)},"__proto__":{"polluted":true}}`);
         const blankEnvGateway = spawn(process.execPath, ['index.js'], {
             cwd: blankEnvDir,
             env: { ...process.env, PORT: '', API_KEY: '', LOG_LEVEL: 'warn' }
         });
         children.push(blankEnvGateway);
-        blankEnvGateway.stdout.on('data', () => {});
-        blankEnvGateway.stderr.on('data', () => {});
+        let blankEnvOut = '';
+        blankEnvGateway.stdout.on('data', (chunk) => { blankEnvOut += chunk.toString(); });
+        blankEnvGateway.stderr.on('data', (chunk) => { blankEnvOut += chunk.toString(); });
         const blankEnvUp = await waitForOk(`http://127.0.0.1:${blankEnvPort}/health`, 10000).then(() => true).catch(() => false);
         const fileKeyStatus = blankEnvUp
             ? await fetch(`http://127.0.0.1:${blankEnvPort}/v1/models`, { headers: { authorization: `Bearer ${blankEnvKey}` } })
@@ -2406,6 +2440,12 @@ async function run() {
         check('a blank environment variable does not hide the port and key from config.json',
             blankEnvUp && fileKeyStatus === 200 && builtinKeyStatus === 401,
             `listening=${blankEnvUp} fileKey=${fileKeyStatus} builtinKey=${builtinKeyStatus}`);
+        check('an unknown config.json key is reported with the key it probably meant',
+            blankEnvOut.includes("unknown key 'APIKEY' (did you mean 'API_KEY'?)") &&
+            blankEnvOut.includes("unknown key '__proto__'"),
+            blankEnvOut.split('\n').filter((line) => line.includes('unknown key')).join(' | ').slice(0, 200));
+        check('an unknown config.json key is never merged into a prototype',
+            ({}).polluted === undefined && fileKeyStatus === 200, `polluted=${({}).polluted}`);
         stopGateway(blankEnvGateway);
         await waitForExit(blankEnvGateway);
     } finally {

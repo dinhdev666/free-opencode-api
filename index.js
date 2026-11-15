@@ -1,5 +1,5 @@
 import { startProxy, DEFAULT_API_KEY, parseBoolean, resolveApiKey, getQueueLimits } from './src/proxy.js';
-import { readConfigFile, envOrFile } from './src/config.js';
+import { readConfigFile, envOrFile, findUnknownKeys } from './src/config.js';
 import { logger, maskBackendUrl } from './src/logger.js';
 import fs from 'fs';
 import path from 'path';
@@ -33,6 +33,23 @@ if (configError) {
     process.exit(1);
 }
 const configPathLoaded = fs.existsSync(configPath);
+// A key the gateway never reads is a typo or a key from another tool: naming it (and the key it probably meant) is the
+// difference between "my setting had no effect" and finding the misspelling. The value itself is never printed - a
+// mistyped API_KEY is still a credential.
+// One log line is one record, the same rule the client-controlled ids follow in src/proxy.js: a key with a control
+// character or a kilobyte of text must not break or bloat the line
+const loggableKey = (key) => String(key).replace(/[\u0000-\u001f\u007f]/g, '?').slice(0, 64);
+const unknownConfigKeys = findUnknownKeys(fileConfig);
+if (unknownConfigKeys.length > 0) {
+    const shown = unknownConfigKeys.slice(0, 5);
+    for (const { key, suggestion } of shown) {
+        logger.warn(`[Config] config.json has an unknown key '${loggableKey(key)}'` +
+            `${suggestion ? ` (did you mean '${suggestion}'?)` : ''} - it is ignored`);
+    }
+    if (unknownConfigKeys.length > shown.length) {
+        logger.warn(`[Config] config.json has ${unknownConfigKeys.length - shown.length} more unknown key(s)`);
+    }
+}
 // Merge configs: env > file > default
 // Note: by design LOG_LEVEL takes env over the config.json logLevel field (same merge direction as the other keys
 // below, where env comes first)

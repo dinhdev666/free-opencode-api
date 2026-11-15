@@ -64,7 +64,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 96 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 99 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -149,9 +149,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `GET /__sessions` so the smoke suite can assert `live === 0`.
 - CORS headers are set on the raw response for every request, including hijacked streams:
   `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, OPTIONS`, `Allow-Headers: Content-Type,
-  Authorization, X-Api-Key, X-Requested-With`, `Max-Age: 600`.
+  Authorization, X-Api-Key, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`.
 - Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
-  to a log entry.
+  to a log entry. An incoming `X-Request-Id` is echoed when it is a short printable token
+  (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a
+  response header, so a header value carrying spaces, newlines or control characters must never be copied through.
+  `Access-Control-Expose-Headers: X-Request-Id` lets a browser client read it back.
 - Request log format: `METHOD url -> status Xms [reqId] model=… stream=…` (info for `/v1/*`, debug otherwise).
 
 ## Working rules for code changes

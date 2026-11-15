@@ -95,8 +95,8 @@ const stopGateway = (child) => {
     if (child && child.exitCode === null) child.kill('SIGINT');
 };
 
-async function request(pathname, { method = 'GET', body, key = API_KEY, stream = false } = {}) {
-    const headers = {};
+async function request(pathname, { method = 'GET', body, key = API_KEY, stream = false, headers: extraHeaders } = {}) {
+    const headers = { ...(extraHeaders || {}) };
     if (key) headers.authorization = `Bearer ${key}`;
     if (body !== undefined) headers['content-type'] = 'application/json';
     const response = await fetch(`${BASE}${pathname}`, {
@@ -578,6 +578,21 @@ async function run() {
         streamedFailure.text.slice(0, 160));
     check('a streaming provider error is never delivered as model text',
         !/Proxy Error/.test(streamedFailure.text), streamedFailure.text.slice(0, 160));
+
+    // --- request ids --------------------------------------------------------------------------------------
+    // A client-supplied trace id is kept so its logs and the gateway's can be joined; the response header is
+    // exposed to browsers, and a value that could break the log line or the header is ignored rather than echoed
+    const traced = await request('/health', { headers: { 'X-Request-Id': 'trace-abc123' } });
+    check('a client trace id is echoed back in X-Request-Id',
+        traced.response.headers.get('x-request-id') === 'trace-abc123',
+        traced.response.headers.get('x-request-id'));
+    check('X-Request-Id is exposed to browser clients',
+        (traced.response.headers.get('access-control-expose-headers') || '').includes('X-Request-Id'),
+        traced.response.headers.get('access-control-expose-headers'));
+    const injected = await request('/health', { headers: { 'X-Request-Id': 'bad id with spaces' } });
+    const injectedId = injected.response.headers.get('x-request-id') || '';
+    check('an unusable client trace id is replaced by a generated one',
+        injectedId.startsWith('gw-'), injectedId);
 
     // --- session lifecycle -------------------------------------------------------------------------------
     // One session is created and must be deleted per completion; a leak would grow the backend without bound

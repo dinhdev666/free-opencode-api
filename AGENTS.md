@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 365 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 371 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -133,7 +133,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   to the same handler, so the open-route test must match it too, or a liveness probe answers 401).
 - `GET /v1/models` → `200 {"object":"list","data":[{id,name,object,owned_by}, …]}`; 5 s cache, and a cold-cache burst
   shares one provider round trip (`modelsInFlight`) instead of one per request; failures — including a provider call
-  that runs into its deadline, because a silent backend would never answer the listing at all — fall back to
+  that runs into its deadline, because a silent backend would never answer the listing — fall back to
   a single static model and are not cached, but a served fallback is held for 1 s (`FALLBACK_HOLD_MS`) so a failing
   provider is not asked once per listing. A fresh cache answers with the body built when it was filled
   (`modelsCacheBody`; by-id answers read `modelsById`). That model is `opencode/big-pickle` (`DEFAULT_MODEL` in `src/proxy.js`), also the model a chat request
@@ -142,9 +142,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   carries just the four OpenAI fields - do not add capabilities, limits or pricing describing a model the gateway
   cannot see.
   An empty provider list takes the same fallback: an unreadable payload (a changed shape, a version reporting
-  nothing) answers `200 {"providers":[]}`, and `{"data":[]}` is as useless as an error. So does a non-empty list that
-  yields no model (no `models` map, an empty one): the empty check runs after the extraction, because the answer - and
-  the "do not cache it" rule - is identical for both shapes.
+  nothing) answers `200 {"providers":[]}`, and `{"data":[]}` is as useless as an error. A non-empty list that yields no
+  model (no `models` map, an empty one) does too: the empty check runs after the extraction.
 - `GET /v1/models/:modelId` and `GET /v1/models/<id with slashes>` → `200 {id,name,object,owned_by}` from the same
   cache; an id the provider list does not contain is described from the id itself (`provider` = text before `/`,
   default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either — the one
@@ -168,7 +167,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   a long think must not let an idle proxy drop the connection.
   `stream_options.include_usage` adds one more chunk with `choices: []` and a zeroed `usage` block, after the finish
   chunk and before `[DONE]`: the OpenAI SDK reads the stream's usage from exactly that frame, and ignoring the option
-  left it with no numbers at all. It is emitted only when the client asks for it — a stream that did not request it
+  left it with no numbers. It is emitted only when the client asks for it — a stream that did not request it
   must not grow an extra frame.
 - **`system` and `developer` messages are the system prompt.** Both roles are folded into the prompt's `system`
   field (joined with blank lines) and never appear as conversation parts; every other role is labelled
@@ -257,6 +256,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   quote its URL. The route handler's own catch writes its `500` body itself, so it reads the sentence through
   `handlerFailureMessage()` - masked, and built *before* the log line that prints it, because a `const` read ahead of
   its declaration is a `ReferenceError` that replaces the cause of the `500` with a bug in the catch itself.
+  A log record prints the sentence *and* the stack behind that error, whose first line is the message: both go
+  through `loggableError()` - masked, stack bounded (`MAX_LOGGED_STACK_CHARS`).
   A backend that disappears mid-request is an upstream failure (`502`), not a bug (`500`): the client is told the upstream is gone and the next request
   restarts it.
 - A backend that rejects `POST /session` (a version whose API moved, a proxy in front of it, an error body) is an
@@ -423,8 +424,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   gateway listened on the default port with the built-in public key while the file named another port and a real
   secret. Keep every key on that rule.
   A **key nobody reads** is named at startup and ignored (`[Config] config.json has an unknown key 'APIKEY' (did you
-  mean 'API_KEY'?) - it is ignored`, via `findUnknownKeys()`): a misspelled key changed nothing at all, so the gateway
-  ran the default while the operator was sure the value in the file was in force. A
+  mean 'API_KEY'?) - it is ignored`, via `findUnknownKeys()`): a misspelled key changed nothing, so the default ran
+  while the operator trusted the file. A
   suggestion is only made for a case/separator difference — a real misspelling (`…MAX_CONCURENCY`) cannot be guessed — the value is never printed (a mistyped `API_KEY` is still a
   credential), and nothing is merged generically, so an unknown key (including `__proto__`) cannot reach the running
   config. `OPENCODE_PROXY_DEBUG` is an environment name only — the file key is `DEBUG`, so a file entry under the
@@ -445,7 +446,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   A value that is present but unusable is **named in a `[Config]` warning with the value actually used**
   (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS='0' is not a positive number, using 300000`, `… HEALTH_CACHE_MS='abc' is not a
   number, using 2000`): a silent fallback left the operator convinced a value was in force while the gateway ran the
-  default, the failure the precedence rule above exists to prevent.
+  default.
 - **Polling answers with the finished message.** `pollForAssistantResponse` is called with `requireDone: true` on
   every path that emits the final answer: the poll loop can start while the answer is still being written, and
   returning the first non-empty message truncated it. A message whose

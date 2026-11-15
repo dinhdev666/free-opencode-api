@@ -98,10 +98,12 @@ function safeClone(value, seen = new WeakSet(), depth = 0) {
     }
     if (typeof value !== 'object') return value;
     if (value instanceof Error) {
+        // Masked like every other sentence that leaves the process: an `Error` handed to a log line is the shape whose
+        // message quotes a credential, and its stack repeats that message on its first line.
         return {
             name: value.name,
-            message: value.message,
-            stack: truncateText(String(value.stack || ''), 1000)
+            message: maskFreeText(value.message),
+            stack: maskFreeText(String(value.stack || ''), MAX_LOGGED_STACK_CHARS)
         };
     }
     if (seen.has(value)) return '[Circular]';
@@ -259,6 +261,67 @@ export function maskQuotedCredentials(text) {
     return String(text).replace(/(\bbasic\s+|\bbearer\s+)([A-Za-z0-9+/=_.~-]{16,})/gi, '$1***');
 }
 
+// Upstream text on its way to a client or a log line is masked and bounded. A backend (or a proxy in front of it) can
+// quote a URL inside an error payload, and a configured backend URL may carry a credential, so every sentence that
+// leaves the process goes through the same chain - the `500` body, the `502` body, the request log and the stack a
+// fatal handler prints.
+const MAX_UPSTREAM_TEXT_CHARS = 512;
+// A stack is bounded separately, and much lower: it is written by whatever threw, and 32 KB of frames helps nobody
+// (the same limit `safeClone()` applies to an `Error` it copies).
+export const MAX_LOGGED_STACK_CHARS = 1000;
+
+// Only the URL-shaped words of the text are masked. `maskUrlQuery()` is written for a URL: given a sentence it
+// read everything after the first `?` as that parameter's value, so `…?x=1: connection refused` answered
+// `…?x=***` and lost the half of the reason that explains the failure.
+//
+// The words are found by splitting on whitespace rather than with `/\S+:\/\/\S+/`, which backtracked over a
+// million-character token with no `://` in it one character at a time: a provider error of 1 MB parked the request
+// for longer than its whole budget. `includes('://')` decides per token, and a token is at most a word.
+export function maskUrlsInText(text) {
+    const value = String(text);
+    if (!value.includes('://')) return value;
+    return value
+        .split(/(\s+)/)
+        .map((token) => (token.includes('://') ? maskUrlQuery(maskUrlCredentials(token)) : token))
+        .join('');
+}
+
+/**
+ * Free text that is about to leave the process - a client-facing 5xx sentence, an error log line, a stack, a string
+ * inside a debug dump - masked and bounded in one place.
+ *
+ * Two credentials can hide in a sentence and neither is the sentence's own: a URL carrying userinfo or a query value
+ * (`http://user:secret@host:4097/session?token=…`, which Node's `fetch` refuses out loud) and an authorization header
+ * value a proxy echoed back (`Authorization: Basic b3BzOnMzY3I…`). Both used to reach a client body and `docker logs`
+ * verbatim; masking one and not the other is why the chain lives here rather than at each call site.
+ * @param {*} value any text (non-strings are stringified the way `maskUrlQuery` does it)
+ * @param {number} [maxChars] length bound; 512 by default, and the marker matches `loggableUrl()`
+ * @returns {string} the masked, bounded text
+ */
+export function maskFreeText(value, maxChars = MAX_UPSTREAM_TEXT_CHARS) {
+    if (value === null || value === undefined) return '';
+    const masked = maskQuotedCredentials(maskUrlsInText(String(value)));
+    if (!Number.isFinite(maxChars) || masked.length <= maxChars) return masked;
+    return `${masked.slice(0, maxChars)}…[truncated ${masked.length - maxChars} chars]`;
+}
+
+/**
+ * The `{ error, stack }` pair an error log line prints, masked and bounded the way a response body is.
+ *
+ * A stack's first line *is* the message, so a line that masked `message` and printed `stack` verbatim published the
+ * sentence it had just masked - and the fatal handlers (`uncaughtException`, `unhandledRejection`, a failed start) did
+ * exactly that, with no masking at all. Reading `.message` off a rejection that carries none also wrote `undefined`.
+ * @param {*} error whatever was thrown or rejected with
+ * @returns {{error: string, stack: string}} the sentence and the (bounded) stack, both masked
+ */
+export function loggableError(error) {
+    const stack = typeof error?.stack === 'string' ? error.stack : '';
+    return {
+        error: maskFreeText(typeof error?.message === 'string' ? error.message : error),
+        stack: maskFreeText(stack, MAX_LOGGED_STACK_CHARS)
+    };
+}
+
 /**
  * Copy a request-header object and mask sensitive headers (authorization/api-key/cookie/token etc.)
  * @param {object} headers original request headers
@@ -286,6 +349,10 @@ export function maskHeaders(headers) {
  * @returns {*} masked copy (the original object is left untouched)
  */
 export function maskDetail(value, seen = new WeakSet(), depth = 0) {
+    // A string is masked too, and by content rather than by key: a client that forwards
+    // `{"endpoint":"http://user:secret@host:4097/session?token=abc"}` in a field named something ordinary wrote that
+    // credential to `docker logs` at debug level, because only values whose *key* looked like a credential were masked.
+    if (typeof value === 'string') return maskFreeText(value, MAX_SERIALIZED_LENGTH);
     if (value === null || typeof value !== 'object') return value;
     if (seen.has(value)) return '[Circular]';
     if (depth >= 8) return '[MaxDepthExceeded]';

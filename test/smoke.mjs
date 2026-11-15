@@ -14,8 +14,8 @@ import os from 'node:os';
 import { clientFacingText, handlerFailureMessage, parseBoolean, resolveBackendAuth, timeoutMessage } from '../src/proxy.js';
 import { readConfigFile, findUnknownKeys, CONFIG_FILE_KEYS } from '../src/config.js';
 import {
-    createLogger, maskBackendUrl, maskHeaders, maskQuotedCredentials, maskSecret, maskUrlCredentials, maskUrlQuery,
-    serializeDetail,
+    createLogger, loggableError, maskBackendUrl, maskDetail, maskHeaders, maskQuotedCredentials, maskSecret,
+    maskUrlCredentials, maskUrlQuery, serializeDetail,
     SENSITIVE_NAME_ALTERNATIVES
 } from '../src/logger.js';
 import path from 'node:path';
@@ -432,10 +432,64 @@ async function run() {
     // operator gets "Cannot access 'handlerMessage' before initialization" instead of a reason. No request the gateway
     // accepts can provoke a handler throw, so the order is asserted on the source (it was wrong once).
     const handlerMessageDeclaredAt = proxySource.indexOf('const handlerMessage = handlerFailureMessage(error);');
-    const handlerMessageLoggedAt = proxySource.indexOf('message: handlerMessage, stack: error.stack');
+    const handlerMessageLoggedAt = proxySource.indexOf('message: handlerMessage, stack:');
     check('the handler catch computes its 500 sentence before the log line that reads it',
         handlerMessageDeclaredAt > 0 && handlerMessageLoggedAt > handlerMessageDeclaredAt,
         `declared at ${handlerMessageDeclaredAt}, read at ${handlerMessageLoggedAt}`);
+
+    // A log line prints a sentence *and* the stack of the error behind it, and a stack's first line is that same
+    // message: masking the sentence and printing the stack verbatim published the credential the masking had just
+    // removed, on the same record, and the fatal handlers (`uncaughtException`, `unhandledRejection`, a failed start)
+    // did not mask either field at all. `loggableError()` is the pair they all log now.
+    const leakyError = new Error('connect ECONNREFUSED http://user:secret@host:4097/session?token=abc');
+    leakyError.stack; // the stack is materialised lazily, and the check reads it to prove the leak was real
+    const loggableLeaky = loggableError(leakyError);
+    check('an error log line masks the sentence and the stack it prints',
+        leakyError.message.includes('secret') && leakyError.stack.includes('secret') &&
+        loggableLeaky.error === 'connect ECONNREFUSED http://***@host:4097/session?token=***' &&
+        loggableLeaky.stack.includes('connect ECONNREFUSED http://***@host:4097/session?token=***') &&
+        !loggableLeaky.stack.includes('secret') &&
+        !loggableLeaky.error.includes('secret'),
+        JSON.stringify(loggableLeaky));
+    check('an error log line still names the error when there is nothing to mask, and nothing when there is no error',
+        loggableError(new Error('the backend went away')).error === 'the backend went away' &&
+        loggableError(new Error('the backend went away')).stack.startsWith('Error: the backend went away') &&
+        loggableError(undefined).error === '' && loggableError(undefined).stack === '' &&
+        loggableError('a thrown string').error === 'a thrown string',
+        JSON.stringify([loggableError(new Error('the backend went away')), loggableError(undefined)]));
+    const longError = new Error(`failed at http://user:secret@host:4097/session ${'x'.repeat(5000)}`);
+    const boundedLoggable = loggableError(longError);
+    check('the stack a fatal line prints is bounded, masked and marked as cut',
+        boundedLoggable.stack.length < 1100 && boundedLoggable.stack.includes('…[truncated ') &&
+        !boundedLoggable.stack.includes('secret'),
+        `stack length ${boundedLoggable.stack.length}`);
+    // An `Error` handed to a log line as a value (not spread into `{ error, stack }`) reaches the same masking: its
+    // message quotes the credential and its stack repeats it.
+    const serializedError = serializeDetail({ cause: leakyError });
+    check('an Error passed to a log line is masked inside the detail copy',
+        !serializedError.includes('secret') && serializedError.includes('http://***@host:4097/session?token=***'),
+        serializedError.slice(0, 240));
+    // The debug dump masks by content too, not only by key name: a client that forwards a credential-bearing URL in a
+    // field named something ordinary (`endpoint`, `base_url`) wrote it to `docker logs`.
+    const maskedEndpoint = maskDetail({
+        endpoint: 'http://user:secret@host:4097/session?token=abc',
+        messages: [{ role: 'user', content: 'hi' }]
+    });
+    check('a debug dump masks a credential-bearing URL in a field that is not named like one',
+        maskedEndpoint.endpoint === 'http://***@host:4097/session?token=***' &&
+        maskedEndpoint.messages[0].content === 'hi',
+        JSON.stringify(maskedEndpoint));
+    // The wiring, on the source: every fatal line logs the masked pair, and none of them prints a raw stack.
+    const indexSource = fs.readFileSync(path.join(ROOT, 'index.js'), 'utf8');
+    check('no fatal handler prints a raw error sentence or stack',
+        !/stack:\s*(err|error|reason)\??\.stack/.test(indexSource) &&
+        !/stack:\s*(err|error|reason)\??\.stack/.test(proxySource) &&
+        (indexSource.match(/loggableError\(/g) || []).length === 3 &&
+        !proxySource.includes('stack: error.stack'),
+        JSON.stringify({
+            indexRaw: /stack:\s*(err|error|reason)\??\.stack/.test(indexSource),
+            proxyRaw: /stack:\s*(err|error|reason)\??\.stack/.test(proxySource)
+        }));
 
     // `http://user:secret@host:4097` was documented as supported and could not work: the SDK calls every endpoint
     // through Node's fetch, which refuses a URL carrying credentials, so every completion answered 502 and the

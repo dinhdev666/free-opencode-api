@@ -1,0 +1,14 @@
+# Keep the build context to what the image actually needs.
+# node_modules is critical: without it `COPY . .` would overwrite the Linux dependencies installed inside the image
+# with whatever the host has (a macOS or Windows tree), and a local config.json/.env would be baked into the image.
+node_modules
+.pnpm-store
+.git
+.gitignore
+.github
+.env
+config.json
+*.log
+.DS_Store
+.vscode
+.idea

@@ -2,6 +2,7 @@ import { startProxy, DEFAULT_API_KEY, resolveApiKey } from './src/proxy.js';
 import { logger } from './src/logger.js';
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -49,8 +50,14 @@ if (fs.existsSync(configPath)) {
 // Merge configs: env > file > default
 // Note: by design LOG_LEVEL takes env over the config.json logLevel field (same merge direction as the other keys
 // below, where env comes first)
+const parsedPort = Number.parseInt(process.env.PORT ?? fileConfig.PORT ?? '', 10);
+const portIsValid = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort < 65536;
+if (!portIsValid && (process.env.PORT !== undefined || fileConfig.PORT !== undefined)) {
+    logger.warn(`[Config] PORT is not a valid TCP port (1-65535), falling back to ${defaultConfig.PORT}`);
+}
+
 const finalConfig = {
-    PORT: parseInt(process.env.PORT) || fileConfig.PORT || defaultConfig.PORT,
+    PORT: portIsValid ? parsedPort : defaultConfig.PORT,
     // Never empty: an unset/blank API_KEY falls back to the built-in default (authentication stays on)
     API_KEY: resolveApiKey(process.env.API_KEY ?? fileConfig.API_KEY ?? defaultConfig.API_KEY),
     OPENCODE_SERVER_URL: process.env.OPENCODE_SERVER_URL || fileConfig.OPENCODE_SERVER_URL || defaultConfig.OPENCODE_SERVER_URL,
@@ -74,10 +81,10 @@ if (!finalConfig.OPENCODE_PATH) {
 }
 
 // Check if opencode is available. The timeout matters: a backend that waits for input (or a wrapper that never
-// returns) must not block the gateway from starting, and the probe result is a warning at most.
-import { execSync } from 'child_process';
+// returns) must not block the gateway from starting, and the probe result is a warning at most. execFileSync (no
+// shell) keeps a path with quotes or spaces intact and cannot be turned into a shell command.
 try {
-    execSync(`"${finalConfig.OPENCODE_PATH}" --version`, { stdio: 'ignore', timeout: 5000 });
+    execFileSync(finalConfig.OPENCODE_PATH, ['--version'], { stdio: 'ignore', timeout: 5000 });
 } catch (e) {
     logger.warn(`[Warning] Cannot verify OpenCode installation: ${finalConfig.OPENCODE_PATH}`);
     logger.warn('[Warning] Please ensure OpenCode is installed:');
@@ -134,6 +141,19 @@ try {
 
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    // A single failed request must not take the gateway down silently: a stray rejection is logged with its stack and
+    // the process keeps serving, while an uncaught exception (state unknown) goes through the normal shutdown path.
+    process.on('unhandledRejection', (reason) => {
+        logger.error('[Fatal] Unhandled promise rejection:', {
+            error: reason?.message || String(reason),
+            stack: reason?.stack
+        });
+    });
+    process.on('uncaughtException', (err) => {
+        logger.error('[Fatal] Uncaught exception:', { error: err.message, stack: err.stack });
+        shutdown('uncaughtException');
+    });
 } catch (error) {
     logger.error('[Fatal] Failed to start proxy:', { error: error.message, stack: error.stack });
     process.exit(1);

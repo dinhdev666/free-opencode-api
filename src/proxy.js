@@ -2666,6 +2666,18 @@ function createApp(config) {
                     // OpenAI clients branch on the type: a gateway/upstream failure is a server_error, and the
                     // constructor name of an internal exception is not part of any contract
                     const payload = { error: { message: errorMessage, type: 'server_error' } };
+                    // A 502 is an upstream failure, and which one is what every other error in this API carries in
+                    // `code`: a client could only tell "the backend refused the session" from "the connection died"
+                    // by parsing the prose. Three stable values, not `error.name` - a connection failure is a
+                    // TypeError, and an internal class name is not part of any contract.
+                    if (statusCode === 502) {
+                        // The connection case is tested first: a backend that dies mid-request surfaces as a
+                        // ProviderError whose message carries `fetch failed`, and `backend_unreachable` is the answer
+                        // a client can act on
+                        payload.error.code = isConnectionError(error)
+                            ? 'backend_unreachable'
+                            : (error.name === 'ProviderError' ? 'ProviderError' : 'upstream_error');
+                    }
                     if (!reply.raw.headersSent) {
                         if (hijacked) {
                             reply.raw.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });

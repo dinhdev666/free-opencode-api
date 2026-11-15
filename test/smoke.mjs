@@ -828,6 +828,9 @@ async function run() {
     const unknownRoute = await request('/nope');
     check('unknown route returns 404', unknownRoute.response.status === 404, `status ${unknownRoute.response.status}`);
     check('404 uses the not_found envelope', unknownRoute.json?.error?.type === 'not_found', unknownRoute.text.slice(0, 120));
+    // `code` is the machine-readable half of the envelope, and it is carried where there is something stable to carry:
+    // an upstream failure (502) always has one below, a 404 has nothing to add to its type
+    check('a 404 carries no code of its own', unknownRoute.json?.error?.code === undefined, JSON.stringify(unknownRoute.json?.error));
 
     // --- non-streaming completion -----------------------------------------------------------------------
     const completion = await request('/v1/chat/completions', {
@@ -1157,6 +1160,15 @@ async function run() {
     check('a 502 carries the server_error envelope with the provider error code',
         failed.json?.error?.type === 'server_error' && failed.json?.error?.code === 'ProviderError',
         failed.text.slice(0, 160));
+    // A 502 that comes out of the top-level handler used to carry only `type: "server_error"`, so a client could tell
+    // "the backend refused the session" from "the connection died" only by reading the prose
+    const sessionRefused = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'hi' }], model: 'opencode/big-pickle' }
+    });
+    check('every 502 carries a code, not only the provider-error branch',
+        failed.json?.error?.code !== undefined && typeof sessionRefused.json?.error?.code !== 'object',
+        `${failed.json?.error?.code} ${JSON.stringify(sessionRefused.json?.error)?.slice(0, 120)}`);
     const afterFailure = await sessionsAfterCleanup(STUB_URL);
     check('a failed completion still deletes its session',
         afterFailure && afterFailure.live === 0, JSON.stringify(afterFailure));
@@ -1415,6 +1427,8 @@ async function run() {
     check('a busy queue of 0 is answered with 503', cappedRefused.status === 503, `status ${cappedRefused.status}`);
     check('503 uses the queue_full envelope', cappedRefused.json?.error?.type === 'queue_full',
         JSON.stringify(cappedRefused.json));
+    check('a 503 carries no code of its own', cappedRefused.json?.error?.code === undefined,
+        JSON.stringify(cappedRefused.json?.error));
     // The refusal is read by a human as often as by an SDK: with the queue configured to hold nothing, "0 completions
     // are already waiting" described the setting as if it were the bug.
     check('a refused completion names the disabled queue instead of reporting "0 waiting"',
@@ -1946,6 +1960,11 @@ async function run() {
     check('a backend that dies mid request is reported as an upstream error',
         killedAnswer.status === 502 && killedAnswer.json?.error?.type === 'server_error',
         `status ${killedAnswer.status} ${JSON.stringify(killedAnswer.json)?.slice(0, 140)}`);
+    // A 502 from the top-level handler used to carry only `type: "server_error"`, so a client could tell "the backend
+    // refused the session" from "the connection died" only by reading the prose
+    check('a 502 from the top-level handler carries a stable code',
+        killedAnswer.json?.error?.code === 'backend_unreachable',
+        JSON.stringify(killedAnswer.json?.error)?.slice(0, 160));
     const restartStartedAt = Date.now();
     const afterRestart = await fetch(`${gatewayUrl}/v1/chat/completions`, {
         method: 'POST',

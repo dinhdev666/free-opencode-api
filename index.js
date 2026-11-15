@@ -3,7 +3,7 @@ import { readConfigFile } from './src/config.js';
 import { logger } from './src/logger.js';
 import fs from 'fs';
 import path from 'path';
-import { execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -113,43 +113,18 @@ if (!finalConfig.OPENCODE_PATH) {
     process.exit(1);
 }
 
-// Check if opencode is available. The timeout matters: a backend that waits for input (or a wrapper that never
-// returns) must not block the gateway from starting, and the probe result is a warning at most. execFileSync (no
-// shell) keeps a path with quotes or spaces intact and cannot be turned into a shell command.
-// The version is read as well, because the CLI's major version decides whether the API this gateway drives exists at
-// all: a 2.x `opencode serve` is the web UI, answers /health with HTML and rejects POST /session, so every completion
-// failed with a 502 whose message named only the status. Saying it at startup puts the cause in front of the operator
-// before the first request instead.
-let opencodeVersion = null;
-try {
-    const output = execFileSync(finalConfig.OPENCODE_PATH, ['--version'], {
-        stdio: ['ignore', 'pipe', 'ignore'],
-        timeout: 5000,
-        encoding: 'utf8'
-    });
-    opencodeVersion = (String(output).match(/\d+\.\d+\.\d+/) || [])[0] || null;
-} catch (e) {
-    logger.warn(`[Warning] Cannot verify OpenCode installation: ${finalConfig.OPENCODE_PATH}`);
-    logger.warn('[Warning] Please ensure OpenCode is installed (a 1.x release is required):');
-    logger.warn('  Windows: npm install -g "opencode-ai@1"');
-    logger.warn('  Linux/macOS: curl -fsSL https://opencode.ai/install | bash  (then check `opencode --version`)');
-    logger.warn('[Warning] Or specify the full path in config.json:');
-    logger.warn('  { "OPENCODE_PATH": "C:\\\\Users\\\\YourName\\\\AppData\\\\Roaming\\\\npm\\\\opencode.cmd" }');
-}
-if (opencodeVersion && Number(opencodeVersion.split('.')[0]) >= 2) {
-    logger.warn(
-        `[Warning] OpenCode CLI ${opencodeVersion} is a 2.x release: its \`serve\` is the web UI, not the session API this gateway drives, ` +
-        'so every completion will fail with 502 "rejected session creation". Install a 1.x release (npm install -g "opencode-ai@1") ' +
-        'or point OPENCODE_PATH at one.'
-    );
-}
+// The CLI check and its version are a warning at most, so they run *after* the server is listening (see
+// probeOpencodeVersion below): the synchronous probe sat here and spent up to its whole 5 s timeout before the gateway
+// bound - a wrapper script that waits for input, a cold npm shim - and during that window the process had not
+// installed its signal handlers yet, so Ctrl-C killed it abruptly instead of shutting it down. execFile (no shell)
+// keeps a path with quotes or spaces intact and cannot be turned into a shell command.
 
 logger.info('[Config] Starting with configuration:');
 logger.info(`  - Port: ${finalConfig.PORT}`);
 logger.info(`  - Bind Host: ${finalConfig.BIND_HOST}`);
 logger.info(`  - Backend: ${finalConfig.OPENCODE_SERVER_URL}`);
 logger.info(`  - Bind Host for OpenCode backend: ${finalConfig.OPENCODE_BIND_HOST}`);
-logger.info(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}${opencodeVersion ? ` (v${opencodeVersion})` : ''}`);
+logger.info(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
 logger.info(`  - API Key: ${finalConfig.API_KEY === DEFAULT_API_KEY ? `default (${DEFAULT_API_KEY})` : 'custom'} - authentication always enforced`);
 logger.info(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
 logger.info(`  - Isolated HOME for OpenCode: ${finalConfig.USE_ISOLATED_HOME ? 'Yes' : 'No'}`);
@@ -160,9 +135,50 @@ logger.info(`  - Wait queue: ${queueLimits.queue} waiting completion(s) before 5
 // The clamp/typo warnings for these two keys are emitted by startProxy(), which owns that resolution: warning here too
 // printed every note twice.
 
+// Reads the CLI version beside the running server. The major version decides whether the API this gateway drives
+// exists at all: a 2.x `opencode serve` is the web UI, answers /health with HTML and rejects POST /session, so every
+// completion fails with a 502 whose message names only the status. Saying it at startup puts the cause in front of the
+// operator before the first request instead. A probe that cannot answer (no binary, a wrapper that never returns) is
+// reported the same way it always was - as a warning, never as a reason not to serve.
+function probeOpencodeVersion(binPath) {
+    return new Promise((resolve) => {
+        execFile(binPath, ['--version'], { timeout: 5000, encoding: 'utf8' }, (error, stdout) => {
+            if (error) {
+                resolve({ error });
+                return;
+            }
+            resolve({ version: (String(stdout).match(/\d+\.\d+\.\d+/) || [])[0] || null });
+        });
+    });
+}
+
+function reportOpencodeVersion(result) {
+    if (result.error) {
+        logger.warn(`[Warning] Cannot verify OpenCode installation: ${finalConfig.OPENCODE_PATH}`);
+        logger.warn('[Warning] Please ensure OpenCode is installed (a 1.x release is required):');
+        logger.warn('  Windows: npm install -g "opencode-ai@1"');
+        logger.warn('  Linux/macOS: curl -fsSL https://opencode.ai/install | bash  (then check `opencode --version`)');
+        logger.warn('[Warning] Or specify the full path in config.json:');
+        logger.warn('  { "OPENCODE_PATH": "C:\\\\Users\\\\YourName\\\\AppData\\\\Roaming\\\\npm\\\\opencode.cmd" }');
+        return;
+    }
+    const version = result.version;
+    if (!version) return;
+    logger.info(`  - OpenCode CLI version: ${version}`);
+    if (Number(version.split('.')[0]) >= 2) {
+        logger.warn(
+            `[Warning] OpenCode CLI ${version} is a 2.x release: its \`serve\` is the web UI, not the session API this gateway drives, ` +
+            'so every completion will fail with 502 "rejected session creation". Install a 1.x release (npm install -g "opencode-ai@1") ' +
+            'or point OPENCODE_PATH at one.'
+        );
+    }
+}
+
 // Start the proxy
 try {
     const proxy = startProxy(finalConfig);
+    // Deliberately not awaited: the gateway is already serving, and the answer only adds a line (or a warning)
+    probeOpencodeVersion(finalConfig.OPENCODE_PATH).then(reportOpencodeVersion).catch(() => {});
 
     // Graceful shutdown: stop accepting connections, let the responses in flight finish, then stop the backend and
     // exit. Long-lived SSE streams can keep server.close() pending, so in-flight sockets get a short grace period

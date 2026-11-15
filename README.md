@@ -376,7 +376,9 @@ All output goes to stdout/stderr with a `[gateway]` prefix:
 Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked before they are logged.
 
 The startup summary prints the effective port, backend URL, tool filtering, log level and capacity
-(`Concurrency: … completion(s) processed in parallel`, `Wait queue: … waiting completion(s) before 503 queue_full`). A
+(`Concurrency: … completion(s) processed in parallel`, `Wait queue: … waiting completion(s) before 503 queue_full`). The
+`opencode` version follows it as its own line: it is read beside the running server, because a `--version` that hangs
+(a wrapper script, a cold npm shim) must not keep the gateway from binding. A
 `OPENCODE_PROXY_MAX_CONCURRENCY` / `OPENCODE_PROXY_MAX_QUEUE` / `OPENCODE_PROXY_MAX_BODY_MB` value that is not a
 number, or is outside its range, is
 reported as a `warn` line next to it instead of being applied silently — a throughput knob that quietly falls back to

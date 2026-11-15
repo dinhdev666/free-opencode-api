@@ -746,6 +746,40 @@ async function run() {
     check('a JSON null body returns 400', nullBody.status === 400, `status ${nullBody.status}`);
     check('400 for a null body keeps the envelope', typeof nullBodyJson?.error?.message === 'string', JSON.stringify(nullBodyJson));
 
+    // A body that is valid JSON but not an object is named by its type. `"hi"` under application/json decodes to a
+    // string, and reading that string as unparsed text answered "request body is not valid JSON" about a body that
+    // parses perfectly; `42`, `true` and `[]` were answered "messages array is required" about a field never sent.
+    const scalarBodies = [
+        ['a JSON string body', '"hi"', 'a string'],
+        ['a JSON number body', '42', 'a number'],
+        ['a JSON boolean body', 'true', 'a boolean'],
+        ['a JSON array body', '[]', 'an array']
+    ];
+    for (const [label, sent, found] of scalarBodies) {
+        const res = await fetch(`${BASE}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+            body: sent
+        });
+        const json = await res.json().catch(() => null);
+        check(`400 for ${label} names what arrived`,
+            res.status === 400 && json?.error?.message === `request body must be a JSON object, found ${found}`,
+            `status ${res.status} ${String(json?.error?.message)}`);
+    }
+    // The text paths parse the string they carry, so a payload that decodes to a scalar is refused instead of being
+    // replaced by `{}` (which answered "messages array is required" and lost the value the client sent).
+    for (const [label, sent, found] of [['a number', '42', 'a number'], ['a JSON string', '"hi"', 'a string']]) {
+        const res = await fetch(`${BASE}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'text/plain' },
+            body: sent
+        });
+        const json = await res.json().catch(() => null);
+        check(`a text/plain body holding ${label} is refused by type`,
+            res.status === 400 && json?.error?.message === `request body must be a JSON object, found ${found}`,
+            `status ${res.status} ${String(json?.error?.message)}`);
+    }
+
     // `curl -d '{...}'` without the header (or a client that sends text/plain) hands the gateway an unparsed string
     // body. Rejecting it with "messages array is required" blames the body for a header problem, though the body is
     // valid; the gateway parses it instead.

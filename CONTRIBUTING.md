@@ -201,7 +201,8 @@ Example: `fix/stream-first-delta-fallback`.
 gateway and asserts the contract: the root index and health, auth (401 with a missing or wrong key, with a `type` and
 `code`), CORS/preflight, the request-id header, model listing (both routes, including an id with several slashes),
 400 validation, 404 envelope, non-streaming completion, SSE frames (valid JSON, streamed content and reasoning, stop
-frame, `[DONE]`), that unrelated backend events do not corrupt a stream, that a stalled stream is closed, that an
+frame, `[DONE]`), that unrelated backend events do not corrupt a stream, that a tool-call block split across deltas
+never leaks into the answer, that a stalled stream is closed, that an
 abandoned stream frees its slot, that a request abandoned while queued never reaches the backend, that every
 completion deletes its session, that a full queue answers `503 queue_full`, and clean `SIGINT` shutdown. No OpenCode
 CLI and no network access are required. The stub listens on port 4199 and the gateway on 8199 by default; override

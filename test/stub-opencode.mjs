@@ -17,6 +17,8 @@
 import http from 'node:http';
 
 const PORT = Number(process.env.STUB_PORT || 4199);
+// An answer with a tool-call block whose tags are cut in the middle by the delta boundaries (prompt marker TOOLTAG)
+const TOOL_TAG_ANSWER = 'hello <function_calls>secret</function_calls> world';
 const HOST = process.env.STUB_HOST || '127.0.0.1';
 export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub.';
 export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
@@ -80,7 +82,8 @@ async function stallAfterTwoDeltas(sessionID) {
 // Wait (briefly) for the gateway to be subscribed before emitting, then replay the answer as incremental updates.
 // `pieces`/`delayMs` let a test ask for a deliberately slow answer (a prompt containing SLOW) so it can abort a
 // stream while the backend is still working.
-async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, delayMs = 5 } = {}) {
+async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, delayMs = 5, chunks = null } = {}) {
+    const full = text;
     for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
 
     // opencode interleaves events that have no `properties` at all; the gateway must ignore them instead of
@@ -89,14 +92,28 @@ async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, de
     sendEvent(partUpdate(sessionID, { type: 'reasoning', text: reasoning }));
     await sleep(delayMs);
 
-    const step = Math.max(1, Math.ceil(text.length / pieces));
-    for (let end = step; end < text.length; end += step) {
-        sendEvent(partUpdate(sessionID, { type: 'text', text: text.slice(0, end) }));
+
+    // `chunks` overrides the even split with explicit incremental pieces, so a test can cut the answer in the
+    // middle of a tag; the gateway sees cumulative snapshots either way.
+    let snapshots;
+    if (chunks) {
+        let text = '';
+        snapshots = chunks.map((piece) => {
+            text += piece;
+            return text;
+        });
+    } else {
+        const step = Math.max(1, Math.ceil(full.length / pieces));
+        snapshots = [];
+        for (let end = step; end < full.length; end += step) snapshots.push(full.slice(0, end));
+        snapshots.push(full);
+    }
+    for (const snapshot of snapshots) {
+        sendEvent(partUpdate(sessionID, { type: 'text', text: snapshot }));
         // A message.updated for something the gateway does not care about, with no `info` at all
         sendEvent({ type: 'message.updated', properties: {} });
         await sleep(delayMs);
     }
-    sendEvent(partUpdate(sessionID, { type: 'text', text }));
     await sleep(delayMs);
 
     sendEvent({
@@ -175,6 +192,7 @@ const server = http.createServer(async (req, res) => {
             }
             session.prompted = true;
             promptedSessions += 1;
+            const toolTag = session.promptText.includes('TOOLTAG');
             if (session.promptText.includes('STALL')) {
                 // Nothing for polling to find and no finish event: the caller must time out and close the stream
                 session.messages = [];
@@ -182,13 +200,18 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
                 return;
             }
-            session.messages.push(buildAssistantMessage(id, ANSWER, REASONING));
+            session.messages.push(buildAssistantMessage(id, toolTag ? TOOL_TAG_ANSWER : ANSWER, REASONING));
             sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
             // Fire and forget: the gateway collects the answer from /event (or polling). A prompt containing SLOW
             // is answered over ~2 s so a test can abort mid-stream while the backend is still working.
             const slow = session.promptText.includes('SLOW');
             const options = slow ? { pieces: 10, delayMs: 200 } : {};
-            streamAssistantReply(id, ANSWER, REASONING, options).catch(() => {});
+            if (toolTag) {
+                // A tool-call block cut in the middle of both its tags: nothing of it may reach the client
+                options.chunks = ['hello ', '<function_ca', 'lls>secret</function_ca', 'lls> world'];
+                options.delayMs = 1;
+            }
+            streamAssistantReply(id, toolTag ? TOOL_TAG_ANSWER : ANSWER, REASONING, options).catch(() => {});
             return;
         }
 

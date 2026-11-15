@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 59 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 61 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -77,9 +77,11 @@ Docker Hub.
 `pnpm test` covers the whole HTTP contract against the stub shipped in `test/stub-opencode.mjs` (which implements
 `GET /health`, `GET /config/providers`, `POST /session`, `POST /session/:id/message`, `GET /session/:id/message`,
 `DELETE /session/:id` and an SSE `GET /event`, plus three test-only hooks: `GET /__sessions` (created/deleted/live
-counts) and the prompt markers `SLOW` (a ~2 s answer, so a test can abort mid-stream) and `STALL` (two deltas and
-then silence, so a test can prove a stalled stream still ends). Extend that stub and `test/smoke.mjs` when you add
-behaviour worth protecting.
+counts) and the prompt markers `SLOW` (a ~2 s answer, so a test can abort mid-stream), `STALL` (two deltas and
+then silence, so a test can prove a stalled stream still ends) and `TOOLTAG` (an answer whose tool-call block is cut
+in the middle of both of its tags, so a test can prove the markup never leaks). Extend that stub and
+`test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
+already taken (a stale process would answer with someone else's build) and SIGKILLs any child that ignores SIGTERM.
 
 For exploratory work, start the stub (or a throwaway one in `/tmp`) on a spare port and point the gateway at it:
 
@@ -142,6 +144,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (`app.options('/*')`) is required for preflight; `onRequest` hooks alone do not answer unmatched paths.
 - **Logging** goes through `src/logger.js` (`logger.info`, `logger.warn`, `logger.error`, `logger.debug`). No
   `console.log` in `src/` or `index.js`. Never log an unmasked `authorization` header.
+- **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
+  streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
+  boundary can fall inside either of them; the held fragment is flushed at end of stream. `DISABLE_TOOLS` is read
+  from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`.
 - **Configuration** follows the precedence env > `config.json` > default, and every new key must be added to
   `config.json.example`, the README configuration table and — for container-relevant keys — `docker/docker-entrypoint.sh`.
 - **Timeouts and fallbacks are behavioural contracts.** The polling fallback, the shortened first-delta wait, the

@@ -53,9 +53,39 @@ async function waitForOk(url, timeoutMs = 20000) {
     throw new Error(`timeout waiting for ${url}: ${lastError ? lastError.message : 'unknown error'}`);
 }
 
+// SIGTERM first, SIGKILL if a child ignores it: a leaked stub keeps the port and the next run silently tests the
+// previous checkout's code
 const stop = (child) => {
-    if (child && child.exitCode === null && !child.killed) child.kill('SIGTERM');
+    if (!child || child.exitCode !== null) return;
+    child.kill('SIGTERM');
+    const timer = setTimeout(() => {
+        if (child.exitCode === null) child.kill('SIGKILL');
+    }, 2000);
+    timer.unref();
+    child.once('exit', () => clearTimeout(timer));
 };
+
+const waitForExit = (child) => new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        resolve();
+    }, 3000);
+    child.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+    });
+});
+
+// A process already listening on the port would answer the checks with someone else's build
+async function assertPortFree(port, label) {
+    try {
+        await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1000) });
+    } catch {
+        return;
+    }
+    throw new Error(`${label} port ${port} is already in use: stop that process or set SMOKE_STUB_PORT / SMOKE_PORT`);
+}
 
 const stopGateway = (child) => {
     if (child && child.exitCode === null) child.kill('SIGINT');
@@ -92,6 +122,9 @@ function parseSseFrames(body) {
 
 async function run() {
     // 1. stub backend first: the gateway trusts a fresh health probe, so the stub must be listening already
+    await assertPortFree(STUB_PORT, 'stub');
+    await assertPortFree(GATEWAY_PORT, 'gateway');
+
     const stub = spawn(process.execPath, [path.join(ROOT, 'test', 'stub-opencode.mjs')], {
         cwd: ROOT,
         env: { ...process.env, STUB_PORT: String(STUB_PORT) }
@@ -442,6 +475,49 @@ async function run() {
     check('the client sees an error frame', stallResponse !== 'timeout' && stallResponse.includes('"error"'),
         String(stallResponse).slice(0, 200));
 
+    // --- a tool-call block split across deltas -----------------------------------------------------------
+    // With tools disabled, the markup has to be removed even when the backend cuts it in the middle of a tag:
+    // the held-back fragment must not leak into the answer and the text after it must still arrive.
+    const toolPort = GATEWAY_PORT + 3;
+    const toolUrl = `http://127.0.0.1:${toolPort}`;
+    const toolGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(toolPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'warn',
+            DISABLE_TOOLS: 'true'
+        }
+    });
+    children.push(toolGateway);
+    toolGateway.stdout.on('data', () => {});
+    toolGateway.stderr.on('data', () => {});
+    await waitForOk(`${toolUrl}/health`);
+
+    const toolResponse = await fetch(`${toolUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'TOOLTAG please' }], stream: true })
+    }).then((response) => response.text());
+    const toolFrames = toolResponse
+        .split('\n\n')
+        .filter((frame) => frame.startsWith('data: ') && !frame.includes('[DONE]'))
+        .map((frame) => {
+            try {
+                return JSON.parse(frame.slice(6));
+            } catch {
+                return null;
+            }
+        })
+        .filter(Boolean);
+    const toolText = toolFrames.map((frame) => frame.choices?.[0]?.delta?.content || '').join('');
+    check('a tag split across deltas never reaches the client',
+        !toolText.includes('function_calls') && !toolText.includes('secret'), toolText);
+    check('the text around a split tag is preserved',
+        toolText.includes('hello') && toolText.trim().endsWith('world'), toolText);
+
     // --- graceful shutdown ------------------------------------------------------------------------------
     const exitCode = await new Promise((resolve) => {
         const timer = setTimeout(() => resolve('timeout'), 10000);
@@ -467,6 +543,7 @@ try {
     record('smoke run completed without throwing', false, error.message);
 } finally {
     for (const child of children) stop(child);
+    await Promise.all(children.map((child) => waitForExit(child)));
 }
 
 const failed = results.filter((result) => !result.ok);

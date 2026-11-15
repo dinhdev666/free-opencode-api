@@ -50,7 +50,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved concurrency/queue capacity and any clamp, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because silently continuing would run with the built-in key instead of the configured one or with a value nobody wrote. A key the gateway does not read is returned by `findUnknownKeys()` so the entry point can name it (with the key a case/separator typo probably meant) and ignore it. A UTF-8 BOM is tolerated. |
-| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`) plus `serializeDetail()` (bounded, truncate-before-stringify) used by debug logging. |
+| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`) plus `serializeDetail()` (bounded, truncate-before-stringify) used by debug logging. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
@@ -72,7 +72,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
 pnpm run check:commits           # commit subjects in the last commits against CONTRIBUTING.md (test/check-commit-messages.mjs)
-pnpm test                        # smoke suite: stub backend + gateway, 260 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 280 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -87,39 +87,23 @@ Docker Hub.
 
 ## Verifying without the OpenCode CLI
 
-`pnpm test` covers the whole HTTP contract against the stub shipped in `test/stub-opencode.mjs` (which implements
-`GET /health`, `GET /config/providers`, `POST /session`, `POST /session/:id/message`, `GET /session/:id/message`,
-`DELETE /session/:id` and an SSE `GET /event`, plus three test-only hooks: `GET /__sessions` (created/deleted/live
-counts) and the prompt markers `SLOW` (a ~2 s answer, so a test can abort mid-stream), `STALL` (two deltas and
-then silence, so a test can prove a stalled stream still ends), `TOOLTAG` (an answer whose tool-call block is cut
-in the middle of both of its tags, so a test can prove the markup never leaks) `FAIL` (a provider error with no
-content, so a test can prove both modes report it as an error and the failure path cleans up after itself) and
-`ENDONLY` (an answer whose finish event carries only `time.completed`, so a test can prove the stream still ends
-without waiting for the idle timeout) and
-`GROW` (an answer that is still being written when the prompt returns, so a test can prove the polled answer is never
-truncated) and `STUB_FAIL_SESSION=1` (a 405 for `POST /session`, so a test can prove an
-incompatible backend is reported as an upstream error with its status and reason), `STUB_FAIL_MESSAGES=<n>` (the first
-n message polls answer 500), `STUB_UNREADABLE_MESSAGES=1` (every poll answers 2xx with a body that is not a message
-list) and `STUB_DROP_MESSAGES=<n>` (the first n message polls drop the connection) — both with
-`STUB_ALWAYS_FAIL_MESSAGES=1` to fail every poll, so a test can prove a completion survives a transient poll failure
-and gives up on a persistent one, `SUICIDE` (the stub SIGKILLs itself right after accepting the prompt, so a test can prove a backend that
-disappears mid request is an upstream error without racing a timer of its own), `PAUSE` (an answer that goes silent for 12.5 s - longer than the idle timeout -
-before it finishes, so a test can prove the recovery poll does not truncate it) and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
-backend is killed or the gateway is shutting down), `SLOWFINISH` (an answer that only finishes after 3 s, so a test can
-prove a non-streaming request whose client disconnected stops holding its slot) and `TAILTAG` (an answer whose last delta ends in a tag prefix that
-never becomes a tag, so a test can prove the held fragment is still delivered), `REJECTPROMPT` (a 500 for
-`POST /session/:id/message`, so a test can prove a rejected prompt is reported as an upstream error instead of a
-timeout) and `PROMPTDONE` (a prompt response that already carries the finished message and stores nothing for
-polling, so a test can prove the fast path needed no poll - `GET /__sessions` reports `messagePolls` for that), plus
-`STUB_EMPTY_PROVIDERS=1` serving an empty provider list on the first call and a provider without a `models` map after
-it, so both shapes of an unreadable payload are covered, `STUB_FAIL_EVENTS=1` (a 500 for `GET /event`, so a test
-can prove a streaming request still answers through the polling fallback when the event stream is refused) and
-`STUB_FAIL_PROVIDERS=1` (a 500 for `GET /config/providers`, so a test can prove a refused listing is reported as a
-refused call and not as an empty one), and `CUTSTREAM` (two cumulative text snapshots followed by a dropped event
-connection, so a test can prove a stream that ends mid-answer is recovered through polling without duplicating or
-truncating the text). Extend that stub and
-`test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
-already taken (a stale process would answer with someone else's build) and SIGKILLs any child that ignores SIGTERM.
+`pnpm test` covers the whole HTTP contract against the stub shipped in `test/stub-opencode.mjs` (health, providers,
+sessions, messages and SSE events, plus a test-only `GET /__sessions` reporting created/deleted/live counts,
+`lastSystemPrompt`, `lastPromptText` and `messagePolls`). Behaviour is selected by markers in the prompt text - `SLOW`
+(an answer slow enough to abort mid-stream), `STALL` (silence after two deltas), `TOOLTAG` (a tool-call block cut inside
+both of its tags), `FAIL` (a provider error with no content), `ENDONLY` (a finish event carrying only `time.completed`),
+`GROW` (an answer still being written when the prompt returns), `SUICIDE` (the stub SIGKILLs itself after accepting the
+prompt), `PAUSE` (silence longer than the idle timeout), `HOLD` (finishes after 400 ms, so a completion can be kept in
+flight while the backend is killed or the gateway shuts down), `SLOWFINISH` (finishes after 3 s), `TAILTAG` (a last
+delta ending in a tag prefix that never becomes a tag), `REJECTPROMPT` (a 500 for `POST /session/:id/message`),
+`PROMPTDONE` (the prompt response already carries the finished message) and `CUTSTREAM` (two cumulative snapshots then
+a dropped event connection) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for `POST /session`),
+`STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 502 whose message quotes a
+credential-bearing URL), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
+list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_EMPTY_PROVIDERS=1` (both shapes of an
+unreadable provider payload), `STUB_FAIL_EVENTS=1` and `STUB_FAIL_PROVIDERS=1`. Extend that stub and `test/smoke.mjs` when you add behaviour worth
+protecting. The suite refuses to start when the stub or gateway port is already taken (a stale process would answer
+with someone else's build) and SIGKILLs any child that ignores SIGTERM.
 The session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting
 the session (the delete is a backend round trip that has nothing to do with the answer), so a single read of
 `/__sessions` raced with it and failed with `live: 1` on a slow runner. Wait for `live: 0` within a bounded window
@@ -216,17 +200,23 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   before the "no text at all" one for that reason. Three causes, three messages: a part of a type the gateway cannot
   forward (the message above), a `text` part whose `text` field is not a string
   (`messages[0].content[1].text must be a string, found a number` — one message for all of them used to call a `text`
-  part unsupported, naming the only part type the gateway does forward), and a part that is not a part at all
+  part unsupported), and a part that is not a part at all
   (`messages[0].content[0] must be a string or an object with a text field, found a number`, for `42`, `null`, `true`,
-  which were dropped in silence and left the request failing the "no text at all" check).
+  which were dropped in silence and left the request failing the "no text at all" check). A `content` that is a
+  **single object instead of an array** follows the same three rules without a part index
+  (`messages[0].content uses an unsupported content part type "image_url"; …`): it was read as an empty message and
+  dropped in silence, so a request that also carried text got an answer built from that text alone. A single object
+  with a string `text` is still forwarded.
+- **A message `name` is a label, not prompt text.** It is interpolated as `USER(name): …` only when it is a string,
+  with control characters replaced and the value cut: a non-string reached the model as `USER([object Object]): …`, and
+  a newline in a name forged a second conversation line.
 - **An announced request body has a deadline.** Fastify sets `requestTimeout: 0`, so nothing bounded the wait: a client
   that sent `Content-Length: 4096` and four bytes held the socket for as long as it liked (measured 20 s with no
   answer), with no credential needed, because the `401` is written from the headers while Node keeps the connection
   alive to drain a body it will never read. `armBodyDeadline()` in the `onRequest` hook (armed before auth, only when
   the request announces a body, cleared on `end`/`close`/`error`) closes it after `min(30 s, REQUEST_TIMEOUT_MS)`,
   answering the `408` envelope when nothing has been sent. It closes the **request's** socket, not `reply.raw`: a
-  keep-alive response is detached from the connection once it ends (measured: `reply.raw.destroyed` true,
-  `reply.raw.socket` null, client still connected), so destroying the response closed nothing.
+  keep-alive response is detached from the connection once it ends, so destroying the response closed nothing.
 - A `model` id whose provider or model half is empty (`"opencode/"`, `"/big-pickle"`) is a `400` in the
   `invalid_request_error` envelope naming the value: `/v1/models` answers `404` for the same ids, and sending them to
   the backend only produced an opaque upstream error. An absent or blank `model` still means `DEFAULT_MODEL`.
@@ -245,8 +235,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `Content-Type` header at all**, which is the likeliest hand-written mistake there is and reached the same message.
   The status and the code stay; the message becomes `unsupported content type "application/xml"; send
   Content-Type: application/json`, or `the request has a body but no Content-Type header; send Content-Type:
-  application/json` when the header is missing (the value is client input echoed into a response body, so control
-  characters are replaced and it is cut at 64 characters). Recognised types are unchanged: `application/json`,
+  application/json` when the header is missing (the value is client input echoed into a response body, so
+  `echoedValue()` replaces control characters and cuts it at 64 characters with a `…[truncated N chars]` marker - the
+  helper every other echoed client value uses). Recognised types are unchanged: `application/json`,
   `application/x-www-form-urlencoded` and `text/plain` (handed to the handler as text and parsed there).
 - A body carrying a **forbidden property name** (`__proto__`, `constructor`) is refused by Fastify's
   prototype-poisoning guard before any handler runs, and that refusal arrives as the same
@@ -308,6 +299,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - Every completion deletes the OpenCode session it created — on the success path, the error path and after a client
   abort. The backend must never accumulate one session per served request; `test/stub-opencode.mjs` exposes
   `GET /__sessions` so the smoke suite can assert `live === 0`.
+- Every response carries `X-Content-Type-Options: nosniff` (`NO_SNIFF`, `createApp()`), on the same three paths as the
+  CORS set - `onRequest` (hijacked streams included), `clientErrorHandler`, `badUrlHandler`: the gateway writes only
+  JSON and SSE, which a browser must not re-read as something else.
 - CORS headers are set on the raw response for every request, including hijacked streams:
   `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, OPTIONS`, `Allow-Headers: Content-Type,
   Authorization, X-Api-Key, X-Request-Id, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`. The
@@ -344,6 +338,14 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   the userinfo and any credential query value and leaves scheme/host/path readable, which is what those lines are read
   for. The entrypoint repeats the masking for its own log line (it cannot import the module: it writes the file the
   module reads), and the stored `config.json` still holds the real value.
+  The same applies to **text**: `resolveBackendAuth()` (`src/proxy.js`) splits the userinfo out of the value the SDK is
+  given and `maskUrlCredentials()` masks a `scheme://user:pass@` inside any sentence. Both exist because the documented
+  shape could not work at all - Node's `fetch` refuses a URL carrying credentials, so every completion answered `502`
+  with `Request cannot be constructed from a URL that includes credentials: http://user:secret@…/session`, the secret
+  inside the client-facing body and the error log. The userinfo now travels as a Basic `Authorization` header (and on
+  `checkHealth()`, which read its `401` as "backend missing"), and every upstream reason that reaches a client or a log
+  line goes through `clientFacingText()` (`maskUrlCredentials()` + `maskUrlQuery()`, cut at 512 characters): a backend
+  or a proxy in front of it can quote a URL in its own error payload.
 - Request log format: `METHOD url -> status Xms [reqId] model=… stream=…` (info for `/v1/*`, debug otherwise).
   The `model` value and the URL are client-controlled, so both are normalised before they are logged
   (`loggableModelId()`: control characters replaced, 128 characters max; a URL over 512 characters is cut with a
@@ -385,12 +387,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   through plain `JSON.parse`, so a provider (or a proxy in front of it) can put that key in a body that is then logged;
   a request body cannot (Fastify's poisoning guard refuses it first, see the API contract), and Node's header parser
   drops a header of that name. Neither copy's prototype is touched either way (asserted).
-  A **closed reader**
-  on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream `error` with no listener is
-  thrown as an uncaught exception, and `node index.js | head -3` (a log shipper that restarted, `docker logs` closing
-  mid-write) killed a gateway that was still serving requests. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that
-  log line is lost, the process keeps answering. The smoke suite destroys the read end of the child's stdout to
-  assert it.
+  A **closed reader** on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream
+  `error` with no listener is an uncaught exception, and `node index.js | head -3` killed a gateway that was still
+  serving. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that log line is lost, the process keeps answering. The
+  smoke suite destroys the read end of the child's stdout to assert it.
 - **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
   boundary can fall inside either of them; the held fragment is flushed at end of stream. The flush must write the
@@ -415,9 +415,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **Configuration** follows the precedence env > `config.json` > default, and every new key must be added to
   `config.json.example`, the README configuration table and — for container-relevant keys — `docker/docker-entrypoint.sh`.
   `config.json` is read from the **application directory** (`path.join(__dirname, 'config.json')`), not from the
-  working directory, because the container writes it next to the app. A `config.json` sitting in the cwd used to be
-  ignored in complete silence, which looks exactly like a broken file, so startup now warns
-  `[Config] config.json is read from …; the file at … is ignored` when one is present there.
+  working directory, because the container writes it next to the app. A `config.json` in the cwd used to be ignored in
+  complete silence, which looks exactly like a broken file, so startup now warns
+  `[Config] config.json is read from …; the file at … is ignored`.
   An environment variable that is present but **blank** counts as unset (`envOrFile()` in `src/config.js`): `PORT` and
   `API_KEY` were the two keys read with `??`, where an empty string is a value, so `API_KEY= PORT=` shadowed
   `config.json` — the gateway listened on the default port and authenticated with the built-in public key while the
@@ -441,9 +441,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **Every tuning key follows the same precedence.** `OPENCODE_PROXY_MAX_CONCURRENCY`, `OPENCODE_PROXY_MAX_QUEUE`,
   `OPENCODE_PROXY_MAX_BODY_MB`, `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_HEALTH_CACHE_MS` and
   `OPENCODE_PROXY_START_RETRY_MS` are read through `readLimit()` / `readMilliseconds()`, which take the `config.json`
-  value as the fallback and let the environment win. They used to be read from the environment alone, so the same keys in `config.json` were ignored in
-  silence while the startup summary reported the default — the same class of failure as a `config.json` in the wrong
-  directory. `startProxy()` applies the resolved queue limits and backend timings before the server listens, and
+  value as the fallback and let the environment win. They used to be read from the environment alone, so the same keys
+  in `config.json` were ignored in silence while the summary reported the default. `startProxy()` applies the resolved queue limits and backend timings before the server listens, and
   `getQueueLimits()` takes the merged configuration so the summary cannot disagree with what the gateway uses.
   A value that is present but unusable is **named in a `[Config]` warning with the value actually used**
   (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS='0' is not a positive number, using 300000`, `… HEALTH_CACHE_MS='abc' is not a

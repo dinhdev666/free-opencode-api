@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
-import { logger, maskBackendUrl, maskHeaders, maskUrlQuery } from './logger.js';
+import { logger, maskBackendUrl, maskHeaders, maskUrlCredentials, maskUrlQuery } from './logger.js';
 
 
 // --- Mutex Logic with Timeout ---
@@ -106,6 +106,20 @@ const loggableUrl = (url) => {
     return masked.length > MAX_LOGGED_URL_LENGTH
         ? `${masked.slice(0, MAX_LOGGED_URL_LENGTH)}…[truncated ${masked.length - MAX_LOGGED_URL_LENGTH} chars]`
         : masked;
+};
+
+// A client-supplied value on its way into a response body, under one rule.
+//
+// The `415` media-type message already replaced control characters and cut the echoed type; the other sites copied the
+// value through verbatim, so a 4,000-character content-part type produced a 4,000-character error body, and a value
+// carrying a newline put a second line into a body the client reads as one record. The marker matches
+// `loggableUrl()`, so a truncated value reads the same wherever it appears.
+const MAX_ECHOED_VALUE_LENGTH = 64;
+const echoedValue = (value) => {
+    const clean = String(value).replace(CONTROL_CHARS_RE, '?');
+    return clean.length > MAX_ECHOED_VALUE_LENGTH
+        ? `${clean.slice(0, MAX_ECHOED_VALUE_LENGTH)}…[truncated ${clean.length - MAX_ECHOED_VALUE_LENGTH} chars]`
+        : clean;
 };
 
 /**
@@ -485,14 +499,57 @@ function lock(task, timeout = 120000) {
 const healthAgent = new http.Agent({ keepAlive: true, maxSockets: 4 });
 const healthAgentSecure = new https.Agent({ keepAlive: true, maxSockets: 4 });
 
+// Credentials lifted out of OPENCODE_SERVER_URL by resolveBackendAuth(); the probe sends them the same way the SDK
+// does, otherwise a backend behind a credential-requiring proxy answers the probe with 401 and the gateway concludes
+// its backend is gone (and tries to start a local one).
+let BACKEND_AUTHORIZATION = null;
+
+/**
+ * Split a configured backend URL into the URL the SDK is given and the header that carries its credentials.
+ *
+ * `http://user:secret@host:4097` - a proxy in front of the backend - was documented as supported but could not work:
+ * every SDK call goes through Node's `fetch`, which refuses a URL with credentials ("Request cannot be constructed
+ * from a URL that includes credentials: …"), so every completion answered `502` and the runtime's message carried the
+ * secret into that response body and into the error log. The userinfo is therefore removed from the URL (which is
+ * what the masking in `maskBackendUrl()` already assumed the gateway was doing) and sent as a Basic `Authorization`
+ * header instead, which is what such a proxy reads.
+ * @param {string} serverUrl normalised backend URL
+ * @returns {{url: string, authorization: string|null}}
+ */
+export function resolveBackendAuth(serverUrl) {
+    const raw = String(serverUrl);
+    let parsed;
+    try {
+        parsed = new URL(raw);
+    } catch {
+        // Not a URL the gateway can parse: leave it exactly as configured and let the caller report the failure
+        return { url: raw, authorization: null };
+    }
+    if (!parsed.username && !parsed.password) return { url: raw, authorization: null };
+    let user = parsed.username;
+    let password = parsed.password;
+    try {
+        user = decodeURIComponent(user);
+        password = decodeURIComponent(password);
+    } catch {
+        // Keep the percent-encoded form when it is not valid encoding (the credential is still well defined)
+    }
+    const scheme = `${parsed.protocol}//`;
+    const authority = raw.slice(scheme.length).split(/[/?#]/)[0];
+    const withoutUserInfo = `${scheme}${authority.slice(authority.lastIndexOf('@') + 1)}${raw.slice(scheme.length + authority.length)}`;
+    return { url: withoutUserInfo, authorization: `Basic ${Buffer.from(`${user}:${password}`, 'utf8').toString('base64')}` };
+}
+
 /**
  * Robust Health Check Helper
  */
-function checkHealth(serverUrl) {
+function checkHealth(serverUrl, authorization = BACKEND_AUTHORIZATION) {
     const secure = String(serverUrl).startsWith('https://');
     const transport = secure ? https : http;
     return new Promise((resolve, reject) => {
-        const req = transport.get(`${serverUrl}/health`, { agent: secure ? healthAgentSecure : healthAgent }, (res) => {
+        const options = { agent: secure ? healthAgentSecure : healthAgent };
+        if (authorization) options.headers = { authorization };
+        const req = transport.get(`${serverUrl}/health`, options, (res) => {
             // Drain the body so the socket goes back to the keep-alive pool
             res.resume();
             if (res.statusCode === 200) resolve(true);
@@ -706,6 +763,11 @@ function createApp(config) {
     // browser client that sets its own trace id sent a header its own preflight did not allow, and the browser refused
     // the request before it left the page. `X-Requested-With` stays for jQuery-era clients that send it unasked.
     const CORS_ALLOW_HEADERS = 'Content-Type, Authorization, X-Api-Key, X-Request-Id, X-Requested-With';
+    // Every body this gateway writes is JSON or SSE, and a browser that navigates to an endpoint has nothing useful to
+    // render. `nosniff` is the one security header that costs a single write and applies to an API: it stops a browser
+    // from re-interpreting a JSON body as HTML or script when its own guess disagree with the Content-Type. Set beside
+    // the CORS set, on the same three paths, for the same reason.
+    const NO_SNIFF = 'nosniff';
 
     const CLIENT_ERROR_STATUS = {
         ERR_HTTP_REQUEST_TIMEOUT: { status: 408, reason: 'Request timeout' },
@@ -728,6 +790,7 @@ function createApp(config) {
                 `HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\n` +
                 'Content-Type: application/json; charset=utf-8\r\n' +
                 `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+                'X-Content-Type-Options: nosniff\r\n' +
                 'Access-Control-Allow-Origin: *\r\n' +
                 'Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n' +
                 `Access-Control-Allow-Headers: ${CORS_ALLOW_HEADERS}\r\n` +
@@ -762,6 +825,7 @@ function createApp(config) {
         rawResponse.writeHead(400, {
             'Content-Type': 'application/json; charset=utf-8',
             'Content-Length': Buffer.byteLength(body),
+            'X-Content-Type-Options': NO_SNIFF,
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
             'Access-Control-Allow-Headers': CORS_ALLOW_HEADERS,
@@ -796,7 +860,17 @@ function createApp(config) {
         done(null, body);
     });
 
-    const client = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL });
+    // A credential in OPENCODE_SERVER_URL (`http://user:secret@host:4097`, a proxy in front of the backend) cannot be
+    // handed to the SDK: it calls every endpoint through Node's `fetch`, which refuses such a URL, so the whole gateway
+    // answered 502 while the runtime's message published the secret. The userinfo leaves the URL and travels as a
+    // Basic Authorization header instead - for the SDK, which merges `config.headers` into every request, and for the
+    // health probe, which the backend (or the proxy) would otherwise refuse with 401 and look like a missing backend.
+    const backendAuth = resolveBackendAuth(OPENCODE_SERVER_URL);
+    BACKEND_AUTHORIZATION = backendAuth.authorization;
+    const client = createOpencodeClient({
+        baseUrl: backendAuth.url,
+        ...(backendAuth.authorization ? { headers: { authorization: backendAuth.authorization } } : {})
+    });
 
     // Precomputed once: comparing against a ready-made buffer avoids rebuilding the token on every request.
     // resolveApiKey() guarantees a non-empty key, so authentication can never be switched off.
@@ -925,6 +999,7 @@ function createApp(config) {
         // CORS headers are written on the raw response so they are present for streamed (hijacked) replies as well.
         // x-api-key is not read by the gateway, but browsers send it on behalf of clients that do, and a rejected
         // preflight would break those clients before they ever reach the auth check.
+        reply.raw.setHeader('X-Content-Type-Options', NO_SNIFF);
         reply.raw.setHeader('Access-Control-Allow-Origin', '*');
         reply.raw.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         reply.raw.setHeader('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS);
@@ -972,7 +1047,7 @@ function createApp(config) {
         if (contentEncoding && contentEncoding.toLowerCase() !== 'identity') {
             reply.code(415).send({
                 error: {
-                    message: `Request bodies with Content-Encoding: ${contentEncoding} are not supported; send the body uncompressed (drop that header)`,
+                    message: `Request bodies with Content-Encoding: ${echoedValue(contentEncoding)} are not supported; send the body uncompressed (drop that header)`,
                     type: 'invalid_request_error'
                 }
             });
@@ -1296,6 +1371,22 @@ function createApp(config) {
         }
     }
 
+    // Upstream text on its way to a client or a log line: masked and bounded.
+    //
+    // A backend (or a proxy in front of it) can quote a URL inside an error payload, and a configured backend URL may
+    // carry a credential - Node's `fetch` answered `Request cannot be constructed from a URL that includes
+    // credentials: http://user:secret@host:4097/session`, which reached the client-facing 502 body and this process's
+    // log verbatim. The query string is masked for the same reason it is masked on a request URL, and the length is
+    // bounded so a backend cannot answer a client with a reason the size of the request body limit.
+    const MAX_UPSTREAM_TEXT_CHARS = 512;
+    const clientFacingText = (value) => {
+        if (typeof value !== 'string' || value === '') return '';
+        const masked = maskUrlQuery(maskUrlCredentials(value));
+        return masked.length > MAX_UPSTREAM_TEXT_CHARS
+            ? `${masked.slice(0, MAX_UPSTREAM_TEXT_CHARS)}…[truncated ${masked.length - MAX_UPSTREAM_TEXT_CHARS} chars]`
+            : masked;
+    };
+
     // Describes a failed SDK call: the status and the reason the backend gave. The SDK hands back the parsed body
     // as-is (`{error:{message}}`, `{message}` or a plain string), so taking the first object would print
     // "[object Object]" in a client-facing message.
@@ -1307,9 +1398,10 @@ function createApp(config) {
             : (raw?.data?.message ?? raw?.message ?? (typeof raw?.error === 'string' ? raw.error : raw?.error?.message));
         // A thrown call carries the runtime's own wording (`fetch failed` for a dead or refused backend), which names
         // no cause at all; the same phrase a client would read from the top-level handler is used here.
-        const reason = typeof candidate === 'string' && candidate && isConnectionError({ message: candidate })
-            ? `the backend is not reachable (${candidate})`
-            : candidate;
+        const text = clientFacingText(candidate);
+        const reason = text && isConnectionError({ message: candidate })
+            ? `the backend is not reachable (${text})`
+            : text;
         return {
             status,
             reason: typeof reason === 'string' && reason ? `: ${reason}` : ''
@@ -1808,7 +1900,7 @@ function createApp(config) {
                     if (!pID || !mID) {
                         return reply.code(400).send({
                             error: {
-                                message: `model "${modelId}" must be a "provider/model" id`,
+                                message: `model "${echoedValue(modelId)}" must be a "provider/model" id`,
                                 type: 'invalid_request_error'
                             }
                         });
@@ -1856,6 +1948,17 @@ function createApp(config) {
                             return { text };
                         }
                         if (content && typeof content.text === 'string') return { text: content.text };
+                        // A single part sent as an object instead of a one-element array (`{"content":{"type":
+                        // "image_url",…}}`, or `{"type":"text","text":5}`): the same three refusals as a part inside an
+                        // array, reported without a part index because the client sent no array to index into. Dropping
+                        // it answered a question the backend never received - and for a `system` message it dropped the
+                        // instructions instead, which is the same silent wrongness with a worse consequence.
+                        if (content && typeof content === 'object') {
+                            if ('text' in content && typeof content.text !== 'string') {
+                                return { text: '', unsupported: { field: 'text', found: jsonTypeName(content.text) } };
+                            }
+                            return { text: '', unsupported: { type: typeof content.type === 'string' ? content.type : 'unknown' } };
+                        }
                         if (content === null || content === undefined) return { text: '' };
                         if (typeof content === 'number' || typeof content === 'boolean') return { text: String(content) };
                         return { text: '' };
@@ -1889,7 +1992,12 @@ function createApp(config) {
                             if (!content) return;
                             if (role === 'user') userContents.push(content);
                             const roleLabel = role.toUpperCase();
-                            const nameSuffix = m?.name ? `(${m.name})` : '';
+                            // `name` is client input and was interpolated raw: a non-string produced
+                            // `USER([object Object]): …` in the prompt, and a name carrying a newline forged another
+                            // conversation line inside the text the model reads. A string is kept - it is a documented
+                            // OpenAI field - sanitised the same way every other value that lands in a prompt line is.
+                            const nameLabel = typeof m?.name === 'string' ? m.name.replace(CONTROL_CHARS_RE, '?').trim() : '';
+                            const nameSuffix = nameLabel ? `(${nameLabel.slice(0, MAX_ECHOED_VALUE_LENGTH)})` : '';
                             parts.push({
                                 type: 'text',
                                 text: `${roleLabel}${nameSuffix}: ${content}`
@@ -1937,7 +2045,10 @@ function createApp(config) {
                     // Named before the "no text at all" check: a request whose only part is an image must say that the
                     // gateway cannot carry images, not that the client forgot to write any text
                     if (unsupported) {
-                        const at = `messages[${unsupported.messageIndex}].content[${unsupported.partIndex}]`;
+                        // No index when the content itself was the part (a single object instead of an array)
+                        const at = unsupported.partIndex === undefined || unsupported.partIndex === null
+                            ? `messages[${unsupported.messageIndex}].content`
+                            : `messages[${unsupported.messageIndex}].content[${unsupported.partIndex}]`;
                         // Three causes, three messages: a part of a type the gateway cannot forward (an image), a text
                         // part whose `text` is not a string, and a part that is not a part at all (`42`, `null`). One
                         // message for all three used to call a `text` part unsupported - naming the only part type the
@@ -1947,7 +2058,7 @@ function createApp(config) {
                             ? `${at}.${unsupported.field} must be a string, found ${unsupported.found}`
                             : unsupported.found
                                 ? `${at} must be a string or an object with a text field, found ${unsupported.found}`
-                                : `${at} uses an unsupported content part type "${unsupported.type}"; this gateway forwards text only`;
+                                : `${at} uses an unsupported content part type "${echoedValue(unsupported.type)}"; this gateway forwards text only`;
                         return reply.code(400).send({
                             error: { message, type: 'invalid_request_error' }
                         });
@@ -2430,9 +2541,10 @@ function createApp(config) {
                     logger.error('[Proxy] API Error (upstream call failed)', {
                         reqId,
                         sessionId,
-                        message: error.message,
+                        message: clientFacingText(error.message),
                         status: upstream.status,
-                        bodySummary: upstream.bodySummary
+                        // The body is backend-controlled text: it can quote a URL and a log line is collected as often as not
+                        bodySummary: upstream.bodySummary ? maskUrlQuery(maskUrlCredentials(upstream.bodySummary)) : null
                     });
                     logger.debug('[Proxy] Error details', { reqId, sessionId, error });
 
@@ -2443,7 +2555,9 @@ function createApp(config) {
                         if (backend) backend.healthyAt = 0;
                     }
 
-                    let errorMessage = error.message;
+                    // The reason can quote a URL (a proxy in front of the backend does), so it is masked before it
+                    // reaches the response body and, below, the log line
+                    let errorMessage = clientFacingText(error.message);
                     let statusCode = 500;
                     if (error.message && error.message.includes('Request timeout')) {
                         statusCode = 504;
@@ -2465,7 +2579,7 @@ function createApp(config) {
                     // is what a dead or refused backend produces, and a client reading it cannot tell whether the
                     // gateway, the backend or its own request is at fault.
                     if (error.name !== 'ProviderError' && isConnectionError(error)) {
-                        errorMessage = `OpenCode backend is not reachable (${error.message})`;
+                        errorMessage = `OpenCode backend is not reachable (${clientFacingText(error.message)})`;
                     }
                     if (error.message && error.message.includes('ENOENT')) {
                         errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
@@ -2612,8 +2726,7 @@ function createApp(config) {
                 }
                 // Client input reaching a response body: control characters replaced and the value cut, like every
                 // other client-controlled string the gateway echoes back
-                const type = rawType.split(';')[0].trim().replace(/[\u0000-\u001f\u007f]/g, '?').slice(0, 64);
-                return `unsupported content type "${type}"; send Content-Type: application/json`;
+                return `unsupported content type "${echoedValue(rawType.split(';')[0].trim())}"; send Content-Type: application/json`;
             }
             return err.message;
         };
@@ -2778,7 +2891,9 @@ async function ensureBackend(config, options = {}) {
             }
             // The probe above suspended for up to its timeout, which is exactly the window a shutdown can land in
             if (state.shuttingDown) throw new Error('The gateway is shutting down');
-            logger.info(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
+            // Masked: the URL can carry a credential (see resolveBackendAuth), and this line is the one an operator
+            // reads in `docker logs`
+            logger.info(`[Proxy] OpenCode backend not found at ${maskBackendUrl(OPENCODE_SERVER_URL)}. Starting...`);
 
             // Kill the existing process if any, and wait for it to be gone before spawning a replacement: SIGTERM
             // was sent and the new backend started on the next line, so the old child still held the port and the
@@ -2919,7 +3034,7 @@ async function ensureBackend(config, options = {}) {
             try {
                 port = new URL(OPENCODE_SERVER_URL).port || '4097';
             } catch (e) {
-                logger.warn(`[Proxy] Could not parse OPENCODE_SERVER_URL '${OPENCODE_SERVER_URL}', assuming port 4097`);
+                logger.warn(`[Proxy] Could not parse OPENCODE_SERVER_URL '${maskBackendUrl(OPENCODE_SERVER_URL)}', assuming port 4097`);
             }
             const resolved = resolveOpencodePath(OPENCODE_PATH);
             const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;

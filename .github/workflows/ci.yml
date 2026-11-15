@@ -77,6 +77,41 @@ jobs:
           test "$status" = "0" || exit 1
           echo "every action reference is pinned to a 40-character commit SHA with its release in a comment"
 
+      # The convention in CONTRIBUTING.md is only as good as the check that sees it before the commit lands: a subject
+      # over 72 characters, an undocumented scope or a generated merge title cannot be corrected afterwards without
+      # rewriting published history. Only the commits this run adds are checked - the range starts at the pull
+      # request's base, or at the previous tip of `main` for a push - because history that already shipped is not
+      # something a contributor can fix.
+      - name: Commit messages follow the convention
+        if: matrix.node == '24'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.number }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case "$PUSH_BEFORE" in ''|0000000000000000000000000000000000000000) PUSH_BEFORE='' ;; esac
+          range=''
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # refs/pull/<n>/head lives in the base repository, so it reaches a fork's commits - fetching the head SHA
+            # would not, and actions/checkout fetched a single commit anyway
+            if git fetch --no-tags --quiet origin "+refs/pull/$PR_NUMBER/head:refs/remotes/pr-head" &&
+               git fetch --no-tags --quiet origin "$PR_BASE" 2>/dev/null; then
+              range="$PR_BASE..refs/remotes/pr-head"
+            fi
+          elif [ -n "$PUSH_BEFORE" ] && git fetch --no-tags --quiet origin "$PUSH_BEFORE" 2>/dev/null; then
+            range="$PUSH_BEFORE..HEAD"
+          fi
+          if [ -n "$range" ]; then
+            echo "checking $range"
+            node test/check-commit-messages.mjs "$range"
+          else
+            # A dispatch, a branch whose first push has no previous tip, or a range that could not be fetched: the
+            # checked-out commit is still checked
+            echo "checking the checked-out commit only"
+            node test/check-commit-messages.mjs
+          fi
+
       - name: Smoke test (OpenAI contract)
         run: pnpm test
 

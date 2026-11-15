@@ -1364,7 +1364,9 @@ async function run() {
     const killInFlight = fetch(`${gatewayUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ messages: [{ role: 'user', content: 'HOLD while the backend dies' }] })
+        // SLOWFINISH keeps the answer unfinished for 3 s, so the SIGKILL below cannot race a completed answer the
+        // way the 400 ms hold it used to use could (~250 ms of margin, which a loaded runner eats)
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'SLOWFINISH while the backend dies' }] })
     }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
     await sleep(250);
     try {
@@ -1779,6 +1781,59 @@ async function run() {
     check('SIGINT shuts the gateway down cleanly', longLivedExit === 0, `exit ${longLivedExit}`);
     check('the shutdown leaves no truncated answer behind', heldLongLivedAnswer.status === 200,
         `status ${heldLongLivedAnswer.status}`);
+}
+
+// --- a stop request leaves no backend behind ---------------------------------------------------------------
+// killBackend() is what the entry point awaits before exiting, so it has to mean "no backend is running, and none
+// will start": a start attempt that was still inside its health probe used to spawn `opencode serve` after
+// killBackend() had already resolved, so the child outlived the gateway it belongs to and kept the backend port.
+// The CLI here is a stand-in that records its pid, and the backend URL points at a server that accepts connections
+// and never answers, which is exactly the window the shutdown lands in. The driver imports startProxy() so the stop
+// can be observed without exiting the process, as a library embedder would do it.
+if (process.platform !== 'win32') {
+    const shutdownDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-stop-'));
+    const pidFile = path.join(shutdownDir, 'child.pid');
+    const fakeCli = path.join(shutdownDir, 'opencode');
+    fs.writeFileSync(fakeCli, [
+        '#!/usr/bin/env node',
+        "if (process.argv.includes('--version')) { process.stdout.write('1.19.5\\n'); process.exit(0); }",
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+        'setInterval(() => {}, 1000);',
+        ''
+    ].join('\n'));
+    fs.chmodSync(fakeCli, 0o755);
+    // Accepts the probe's connection and never answers, so checkHealth stays inside that connection for its timeout
+    const silent = http.createServer(() => { });
+    await new Promise((resolve) => silent.listen(GATEWAY_PORT + 8, '127.0.0.1', resolve));
+    const driverPort = GATEWAY_PORT + 9;
+    const driverSource = [
+        "import { startProxy } from './src/proxy.js';",
+        `const proxy = startProxy({ PORT: ${driverPort}, API_KEY: 'stop-key', OPENCODE_SERVER_URL: 'http://127.0.0.1:${GATEWAY_PORT + 8}', OPENCODE_PATH: ${JSON.stringify(fakeCli)}, LOG_LEVEL: 'error' });`,
+        'await new Promise((r) => setTimeout(r, 300));',
+        'await proxy.killBackend();',
+        "process.stdout.write('stopped\\n');",
+        'await new Promise((r) => setTimeout(r, 3000));',
+        'process.exit(0);',
+        ''
+    ].join('\n');
+    const driver = spawn(process.execPath, ['--input-type=module', '-e', driverSource], {
+        cwd: ROOT,
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let driverOut = '';
+    driver.stdout.on('data', (chunk) => { driverOut += chunk; });
+    driver.stderr.on('data', () => { });
+    const driverExit = await new Promise((resolve) => driver.once('exit', (code) => resolve(code)));
+    const spawnedPid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, 'utf8')) : null;
+    if (spawnedPid) {
+        try { process.kill(spawnedPid, 'SIGKILL'); } catch (e) { }
+    }
+    check('killBackend() resolves after the stop', driverOut.includes('stopped') && driverExit === 0,
+        `exit ${driverExit}, output ${JSON.stringify(driverOut.trim())}`);
+    check('a start attempt in flight spawns no backend once the gateway is stopping', spawnedPid === null,
+        `spawned pid ${spawnedPid}`);
+    await new Promise((resolve) => silent.close(resolve));
+    fs.rmSync(shutdownDir, { recursive: true, force: true });
 }
 
 const TIMEOUT_MS = 120000;

@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 172 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 174 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -361,6 +361,11 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   resolves to the 2.x line, whose `opencode serve` serves the web UI — it answers `/health` with HTML (so the readiness
   probe passes) and `405` for `POST /session` (so every completion failed). Bumping that default means checking the
   session API still exists.
+- **The CLI version probe never blocks the start.** `opencode --version` is read with the asynchronous `execFile`
+  *after* the server is listening and reported as its own line (or, on failure, as the installation warning): the
+  synchronous probe sat in the startup path with a 5 s timeout, so a wrapper script that waits for input delayed the
+  bind by the whole timeout and the process reached Ctrl-C without its signal handlers installed - a shutdown that was
+  not the graceful one. The 2.x warning it feeds is unchanged, and it now arrives while the gateway is already serving.
 - **The backend command survives the shell it runs in.** `opencodeBin` is quoted whenever the spawn uses a shell
   (`C:\Program Files\...opencode.cmd` does not start unquoted, and `;`/`&` in a path would be read as operators);
   paths carrying `"`, `$` or a backtick are refused instead, because quoting cannot neutralise them. A configured
@@ -374,7 +379,13 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **`killBackend()` returns a promise that settles when the child is gone** (SIGTERM, then SIGKILL after 3 s), and
   `index.js` awaits it before `process.exit(0)`; the jail directory is removed only after the child is gone, because it
   is the child's cwd. Exiting right after SIGTERM skipped the escalation, so a backend that ignores SIGTERM outlived
-  the gateway that owns it.
+  the gateway that owns it. It also sets `state.shuttingDown`, which every `ensureBackend()` path checks before it
+  spawns: a start attempt that was still inside its health probe (or waiting for the previous child) used to spawn
+  `opencode serve` *after* the promise had resolved, so a caller that keeps running - an embedder, or an in-flight
+  request during teardown - ended up with a backend nobody tracked while it held the backend port. A pending attempt is
+  waited for (`waitForPendingStart()`, bounded by the largest step it can be inside and by the 5 s hard exit in
+  `index.js`), and the jail bookkeeping no longer accumulates: each respawn deletes its predecessor's path from
+  `ownedJailRoots` before replacing it.
 - **Backend lifecycle changes** must keep these properties: `ensureBackend()` trusts a successful probe for
   `OPENCODE_PROXY_HEALTH_CACHE_MS`, connection failures clear that trust, a spawned process that exits during startup
   aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm.

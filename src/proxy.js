@@ -2159,6 +2159,18 @@ function createApp(config) {
 // Backend management state (per-instance)
 const backendState = new Map();
 
+// Waits (bounded) for a start attempt that was still in flight when the gateway began shutting down, so a child it
+// spawned a moment later is tracked instead of orphaned. The attempt aborts at its next checkpoint and the wait only
+// has to cover what it is already inside: a health probe (2 s timeout) or the SIGTERM/SIGKILL escalation of the
+// previous child (3 s). It stays under the 5 s hard exit `index.js` keeps as a backstop.
+const PENDING_START_WAIT_MS = 3500;
+async function waitForPendingStart(state) {
+    const deadline = Date.now() + PENDING_START_WAIT_MS;
+    while (state.isStarting && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 50));
+    }
+}
+
 /**
  * Backend Lifecycle Management
  */
@@ -2169,6 +2181,9 @@ async function ensureBackend(config, options = {}) {
     if (!backendState.has(stateKey)) {
         backendState.set(stateKey, {
             isStarting: false,
+            // Set by killBackend(): a start attempt that is still in flight must not spawn a backend after the
+            // gateway has gone, otherwise that child outlives the process that owns it and holds the backend port.
+            shuttingDown: false,
             process: null,
             jailRoot: null,
             healthyAt: 0,
@@ -2178,6 +2193,9 @@ async function ensureBackend(config, options = {}) {
     }
 
     const state = backendState.get(stateKey);
+
+    // The gateway is going away: never start (or restart) a backend from here
+    if (state.shuttingDown) throw new Error('The gateway is shutting down');
 
     // A recent successful probe is trusted for BACKEND_HEALTH_CACHE_MS so a burst of chat requests shares one
     // health round trip instead of one per request; connection failures reset the timestamp (see chat error path)
@@ -2220,6 +2238,8 @@ async function ensureBackend(config, options = {}) {
             if (state.lastStartFailureAt && Date.now() - state.lastStartFailureAt < BACKEND_START_RETRY_COOLDOWN_MS) {
                 throw new Error(`OpenCode backend unavailable (last start attempt failed: ${state.lastStartError || 'unknown error'})`);
             }
+            // The probe above suspended for up to its timeout, which is exactly the window a shutdown can land in
+            if (state.shuttingDown) throw new Error('The gateway is shutting down');
             logger.info(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
 
             // Kill the existing process if any, and wait for it to be gone before spawning a replacement: SIGTERM
@@ -2254,12 +2274,23 @@ async function ensureBackend(config, options = {}) {
                 }
             }
 
-            // Cleanup old temp dir - after the child is gone, because it is that child's working directory
-            if (state.jailRoot && fs.existsSync(state.jailRoot)) {
-                try {
-                    fs.rmSync(state.jailRoot, { recursive: true, force: true });
-                } catch (e) { }
+            // Cleanup old temp dir - after the child is gone, because it is that child's working directory. The path
+            // leaves the tracked set too: it used to stay in it, so every respawn added an entry that cleanupTempDirs()
+            // then tried to remove again at shutdown.
+            if (state.jailRoot) {
+                const previousJail = state.jailRoot;
+                state.jailRoot = null;
+                ownedJailRoots.delete(previousJail);
+                if (fs.existsSync(previousJail)) {
+                    try {
+                        fs.rmSync(previousJail, { recursive: true, force: true });
+                    } catch (e) { }
+                }
             }
+
+            // Last checkpoint before the spawn below, which has no suspension of its own: the wait for the previous
+            // child (up to 3 s) can end with the process already shutting down.
+            if (state.shuttingDown) throw new Error('The gateway is shutting down');
 
             const isWindows = process.platform === 'win32';
             const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
@@ -2530,21 +2561,19 @@ export function startProxy(options) {
         // backend that ignores SIGTERM outlived the gateway that owns it.
         killBackend: () => {
             const state = backendState.get(config.OPENCODE_SERVER_URL);
+            if (!state) return Promise.resolve();
             // The jail directory is the child's cwd, so it goes only after the child is gone
             const removeJail = () => {
-                if (state && state.jailRoot && process.platform !== 'win32') {
-                    try {
-                        fs.rmSync(state.jailRoot, { recursive: true, force: true });
-                        ownedJailRoots.delete(state.jailRoot);
-                    } catch (e) { }
-                }
+                if (!state.jailRoot || process.platform === 'win32') return;
+                const jail = state.jailRoot;
+                try {
+                    fs.rmSync(jail, { recursive: true, force: true });
+                    ownedJailRoots.delete(jail);
+                } catch (e) { }
             };
-            if (!state || !state.process || state.process.exitCode !== null || state.process.signalCode !== null) {
-                removeJail();
-                return Promise.resolve();
-            }
-            const child = state.process;
-            return new Promise((resolve) => {
+            // SIGTERM, then SIGKILL after 3 s: a backend that ignores SIGTERM must not survive the gateway. Both timers
+            // are unref'd so they cannot hold the process open, and the child keeps the loop alive while it still runs.
+            const terminate = (child) => new Promise((resolve) => {
                 let settled = false;
                 let killTimer = null;
                 let graceTimer = null;
@@ -2553,7 +2582,6 @@ export function startProxy(options) {
                     settled = true;
                     if (killTimer) clearTimeout(killTimer);
                     if (graceTimer) clearTimeout(graceTimer);
-                    removeJail();
                     resolve();
                 };
                 child.once('exit', finish);
@@ -2564,8 +2592,6 @@ export function startProxy(options) {
                     finish();
                     return;
                 }
-                // Escalate when the backend ignores SIGTERM; SIGKILL is not ignored. Both timers are unref'd so they
-                // cannot hold the process open, and the child itself keeps the loop alive while it is still running.
                 killTimer = setTimeout(() => {
                     if (child.exitCode !== null || child.signalCode !== null) {
                         finish();
@@ -2583,6 +2609,17 @@ export function startProxy(options) {
                 }, 3000);
                 killTimer.unref();
             });
+            return (async () => {
+                // Tell any start attempt in flight to stop: one that is still waiting on a health probe (or on the
+                // previous child) would otherwise spawn a backend after this function resolved and after the gateway
+                // exited, leaving an orphaned `opencode serve` that holds the backend port. The attempt notices the flag
+                // at its next checkpoint and throws instead.
+                state.shuttingDown = true;
+                if (state.isStarting) await waitForPendingStart(state);
+                const child = state.process;
+                if (child && child.exitCode === null && child.signalCode === null) await terminate(child);
+                removeJail();
+            })();
         }
     };
 }

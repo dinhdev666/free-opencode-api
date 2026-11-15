@@ -554,6 +554,31 @@ async function run() {
     check('a failed completion still deletes its session',
         afterFailure && afterFailure.live === 0, JSON.stringify(afterFailure));
 
+    // --- a provider failure in streaming mode -------------------------------------------------------------
+    // The provider reports the failure before a single frame reaches the client, so the answer is an HTTP error
+    // envelope (like the non-streaming 502). It used to be a 200 SSE stream whose only content was the string
+    // "[Proxy Error] …" with finish_reason stop, which every client reads as a successful answer.
+    const streamedFailure = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'FAIL' }], stream: true },
+        stream: true
+    });
+    check('a streaming provider error answers 502, not a 200 stream',
+        streamedFailure.response.status === 502, `status ${streamedFailure.response.status}`);
+    const streamedFailureError = (() => {
+        try {
+            return JSON.parse(streamedFailure.text);
+        } catch {
+            return null;
+        }
+    })();
+    check('a streaming provider error carries the server_error envelope',
+        streamedFailureError?.error?.type === 'server_error' &&
+        /ProviderError/.test(streamedFailureError?.error?.message || ''),
+        streamedFailure.text.slice(0, 160));
+    check('a streaming provider error is never delivered as model text',
+        !/Proxy Error/.test(streamedFailure.text), streamedFailure.text.slice(0, 160));
+
     // --- session lifecycle -------------------------------------------------------------------------------
     // One session is created and must be deleted per completion; a leak would grow the backend without bound
     const stubStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);

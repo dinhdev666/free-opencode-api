@@ -788,6 +788,16 @@ function createApp(config) {
         }
     }
 
+    // A provider failure reported by the backend for a completion that produced no text. A streaming request has to
+    // raise it so the stream can be terminated with an in-band error frame, exactly like any other post-header
+    // failure: the alternative is a successful-looking stream whose only "answer" is an error message.
+    class ProviderError extends Error {
+        constructor(message) {
+            super(message);
+            this.name = 'ProviderError';
+        }
+    }
+
     function extractFromParts(parts) {
         if (!Array.isArray(parts)) return { content: '', reasoning: '' };
         // Single pass, no intermediate arrays: this runs for every polled message of every request
@@ -1320,8 +1330,9 @@ function createApp(config) {
                             );
                             if (clientGone) return;
                             if (error && !content && !reasoning) {
-                                await sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
-                                return;
+                                // The prompt succeeded but the provider reported an error and no text: terminate the
+                                // stream with an error frame instead of streaming the message back as model output
+                                throw new ProviderError(`${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             }
                             let safeReasoning = stripFunctionCalls(reasoning, false) || '';
                             let safeContent = stripFunctionCalls(content, false) || '';
@@ -1470,6 +1481,11 @@ function createApp(config) {
                     let statusCode = 500;
                     if (error.message && error.message.includes('Request timeout')) {
                         statusCode = 504;
+                    }
+                    // A provider failure is an upstream error, whether the client asked for a stream or not: the
+                    // non-streaming path answers 502 for the same condition
+                    if (error.name === 'ProviderError') {
+                        statusCode = 502;
                     }
                     if (error.message && error.message.includes('ENOENT')) {
                         errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';

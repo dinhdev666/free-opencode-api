@@ -64,7 +64,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 93 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 96 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -85,8 +85,9 @@ Docker Hub.
 counts) and the prompt markers `SLOW` (a ~2 s answer, so a test can abort mid-stream), `STALL` (two deltas and
 then silence, so a test can prove a stalled stream still ends), `TOOLTAG` (an answer whose tool-call block is cut
 in the middle of both of its tags, so a test can prove the markup never leaks) `FAIL` (a provider error with no
-content, so a test can prove the failure path cleans up after itself) and `ENDONLY` (an answer whose finish event
-carries only `time.completed`, so a test can prove the stream still ends without waiting for the idle timeout) and
+content, so a test can prove both modes report it as an error and the failure path cleans up after itself) and
+`ENDONLY` (an answer whose finish event carries only `time.completed`, so a test can prove the stream still ends
+without waiting for the idle timeout) and
 `GROW` (an answer that is still being written when the prompt returns, so a test can prove the polled answer is never
 truncated) and `TAILTAG` (an answer whose last delta ends in a tag prefix that never becomes a tag, so a test can
 prove the held fragment is still delivered). Extend that stub and
@@ -134,6 +135,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error), `503`
   (`type: "queue_full"`, the wait queue is full), `504` (timeout), `500` (anything else). Every error body carries a
   `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name.
+- A provider failure is an upstream error in both modes. Non-streaming answers `502`; a streaming request whose
+  provider failed before the first frame answers the same `502` envelope (the stream never started), and one that
+  fails after frames are on the wire ends with the in-band error frame. It must never be streamed as assistant text:
+  `data: {… delta: {content: "[Proxy Error] …"}}` with `finish_reason: "stop"` is a successful answer to every client.
 - A client that disconnects mid-stream releases its queue slot immediately: the event subscription is aborted and
   the polling fallbacks are skipped (the backend keeps finishing on its own).
 - An error after the first SSE frame is delivered in-band (`data: {"error":…}` then `data: [DONE]`) and closes the

@@ -68,7 +68,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 139 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 140 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -143,6 +143,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (upstream does not report token counts).
 - `POST /v1/chat/completions` streaming → `text/event-stream`, frames `data: {…chat.completion.chunk…}\n\n`,
   a final frame with `"finish_reason":"stop"`, then `data: [DONE]\n\n`. Reasoning deltas use `reasoning_content`.
+  The first delta frame carries `"role":"assistant"` (with the first delta, not as an extra empty frame): OpenAI opens
+  its stream that way, and a client that creates the message from `delta.role` had to infer it from the request.
   The terminal frame carries the whole envelope (`id`, `object`, `created`, `model`) like every delta, not just
   `{id, choices}`: clients that check the object type of each frame rejected a bare terminal chunk.
   Before the first delta, a `: keep-alive` comment line is written every 15 s (ignored by OpenAI clients, keeps idle

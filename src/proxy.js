@@ -1385,6 +1385,18 @@ function createApp(config) {
                         // once up front; per delta only the escaped text is stringified and appended.
                         const createdAt = Math.floor(Date.now() / 1000);
                         const chunkHead = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${JSON.stringify(`${pID}/${mID}`)},"choices":[{"index":0,"delta":{"`;
+                        // OpenAI opens every stream with the assistant role in the delta, and clients that drive a chat
+                        // state machine (they create the message on `delta.role`) had to infer it themselves; the role
+                        // rides along with the first real frame instead of adding an empty one.
+                        // `chunkHead` ends with the opening quote of the field name, so the role goes before it and the
+                        // trailing quote opens the field that follows
+                        const chunkHeadWithRole = `${chunkHead.slice(0, -1)}"role":"assistant","`;
+                        let roleSent = false;
+                        const frameHead = () => {
+                            if (roleSent) return chunkHead;
+                            roleSent = true;
+                            return chunkHeadWithRole;
+                        };
                         // Closes the delta object and the chunk envelope: `"<field>":<value>},"finish_reason":null}]}`
                         const chunkTail = '},"finish_reason":null}]}\n\n';
                         // The terminal frame carries the same envelope as every delta: clients that validate each chunk
@@ -1457,7 +1469,7 @@ function createApp(config) {
                             } else {
                                 streamedContent += filtered;
                             }
-                            await writeFrame(`${chunkHead}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(filtered)}${chunkTail}`);
+                            await writeFrame(`${frameHead()}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(filtered)}${chunkTail}`);
                             sseChunkCount++;
                         };
 
@@ -1471,7 +1483,7 @@ function createApp(config) {
                             } else {
                                 streamedContent += delta;
                             }
-                            await writeFrame(`${chunkHead}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(delta)}${chunkTail}`);
+                            await writeFrame(`${frameHead()}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(delta)}${chunkTail}`);
                             sseChunkCount++;
                         };
 

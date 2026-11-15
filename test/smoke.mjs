@@ -432,6 +432,11 @@ async function run() {
         .map((chunk) => chunk.choices[0].delta.content)
         .join('');
     check('streamed content matches the stubbed answer', contentDeltas === ANSWER, JSON.stringify(contentDeltas));
+    // Clients that drive a chat state machine create the message from `delta.role`; OpenAI sends it in the first frame
+    const withRole = chunks.filter((chunk) => chunk?.choices?.[0]?.delta?.role !== undefined);
+    check('the first delta frame names the assistant role',
+        withRole.length === 1 && withRole[0] === chunks[0] && withRole[0].choices[0].delta.role === 'assistant',
+        JSON.stringify(withRole.map((chunk) => chunk.choices[0].delta)));
     // The stub interleaves events that carry no properties; a subscription that gave up on them would deliver the
     // answer in one polled frame instead of the stub's incremental ones
     const contentFrameCount = chunks.filter((chunk) => chunk?.choices?.[0]?.delta?.content).length;

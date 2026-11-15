@@ -303,6 +303,22 @@ async function run() {
         otherModel.json?.id === 'some-other-model' && otherModel.json?.owned_by === 'opencode',
         otherModel.text.slice(0, 120));
 
+    // A doubled slash is read as a trailing slash, so `/v1/models//` reaches the by-id route with an empty id.
+    // Describing "" answered 200 with {"id":"","name":""} - not a model at all - so it is a missing route instead.
+    const blankList = await fetch(`${BASE}/v1/models//`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then(async (r) => ({ status: r.status, json: await r.json() }));
+    check('a blank model id is a missing route',
+        blankList.status === 404 && blankList.json?.error?.type === 'not_found',
+        `status ${blankList.status} ${JSON.stringify(blankList.json)?.slice(0, 120)}`);
+    const blankEncoded = await fetch(`${BASE}/v1/models/%20`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then(async (r) => ({ status: r.status, json: await r.json() }));
+    check('a whitespace model id is a missing route',
+        blankEncoded.status === 404 && blankEncoded.json?.error?.type === 'not_found',
+        `status ${blankEncoded.status} ${JSON.stringify(blankEncoded.json)?.slice(0, 120)}`);
+    const trailingSlash = await request('/v1/models/');
+    check('the trailing-slash listing still answers', trailingSlash.response.status === 200 &&
+        trailingSlash.json?.object === 'list', trailingSlash.text.slice(0, 120));
+
     // --- validation -------------------------------------------------------------------------------------
     const invalid = await request('/v1/chat/completions', { method: 'POST', body: {} });
     check('missing messages array returns 400', invalid.response.status === 400, `status ${invalid.response.status}`);

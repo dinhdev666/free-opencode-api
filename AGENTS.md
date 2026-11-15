@@ -67,7 +67,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 128 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 131 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -129,7 +129,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - `GET /v1/models/:modelId` and `GET /v1/models/<id with slashes>` → `200 {id,name,object,owned_by}` from the same
   cache; an id the provider list does not contain is described from the id itself (`provider` = text before `/`,
   default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either. The
-  wildcard route exists because clients send `opencode/kimi-k2.5-free` unencoded as often as `%2F`-escaped.
+  wildcard route exists because clients send `opencode/kimi-k2.5-free` unencoded as often as `%2F`-escaped. A **blank**
+  id (`/v1/models//`, `/v1/models/%20`) is a `404` in the usual `not_found` envelope instead of a `200` whose body is
+  `{"id":"","name":""}`: a doubled slash is read as a trailing slash, so those paths reached the by-id route with an
+  empty parameter, and an empty id is not a model. `/v1/models/` itself still answers the listing.
 - `POST /v1/chat/completions` non-streaming → `chat.completion` with
   `choices[0].message.{role,content,reasoning_content}`, `finish_reason:"stop"` and a `usage` block of zeroes
   (upstream does not report token counts).

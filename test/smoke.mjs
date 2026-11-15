@@ -39,6 +39,21 @@ const check = (name, condition, detail) => record(name, Boolean(condition), deta
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// The gateway answers the client before deleting the session: the delete is a backend round trip that has nothing to
+// do with the answer, and making the client wait for it held the completion slot. A single read of the stub's counters
+// therefore races with it - on a slow runner the session was still alive a few milliseconds after the response and the
+// "still deletes its session" checks failed with `live: 1`. Wait for the deletion to land instead of sampling one
+// instant, and keep the whole window bounded so a real leak still fails.
+async function sessionsAfterCleanup(url, timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    let stats = null;
+    for (;;) {
+        stats = await fetch(`${url}/__sessions`).then((r) => r.json()).catch(() => null);
+        if (!stats || stats.live === 0 || Date.now() >= deadline) return stats;
+        await sleep(50);
+    }
+}
+
 async function waitForOk(url, timeoutMs = 20000) {
     const deadline = Date.now() + timeoutMs;
     let lastError = null;
@@ -790,7 +805,7 @@ async function run() {
     });
     check('a rejected prompt in streaming mode answers the same 502',
         promptRejectedStream.response.status === 502, `status ${promptRejectedStream.response.status}`);
-    const afterRejection = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    const afterRejection = await sessionsAfterCleanup(STUB_URL);
     check('a rejected prompt still deletes its session',
         afterRejection && afterRejection.live === 0, JSON.stringify(afterRejection));
 
@@ -803,7 +818,7 @@ async function run() {
     check('a 502 carries the server_error envelope with the provider error code',
         failed.json?.error?.type === 'server_error' && failed.json?.error?.code === 'ProviderError',
         failed.text.slice(0, 160));
-    const afterFailure = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    const afterFailure = await sessionsAfterCleanup(STUB_URL);
     check('a failed completion still deletes its session',
         afterFailure && afterFailure.live === 0, JSON.stringify(afterFailure));
 
@@ -849,7 +864,7 @@ async function run() {
 
     // --- session lifecycle -------------------------------------------------------------------------------
     // One session is created and must be deleted per completion; a leak would grow the backend without bound
-    const stubStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    const stubStats = await sessionsAfterCleanup(STUB_URL);
     check('every completion deletes the session it created',
         stubStats && stubStats.deleted > 0 && stubStats.live === 0, JSON.stringify(stubStats));
 
@@ -1618,8 +1633,7 @@ async function run() {
         /status 500/.test(String(failPolled.json?.error?.message)),
         `status ${failPolled.status} ${JSON.stringify(failPolled.json)?.slice(0, 160)}`);
     check('the failed poll gives up well before the request timeout', failPollMs < 7000, `${failPollMs}ms`);
-    const failPollSessions = await fetch(`http://127.0.0.1:${failPollStubPort}/__sessions`)
-        .then((r) => r.json()).catch(() => null);
+    const failPollSessions = await sessionsAfterCleanup(`http://127.0.0.1:${failPollStubPort}`);
     check('the failed poll still deletes its session', failPollSessions?.live === 0,
         JSON.stringify(failPollSessions)?.slice(0, 120));
     stopGateway(failPollGateway);

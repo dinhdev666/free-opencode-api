@@ -144,7 +144,8 @@ docker run -d --restart=always --network common-all --name free-opencode-api --p
 
 > Advanced tuning variables (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_HEALTH_CACHE_MS`,
 > `OPENCODE_PROXY_START_RETRY_MS`, `OPENCODE_PROXY_MAX_CONCURRENCY`, `OPENCODE_PROXY_MAX_QUEUE`, `LOG_LEVEL`) are read
-> from the environment at runtime and documented in the main [README](../README.md#configuration).
+> from the environment (or from `config.json`, which wins only when the environment does not set them) and documented
+> in the main [README](../README.md#configuration).
 
 ### Precedence rules
 
@@ -270,9 +271,12 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -f docker/Dockerfile -t dinhdev666/free-opencode-api:2.0.0 --push .
 ```
 
-The image installs the OpenCode CLI from npm at build time. Pass `--build-arg OPENCODE_VERSION=<version>` to pin it
-(the default is `latest`, so two builds of the same tag can differ); the version that ended up in a running container
-is available with `docker run --rm <image> opencode --version`.
+The image installs the OpenCode CLI from npm at build time and pins it with `ARG OPENCODE_VERSION`, defaulting to
+`1.19.5` — the newest 1.x release and the line the bundled `@opencode-ai/sdk` drives. Do not build with a 2.x version:
+its `opencode serve` serves the web UI instead of the session API, so the container answers
+`502 … rejected session creation (status 405)` for every completion. Override the pin deliberately with
+`--build-arg OPENCODE_VERSION=<1.x version>`; the version that ended up in a running container is available with
+`docker run --rm <image> opencode --version`.
 
 ---
 

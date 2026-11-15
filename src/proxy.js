@@ -1038,8 +1038,10 @@ function createApp(config) {
                         return reply.code(400).send({ error: { message: 'model must be a string', type: 'invalid_request_error' } });
                     }
 
-                    // `stream` may arrive as a boolean or as the strings "true"/"false"
-                    const wantsStream = stream === true || stream === 'true';
+                    // `stream` arrives as a boolean from real SDKs, but hand-written clients (and template engines that
+                    // stringify booleans) also send "true"/"1"/"yes". Anything unrecognised keeps the historical
+                    // non-streaming default instead of guessing.
+                    const wantsStream = parseBoolean(stream, false) === true;
 
                     // Split on the first slash only: a model id may itself contain slashes
                     // (`vendor/family/version`), and `split('/')` used to drop everything after the second one

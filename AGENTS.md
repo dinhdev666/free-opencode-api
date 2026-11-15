@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 225 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 226 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -342,6 +342,11 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   working directory, because the container writes it next to the app. A `config.json` sitting in the cwd used to be
   ignored in complete silence, which looks exactly like a broken file, so startup now warns
   `[Config] config.json is read from …; the file at … is ignored` when one is present there.
+  An environment variable that is present but **blank** counts as unset (`envOrFile()` in `src/config.js`): `PORT` and
+  `API_KEY` were the two keys read with `??`, where an empty string is a value, so `API_KEY= PORT=` shadowed
+  `config.json` — the gateway listened on the default port and authenticated with the built-in public key while the
+  file named a different port and a real secret. Every other key falls through on a blank value (`||` or a parser
+  that ignores blanks); keep it that way.
   `OPENCODE_SERVER_URL` is normalised at startup (`normalizeBackendUrl`): a trailing slash is stripped and a missing
   scheme is read as `http://`, both with a `[Config]` warning. A trailing slash made every SDK path `//session`, which
   the backend answers with 404 — the gateway then reported "backend exited during startup", which points nowhere near

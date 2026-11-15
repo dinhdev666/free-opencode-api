@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
-import { clientFacingText, parseBoolean, resolveBackendAuth, timeoutMessage } from '../src/proxy.js';
+import { clientFacingText, handlerFailureMessage, parseBoolean, resolveBackendAuth, timeoutMessage } from '../src/proxy.js';
 import { readConfigFile, findUnknownKeys, CONFIG_FILE_KEYS } from '../src/config.js';
 import {
     createLogger, maskBackendUrl, maskHeaders, maskQuotedCredentials, maskSecret, maskUrlCredentials, maskUrlQuery,
@@ -406,12 +406,36 @@ async function run() {
         proxySource.includes('const errorMessage = statusCode >= 500 ? clientFacingText(rawMessage)'),
         'src/proxy.js no longer masks the message a 5xx body carries');
     // The route handler's own catch writes its 500 body itself, so the top-level handler never sees it - and that catch
-    // is the one an error thrown inside a completion reaches. Asserted on the source for the same reason: no accepted
-    // request makes a handler throw.
-    check('the handler catch sends its 500 sentence through the masking too',
-        proxySource.includes('const handlerMessage = clientFacingText(rawMessage) || rawMessage;') &&
-        proxySource.includes("message: handlerMessage, stack: error.stack"),
-        'src/proxy.js no longer masks the sentence or the log line its own catch writes');
+    // is the one an error thrown inside a completion reaches. Its sentence is read by `handlerFailureMessage()`, which
+    // has to hold up for whatever a rejection carries: `.message` is the usual shape, but a thrown string, an object
+    // without one or a thrown `undefined` all reach the same catch, and reading `.message` off those wrote `undefined`
+    // into the body of a 500. An empty message stays empty rather than becoming the word `Error`, which would invent
+    // a cause the operator then goes looking for.
+    const handlerMessageCases = [
+        [new Error('connect ECONNREFUSED http://user:secret@host:4097/session?token=abc'),
+            'connect ECONNREFUSED http://***@host:4097/session?token=***'],
+        [new Error('the proxy refused: Authorization: Basic b3BzOnMzY3IzdC12YWx1ZQ=='),
+            'the proxy refused: Authorization: Basic ***'],
+        [new Error(''), ''],
+        ['a thrown string, not an Error', 'a thrown string, not an Error'],
+        [{ code: 'EPIPE' }, '[object Object]'],
+        [undefined, 'undefined'],
+        [null, 'null']
+    ];
+    const handlerMessageResults = handlerMessageCases.map(([input, expected]) => [handlerFailureMessage(input), expected]);
+    check('the sentence a failed completion carries is read from whatever was thrown, masked',
+        handlerMessageResults.every(([actual, expected]) => actual === expected),
+        JSON.stringify(handlerMessageResults.filter(([actual, expected]) => actual !== expected)));
+
+    // The catch reads that sentence in its log line before it builds the body, and reading a `const` ahead of its
+    // declaration is a ReferenceError: that one replaces the cause of the 500 with a bug in the catch itself, and an
+    // operator gets "Cannot access 'handlerMessage' before initialization" instead of a reason. No request the gateway
+    // accepts can provoke a handler throw, so the order is asserted on the source (it was wrong once).
+    const handlerMessageDeclaredAt = proxySource.indexOf('const handlerMessage = handlerFailureMessage(error);');
+    const handlerMessageLoggedAt = proxySource.indexOf('message: handlerMessage, stack: error.stack');
+    check('the handler catch computes its 500 sentence before the log line that reads it',
+        handlerMessageDeclaredAt > 0 && handlerMessageLoggedAt > handlerMessageDeclaredAt,
+        `declared at ${handlerMessageDeclaredAt}, read at ${handlerMessageLoggedAt}`);
 
     // `http://user:secret@host:4097` was documented as supported and could not work: the SDK calls every endpoint
     // through Node's fetch, which refuses a URL carrying credentials, so every completion answered 502 and the

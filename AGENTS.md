@@ -26,7 +26,7 @@ These are product decisions, not implementation details. Do not "improve" them w
    missing `API_KEY` falls back to the built-in default `sk-dummy-123` (`resolveApiKey()` in `src/proxy.js`). Never add a
    "disable auth" switch, never treat an empty key as "no auth". The bearer is compared in **bytes** (`timingSafeEqual`
    on two `Buffer`s of equal length): a non-ASCII key matches in string length but not in byte length, and comparing
-   strings threw a `RangeError` that turned a wrong key into a `500`. The refusal names the cause the reader can act on -
+   strings threw a `RangeError` for a wrong key. The refusal names the cause the reader can act on -
    no key sent, a wrong `Authorization` (a proxy-injected `Basic …` included) or `X-Api-Key` header - and
    never the value; `Unauthorized` alone named none of them.
 2. **The default key stays visible and warned about.** `index.js` logs a `[Security]` warning when the built-in key is
@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 364 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 365 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -254,7 +254,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   the request), `504` (timeout), `500` (anything else). Every error body carries a
   `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name, and its message is
   masked and bounded (`clientFacingText()`): a 5xx sentence comes from whatever threw, and a thrown `fetch`/SDK error can
-  quote its URL. The route handler's own catch writes its `500` body itself, so it masks its sentence and log line too.
+  quote its URL. The route handler's own catch writes its `500` body itself, so it reads the sentence through
+  `handlerFailureMessage()` - masked, and built *before* the log line that prints it, because a `const` read ahead of
+  its declaration is a `ReferenceError` that replaces the cause of the `500` with a bug in the catch itself.
   A backend that disappears mid-request is an upstream failure (`502`), not a bug (`500`): the client is told the upstream is gone and the next request
   restarts it.
 - A backend that rejects `POST /session` (a version whose API moved, a proxy in front of it, an error body) is an
@@ -423,8 +425,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   A **key nobody reads** is named at startup and ignored (`[Config] config.json has an unknown key 'APIKEY' (did you
   mean 'API_KEY'?) - it is ignored`, via `findUnknownKeys()`): a misspelled key changed nothing at all, so the gateway
   ran the default while the operator was sure the value in the file was in force. A
-  suggestion is only made for a case/separator difference — a real misspelling (`…MAX_CONCURENCY`) cannot be guessed
-  without sending the reader to the wrong key — the value is never printed (a mistyped `API_KEY` is still a
+  suggestion is only made for a case/separator difference — a real misspelling (`…MAX_CONCURENCY`) cannot be guessed — the value is never printed (a mistyped `API_KEY` is still a
   credential), and nothing is merged generically, so an unknown key (including `__proto__`) cannot reach the running
   config. `OPENCODE_PROXY_DEBUG` is an environment name only — the file key is `DEBUG`, so a file entry under the
   former is reported as unknown instead of doing nothing.
@@ -510,8 +511,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   gateway. Session cleanup uses its own shorter budget
   (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client already has its answer, so it must not hold the slot for
   the full budget. The metadata calls (`/v1/models`, the tool list) are capped separately
-  (`METADATA_TIMEOUT_CAP_MS`, never above `REQUEST_TIMEOUT_MS`), because they fall back — a client listing models must
-  get the fallback quickly instead of waiting a completion budget.
+  (`METADATA_TIMEOUT_CAP_MS`, never above `REQUEST_TIMEOUT_MS`), because they fall back — a listing must get the fallback
+  quickly, not a completion budget.
 - **A promise that loses a race needs a handler.** `promptWithTimeout` races the prompt against its own timer and the
   losing promise keeps running: a rejection arriving afterwards (the backend dies, the deadline aborts the fetch)
   reached nothing and became an unhandled rejection, which terminates the process: one slow completion could take the
@@ -537,7 +538,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   disconnect signal is not `request.raw.destroyed`: that stream is destroyed once its body is read.
   A body over `OPENCODE_PROXY_MAX_BODY_MB` is still refused with `413`, but only after it has been read to its end (`refuseOversizedBody()`, bounded by `BODY_DRAIN_TIMEOUT_MS`): Node ends the socket when a response finishes with
   the request body unread, and the kernel answers the client's remaining bytes with RST, so the client could lose the
-  413 entirely. A client that keeps writing is cut off after the drain window. The message names the limit in force
+  413 entirely. The message names the limit in force
   (`request body is too large (limit 50 MiB); send a smaller body or raise OPENCODE_PROXY_MAX_BODY_MB`) instead of
   Fastify's bare sentence: the fix depends on a number only the gateway knows, and it comes from the value
   `createApp()` was built with (`bodyLimitMb`), so it cannot disagree.
@@ -625,8 +626,8 @@ pnpm dlx autocannon -c 10 -d 8 -m POST -H "content-type: application/json" \
 
 Measure with the request log off (`LOG_LEVEL=error`): at the default `info` every `/v1/*` request writes a line, and
 a redirected stdout is synchronous, so the log sets the ceiling (`GET /v1/models`: ~104,900 req/s at 0.08 ms quiet vs
-~71,600 at 1.02 ms with the line - mixing log levels compares the logger). Report before/after instead of an
-improvement, and update the README table only with numbers you measured on that machine, naming the conditions.
+~71,600 at 1.02 ms with the line - mixing log levels compares the logger). Report before/after, and update the README table only with
+numbers measured on that machine.
 Completion requests are serialised by default (`OPENCODE_PROXY_MAX_CONCURRENCY=1`); that default stays `1`.
 
 ## Definition of done

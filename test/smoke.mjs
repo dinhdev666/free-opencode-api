@@ -1163,6 +1163,98 @@ async function run() {
     stop(emptyStub);
     await waitForExit(emptyStub);
 
+    // --- a poll that fails while the answer is being written ---------------------------------------------
+    // One failed poll used to end the completion: a 5xx was silently skipped and a dropped connection threw out of the
+    // loop, although the answer was one poll away. Polls are retried now, and only a run of consecutive failures is
+    // reported - as an upstream error, in bounded time.
+    const retryStubPort = GATEWAY_PORT + 15;
+    const retryStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(retryStubPort), STUB_FAIL_MESSAGES: '1', STUB_DROP_MESSAGES: '1' }
+    });
+    children.push(retryStub);
+    retryStub.stdout.on('data', () => {});
+    retryStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${retryStubPort}/health`);
+    const retryGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(retryStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${retryStubPort}`,
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '8000',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(retryGateway);
+    retryGateway.stdout.on('data', () => {});
+    retryGateway.stderr.on('data', () => {});
+    const retryUrl = `http://127.0.0.1:${retryStubPort + 1}`;
+    await waitForOk(`${retryUrl}/health`);
+    const retried = await fetch(`${retryUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(20000)
+    }).then((r) => r.json().then((json) => ({ status: r.status, json })))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    check('a dropped or failed poll is retried instead of ending the completion',
+        retried.status === 200 && /smoke test stub/.test(String(retried.json?.choices?.[0]?.message?.content)),
+        `status ${retried.status} ${JSON.stringify(retried.json)?.slice(0, 140)}`);
+    stopGateway(retryGateway);
+    await waitForExit(retryGateway);
+    stop(retryStub);
+    await waitForExit(retryStub);
+
+    const failPollStubPort = GATEWAY_PORT + 17;
+    const failPollStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(failPollStubPort), STUB_ALWAYS_FAIL_MESSAGES: '1' }
+    });
+    children.push(failPollStub);
+    failPollStub.stdout.on('data', () => {});
+    failPollStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${failPollStubPort}/health`);
+    const failPollGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(failPollStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${failPollStubPort}`,
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '8000',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(failPollGateway);
+    failPollGateway.stdout.on('data', () => {});
+    failPollGateway.stderr.on('data', () => {});
+    const failPollUrl = `http://127.0.0.1:${failPollStubPort + 1}`;
+    await waitForOk(`${failPollUrl}/health`);
+    const failPollStart = Date.now();
+    const failPolled = await fetch(`${failPollUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(30000)
+    }).then((r) => r.json().then((json) => ({ status: r.status, json })))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    const failPollMs = Date.now() - failPollStart;
+    check('a backend that keeps failing the poll is an upstream error',
+        failPolled.status === 502 && failPolled.json?.error?.type === 'server_error' &&
+        /status 500/.test(String(failPolled.json?.error?.message)),
+        `status ${failPolled.status} ${JSON.stringify(failPolled.json)?.slice(0, 160)}`);
+    check('the failed poll gives up well before the request timeout', failPollMs < 7000, `${failPollMs}ms`);
+    const failPollSessions = await fetch(`http://127.0.0.1:${failPollStubPort}/__sessions`)
+        .then((r) => r.json()).catch(() => null);
+    check('the failed poll still deletes its session', failPollSessions?.live === 0,
+        JSON.stringify(failPollSessions)?.slice(0, 120));
+    stopGateway(failPollGateway);
+    await waitForExit(failPollGateway);
+    stop(failPollStub);
+    await waitForExit(failPollStub);
+
     // --- a backend that answers /health but nothing else -------------------------------------------------
     // A wedged opencode process (health OK, /session silent) used to hang the request handler forever: fetch has no
     // default timeout, so the promise never settled, the client got no answer at all and the queue slot was never

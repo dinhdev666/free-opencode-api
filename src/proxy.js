@@ -24,6 +24,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
 // client already has its answer and a wedged delete would otherwise hold a queue slot for the full request budget.
 const SESSION_CLEANUP_TIMEOUT_MS = 10000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
+// How many polls in a row may fail before a completion is reported as an upstream error
+const MAX_POLL_FAILURES = 5;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
 // A stream that has written nothing for this long gets a comment line, so a proxy or client does not drop the
@@ -901,6 +903,21 @@ function createApp(config) {
         }
     }
 
+    // Describes a failed SDK call: the status and the reason the backend gave. The SDK hands back the parsed body
+    // as-is (`{error:{message}}`, `{message}` or a plain string), so taking the first object would print
+    // "[object Object]" in a client-facing message.
+    const upstreamFailureReason = (res) => {
+        const status = res?.response?.status;
+        const raw = res?.error;
+        const candidate = typeof raw === 'string'
+            ? raw
+            : (raw?.data?.message ?? raw?.message ?? (typeof raw?.error === 'string' ? raw.error : raw?.error?.message));
+        return {
+            status,
+            reason: typeof candidate === 'string' && candidate ? `: ${candidate}` : ''
+        };
+    };
+
     function extractFromParts(parts) {
         if (!Array.isArray(parts)) return { content: '', reasoning: '' };
         // Single pass, no intermediate arrays: this runs for every polled message of every request
@@ -925,15 +942,38 @@ function createApp(config) {
         const requireDone = Boolean(options.requireDone);
         let lastContent = '';
         let stablePolls = 0;
+        // One failed poll used to end the whole completion: a single 5xx or a reset connection while the backend was
+        // busy threw out of the loop, so the client got an error although the answer was one poll away. Polls are
+        // retried instead, and only a run of consecutive failures (the backend really is gone) is reported.
+        let consecutiveFailures = 0;
         while (Date.now() - startedAt < timeoutMs) {
             // A disconnected client must not keep the completion queue busy while polling for an answer nobody reads
             if (shouldAbort && shouldAbort()) {
                 logDebug('Polling abandoned', { sessionId, ms: Date.now() - pollStart });
                 return { content: '', reasoning: '', aborted: true };
             }
-            const messagesRes = await client.session.messages({ path: { id: sessionId }, ...backendDeadline(timeoutMs) });
-            const messages = messagesRes?.data || messagesRes || [];
-            if (Array.isArray(messages) && messages.length) {
+            let messagesRes = null;
+            try {
+                messagesRes = await client.session.messages({ path: { id: sessionId }, ...backendDeadline(timeoutMs) });
+            } catch (error) {
+                // The deadline is the caller's budget, not a failed poll: it still surfaces as a timeout
+                if (isTimeoutError(error)) throw error;
+                messagesRes = { error: error?.message || String(error) };
+            }
+            const messages = Array.isArray(messagesRes?.data)
+                ? messagesRes.data
+                : (Array.isArray(messagesRes) ? messagesRes : null);
+            if (!messages) {
+                consecutiveFailures += 1;
+                const { status, reason } = upstreamFailureReason(messagesRes);
+                logger.warn('[Proxy] Polling failed', { sessionId, attempt: consecutiveFailures, status });
+                if (consecutiveFailures >= MAX_POLL_FAILURES) {
+                    throw new ProviderError(
+                        `OpenCode backend failed while polling the answer${status ? ` (status ${status})` : ''}${reason}`,
+                        status
+                    );
+                }
+            } else if (messages.length) {
                 for (let i = messages.length - 1; i >= 0; i -= 1) {
                     const entry = messages[i];
                     const info = entry?.info;
@@ -961,6 +1001,9 @@ function createApp(config) {
                         return { content, reasoning, error };
                     }
                 }
+            } else {
+                // An empty list is a normal "not written yet" poll, not a failure
+                consecutiveFailures = 0;
             }
             await sleep(intervalMs);
         }
@@ -1280,17 +1323,9 @@ function createApp(config) {
                         // A backend that answers /health but rejects POST /session (a version whose API moved, a proxy
                         // in front of it, an error body) used to surface as a bare 500 "Failed to create OpenCode
                         // session": no status, no reason, and it blamed the gateway for an upstream failure.
-                        const upstreamStatus = sessionRes?.response?.status;
-                        const upstreamError = sessionRes?.error;
-                        // The SDK hands back the parsed body as-is: `{error:{message}}`, `{message}` or a plain
-                        // string. Taking the first non-string object would print "[object Object]" in the answer.
-                        const rawMessage = typeof upstreamError === 'string'
-                            ? upstreamError
-                            : (upstreamError?.data?.message ?? upstreamError?.message ??
-                                (typeof upstreamError?.error === 'string' ? upstreamError.error : upstreamError?.error?.message));
-                        const upstreamMessage = typeof rawMessage === 'string' ? rawMessage : '';
+                        const { status: upstreamStatus, reason } = upstreamFailureReason(sessionRes);
                         throw new ProviderError(
-                            `OpenCode backend rejected session creation${upstreamStatus ? ` (status ${upstreamStatus})` : ''}${upstreamMessage ? `: ${upstreamMessage}` : ''}`,
+                            `OpenCode backend rejected session creation${upstreamStatus ? ` (status ${upstreamStatus})` : ''}${reason}`,
                             upstreamStatus
                         );
                     }

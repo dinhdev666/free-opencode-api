@@ -965,6 +965,34 @@ async function run() {
     check('the client sees an error frame', stallResponse !== 'timeout' && stallResponse.includes('"error"'),
         String(stallResponse).slice(0, 200));
 
+    // --- a silent gap longer than the idle timeout ---------------------------------------------------------
+    // The stub goes quiet for 12.5 s - longer than the 8 s idle timeout - and only then finishes writing. The gateway
+    // falls back to polling on that silence, and giving up 1.5 s into it ended the stream with `finish_reason: "stop"`
+    // for text that stopped mid-sentence.
+    const pauseStartedAt = Date.now();
+    const pauseResponse = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'PAUSE please' }], stream: true })
+    }).then((response) => response.text());
+    const pauseMs = Date.now() - pauseStartedAt;
+    const pauseContent = parseSseFrames(pauseResponse)
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        })
+        .map((chunk) => chunk?.choices?.[0]?.delta?.content || '')
+        .join('');
+    check('a silent gap longer than the idle timeout still delivers the whole answer', pauseContent === ANSWER,
+        `${JSON.stringify(pauseContent)} after ${pauseMs} ms`);
+    check('the recovered stream still ends with [DONE]', pauseResponse.includes('data: [DONE]'),
+        pauseResponse.slice(-120));
+    check('the recovery waited for the answer instead of trusting the silence', pauseMs >= 12000, `${pauseMs} ms`);
+
     // --- a tool-call block split across deltas -----------------------------------------------------------
     // With tools disabled, the markup has to be removed even when the backend cuts it in the middle of a tag:
     // the held-back fragment must not leak into the answer and the text after it must still arrive.

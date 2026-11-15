@@ -85,8 +85,9 @@ Docker Hub.
 counts) and the prompt markers `SLOW` (a ~2 s answer, so a test can abort mid-stream), `STALL` (two deltas and
 then silence, so a test can prove a stalled stream still ends), `TOOLTAG` (an answer whose tool-call block is cut
 in the middle of both of its tags, so a test can prove the markup never leaks) `FAIL` (a provider error with no
-content, so a test can prove both modes report it as an error and the failure path cleans up after itself) and `ENDONLY` (an answer whose finish event
-carries only `time.completed`, so a test can prove the stream still ends without waiting for the idle timeout) and
+content, so a test can prove both modes report it as an error and the failure path cleans up after itself) and
+`ENDONLY` (an answer whose finish event carries only `time.completed`, so a test can prove the stream still ends
+without waiting for the idle timeout) and
 `GROW` (an answer that is still being written when the prompt returns, so a test can prove the polled answer is never
 truncated) and `TAILTAG` (an answer whose last delta ends in a tag prefix that never becomes a tag, so a test can
 prove the held fragment is still delivered). Extend that stub and

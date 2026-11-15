@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
-import { logger, maskBackendUrl, maskHeaders, maskUrlQuery } from './logger.js';
+import { logger, maskBackendUrl, maskHeaders, maskUrlCredentials, maskUrlQuery } from './logger.js';
 
 
 // --- Mutex Logic with Timeout ---
@@ -1349,6 +1349,22 @@ function createApp(config) {
         }
     }
 
+    // Upstream text on its way to a client or a log line: masked and bounded.
+    //
+    // A backend (or a proxy in front of it) can quote a URL inside an error payload, and a configured backend URL may
+    // carry a credential - Node's `fetch` answered `Request cannot be constructed from a URL that includes
+    // credentials: http://user:secret@host:4097/session`, which reached the client-facing 502 body and this process's
+    // log verbatim. The query string is masked for the same reason it is masked on a request URL, and the length is
+    // bounded so a backend cannot answer a client with a reason the size of the request body limit.
+    const MAX_UPSTREAM_TEXT_CHARS = 512;
+    const clientFacingText = (value) => {
+        if (typeof value !== 'string' || value === '') return '';
+        const masked = maskUrlQuery(maskUrlCredentials(value));
+        return masked.length > MAX_UPSTREAM_TEXT_CHARS
+            ? `${masked.slice(0, MAX_UPSTREAM_TEXT_CHARS)}…[truncated ${masked.length - MAX_UPSTREAM_TEXT_CHARS} chars]`
+            : masked;
+    };
+
     // Describes a failed SDK call: the status and the reason the backend gave. The SDK hands back the parsed body
     // as-is (`{error:{message}}`, `{message}` or a plain string), so taking the first object would print
     // "[object Object]" in a client-facing message.
@@ -1360,9 +1376,10 @@ function createApp(config) {
             : (raw?.data?.message ?? raw?.message ?? (typeof raw?.error === 'string' ? raw.error : raw?.error?.message));
         // A thrown call carries the runtime's own wording (`fetch failed` for a dead or refused backend), which names
         // no cause at all; the same phrase a client would read from the top-level handler is used here.
-        const reason = typeof candidate === 'string' && candidate && isConnectionError({ message: candidate })
-            ? `the backend is not reachable (${candidate})`
-            : candidate;
+        const text = clientFacingText(candidate);
+        const reason = text && isConnectionError({ message: candidate })
+            ? `the backend is not reachable (${text})`
+            : text;
         return {
             status,
             reason: typeof reason === 'string' && reason ? `: ${reason}` : ''
@@ -2483,9 +2500,10 @@ function createApp(config) {
                     logger.error('[Proxy] API Error (upstream call failed)', {
                         reqId,
                         sessionId,
-                        message: error.message,
+                        message: clientFacingText(error.message),
                         status: upstream.status,
-                        bodySummary: upstream.bodySummary
+                        // The body is backend-controlled text: it can quote a URL and a log line is collected as often as not
+                        bodySummary: upstream.bodySummary ? maskUrlQuery(maskUrlCredentials(upstream.bodySummary)) : null
                     });
                     logger.debug('[Proxy] Error details', { reqId, sessionId, error });
 
@@ -2496,7 +2514,9 @@ function createApp(config) {
                         if (backend) backend.healthyAt = 0;
                     }
 
-                    let errorMessage = error.message;
+                    // The reason can quote a URL (a proxy in front of the backend does), so it is masked before it
+                    // reaches the response body and, below, the log line
+                    let errorMessage = clientFacingText(error.message);
                     let statusCode = 500;
                     if (error.message && error.message.includes('Request timeout')) {
                         statusCode = 504;
@@ -2518,7 +2538,7 @@ function createApp(config) {
                     // is what a dead or refused backend produces, and a client reading it cannot tell whether the
                     // gateway, the backend or its own request is at fault.
                     if (error.name !== 'ProviderError' && isConnectionError(error)) {
-                        errorMessage = `OpenCode backend is not reachable (${error.message})`;
+                        errorMessage = `OpenCode backend is not reachable (${clientFacingText(error.message)})`;
                     }
                     if (error.message && error.message.includes('ENOENT')) {
                         errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';

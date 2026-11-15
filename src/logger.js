@@ -218,6 +218,24 @@ export function maskBackendUrl(url) {
 }
 
 /**
+ * Mask the userinfo of any URL inside an arbitrary piece of text.
+ *
+ * `maskBackendUrl()` takes a URL; this takes a *message* that can contain one. An upstream error message is the case
+ * that matters: Node's `fetch` answered `Request cannot be constructed from a URL that includes credentials:
+ * http://user:secret@host:4097/session`, and that sentence went into a client-facing `502` body and into the error
+ * log - a configured backend credential published to every caller. A backend, or a proxy in front of it, can also
+ * quote a URL back in its own error payload, so the masking is applied to whatever text is about to leave the process.
+ * Only the credential is replaced: scheme, host, port and path stay readable.
+ * @param {*} text any text (non-strings are stringified the way `maskUrlQuery` does it)
+ * @returns {string} the text with every `scheme://user:pass@` reduced to `scheme://***@`
+ */
+export function maskUrlCredentials(text) {
+    // Not anchored: the URL can sit anywhere in the sentence, and a `@` in a path or query is not userinfo (the
+    // authority is everything up to the first `/`, `?` or `#`, which the character class excludes)
+    return String(text).replace(/(\w[\w+.-]*:\/\/)[^\s/?#@]*@/g, '$1***@');
+}
+
+/**
  * Copy a request-header object and mask sensitive headers (authorization/api-key/cookie/token etc.)
  * @param {object} headers original request headers
  * @returns {object} masked copy (the original object is left untouched)

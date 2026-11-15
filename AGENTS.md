@@ -129,13 +129,21 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - `GET /v1/models` → `200 {"object":"list","data":[{id,name,object,owned_by}, …]}`; 5 s cache, and a cold-cache burst
   shares one provider round trip (`modelsInFlight`) instead of one per request; failures — including a provider call
   that runs into its deadline, because a silent backend would otherwise never answer the listing at all — fall back to
-  a single static model and are not cached. An **empty** provider list takes the same fallback: a payload the gateway
+  a single static model and are not cached. That model is `opencode/big-pickle` (`DEFAULT_MODEL` in `src/proxy.js`),
+  which is also the model a chat request that omits `model` is sent to; both uses read the same constant, so the
+  fallback listing and the request default cannot name different ids. `big-pickle` is an **alias**: OpenCode routes it
+  to whichever model it currently serves and never publishes which one, so it is the only id worth hardcoding — and the
+  reason its entry carries just the four OpenAI fields. Do not add capabilities, limits or pricing to it: they would
+  describe a model the gateway cannot see, and the concrete ids around it rotate.
+  An **empty** provider list takes the same fallback: a payload the gateway
   cannot read (a changed shape, a version that reports nothing) answers `200 {"providers":[]}`, and serving
   `{"data":[]}` is as useless to a client as an error, because it leaves nothing to choose from.
 - `GET /v1/models/:modelId` and `GET /v1/models/<id with slashes>` → `200 {id,name,object,owned_by}` from the same
   cache; an id the provider list does not contain is described from the id itself (`provider` = text before `/`,
-  default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either. The
-  wildcard route exists because clients send `opencode/kimi-k2.5-free` unencoded as often as `%2F`-escaped. A **blank**
+  default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either — the one
+  exception is `opencode/big-pickle`, answered from `DEFAULT_MODEL` so it keeps its `Big Pickle` name instead of the
+  id-derived `big-pickle`. The
+  wildcard route exists because clients send `opencode/big-pickle` unencoded as often as `%2F`-escaped. A **blank**
   id (`/v1/models//`, `/v1/models/%20`) is a `404` in the usual `not_found` envelope instead of a `200` whose body is
   `{"id":"","name":""}`: a doubled slash is read as a trailing slash, so those paths reached the by-id route with an
   empty parameter, and an empty id is not a model. `/v1/models/` itself still answers the listing.

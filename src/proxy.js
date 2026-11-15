@@ -471,6 +471,18 @@ const MODEL_ITEM_SCHEMA = {
     }
 };
 
+// The one id this gateway knows without asking the backend: the answer `/v1/models` gives when the provider list cannot
+// be read, and the model a chat request that omits `model` is sent to. Both uses share this constant, so the fallback
+// listing and the request default can never name different ids.
+//
+// `opencode/big-pickle` is an alias, not a model of its own: OpenCode routes it to whichever model it currently serves
+// and never publishes which one that is. That makes the alias stable enough to hardcode while every concrete model id
+// comes and goes - but it also means no capability, context or price can be claimed for it, so it carries only the four
+// OpenAI fields. Do not add metadata here: it would describe a model this gateway cannot see.
+const DEFAULT_MODEL = { id: 'opencode/big-pickle', name: 'Big Pickle', object: 'model', owned_by: 'opencode' };
+
+const DEFAULT_MODEL_ID = DEFAULT_MODEL.id;
+
 const MODELS_SCHEMA = {
     type: 'object',
     properties: {
@@ -652,7 +664,7 @@ function createApp(config) {
     // on every client startup/probe; failures are never cached so a recovering backend is picked up immediately.
     const MODELS_CACHE_TTL_MS = 5000;
     // What a client sees when the provider list cannot be read: a single model, never an empty list
-    const STATIC_FALLBACK_MODELS = [{ id: 'opencode/kimi-k2.5-free', name: 'Kimi K2.5 Free', object: 'model', owned_by: 'opencode' }];
+    const STATIC_FALLBACK_MODELS = [DEFAULT_MODEL];
     const MODELS_TIMEOUT_MS = Math.min(REQUEST_TIMEOUT_MS, METADATA_TIMEOUT_CAP_MS);
     const TOOL_IDS_TIMEOUT_MS = MODELS_TIMEOUT_MS;
     let modelsCache = null;
@@ -725,6 +737,9 @@ function createApp(config) {
     const describeModel = async (requestedId) => {
         const known = (await loadModels()).find((m) => m.id === requestedId);
         if (known) return known;
+        // The default model answers with its own name even when a healthy backend lists other models: it is the id a
+        // request that omits `model` is sent to, so it should not be described as the bare id-derived `big-pickle`.
+        if (requestedId === DEFAULT_MODEL_ID) return DEFAULT_MODEL;
         const slash = requestedId.indexOf('/');
         const provider = slash > 0 ? requestedId.slice(0, slash) : 'opencode';
         const name = slash > 0 ? requestedId.slice(slash + 1) : requestedId;
@@ -739,7 +754,7 @@ function createApp(config) {
         if (!modelId) return reply.callNotFound();
         return describeModel(modelId);
     });
-    // Model ids contain slashes (`opencode/kimi-k2.5-free`), and clients send them unencoded as often as escaped:
+    // Model ids contain slashes (`opencode/big-pickle`), and clients send them unencoded as often as escaped:
     // without the wildcard route the unencoded form hit the 404 handler.
     app.get('/v1/models/*', modelByIdSchema, async (request, reply) => {
         // `/v1/models/` answers the listing (a trailing slash is ignored), so an empty id here means a doubled slash or
@@ -1263,7 +1278,7 @@ function createApp(config) {
 
                     // Split on the first slash only: a model id may itself contain slashes
                     // (`vendor/family/version`), and `split('/')` used to drop everything after the second one
-                    const modelId = (model || '').trim() || 'opencode/kimi-k2.5-free';
+                    const modelId = (model || '').trim() || DEFAULT_MODEL_ID;
                     const modelSlash = modelId.indexOf('/');
                     const pID = modelSlash === -1 ? 'opencode' : modelId.slice(0, modelSlash);
                     const mID = modelSlash === -1 ? modelId : modelId.slice(modelSlash + 1);

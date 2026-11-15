@@ -5,7 +5,13 @@
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI%20compatible-412991.svg)](#api-reference)
 
-**Free OpenCode API** turns the [OpenCode](https://opencode.ai) CLI into a standard, OpenAI-compatible REST API. It runs as a small Node.js gateway in front of `opencode serve`, so any client that understands the OpenAI protocol — Cursor, Claude Code, the official OpenAI SDKs, or your own scripts — can use free models such as **Kimi k2.5**, **GLM 4.7**, and **MiniMax m2.1** without a paid API key.
+**Free OpenCode API** turns the [OpenCode](https://opencode.ai) CLI into a standard, OpenAI-compatible REST API. It runs as a small Node.js gateway in front of `opencode serve`, so any client that understands the OpenAI protocol — Cursor, Claude Code, the official OpenAI SDKs, or your own scripts — can use the free models your OpenCode installation currently serves, without a paid API key.
+
+> OpenCode rotates its free lineup, so this README only names `opencode/big-pickle`, the one id that stays put. It is an
+> **alias**, not a model of its own: OpenCode routes it to whichever model it currently serves and never says which one,
+> so its capabilities (context size, tool support, reasoning) can change without notice. It is the gateway's built-in
+> default, so a chat request that omits `model` goes to it. Every other id comes and goes — `GET /v1/models` returns
+> what your installation serves right now.
 
 ---
 
@@ -156,20 +162,22 @@ cp config.json.example config.json   # optional: edit port, API key, paths
 pnpm start                           # or: node index.js
 ```
 
-Verify the gateway is up (`/health` is the only unauthenticated route besides `/`):
+Verify the gateway is up (`/health` is the only unauthenticated route besides `/`), and list the models it can serve
+right now:
 
 ```bash
 curl http://127.0.0.1:8083/health
 curl -H "Authorization: Bearer sk-dummy-123" http://127.0.0.1:8083/v1/models
 ```
 
-Send your first message:
+Send your first message — `opencode/big-pickle` is a stable alias for whatever model OpenCode is serving right now; any
+other id from that list works too:
 
 ```bash
 curl -X POST http://127.0.0.1:8083/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-dummy-123" \
-  -d '{"model":"opencode/kimi-k2.5-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
+  -d '{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
 > `sk-dummy-123` is the built-in default key. Change `API_KEY` (environment variable or `config.json`) for any real deployment; leaving it blank still enforces the default.
@@ -249,7 +257,10 @@ A provider call that stops answering is bounded by its own deadline (10 s at mos
 budget), so `/v1/models` still answers — with the single static fallback model — instead of hanging. The same fallback
 covers a backend that reports no models at all: an empty list would leave a client with nothing to choose from.
 
-**Chat completions** accepts the usual OpenAI fields; model IDs use the `opencode/<model>` form (for example `opencode/kimi-k2.5-free`).
+**Chat completions** accepts the usual OpenAI fields; model IDs use the `opencode/<model>` form. `opencode/big-pickle`
+is a stable alias that OpenCode routes to the model it currently serves (the target is not published), and it is the
+gateway's built-in default, used when `model` is omitted; every other id is one that `GET /v1/models` lists for your
+installation right now.
 
 Fields the gateway respects: `messages` (string content, or an array of parts whose `text` is concatenated), `model`,
 `stream` (a boolean, or one of `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off` — hand-written clients stringify it, and a
@@ -270,7 +281,7 @@ curl -X POST http://127.0.0.1:8083/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-dummy-123" \
   -d '{
-        "model": "opencode/kimi-k2.5-free",
+        "model": "opencode/big-pickle",
         "messages": [{"role": "user", "content": "Explain event loops in two sentences."}],
         "stream": false
       }'
@@ -308,7 +319,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8083/v1", api_key="sk-dummy-123")
 response = client.chat.completions.create(
-    model="opencode/kimi-k2.5-free",
+    model="opencode/big-pickle",  # stable alias; any id from GET /v1/models works
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)
@@ -321,7 +332,7 @@ import OpenAI from 'openai';
 
 const client = new OpenAI({ baseURL: 'http://127.0.0.1:8083/v1', apiKey: 'sk-dummy-123' });
 const res = await client.chat.completions.create({
-    model: 'opencode/kimi-k2.5-free',
+    model: 'opencode/big-pickle', // stable alias; any id from GET /v1/models works
     messages: [{ role: 'user', content: 'Hello!' }],
 });
 console.log(res.choices[0].message.content);

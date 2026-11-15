@@ -303,6 +303,14 @@ async function run() {
         otherModel.json?.id === 'some-other-model' && otherModel.json?.owned_by === 'opencode',
         otherModel.text.slice(0, 120));
 
+    // The static model is the id a request without `model` is sent to, so it answers with its own name rather than the
+    // id-derived `big-pickle` even though the stub backend lists only kimi and gpt-5-mini.
+    const defaultModel = await request('/v1/models/opencode%2Fbig-pickle');
+    check('the default model is described by id when the backend lists other models',
+        defaultModel.response.status === 200 && defaultModel.json?.id === 'opencode/big-pickle' &&
+        defaultModel.json?.name === 'Big Pickle' && defaultModel.json?.owned_by === 'opencode',
+        defaultModel.text.slice(0, 160));
+
     // A doubled slash is read as a trailing slash, so `/v1/models//` reaches the by-id route with an empty id.
     // Describing "" answered 200 with {"id":"","name":""} - not a model at all - so it is a missing route instead.
     const blankList = await fetch(`${BASE}/v1/models//`, { headers: { authorization: `Bearer ${API_KEY}` } })
@@ -478,8 +486,12 @@ async function run() {
     check('stream_options.include_usage is answered with a usage chunk',
         Boolean(usageChunk) && Array.isArray(usageChunk.choices) && usageChunk.choices.length === 0,
         JSON.stringify(usageChunk));
+    // The request above omits `model`, so this frame is the first place the default model id shows up: compare it with
+    // the sibling chunks of the same stream instead of a literal, which the later default model would break.
+    const streamModel = usageChunks.find((chunk) => !chunk?.usage)?.model;
     check('the usage chunk carries the same envelope as the other chunks',
-        usageChunk?.object === 'chat.completion.chunk' && usageChunk?.model === 'opencode/kimi-k2.5-free' &&
+        usageChunk?.object === 'chat.completion.chunk' && typeof streamModel === 'string' &&
+        usageChunk?.model === streamModel &&
         typeof usageChunk?.usage?.total_tokens === 'number', JSON.stringify(usageChunk));
     check('the usage chunk comes after the finish chunk and before [DONE]',
         usageChunks.indexOf(usageChunk) > usageChunks.findIndex((chunk) => chunk?.choices?.[0]?.finish_reason === 'stop') &&
@@ -1278,12 +1290,13 @@ async function run() {
     const emptyList = await fetch(`${emptyUrl}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
         .then((r) => r.json()).catch(() => null);
     check('an empty provider list falls back to the static model',
-        emptyList?.object === 'list' && emptyList.data?.length === 1 && emptyList.data[0].id === 'opencode/kimi-k2.5-free',
+        emptyList?.object === 'list' && emptyList.data?.length === 1 && emptyList.data[0].id === 'opencode/big-pickle' &&
+        emptyList.data[0].name === 'Big Pickle' && emptyList.data[0].owned_by === 'opencode',
         JSON.stringify(emptyList)?.slice(0, 140));
     const emptyListAgain = await fetch(`${emptyUrl}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
         .then((r) => r.json()).catch(() => null);
     check('the empty answer is not cached',
-        emptyListAgain?.data?.length === 1 && emptyListAgain.data[0].id === 'opencode/kimi-k2.5-free',
+        emptyListAgain?.data?.length === 1 && emptyListAgain.data[0].id === 'opencode/big-pickle',
         JSON.stringify(emptyListAgain)?.slice(0, 140));
     stopGateway(emptyGateway);
     await waitForExit(emptyGateway);

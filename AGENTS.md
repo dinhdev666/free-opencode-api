@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 247 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 250 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -192,6 +192,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (`USER: …`, `ASSISTANT: …`) and sent as text. `developer` is OpenAI's newer name for the system role, so a client
   using it must not end up with "DEVELOPER: …" inside the conversation. The stub reports the last system prompt it
   received (`GET /__sessions` → `lastSystemPrompt`) so the suite can assert it.
+- **A missing `messages` is not an unusable one.** Three client mistakes used to share a single message: a body with
+  no `messages`, a `messages` that is not an array (`"hi"`, `{}`) and an empty array (`[]`) all answered
+  `messages array is required`, which sends the reader looking for a field they did send. They are separated now:
+  `messages array is required` (absent or `null`), `messages must be an array of message objects, found a string`
+  (`jsonTypeName()`, so the message names what arrived — `Array.isArray` first, because `typeof []` is `'object'`) and
+  `messages must contain at least one message`.
 - A `messages[].role` that is present but not a string (`5`, `{}`, `[]`, `true`) is a `400`
   (`messages[0].role must be a string`): `(role || 'user').toLowerCase()` threw on a truthy non-string, so a client's
   bad field was answered `500` with the internal expression in the message. A missing or `null` role keeps its lenient

@@ -22,6 +22,14 @@ const EMPTY_PROVIDERS = process.env.STUB_EMPTY_PROVIDERS === '1';
 // Reject POST /session (an incompatible backend, a proxy in front of it) so a test can prove the gateway reports the
 // upstream status and reason instead of a bare 500
 const FAIL_SESSION = process.env.STUB_FAIL_SESSION === '1';
+// Fail the first N polls of a session's messages with a 500 (a transient backend hiccup), or every poll
+// (STUB_ALWAYS_FAIL_MESSAGES=1), so a test can prove the gateway retries a failed poll and gives up in bounded time
+const FAIL_MESSAGES = Number(process.env.STUB_FAIL_MESSAGES || 0);
+const ALWAYS_FAIL_MESSAGES = process.env.STUB_ALWAYS_FAIL_MESSAGES === '1';
+// Drop the connection on the first N polls, the way a backend that is being restarted does
+const DROP_MESSAGES = Number(process.env.STUB_DROP_MESSAGES || 0);
+let failedMessagePolls = 0;
+let droppedMessagePolls = 0;
 // An answer with a tool-call block whose tags are cut in the middle by the delta boundaries (prompt marker TOOLTAG)
 const TOOL_TAG_ANSWER = 'hello <function_calls>secret</function_calls> world';
 // An answer whose last delta ends with a fragment that looks like the start of a tool-call tag but never becomes
@@ -297,6 +305,15 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (isMessage && req.method === 'GET') {
+            droppedMessagePolls += 1;
+            if (droppedMessagePolls <= DROP_MESSAGES) {
+                req.destroy();
+                return undefined;
+            }
+            failedMessagePolls += 1;
+            if (ALWAYS_FAIL_MESSAGES || failedMessagePolls <= FAIL_MESSAGES) {
+                return sendJson(res, 500, { error: { message: 'transient poll failure' } });
+            }
             return sendJson(res, 200, session ? session.messages : []);
         }
     }

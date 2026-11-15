@@ -48,7 +48,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | --- | --- |
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved concurrency/queue capacity and any clamp, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
-| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because silently continuing would run with the built-in key instead of the configured one. A key the gateway does not read is returned by `findUnknownKeys()` so the entry point can name it (with the key a case/separator typo probably meant). A BOM is tolerated. |
+| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. `findUnknownKeys()` names a key nobody reads (with the key a typo probably meant). A BOM is tolerated. |
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`) plus `serializeDetail()` (bounded, truncate-before-stringify) used by debug logging. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
@@ -309,8 +309,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   then closes with `socket.end()` (`closeSocketAfterFlush()`), never `socket.destroy()`: `destroy()` discards buffered
   writes, so under backpressure the client got a reset instead of the error it was promised.
 - A URL the **router** cannot decode (a percent escape that is not valid UTF-8, `GET /v1/models/%E0%A4%A`) never reaches
-  a hook, so Fastify answered its own body (`{"error":"Bad Request","code":"FST_ERR_BAD_URL",…}`: no `type`, CORS,
-  `X-Request-Id` or log line). `routerOptions.onBadUrl` (`badUrlHandler`) writes the usual envelope, with a generated
+  a hook, so Fastify answered its own body (no `type`, CORS, `X-Request-Id` or log line). `routerOptions.onBadUrl` (`badUrlHandler`) writes the usual envelope, with a generated
   request id and one `warn` line carrying the path truncated by `loggableUrl`. It is handed the raw request/response
   (`find-my-way` builds no Fastify request for a routable-less path), like `clientErrorHandler`.
 - Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
@@ -356,19 +355,17 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   the in-process equivalents, deliberately identical). Header **names** are matched against
   `SENSITIVE_HEADER_PATTERN`, built from the exported `SENSITIVE_NAME_ALTERNATIVES` (`auth`, `authorization`,
   `authentication`, `api-key`/`apikey`, `token`, `secret`, `cookie`, `session`, `passw`, `key`, `code`, `sig`,
-  `signature`, `credential`, `bearer` as whole name segments) rather than a fixed denylist: a credential forwarded as
-  `x-goog-api-key`, `x-auth-token` or `openai-api-key` used to be logged raw, and the client decides that name, not the
-  gateway. **URLs are masked too** (`maskUrlQuery()` before `loggableUrl()` truncates): `?api_key=…`, `?token=…` and
-  `?Authorization=…` are a documented OpenAI-compatible client convention — and so are the spellings other clients use
-  for the same secret (Google's `?key=…`, an OAuth `?code=…`, an Azure SAS `?sig=`/`?signature=…`), each of which
-  reached the default info line verbatim until the list carried those names. The list is one exported string because
+  `signature`, `credential`, `bearer` as whole name segments) rather than a fixed denylist: `x-goog-api-key`,
+  `x-auth-token` or `openai-api-key` is a credential too, and the client decides that name. **URLs are masked too**
+  (`maskUrlQuery()` before `loggableUrl()` truncates): `?api_key=…`, `?token=…` and `?Authorization=…` are a
+  documented OpenAI-compatible client convention, and so are Google's `?key=…`, an OAuth `?code=…` and an Azure SAS
+  `?sig=`/`?signature=…`. The list is one exported string because
   `docker/docker-entrypoint.sh` cannot import this module and repeats it for its own first-boot dump; the smoke suite
   asserts the two copies are identical, the way `CORS_ALLOW_HEADERS` is the one place the CORS list lives.
-  A request body reaches the debug dump through `maskDetail()` (the same name list on a bounded copy); the
-  model-fetch error line uses the same two helpers, because it quoted `error.message` (whose documented symptom is a
-  credential-bearing backend URL) and the raw upstream body. A detail object handed to a debug line is **truncated
-  before it is cloned** (`serializeDetail()`): a 50 MB body used to be structured-cloned and re-stringified to produce
-  a 32 KB line (43 ms and +100 MB of heap per line).
+  A request body reaches the debug dump through `maskDetail()` (the same name list on a bounded copy), and the
+  model-fetch error line uses the same helpers for `error.message` and the upstream body. A detail object handed to a
+  debug line is **truncated before it is cloned** (`serializeDetail()`): a 50 MB body used to be cloned and
+  re-stringified into a 32 KB line (43 ms and +100 MB of heap per line).
   Masking replaces a value and never drops the key: the copy these helpers build is assigned to with
   `setOwnProperty()` (a `defineProperty` for exactly the name `__proto__`) because `copy[key] = value` runs the
   `__proto__` setter, so a key of that name vanished from the masked header dump and the debug detail — the one place

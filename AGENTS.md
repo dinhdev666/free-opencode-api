@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 57 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 59 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -101,9 +101,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - `GET /health` → `200 {"status":"ok","backend":"<OPENCODE_SERVER_URL>"}`, never touches the backend.
 - `GET /v1/models` → `200 {"object":"list","data":[{id,name,object,owned_by}, …]}`; 5 s cache; failures fall back to a
   single static model and are not cached.
-- `GET /v1/models/:modelId` → `200 {id,name,object,owned_by}` from the same cache; an id the provider list does not
-  contain is described from the id itself (`provider` = text before `/`, default `opencode`) rather than 404, because
-  `/v1/chat/completions` does not restrict the model either.
+- `GET /v1/models/:modelId` and `GET /v1/models/<id with slashes>` → `200 {id,name,object,owned_by}` from the same
+  cache; an id the provider list does not contain is described from the id itself (`provider` = text before `/`,
+  default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either. The
+  wildcard route exists because clients send `opencode/kimi-k2.5-free` unencoded as often as `%2F`-escaped.
 - `POST /v1/chat/completions` non-streaming → `chat.completion` with
   `choices[0].message.{role,content,reasoning_content}`, `finish_reason:"stop"` and a `usage` block of zeroes
   (upstream does not report token counts).

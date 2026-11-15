@@ -252,6 +252,10 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -f docker/Dockerfile -t dinhdev666/free-opencode-api:1.0.0 --push .
 ```
 
+The image installs the OpenCode CLI from npm at build time. Pass `--build-arg OPENCODE_VERSION=<version>` to pin it
+(the default is `latest`, so two builds of the same tag can differ); the version that ended up in a running container
+is available with `docker run --rm <image> opencode --version`.
+
 ---
 
 ## Related Links

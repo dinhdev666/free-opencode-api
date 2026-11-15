@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 323 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 325 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -341,8 +341,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   attacker-written line (`FORGED [INFO] …`) while a 2 MB id produced a 2 MB line. The backend still receives the id
   verbatim - the contract does not restrict model ids, only what is logged is normalised, and an **operator** value
   quoted in a startup line goes through `loggableConfigValue()` for the same reason: `config.json` and the environment
-  are text a script can write. It covers every `[Config]` note naming a value it could not use, and
-  `docker/docker-entrypoint.sh` repeats the rule for its log-level line (`tr '[:cntrl:]' '?'`, cut at 128).
+  are text a script can write. It covers every `[Config]` note naming a value it could not use, the ignored-file
+  paths and the `[Security]` warning that names the bind address; `docker/docker-entrypoint.sh` repeats the rule for
+  its log-level line (`tr '[:cntrl:]' '?'`, cut at 128), because it cannot import the module.
 
 ## Working rules for code changes
 

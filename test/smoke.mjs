@@ -1571,6 +1571,67 @@ async function run() {
         forgedKnobLines.length >= 6 && forgedKnobLines.every((line) => line.includes('abc?[Shutdown]') || line.includes('8083x?[Shutdown]')),
         JSON.stringify(forgedKnobLines));
 
+    // The one line that describes the exposure quotes the bind address too: the `[Security]` warning is what tells an
+    // operator the built-in key is public on that interface, and a newline in `BIND_HOST` split it into a record of its
+    // own exactly where the real one was being read. A host carrying a newline cannot be listened on, so this child
+    // exits - after writing the line, which is what is asserted.
+    const forgedHostPort = GATEWAY_PORT + 70;
+    const forgedHostGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(forgedHostPort),
+            // Blank counts as unset, which is what puts the built-in key (and its warning) in force.
+            API_KEY: '',
+            BIND_HOST: '127.0.0.1\n[Security] Not really exposed',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(forgedHostGateway);
+    let forgedHostOutput = '';
+    forgedHostGateway.stdout.on('data', (chunk) => { forgedHostOutput += chunk; });
+    forgedHostGateway.stderr.on('data', (chunk) => { forgedHostOutput += chunk; });
+    await new Promise((resolve) => forgedHostGateway.once('exit', resolve));
+    const forgedHostLines = forgedHostOutput.split('\n').filter((line) => line.includes('Not really exposed'));
+    // Every line carrying the text is a real logger record: `[gateway] <stamp> [LEVEL] …`, or the JSON detail of the
+    // listen failure, whose newline is escaped. A forged record is the one that lost that prefix.
+    check('a newline in the bind host cannot forge a security warning',
+        forgedHostLines.some((line) => line.includes('it listens on 127.0.0.1?[Security] Not really exposed')) &&
+            forgedHostLines.every((line) => line.includes('[gateway]')),
+        JSON.stringify(forgedHostLines));
+
+    // The note about a `config.json` in the wrong directory names two paths, and one of them comes from the shell's
+    // working directory - a directory name can carry a newline on any POSIX host. It is the line that tells an operator
+    // which file was ignored, so a forged record after it hides the real advice.
+    const forgedCwdDir = path.join(os.tmpdir(), `gateway-cwd-${process.pid}\n[Config] Not really a gateway line`);
+    fs.rmSync(forgedCwdDir, { recursive: true, force: true });
+    fs.mkdirSync(forgedCwdDir, { recursive: true });
+    fs.writeFileSync(path.join(forgedCwdDir, 'config.json'), JSON.stringify({ PORT: 1 }));
+    const forgedCwdPort = GATEWAY_PORT + 71;
+    const forgedCwdGateway = spawn(process.execPath, [path.join(ROOT, 'index.js')], {
+        cwd: forgedCwdDir,
+        env: {
+            ...process.env,
+            PORT: String(forgedCwdPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'info'
+        }
+    });
+    children.push(forgedCwdGateway);
+    let forgedCwdOutput = '';
+    forgedCwdGateway.stdout.on('data', (chunk) => { forgedCwdOutput += chunk; });
+    forgedCwdGateway.stderr.on('data', (chunk) => { forgedCwdOutput += chunk; });
+    await waitForOk(`http://127.0.0.1:${forgedCwdPort}/health`);
+    const forgedCwdLines = forgedCwdOutput.split('\n').filter((line) => line.includes('Not really a gateway line'));
+    check('a newline in the working directory cannot forge a config note',
+        forgedCwdLines.length > 0 && forgedCwdLines.every((line) => line.includes('[gateway]')),
+        JSON.stringify(forgedCwdLines));
+    stopGateway(forgedCwdGateway);
+    await waitForExit(forgedCwdGateway);
+    fs.rmSync(forgedCwdDir, { recursive: true, force: true });
+
     // The legacy debug switch loses to an explicit LOG_LEVEL. That used to happen in complete silence: an operator who
     // raised the detail with the documented switch got a warn-only log and a summary line that looked as if the switch
     // had never been needed. Both directions are asserted, so the promotion cannot be dropped either.

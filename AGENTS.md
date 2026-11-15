@@ -49,8 +49,8 @@ These are product decisions, not implementation details. Do not "improve" them w
 | --- | --- |
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved concurrency/queue capacity and any clamp, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
-| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object) stops the gateway, because silently continuing would run with the built-in key instead of the configured one. |
-| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix and `maskHeaders()` used by debug logging. |
+| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because silently continuing would run with the built-in key instead of the configured one or with a value nobody wrote. A UTF-8 BOM is tolerated. |
+| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`) plus `serializeDetail()` (bounded, truncate-before-stringify) used by debug logging. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 190 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 218 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -110,8 +110,12 @@ never becomes a tag, so a test can prove the held fragment is still delivered), 
 timeout) and `PROMPTDONE` (a prompt response that already carries the finished message and stores nothing for
 polling, so a test can prove the fast path needed no poll - `GET /__sessions` reports `messagePolls` for that), plus
 `STUB_EMPTY_PROVIDERS=1` serving an empty provider list on the first call and a provider without a `models` map after
-it, so both shapes of an unreadable payload are covered, and `STUB_FAIL_EVENTS=1` (a 500 for `GET /event`, so a test
-can prove a streaming request still answers through the polling fallback when the event stream is refused). Extend that stub and
+it, so both shapes of an unreadable payload are covered, `STUB_FAIL_EVENTS=1` (a 500 for `GET /event`, so a test
+can prove a streaming request still answers through the polling fallback when the event stream is refused) and
+`STUB_FAIL_PROVIDERS=1` (a 500 for `GET /config/providers`, so a test can prove a refused listing is reported as a
+refused call and not as an empty one), and `CUTSTREAM` (two cumulative text snapshots followed by a dropped event
+connection, so a test can prove a stream that ends mid-answer is recovered through polling without duplicating or
+truncating the text). Extend that stub and
 `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
 already taken (a stale process would answer with someone else's build) and SIGKILLs any child that ignores SIGTERM.
 The session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting
@@ -289,8 +293,17 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (`app.options('/*')`) is required for preflight; `onRequest` hooks alone do not answer unmatched paths.
 - **Logging** goes through `src/logger.js` (`logger.info`, `logger.warn`, `logger.error`, `logger.debug`). No
   `console.log` in `src/` or `index.js`. Never log an unmasked `authorization` header, and never print the API key:
-  `docker/docker-entrypoint.sh` reports the key it generated as `sup*** (22 chars)`, because `docker logs` is collected
-  as often as not (`maskHeaders`/`maskSecret` in `src/logger.js` are the in-process equivalents). A **closed reader**
+  `docker/docker-entrypoint.sh` reports the key it generated as `sk-a***(22 chars)` — nothing but the length up to 16
+  characters — because `docker logs` is collected as often as not (`maskHeaders`/`maskSecret` in `src/logger.js` are
+  the in-process equivalents, and the two rules are deliberately identical). Header **names** are matched against
+  `SENSITIVE_HEADER_PATTERN` (`auth`, `authorization`, `authentication`, `api-key`/`apikey`, `token`, `secret`,
+  `cookie`, `session`, `passw` as whole name segments) rather than a fixed denylist: a credential forwarded as
+  `x-goog-api-key`, `x-auth-token` or `openai-api-key` used to be logged raw, and the client decides that name, not the
+  gateway. **URLs are masked too** (`maskUrlQuery()` before `loggableUrl()` truncates): `?api_key=…`, `?token=…` and
+  `?Authorization=…` are a documented OpenAI-compatible client convention, and they reached the default info line
+  verbatim. A detail object handed to a debug line is **truncated before it is cloned** (`serializeDetail()`): a 50 MB
+  body used to be structured-cloned and re-stringified to produce a 32 KB line (43 ms and +100 MB of heap per line).
+  A **closed reader**
   on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream `error` with no listener is
   thrown as an uncaught exception, and `node index.js | head -3` (a log shipper that restarted, `docker logs` closing
   mid-write) killed a gateway that was still serving requests. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that
@@ -361,6 +374,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   backend never marks finished: the default allowance of three identical polls (~1.5 s) is right after a normal
   prompt, but applied to a stream that had already been silent for 8 s it ended the response with
   `finish_reason: "stop"` on text that stopped mid-sentence, which a slow provider still writing looks exactly like.
+- **A stream that ends without a finish event is recovered, not timed out.** When the event stream is closed
+  mid-answer (backend restart, a proxy dropping idle SSE connections) the collector settles with
+  `streamEnded: true` and the streaming path polls for the rest of the answer, appending only what the client does not
+  have yet — exactly like the idle-timeout path. Before that it stayed silent until the whole request budget ran out
+  and then ended the response with an in-band error (`5992 ms` of a `6000 ms` budget for an answer the backend had
+  already finished), which is the one case where a truncation-free answer was available and not served.
 - **A finished message ends the stream, whatever the finish reason.** The collector settles on any non-empty
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.
@@ -408,7 +427,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `USER node` (uid/gid 1000) after the CLI install, so the gateway, the backend it spawns and every tool that backend
   runs are not UID 0. The entrypoint still writes `/app/config.json` (0600, owned by that user) on first boot, so
   anything bind-mounted there must be readable - and a credentials directory writable - by uid 1000
-  (`docker/README.md`). CI asserts the uid is not 0.
+  (`docker/README.md`). CI asserts the uid is not 0. The entrypoint writes that file through a temporary file and an
+  atomic `rename` (a container killed mid-write must not leave a truncated `config.json`, which made every later start
+  exit with "is not valid JSON"), and it keeps `OPENCODE_BIND_HOST` on `127.0.0.1`: the backend has no authentication
+  of its own, so publishing 4097 would bypass the gateway's key.
 - **Workflow actions are pinned to commit SHAs.** Every `uses:` in `.github/workflows/` names a 40-character commit
   with the release in a trailing comment (`actions/checkout@<sha> # v4.4.0`), and a CI step fails the build when a
   movable ref reappears: `docker-publish.yml` leaves a write-scoped registry token on the runner, so an action resolved

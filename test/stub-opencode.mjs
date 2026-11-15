@@ -202,6 +202,22 @@ const server = http.createServer(async (req, res) => {
             }
             session.prompted = true;
             promptedSessions += 1;
+            if (session.promptText.includes('FAIL')) {
+                // A provider failure: the assistant message carries an error and no content, so a non-streaming
+                // request must answer 502 and a streaming one must end with an in-band error frame
+                session.messages.push({
+                    info: {
+                        id: `msg_${id}`,
+                        sessionID: id,
+                        role: 'assistant',
+                        error: { name: 'ProviderError', data: { message: 'provider failed' } },
+                        time: { created: Date.now(), completed: Date.now() }
+                    },
+                    parts: []
+                });
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                return;
+            }
             const toolTag = session.promptText.includes('TOOLTAG');
             if (session.promptText.includes('STALL')) {
                 // Nothing for polling to find and no finish event: the caller must time out and close the stream

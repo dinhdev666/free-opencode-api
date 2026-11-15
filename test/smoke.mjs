@@ -128,6 +128,13 @@ async function run() {
         (health.response.headers.get('content-type') || '').includes('application/json'),
         health.response.headers.get('content-type'));
 
+    // --- root index -------------------------------------------------------------------------------------
+    const root = await request('/', { key: null });
+    check('GET / answers without a key', root.response.status === 200, `status ${root.response.status}`);
+    check('GET / lists the service endpoints',
+        root.json?.service === 'free-opencode-api' && root.json?.endpoints?.chat_completions === '/v1/chat/completions',
+        root.text.slice(0, 160));
+
     // --- auth -------------------------------------------------------------------------------------------
     const noAuth = await request('/v1/models', { key: null });
     check('unauthenticated /v1/models is rejected', noAuth.response.status === 401, `status ${noAuth.response.status}`);

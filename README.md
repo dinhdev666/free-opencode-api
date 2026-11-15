@@ -212,6 +212,7 @@ Every response carries an `X-Request-Id` header, and the same id appears in the 
 
 | Endpoint | Method | Description |
 | --- | --- | --- |
+| `/` | GET | Service index (no key required): service name, status and the endpoint paths |
 | `/health` | GET | Liveness probe; returns gateway status and the configured backend URL |
 | `/v1/models` | GET | OpenAI-style model list |
 | `/v1/models/{id}` | GET | Single model; an id the provider list does not contain is still described (the gateway does not restrict models) |

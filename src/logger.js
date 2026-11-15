@@ -187,11 +187,16 @@ const isSensitiveHeader = (lowerName) => SENSITIVE_HEADER_NAMES.has(lowerName) |
  * convention some tools still use) wrote it into `docker logs` on every request, because the request summary, the
  * debug dump and the rejected-request warning log the raw URL. The URL itself is kept: only values whose *name* looks
  * like a credential are replaced.
+ *
+ * `#` separates too, not just `?` and `&`: a browser and `curl` drop a fragment before sending, but a raw client can
+ * put one in the request target (`GET /v1/models#access_token=…`), Node hands that URL over as it arrived, and the
+ * gateway logged the credential at the default level. A fragment is not part of an HTTP request, so masking one costs
+ * nothing, and an unmasked one is a secret in `docker logs`.
  * @param {string} url raw request URL
  * @returns {string} the URL with credential query values masked
  */
 export function maskUrlQuery(url) {
-    return String(url).replace(/([?&])([^=&#]+)=([^&#]*)/g, (match, separator, name, value) => {
+    return String(url).replace(/([?&#])([^=&#]+)=([^&#]*)/g, (match, separator, name, value) => {
         let decoded = name;
         try {
             decoded = decodeURIComponent(name);

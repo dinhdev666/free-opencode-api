@@ -359,7 +359,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   `x-auth-token` or `openai-api-key` is a credential too, and the client decides that name. **URLs are masked too**
   (`maskUrlQuery()` before `loggableUrl()` truncates): `?api_key=…`, `?token=…` and `?Authorization=…` are a
   documented OpenAI-compatible client convention, and so are Google's `?key=…`, an OAuth `?code=…` and an Azure SAS
-  `?sig=`/`?signature=…`. The list is one exported string because
+  `?sig=`/`?signature=…`; `#` separates a pair too, because a raw client can put a fragment in the request target
+  (`GET /v1/models#access_token=…`) even though `curl` and browsers strip it, and Node logs the URL as it arrived. The
+  list is one exported string because
   `docker/docker-entrypoint.sh` cannot import this module and repeats it for its own first-boot dump; the smoke suite
   asserts the two copies are identical, the way `CORS_ALLOW_HEADERS` is the one place the CORS list lives.
   A request body reaches the debug dump through `maskDetail()` (the same name list on a bounded copy), and the

@@ -268,7 +268,10 @@ class QueueFullError extends Error {
 
 function lock(task, timeout = 120000) {
     return new Promise((resolve, reject) => {
-        if (queue.length >= MAX_QUEUE_LENGTH) {
+        // The cap bounds the requests *waiting* for a slot, so it is only reached when every slot is busy: a queue of
+        // 0 then means "never queue" (reject instead of waiting) rather than "refuse every completion", which would
+        // let one configuration value switch the whole gateway off while it sits there looking healthy.
+        if (activeTasks >= MAX_CONCURRENCY && queue.length >= MAX_QUEUE_LENGTH) {
             reject(new QueueFullError());
             return;
         }

@@ -33,7 +33,7 @@
 
 - **OpenAI-compatible surface** — `/v1/models`, `/v1/chat/completions`, streaming and non-streaming responses.
 - **Zero extra infrastructure** — one Node.js process; the OpenCode backend is launched and supervised automatically.
-- **Mandatory authentication** — every request needs `Authorization: Bearer <key>`. The default key is `sk-dummy-123`, and authentication cannot be disabled: a blank `API_KEY` simply falls back to that default.
+- **Mandatory authentication** — every request needs `Authorization: Bearer <key>` (the scheme is case-insensitive, and `X-Api-Key: <key>` works as an alias). The default key is `sk-dummy-123`, and authentication cannot be disabled: a blank `API_KEY` simply falls back to that default.
 - **Tool guard** — `DISABLE_TOOLS=true` keeps models from running commands or touching files on the host.
 - **Structured logging** — `error` / `warn` / `info` / `debug` levels, one-line request summaries, secrets masked.
 - **Production friendly** — configurable bind host, request timeouts, graceful shutdown, Docker image available.
@@ -223,7 +223,7 @@ Advanced tuning (environment only):
 
 ## API Reference
 
-Base URL: `http://<host>:<port>/v1` (for example `http://127.0.0.1:8083/v1`). Every `/v1` request needs `Authorization: Bearer <API_KEY>`; the default key is `sk-dummy-123` and authentication cannot be turned off. Only `/health` and `/` are unauthenticated.
+Base URL: `http://<host>:<port>/v1` (for example `http://127.0.0.1:8083/v1`). Every `/v1` request needs `Authorization: Bearer <API_KEY>` — the scheme is case-insensitive (`bearer`, `Bearer   <key>` both work) and `X-Api-Key: <API_KEY>` is accepted as an alias for clients configured with an api-key header; when both are present the `Authorization` header decides. The default key is `sk-dummy-123` and authentication cannot be turned off. Only `/health` and `/` are unauthenticated.
 
 Every response carries an `X-Request-Id` header, and the same id appears in the gateway's request log line, so a client-side failure can be matched to a log entry.
 

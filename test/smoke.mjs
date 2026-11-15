@@ -762,7 +762,11 @@ async function run() {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
         body: JSON.stringify({ messages: [{ role: 'user', content }] })
-    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
+    }).then(async (response) => ({
+        status: response.status,
+        retryAfter: response.headers.get('retry-after'),
+        json: await response.json().catch(() => null)
+    }));
     // The slot is released when the response is complete, not when the session cleanup round trip finishes: a client
     // that sends its next request straight after an answer must be served, never told the gateway is full.
     const sequentialStatuses = [];
@@ -780,6 +784,9 @@ async function run() {
     check('a busy queue of 0 is answered with 503', cappedRefused.status === 503, `status ${cappedRefused.status}`);
     check('503 uses the queue_full envelope', cappedRefused.json?.error?.type === 'queue_full',
         JSON.stringify(cappedRefused.json));
+    // A retryable refusal has to say how long to wait, or an OpenAI SDK gives up instead of retrying
+    check('a full queue tells the client when to retry', cappedRefused.retryAfter === '1',
+        `retry-after ${cappedRefused.retryAfter}`);
     const cappedHeld = await cappedHolder;
     check('the request that held the slot is still served', cappedHeld.status === 200, `status ${cappedHeld.status}`);
     const cappedHealth = await fetch(`${cappedUrl}/health`);

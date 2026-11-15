@@ -1888,12 +1888,26 @@ function createApp(config) {
                         };
                     };
 
-                    // A role is client input, and `(role || 'user').toLowerCase()` threw on a truthy non-string
+                    // A message is an object with a `role` and a `content`. An entry that is not one (`"hi"`, `42`,
+                    // `null`) was read through `m?.role`/`m?.content` as an empty user message, so the request ended
+                    // at "messages must include at least one non-system text message": a complaint about the text of
+                    // a message nobody wrote, for an array whose entries are not messages at all.
+                    //
+                    // A role is client input too, and `(role || 'user').toLowerCase()` threw on a truthy non-string
                     // (`5`, `{}`, `[]`, `true`): the client's bad field was answered 500 and the message carried the
                     // internal expression (`((intermediate value) || "user").toLowerCase is not a function`). A missing
                     // or null role keeps its documented lenient default; anything that is not a string is a 400.
                     for (let i = 0; i < messages.length; i++) {
-                        const role = messages[i]?.role;
+                        const message = messages[i];
+                        if (!message || typeof message !== 'object' || Array.isArray(message)) {
+                            return reply.code(400).send({
+                                error: {
+                                    message: `messages[${i}] must be a message object, found ${jsonTypeName(message)}`,
+                                    type: 'invalid_request_error'
+                                }
+                            });
+                        }
+                        const role = message.role;
                         if (role !== undefined && role !== null && typeof role !== 'string') {
                             return reply.code(400).send({
                                 error: {

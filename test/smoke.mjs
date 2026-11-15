@@ -1077,6 +1077,29 @@ async function run() {
         shrinkContent.startsWith('alpha beta gamma') && shrinkContent.endsWith('alpha beta'),
         JSON.stringify(shrinkContent));
 
+    // Part updates that carry a `delta` *and* the part's cumulative text, followed by a closing update with no delta.
+    // Recording the snapshot only on the delta-less branch left the map unset for such a backend, so the closing update
+    // was diffed against '' and the whole part was delivered a second time ("Hello worldHello world").
+    const mixed = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'MIXED' }], stream: true },
+        stream: true
+    });
+    const mixedContent = parseSseFrames(mixed.text)
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        })
+        .filter((chunk) => chunk?.choices?.[0]?.delta?.content)
+        .map((chunk) => chunk.choices[0].delta.content)
+        .join('');
+    check('a closing part update that carries no delta does not repeat the answer',
+        mixedContent === 'Hello world', JSON.stringify(mixedContent));
+
     // --- no stalled stream requests ---------------------------------------------------------------------
     // Regression guard: a silent event stream used to cost a fixed 4 s wait on every other request
     const durations = [];
@@ -1940,6 +1963,34 @@ async function run() {
         .join('');
     check('a held fragment that is not a tag is delivered at the end of the stream',
         tailText.trim() === 'hello world <function_call', JSON.stringify(tailText));
+
+    // The recovery poll appends the *raw* remainder of the stream through the same filter. It used to hand the filter
+    // the already-stripped reminder of the answer while the filter still held the state of the interrupted stream, so a
+    // cut inside a tool block either leaked the raw markup (holding a partial opening tag) or swallowed the rest of the
+    // answer (inBlock, with no closing tag in the stripped text) - and the truncation was reported as a complete answer.
+    const cutToolAnswer = 'hello  world';
+    for (const marker of ['CUTTOOL', 'OPENTOOL']) {
+        const cutToolResponse = await fetch(`${toolUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ messages: [{ role: 'user', content: `${marker} please` }], stream: true })
+        }).then((response) => response.text());
+        const cutToolText = cutToolResponse
+            .split('\n\n')
+            .filter((frame) => frame.startsWith('data: ') && !frame.includes('[DONE]'))
+            .map((frame) => {
+                try {
+                    return JSON.parse(frame.slice(6));
+                } catch {
+                    return null;
+                }
+            })
+            .filter(Boolean)
+            .map((frame) => frame.choices?.[0]?.delta?.content || '')
+            .join('');
+        check(`a stream cut inside a tool block is recovered whole (${marker})`,
+            cutToolText === cutToolAnswer, JSON.stringify(cutToolText));
+    }
 
     // The tag sweep runs over the whole answer, which is not bounded by MAX_BODY_MB (that limits the request). A lazy
     // regex restarted its closing-tag search at every opening one, so 64 000 unclosed tags spent 8.5 s on the single
@@ -3310,6 +3361,64 @@ async function run() {
     await waitForExit(budgetGateway);
     stop(budgetStub);
     await waitForExit(budgetStub);
+
+    // --- the queue wait is inside the budget, not before it -----------------------------------------------
+    // `session.create` used to take a fresh REQUEST_TIMEOUT_MS instead of what was left, so a completion that had
+    // waited in the queue was granted a second create deadline: measured 3.66 s for a 2 s budget. A completion now
+    // answers inside its own budget, however long it queued first.
+    const createStubPort = GATEWAY_PORT + 26;
+    const createStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        // The first completion is answered after 3 s; every later session creation hangs, so the queued request can only
+        // end through its deadline
+        env: { ...process.env, STUB_PORT: String(createStubPort), STUB_HANG_CREATE_AFTER: '1' }
+    });
+    children.push(createStub);
+    createStub.stdout.on('data', () => {});
+    createStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${createStubPort}/health`);
+    const createGatewayPort = GATEWAY_PORT + 27;
+    const createGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(createGatewayPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${createStubPort}`,
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '4000',
+            OPENCODE_PROXY_MAX_CONCURRENCY: '1',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(createGateway);
+    createGateway.stdout.on('data', () => {});
+    createGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${createGatewayPort}/health`);
+    const completionFor = (content) => fetch(`http://127.0.0.1:${createGatewayPort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content }], stream: false }),
+        signal: AbortSignal.timeout(20000)
+    }).then(async (response) => ({ status: response.status, text: await response.text() }))
+        .catch((error) => ({ status: 0, text: error.message }));
+    const firstCompletion = completionFor('SLOWFINISH please');
+    await sleep(200);
+    const queuedStartedAt = Date.now();
+    const queuedCompletion = await completionFor('anything else');
+    const queuedElapsed = Date.now() - queuedStartedAt;
+    const firstResult = await firstCompletion;
+    check('a queued completion is answered inside its own budget, not one budget after it',
+        firstResult.status === 200 && queuedCompletion.status === 504 && queuedElapsed < 5000,
+        `queued ${queuedElapsed}ms (budget 4000ms), first status ${firstResult.status}, queued status ${queuedCompletion.status}`);
+    // The message names what was left of the budget, never more than the request budget itself (a fresh create
+    // deadline would have said 4000 ms after 3 s of queueing)
+    const queuedBudget = Number((queuedCompletion.text.match(/did not answer within (\d+)ms/) || [])[1]);
+    check('a queued completion reports the budget it actually had left',
+        queuedBudget > 0 && queuedBudget <= 4000, `${queuedBudget}ms, ${queuedCompletion.text.slice(0, 200)}`);
+    stopGateway(createGateway);
+    await waitForExit(createGateway);
+    stop(createStub);
+    await waitForExit(createStub);
 
     // --- the backend child does not inherit the gateway's key, and its jail is private --------------------
     // The child is an agent runtime that, with tools enabled, executes model-directed work: it must not receive the

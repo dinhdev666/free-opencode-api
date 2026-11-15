@@ -27,6 +27,7 @@ const sessions = new Map();
 const eventClients = new Set();
 let sessionSeq = 0;
 let deletedSessions = 0;
+let promptedSessions = 0;
 
 const sendJson = (res, statusCode, body) => {
     const payload = JSON.stringify(body);
@@ -127,7 +128,12 @@ const server = http.createServer(async (req, res) => {
 
     // Test-only introspection (not part of the OpenCode API): proves the gateway deletes the session it created
     if (path === '/__sessions') {
-        return sendJson(res, 200, { live: sessions.size, created: sessionSeq, deleted: deletedSessions });
+        return sendJson(res, 200, {
+            live: sessions.size,
+            created: sessionSeq,
+            deleted: deletedSessions,
+            prompts: promptedSessions
+        });
     }
 
     if (path === '/config/providers') {
@@ -168,6 +174,7 @@ const server = http.createServer(async (req, res) => {
                 session.promptText = '';
             }
             session.prompted = true;
+            promptedSessions += 1;
             if (session.promptText.includes('STALL')) {
                 // Nothing for polling to find and no finish event: the caller must time out and close the stream
                 session.messages = [];

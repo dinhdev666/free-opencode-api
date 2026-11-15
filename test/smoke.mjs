@@ -320,6 +320,37 @@ async function run() {
     check('an aborted stream releases its queue slot before the backend finishes', afterAbortMs < 1200,
         `${afterAbortMs} ms (the slow reply takes ~2000 ms)`);
 
+    // --- a request abandoned while queued never reaches the backend ---------------------------------------
+    // The aborted stream above frees the slot; this one proves the queue itself drops work nobody waits for, so an
+    // abandoned request cannot spend backend time or delay the requests queued behind it.
+    const statsBefore = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json());
+    const holderController = new AbortController();
+    const holderPromise = fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'SLOW holder' }], stream: true }),
+        signal: holderController.signal
+    }).then((response) => response.text()).catch(() => null);
+    await sleep(250); // the holder owns the only completion slot
+
+    const queuedController = new AbortController();
+    const queuedPromise = fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'never answered' }] }),
+        signal: queuedController.signal
+    }).then((response) => response.text()).catch(() => null);
+    await sleep(200); // now queued behind the holder
+    queuedController.abort();
+    await queuedPromise;
+    await holderPromise;
+    await sleep(300);
+
+    const statsAfter = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json());
+    check('a request abandoned while queued never reaches the backend',
+        statsAfter.prompts === statsBefore.prompts + 1,
+        `prompts ${statsBefore.prompts} -> ${statsAfter.prompts} (only the holder should have run)`);
+
     // --- session lifecycle -------------------------------------------------------------------------------
     // One session is created and must be deleted per completion; a leak would grow the backend without bound
     const stubStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);

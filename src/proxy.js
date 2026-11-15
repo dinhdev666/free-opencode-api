@@ -887,7 +887,22 @@ function createApp(config) {
         // handling itself throws
         let reqId = null;
         try {
+            // A client can disappear while its request waits for a slot. The response object reports that as 'close'
+            // (the request stream is destroyed as soon as its body has been read, so it cannot be used as a signal).
+            let clientDisconnected = false;
+            reply.raw.once('close', () => {
+                clientDisconnected = true;
+            });
+
             await lock(async () => {
+                // Nothing to answer and no reason to run the completion: it would spend backend time (and tokens) for
+                // nobody while delaying the requests still waiting behind this one.
+                if (clientDisconnected) {
+                    logDebug('Abandoned while queued, skipping completion', { url: request.url });
+                    if (!reply.raw.writableEnded) reply.raw.end();
+                    return reply;
+                }
+
                 let sessionId = null;
                 // Assigned once the session exists; the error path uses it to clean up
                 let cleanupSession = null;

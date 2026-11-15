@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 54 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 55 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -148,7 +148,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   backend and exits, with a watchdog so an open SSE stream cannot block shutdown. Do not register signal handlers
   that call `process.exit()` from a module — they win the race and skip backend teardown.
 - **The wait queue is bounded** (`OPENCODE_PROXY_MAX_QUEUE`, default 64) because every waiting request pins its parsed
-  body; overflow answers `503 queue_full` instead of growing memory.
+  body; overflow answers `503 queue_full` instead of growing memory. A request whose client disconnects while it is
+  still queued is dropped when its turn comes (`reply.raw` 'close'), so it never spends backend time or delays the
+  requests behind it. Do not use `request.raw.destroyed` as the disconnect signal: the request stream is destroyed as
+  soon as its body has been read, which is the normal case.
 - **Backend lifecycle changes** must keep these properties: `ensureBackend()` trusts a successful probe for
   `OPENCODE_PROXY_HEALTH_CACHE_MS`, connection failures clear that trust, a spawned process that exits during startup
   aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm.

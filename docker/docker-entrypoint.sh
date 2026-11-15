@@ -33,14 +33,19 @@ if [ ! -f "$CONFIG" ]; then
             PORT: String(env("PORT", "8083")).trim(),
             API_KEY: env("API_KEY", "sk-dummy-123"),
             BIND_HOST: env("BIND_HOST", "0.0.0.0"),
-            DISABLE_TOOLS: flag(["OPENCODE_DISABLE_TOOLS", "DISABLE_TOOLS"], "true"),
+            DISABLE_TOOLS: flag(["DISABLE_TOOLS", "OPENCODE_DISABLE_TOOLS"], "true"),
             OPENCODE_PATH: env("OPENCODE_PATH", ""),
             OPENCODE_SERVER_URL: env("OPENCODE_SERVER_URL", "http://127.0.0.1:4097"),
             OPENCODE_BIND_HOST: env("OPENCODE_BIND_HOST", "0.0.0.0"),
-            USE_ISOLATED_HOME: flag(["OPENCODE_USE_ISOLATED_HOME", "USE_ISOLATED_HOME"], "false")
+            USE_ISOLATED_HOME: flag(["USE_ISOLATED_HOME", "OPENCODE_USE_ISOLATED_HOME"], "false")
         };
         fs.writeFileSync("/app/config.json", JSON.stringify(cfg, null, 4));
-        console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(cfg));
+        // The generated config holds the API key, and this line ends up in `docker logs` (collected and shipped as
+        // often as not): print where the key came from, never the key itself
+        const key = String(cfg.API_KEY);
+        const masked = (key.length <= 8 ? "***" : key.slice(0, 3) + "***") + ` (${key.length} chars)`;
+        const shown = Object.assign({}, cfg, { API_KEY: masked });
+        console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(shown));
         console.log("[entrypoint] log level (LOG_LEVEL env, higher priority than config.json):", env("LOG_LEVEL", "info"));
     '
 else

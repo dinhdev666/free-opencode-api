@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 226 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 228 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -288,6 +288,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   envelope and then closes with `socket.end()` (`closeSocketAfterFlush()`), never `socket.destroy()` on the next line:
   `destroy()` discards userland buffered writes, so under backpressure the client got a reset instead of the error it was
   promised.
+- A URL the **router** cannot decode (a percent escape that is not valid UTF-8, `GET /v1/models/%E0%A4%A`) never reaches
+  a hook, so Fastify's fallback answered its own body — `{"error":"Bad Request","code":"FST_ERR_BAD_URL",…}` with no
+  `type`, no CORS headers, no `X-Request-Id` and no log line. `routerOptions.onBadUrl` (`badUrlHandler`) writes the same
+  envelope as every other rejection, with the CORS set, a generated request id and one `warn` line carrying the path
+  truncated by `loggableUrl`. It is handed the raw request/response (`find-my-way` does not build a Fastify request for
+  a path it cannot route), so headers are written directly, exactly like `clientErrorHandler`.
 - Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
   to a log entry. An incoming `X-Request-Id` is echoed when it is a short printable token
   (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a

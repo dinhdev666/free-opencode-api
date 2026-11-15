@@ -59,7 +59,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # From the tag v1.2.3 this emits 1.2.3, 1.2 and latest (see the flavor default of latest=auto)
+      # From the tag v1.2.3 this emits 1.2.3 and latest (see the flavor default of latest=auto). Only whole
+      # versions are published, so there is no floating "1" or "1.2" tag to keep in sync
       - name: Derive image tags and labels
         id: meta
         uses: docker/metadata-action@v5
@@ -67,7 +68,6 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push
         uses: docker/build-push-action@v6

@@ -262,6 +262,13 @@ function readLimit(name, { min, max, fallback }, fileValue) {
 // only, so the same key in the file was silently ignored while the startup summary reported the default.
 let MAX_CONCURRENCY = readLimit('OPENCODE_PROXY_MAX_CONCURRENCY', { min: 1, max: 32, fallback: 1 }).value;
 
+// Largest request body accepted, in MiB. Every waiting completion pins its parsed body, so the memory a burst can hold
+// is this value times OPENCODE_PROXY_MAX_QUEUE: the 50 MiB default times the 64-entry default queue allows 3.2 GiB that
+// no small host plans for, and a prompt is a few kilobytes. Lowering it is the cheap way to bound a gateway that faces
+// clients it does not trust. Resolved again by startProxy() so a value in config.json takes effect too.
+const DEFAULT_MAX_BODY_MB = 50;
+let MAX_BODY_MB = readLimit('OPENCODE_PROXY_MAX_BODY_MB', { min: 1, max: 200, fallback: DEFAULT_MAX_BODY_MB }).value;
+
 let activeTasks = 0;
 
 function runQueuedTask() {
@@ -579,7 +586,9 @@ function createApp(config) {
     // nothing to write to anyway), 50 MB JSON body limit, and trailing-slash tolerance matching the previous behavior.
     const app = Fastify({
         logger: false,
-        bodyLimit: 50 * 1024 * 1024,
+        // Resolved from OPENCODE_PROXY_MAX_BODY_MB (see MAX_BODY_MB): the wait queue pins every waiting request's
+        // parsed body, so this is the other half of the gateway's memory bound
+        bodyLimit: MAX_BODY_MB * 1024 * 1024,
         routerOptions: { ignoreTrailingSlash: true },
         trustProxy: false
     });
@@ -2458,6 +2467,14 @@ export function startProxy(options) {
     MAX_CONCURRENCY = resolvedLimits.concurrency;
     MAX_QUEUE_LENGTH = resolvedLimits.queue;
     resolvedLimits.notes.forEach((note) => logger.warn(`[Config] ${note}`));
+    // Same treatment for the body limit: a value that cannot be used must not look like it took effect
+    const resolvedBodyLimit = readLimit(
+        'OPENCODE_PROXY_MAX_BODY_MB',
+        { min: 1, max: 200, fallback: DEFAULT_MAX_BODY_MB },
+        options.OPENCODE_PROXY_MAX_BODY_MB
+    );
+    MAX_BODY_MB = resolvedBodyLimit.value;
+    if (resolvedBodyLimit.note) logger.warn(`[Config] ${resolvedBodyLimit.note}`);
     // The two backend timings follow the same precedence
     BACKEND_HEALTH_CACHE_MS = readMilliseconds(
         'OPENCODE_PROXY_HEALTH_CACHE_MS',

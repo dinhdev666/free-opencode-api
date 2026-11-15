@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 330 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 336 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -90,7 +90,7 @@ messages and SSE events, plus a test-only `GET /__sessions` reporting created/de
 (an answer slow enough to abort mid-stream), `STALL` (silence after two deltas), `TOOLTAG` (a tool-call block cut inside
 both of its tags), `FAIL` (a provider error with no content), `ENDONLY` (a finish event carrying only `time.completed`),
 `GROW` (an answer still being written when the prompt returns), `SUICIDE` (the stub SIGKILLs itself after accepting the
-prompt), `PAUSE` (silence longer than the idle timeout), `HOLD` (finishes after 400 ms, so a completion can be kept in
+prompt), `PAUSE` (silence longer than the idle timeout), `HOLD` (finishes after 400 ms, so a completion stays in
 flight while the backend is killed or the gateway shuts down), `SLOWFINISH` (finishes after 3 s), `TAILTAG` (a last
 delta ending in a tag prefix that never becomes a tag), `REJECTPROMPT` (a 500 for `POST /session/:id/message`),
 `PROMPTDONE` (the prompt response already carries the finished message), `CUTSTREAM` (two cumulative snapshots then
@@ -103,12 +103,12 @@ block repeated by the answer), `BADPART` (a text part whose `text` is a number, 
 credential-bearing URL behind a long message) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
 `POST /session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 502 whose message quotes a
 credential-bearing URL), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
-list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every session creation after the n-th goes
+list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every creation after the n-th goes
 unanswered), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
 body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. Session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the
 session (its own backend round trip), so one read of `/__sessions` raced it and failed with `live: 1`; wait for
-`live: 0` in a bounded window. The suite refuses a taken port and SIGKILLs a stubborn child.
+`live: 0`. The suite refuses a taken port and SIGKILLs a stubborn child.
 
 For exploratory work, start the stub (or a throwaway one in `/tmp`) on a spare port - `STUB_PORT=4405
 node test/stub-opencode.mjs`, which reads `STUB_PORT` and ignores a positional argument - and point the gateway at
@@ -143,7 +143,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   routes it to whichever model it serves and never publishes which, so it is the only id worth hardcoding and its entry
   carries just the four OpenAI fields - do not add capabilities, limits or pricing describing a model the gateway
   cannot see.
-  An **empty** provider list takes the same fallback: an unreadable payload (a changed shape, a version reporting
+  An empty provider list takes the same fallback: an unreadable payload (a changed shape, a version reporting
   nothing) answers `200 {"providers":[]}`, and `{"data":[]}` is as useless as an error. So does a non-empty list that
   yields no model (no `models` map, an empty one): the empty check runs after the extraction, because the answer - and
   the "do not cache it" rule - is identical for both shapes.
@@ -153,8 +153,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   exception is `opencode/big-pickle`, answered from `DEFAULT_MODEL` so it keeps its `Big Pickle` name instead of the
   id-derived `big-pickle`. The wildcard route exists because clients send `opencode/big-pickle` unencoded as often as
   `%2F`-escaped. A **blank** id (`/v1/models//`, `/v1/models/%20`) is a `404` in the usual `not_found` envelope, not a
-  `200` whose body is `{"id":"","name":""}`: a doubled slash reads as a trailing slash, so those paths reached the
-  by-id route with an empty parameter. An id whose **last segment** is empty (`/v1/models/%2F`, `/v1/models/opencode%2F`)
+  `200` whose body is `{"id":"","name":""}`: a doubled slash reads as a trailing slash. An id whose **last segment** is empty (`/v1/models/%2F`, `/v1/models/opencode%2F`)
   is the same class of non-model and answers `404` too; `/v1/models/` itself still answers the listing.
 - `POST /v1/chat/completions` non-streaming → `chat.completion` with
   `choices[0].message.{role,content,reasoning_content}`, `finish_reason:"stop"` and a `usage` block of zeroes
@@ -178,6 +177,11 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   (`USER: …`, `ASSISTANT: …`) and sent as text. `developer` is OpenAI's newer name for the system role, so a client
   using it must not end up with "DEVELOPER: …" inside the conversation. The stub reports the last system prompt it
   received (`GET /__sessions` → `lastSystemPrompt`) so the suite can assert it.
+- **A body that is not a JSON object is named as one.** Whether a string body still needs parsing is decided by the
+  **content type**, not by the value: `"hi"` under `application/json` decoded to a string, and reading it as unparsed
+  text answered "not valid JSON" about a body that parses perfectly, while `42`, `true`, `[]` (and a parsed scalar on a
+  text path, which was replaced by `{}`) were answered `messages array is required` about a field never sent. All are
+  `request body must be a JSON object, found …`; no body at all keeps `messages array is required`.
 - **A missing `messages` is not an unusable one.** Three client mistakes used to share a single message: a body with
   no `messages`, a `messages` that is not an array (`"hi"`, `{}`) and an empty array (`[]`) all answered
   `messages array is required`, which sends the reader looking for a field they did send. They are separated now:
@@ -205,7 +209,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **A message `name` is a label, not prompt text.** It is interpolated as `USER(name): …` only when it is a string,
   with control characters replaced and the value cut: a non-string reached the model as `USER([object Object]): …`.
 - **An announced request body has a deadline.** Fastify sets `requestTimeout: 0`, so nothing bounded the wait: a client
-  that sent `Content-Length: 4096` and four bytes held the socket for as long as it liked, with no
+  that sent `Content-Length: 4096` and four bytes held the socket as long as it liked, with no
   credential needed, because the `401` is written from the headers while Node keeps the connection
   alive to drain a body it will never read. `armBodyDeadline()` in the `onRequest` hook (armed before auth, only when
   the request announces a body, cleared on `end`/`close`/`error`) closes it after `min(30 s, REQUEST_TIMEOUT_MS)`,
@@ -235,7 +239,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - A body carrying a **forbidden property name** (`__proto__`, `constructor`) is refused by Fastify's
   prototype-poisoning guard before any handler runs, and that refusal arrives as the same
   `FST_ERR_CTP_INVALID_JSON_BODY` a syntax error produces: the client was told `Body is not valid JSON but
-  content-type is set to 'application/json'` about a body that parses perfectly, which sends the reader looking for a
+  content-type is set to 'application/json'` about a body that parses perfectly, sending the reader after a
   missing comma. The envelope keeps Fastify's `code` and names both causes (`request body is not valid JSON, or it
   carries a forbidden property name (__proto__, constructor); send Content-Type: application/json`). The refusal stays:
   an OpenAI client does not send those names, and `onProtoPoisoning: 'remove'` would silently drop a field it did send.
@@ -250,26 +254,25 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   the upstream is gone, and the next request starts the backend again.
 - A backend that rejects `POST /session` (a version whose API moved, a proxy in front of it, an error body) is an
   upstream failure too: `502` with the upstream status and reason in the message
-  (`OpenCode backend rejected session creation (status 405): …`), not a bare `500 "Failed to create OpenCode session"`
+  (`OpenCode backend rejected session creation (status 405): …`), not a bare `500`
   that blames the gateway and explains nothing. The SDK hands back the parsed body as-is, so the extraction handles
   `{error:{message}}`, `{message}` and a plain string, and never prints `[object Object]`. A `405` on that call also
   logs a warning naming the likeliest cause — a 2.x `opencode` CLI, whose `serve` is the web UI and answers `/health`
-  with HTML, so the readiness probe passes and every completion fails here. The README's Requirements table and
-  Troubleshooting section state the supported major version for the same reason.
+  with HTML, so the readiness probe passes and every completion fails here. The README's Requirements table states
+  the supported major version for the same reason.
 - A **rejected prompt** is an upstream failure in both modes: the SDK resolves a non-2xx `POST /session/:id/message`
   with `{ error, response }` instead of throwing, so the tuple is inspected and answered `502` with the upstream status
   and reason (`OpenCode backend rejected the prompt (status 500): …`). Ignoring it made a rejected prompt look like a
-  slow answer - no assistant message was ever created, so the gateway polled until its budget ran out and reported
-  `504`. A streaming request keeps streaming only when deltas already reached the client.
+  slow answer - no assistant message was created, so the gateway polled until its budget ran out and reported `504`. A streaming request keeps streaming only when deltas already reached the client.
 - **A finished message in the prompt response is the answer.** `POST /session/:id/message` returns the message it
   produced; when it already carries `finish` or `time.completed`, the non-streaming path serves it instead of spending
-  a `GET …/message` round trip (plus up to a poll interval) on data it holds. A message still being written has no
-  `finish` and keeps using the poll loop, so a partial answer is never served.
+  a `GET …/message` round trip (plus a poll interval) on data it holds. A message still being written has no `finish`
+  and keeps the poll loop, so a partial answer is never served.
 - Every SDK call hands back an error tuple instead of throwing, and every tuple is inspected: `session.create`,
   `session.prompt`, `session.messages`, `session.delete`, `config.providers`, `tool.ids` and `event.subscribe`.
   A refused `event.subscribe` carries no stream, so the streaming path falls back to polling and still answers.
-  Reading any of these as "the backend returned nothing" turned a refusal into a missing answer (`tool.ids` was the
-  worst case: an error tuple cached an empty override map, so `DISABLE_TOOLS` sent no tool switches for the whole
+  Reading any of these as "the backend returned nothing" turned a refusal into a missing answer (`tool.ids` was worst:
+  an error tuple cached an empty override map, so `DISABLE_TOOLS` sent no tool switches for the whole
   cache window).
 - A provider failure is an upstream error in both modes. Non-streaming answers `502`; a streaming request whose
   provider failed before the first frame answers the same `502` envelope (the stream never started), and one that
@@ -280,7 +283,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   closing the connection (a tab that stops consuming, a buffering proxy, a stalled phone link) is treated the same
   way: a write that does not drain within `SSE_CLIENT_WRITE_TIMEOUT_MS` (30 s) marks the client gone, aborts the
   collector and destroys the socket - an unbounded `drain` wait parked the task, and with it the only completion slot,
-  for the rest of the process lifetime while `/health` kept answering 200. The gone flag is set even when someone else
+  while `/health` kept answering 200. The gone flag is set even when someone else
   already ended the response (the in-band timeout path): the socket is still open then, and the short-circuit left the
   task writing into an ended stream. A **non-streaming** client that disconnects is handled the same way: the closed
   socket stops the poll loop, so the slot is free at the next tick.
@@ -297,20 +300,19 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, OPTIONS`, `Allow-Headers: Content-Type,
   Authorization, X-Api-Key, X-Request-Id, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`. The
   allow-list lives in one constant (`CORS_ALLOW_HEADERS` in `createApp()`) because three paths write it — the
-  `onRequest` hook, `clientErrorHandler` and `badUrlHandler`. It carries `X-Request-Id` because the gateway reads and
-  echoes that header, and a browser client setting its own trace id had its request refused by its own preflight.
+  `onRequest` hook, `clientErrorHandler` and `badUrlHandler`. It carries `X-Request-Id` because the gateway echoes that header, and a browser client setting its own trace id had its request refused by its own preflight.
 - A request the HTTP parser rejects (a malformed request line or header, an oversized header block, a header
   timeout) never reaches a hook, so the `clientErrorHandler` Fastify option answers it: `400` for a parse error,
   `431` for `HPE_HEADER_OVERFLOW`, `408` for `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope
   (`type: "invalid_request_error"`, the parser's code in `code` when it is a plain `[A-Z_]+` token) with CORS headers,
   an `X-Request-Id` and a `warn` log line, where Fastify's own
-  handler answered `{"error":"Bad Request",…}` with none of those. It writes the envelope,
+  handler answered a bare `Bad Request` with none of those. It writes the envelope,
   then closes with `socket.end()` (`closeSocketAfterFlush()`), never `socket.destroy()`: `destroy()` discards buffered
-  writes, so under backpressure the client got a reset instead of the error it was promised.
+  writes, so under backpressure the client got a reset instead of its error.
 - A URL the **router** cannot decode (a percent escape that is not valid UTF-8, `GET /v1/models/%E0%A4%A`) never reaches
   a hook, so Fastify answered its own body (no `type`, CORS, `X-Request-Id` or log line). `routerOptions.onBadUrl` (`badUrlHandler`) writes the usual envelope, with a generated
   request id and one `warn` line carrying the path truncated by `loggableUrl`. It is handed the raw request/response
-  (`find-my-way` builds no Fastify request for a routable-less path), like `clientErrorHandler`.
+  (`find-my-way` builds no Fastify request), like `clientErrorHandler`.
 - Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
   to a log entry. An incoming `X-Request-Id` is echoed when it is a short printable token
   (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a
@@ -335,7 +337,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   The `model` value and the URL are client-controlled, so both are normalised before they are logged
   (`loggableModelId()`: control characters replaced, 128 characters max; a URL over 512 characters is cut with a
   `…[truncated N chars]` marker): one log line is one record, and a newline in a model id used to start a second,
-  attacker-written line (`FORGED [INFO] …`) while a 2 MB id produced a 2 MB line. The backend still receives the id
+  attacker-written line while a 2 MB id produced a 2 MB line. The backend still receives the id
   verbatim - the contract does not restrict model ids, only what is logged is normalised, and an **operator** value
   quoted in a startup line goes through `loggableConfigValue()` for the same reason: `config.json` and the environment
   are text a script can write. It covers every `[Config]` note naming a value it could not use, the ignored-file
@@ -379,8 +381,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   is touched either way (asserted).
   A **closed reader** on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream
   `error` with no listener is an uncaught exception, and `node index.js | head -3` killed a gateway that was still
-  serving. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that line is lost, the process keeps answering. The
-  suite destroys the read end of the child's stdout to assert it.
+  serving. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that line is lost, the process keeps answering. The suite asserts it.
 - **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
   boundary can fall inside either of them; the held fragment is flushed at end of stream. The filter is one
@@ -407,7 +408,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   `stream_options.include_usage` there is a `400` naming the field, because a typo answered JSON to a client parsing
   SSE, and `stream_options` must be an object); `readFlag()` only reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable); the value goes
   through `loggableConfigValue()` too, because it lands in a log line.
-  `startProxy()` applies the same rule to its own fallbacks (`flagOption()`), for an embedder that calls it with no
+  `startProxy()` applies the same rule to its own fallbacks (`flagOption()`), for an embedder with no
   entry point to resolve the option first: an option the caller passed is taken as given — `index.js` already
   reported it, and a second line for one value reads like two different settings — while an option that is absent
   reads the environment through `readFlag()`.
@@ -454,19 +455,18 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   documented ~1.5 s of silence to ~75 ms and started serving half-written answers. It
   watches the whole visible answer, `content` **and** `reasoning`, and requires one of them to be non-empty: watching
   `content` alone left the window at 0 for a reasoning-only message, so a provider that never reports `finish` could
-  not be accepted and the completion answered `504` on its whole budget for an answer
-  the first poll already held. `extractFromParts()` reads a part's `text` only when it is a string, like the streaming
+  not be accepted and the completion answered `504`. `extractFromParts()` reads a part's `text` only when it is a string, like the streaming
   collector and the request parser: concatenating whatever arrived served a numeric part as answer text
   (`parts: [{text: 42}, {text: 'Alpha'}]` answered `"42Alpha"`). The
-  first four polls use `min(intervalMs, POLL_BACKOFF_MS[i])`, because an answer landing a few tens of milliseconds after
+  first four polls use `min(intervalMs, POLL_BACKOFF_MS[i])`, an answer landing a few tens of milliseconds after
   the prompt returned used to wait a whole interval, for a few cheap extra
   `GET …/message` calls. Do not remove the backoff without keeping the time window: the two belong together.
 - **A completion has one budget, not one per phase.** The prompt, the event subscription and the polling fallback all
   take what is left of `REQUEST_TIMEOUT_MS` (`remainingBudget()` in the handler) instead of each starting a fresh
   copy: a streaming request whose event stream timed out spent a second full budget polling, so the client waited
   about twice the advertised timeout (measured 60 s for a 40 s budget) and the queue timer's message named a budget
-  that had already been exceeded. `remainingBudget()` never goes below 1 ms, so an exhausted budget surfaces as the
-  timeout it is rather than as a loop that spins. `client.session.create` takes it too: with a fresh budget there, a
+  that had already been exceeded. `remainingBudget()` never goes below 1 ms, so an exhausted budget surfaces as its
+  timeout rather than a spinning loop. `client.session.create` takes it too: with a fresh budget there, a
   completion that had queued 3 s answered at 5.7 s with a 4 s budget.
 - **A failed poll does not end the completion.** `pollForAssistantResponse` retries a poll that answers with an error
   (a 5xx while the backend is busy) or throws (a connection reset while it restarts): one bad poll used to lose an
@@ -489,7 +489,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   mid-answer (backend restart, a proxy dropping idle SSE connections) the collector settles with
   `streamEnded: true` and the streaming path polls for the rest of the answer, appending only what the client does not
   have yet — exactly like the idle-timeout path. Before that it stayed silent until the whole budget ran out and then
-  wrote an in-band error at the end of the budget, for an answer the backend had finished.
+  wrote an in-band error, for an answer the backend had finished.
 - **A cumulative part snapshot is diffed against that part, not against the answer.** opencode ≥ 1.19 sends no
   `delta`: `part.text` is the part's current full text, so the gateway derives the increment. It belongs to the part
   it came from (`partTexts` in `collectFromEvents`): measuring it against the accumulated `content` never matched a
@@ -515,7 +515,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client already has its answer, so it must not hold the slot for
   the full request budget. The metadata calls (`/v1/models`, the tool list) are capped separately
   (`METADATA_TIMEOUT_CAP_MS`, never above `REQUEST_TIMEOUT_MS`), because they fall back — a client listing models must
-  get the static fallback quickly instead of waiting a completion budget for a silent provider.
+  get the static fallback quickly instead of waiting a completion budget.
 - **A promise that loses a race needs a handler.** `promptWithTimeout` races the prompt against its own timer and the
   losing promise keeps running: a rejection arriving afterwards (the backend dies, the deadline aborts the fetch)
   reached nothing and became an unhandled rejection, which terminates the process: one slow completion could take the
@@ -562,12 +562,12 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **The CLI version probe never blocks the start.** `opencode --version` is read with the asynchronous `execFile`
   *after* the server is listening and reported as its own line (or, on failure, as the installation warning): the
   synchronous probe sat in the startup path with a 5 s timeout, so a wrapper script that waits for input delayed the
-  bind by the whole timeout and the process reached Ctrl-C without its signal handlers installed - a shutdown that was
-  not the graceful one. The 2.x warning it feeds is unchanged, and it now arrives while the gateway is already serving.
+  bind by the whole timeout and the process reached Ctrl-C without its signal handlers installed - not a
+  graceful shutdown. The 2.x warning it feeds is unchanged, and it now arrives while the gateway is already serving.
 - **The backend command survives the shell it runs in.** `opencodeBin` is quoted whenever the spawn uses a shell
   (`C:\Program Files\...opencode.cmd` does not start unquoted, and `;`/`&` in a path would be read as operators);
   paths carrying `"`, `$`, a backtick or a control character are refused instead, because quoting cannot neutralise
-  them (a line break splits the command into two). A configured
+  them (a line break splits the command). A configured
   `OPENCODE_PATH` that does not exist is warned about rather than silently replaced by whatever the PATH search finds.
 - **The start attempt is claimed before the probe.** `state.isStarting` is set synchronously, before the
   `checkHealth` call that may suspend, and released in a `finally` on every path: claiming it only after that probe

@@ -2020,11 +2020,23 @@ function createApp(config) {
                         });
                     }
                     // A body like `null` or `"text"` is valid JSON but not a completion request: answer 400 instead of
-                    // letting a destructuring TypeError turn into a 500. A string body means the client sent JSON
-                    // under a non-JSON content type (`curl -d '{...}'` without the header, or `text/plain`), which
-                    // Fastify hands over unparsed - parse it here rather than reject a request whose body is fine.
+                    // letting a destructuring TypeError turn into a 500. Whether a string body is JSON the handler must
+                    // still parse, or JSON that already decoded to a string, depends on the **content type** and not on
+                    // the value: `"hi"` under `application/json` is valid JSON that decoded to a string, and reading it
+                    // as unparsed text answered "request body is not valid JSON" about a body that parses perfectly.
+                    const contentType = String(request.headers['content-type'] || '').toLowerCase();
+                    const handedOverAsText = typeof request.body === 'string' && !contentType.startsWith('application/json');
+                    // One answer for every value that is not a plain object, so the message names what arrived
+                    // (`42` and `null` used to be answered "messages array is required" about a field never sent, and a
+                    // parsed scalar on a text path was thrown away and replaced by `{}`)
+                    const refuseNonObjectBody = (value) => reply.code(400).send({
+                        error: {
+                            message: `request body must be a JSON object, found ${jsonTypeName(value)}`,
+                            type: 'invalid_request_error'
+                        }
+                    });
                     let body = {};
-                    if (typeof request.body === 'string') {
+                    if (handedOverAsText) {
                         // A body handed over as text can start with a UTF-8 BOM: PowerShell 5.1, `Out-File` and most
                         // Windows editors write one, and `JSON.parse` refuses the first character, so a client whose
                         // body was perfectly good JSON was told "request body is not valid JSON" - the path that
@@ -2033,7 +2045,10 @@ function createApp(config) {
                         const text = request.body.charCodeAt(0) === 0xfeff ? request.body.slice(1) : request.body;
                         try {
                             const parsed = JSON.parse(text);
-                            body = parsed && typeof parsed === 'object' ? parsed : {};
+                            if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                                return refuseNonObjectBody(parsed);
+                            }
+                            body = parsed;
                         } catch (e) {
                             return reply.code(400).send({
                                 error: {
@@ -2042,7 +2057,12 @@ function createApp(config) {
                                 }
                             });
                         }
-                    } else if (request.body && typeof request.body === 'object') {
+                    } else if (request.body !== undefined && request.body !== null) {
+                        // An array is an object to `typeof`, and it used to reach the `messages` checks: a client that
+                        // sent the wrong shape was told about a field it never mentioned
+                        if (typeof request.body !== 'object' || Array.isArray(request.body)) {
+                            return refuseNonObjectBody(request.body);
+                        }
                         body = request.body;
                     }
                     const { messages, model, stream } = body;

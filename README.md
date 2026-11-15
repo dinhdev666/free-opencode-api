@@ -351,6 +351,11 @@ answer `request body is not valid JSON`. An unparsable body is a `400` whose mes
 unrelated type (`application/xml`) is a `415`, and so is a compressed body (`Content-Encoding: gzip`): the gateway does
 not decompress, and answering "not valid JSON" would blame the one part of the request that was correct.
 
+A body that parses but is **not a JSON object** (`"hi"`, `42`, `true`, `[]`) is a `400` naming what arrived
+(`request body must be a JSON object, found an array`) on every path, JSON and text alike. A JSON string body used to
+be read as unparsed text and answered "request body is not valid JSON" about a body that parses perfectly, while a
+scalar or an array carried by a `text/plain` request was replaced by an empty object and blamed on `messages`.
+
 ```bash
 curl -X POST http://127.0.0.1:8083/v1/chat/completions \
   -H "Content-Type: application/json" \

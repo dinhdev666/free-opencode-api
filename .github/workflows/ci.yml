@@ -65,15 +65,17 @@ jobs:
             [ -f "$file" ] || continue
             hits=$(grep -nE '^[[:space:]]*(-[[:space:]]+)?us[e]s:[[:space:]]*[^[:space:]#]+@[^[:space:]#]+' "$file" || true)
             [ -n "$hits" ] || continue
-            unpinned=$(printf '%s\n' "$hits" | grep -vE '@[0-9a-f]{40}([[:space:]]|$)' || true)
+            # A bare SHA is not enough: the release it belongs to has to be written next to it, or a reviewer cannot
+            # tell a frozen v4.4.0 from a commit that was never released
+            unpinned=$(printf '%s\n' "$hits" | grep -vE '@[0-9a-f]{40}[[:space:]]+#[[:space:]]*v[0-9]' || true)
             if [ -n "$unpinned" ]; then
-              echo "::error file=$file::an action is referenced by a movable ref instead of a commit SHA"
+              echo "::error file=$file::an action is referenced by a movable ref, or its commit SHA has no '# vX.Y.Z' release comment"
               printf '%s\n' "$unpinned"
               status=1
             fi
           done
           test "$status" = "0" || exit 1
-          echo "every action reference is pinned to a 40-character commit SHA"
+          echo "every action reference is pinned to a 40-character commit SHA with its release in a comment"
 
       - name: Smoke test (OpenAI contract)
         run: pnpm test
@@ -130,34 +132,104 @@ jobs:
           docker logs gateway-ci
           exit 1
 
-      # The entrypoint writes -e values into /app/config.json, but the environment must still beat the stored file
-      # (docker/README.md: environment > config.json > defaults). This also proves the stored file, which carries the
-      # API key, is not world readable.
-      - name: Container honours -e and protects the stored config
+      # The image's own HEALTHCHECK (docker/Dockerfile) is what an orchestrator acts on: this asserts the container
+      # reports `healthy` for itself, instead of re-implementing the probe with the runner's curl (which is how a
+      # broken probe shipped silently). The probe is `--interval=30s --start-period=20s`, so this waits.
+      - name: The image's own HEALTHCHECK reports healthy
         run: |
-          docker run -d --name gateway-ci-env -p 8084:8084 -e PORT=8084 -e API_KEY=sk-from-env free-opencode-api:ci
+          for attempt in $(seq 1 60); do
+            status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' gateway-ci)
+            echo "attempt ${attempt}: health=$status"
+            case "$status" in
+              healthy) exit 0 ;;
+              unhealthy)
+                docker inspect --format '{{json .State.Health}}' gateway-ci
+                docker logs gateway-ci
+                exit 1
+                ;;
+            esac
+            sleep 2
+          done
+          echo "the container never reported healthy"
+          docker inspect --format '{{json .State.Health}}' gateway-ci
+          docker logs gateway-ci
+          exit 1
+
+      # The entrypoint writes -e values into /app/config.json, but the environment must still beat the stored file
+      # (docker/README.md: environment > config.json > defaults). A fresh container cannot prove that: its entrypoint
+      # writes the same -e values into the file, so both sources agree and the assertion passes either way. This
+      # mounts a config.json that *disagrees* with -e, so the environment beating the file is observable.
+      - name: The environment beats a stored config.json
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-config"
+          # BIND_HOST is in the file because the gateway's own default is 127.0.0.1: a fixture without it would bind
+          # loopback inside the container and the published ports below would never answer
+          printf '%s\n' '{ "PORT": "8086", "API_KEY": "sk-from-file", "BIND_HOST": "0.0.0.0", "OPENCODE_BIND_HOST": "127.0.0.1" }' \
+            > "$RUNNER_TEMP/ci-config/config.json"
+          chmod 644 "$RUNNER_TEMP/ci-config/config.json"
+          # PORT is -e 8084 (the file says 8086) and API_KEY is -e sk-from-env (the file says sk-from-file)
+          docker run -d --name gateway-ci-env -p 8084:8084 \
+            -v "$RUNNER_TEMP/ci-config/config.json:/app/config.json:ro" \
+            -e PORT=8084 -e API_KEY=sk-from-env free-opencode-api:ci
           healthy=0
           for attempt in $(seq 1 30); do
             if curl -fsS --max-time 2 --connect-timeout 1 http://127.0.0.1:8084/health >/dev/null; then
-              echo "gateway answered /health after ${attempt}s"
+              echo "gateway answered /health on 8084 (the -e PORT) after ${attempt}s"
               healthy=1
               break
             fi
             sleep 1
           done
           if [ "$healthy" != "1" ]; then
+            echo "nothing answered on 8084: the stored PORT was used instead of -e PORT"
             docker logs gateway-ci-env
             exit 1
           fi
-          code=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8084/v1/models)
-          echo "GET /v1/models with the built-in key -> $code (expected 401: -e API_KEY won)"
+          code=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-from-file' http://127.0.0.1:8084/v1/models)
+          echo "GET /v1/models with the stored key -> $code (expected 401: -e API_KEY won)"
           test "$code" = "401"
           code=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-from-env' http://127.0.0.1:8084/v1/models)
           echo "GET /v1/models with the -e key -> $code"
           test "$code" = "200"
-          mode=$(docker exec gateway-ci-env stat -c '%a' /app/config.json)
+
+      # Without -e the stored file is the fallback (environment > config.json > default), and the image's own
+      # HEALTHCHECK has to read the port from that file: a probe that only looks at the environment reported this
+      # container unhealthy forever.
+      - name: The stored config.json is used when nothing is passed in
+        run: |
+          docker rm -f gateway-ci-file >/dev/null 2>&1 || true
+          docker run -d --name gateway-ci-file -p 8086:8086 \
+            -v "$RUNNER_TEMP/ci-config/config.json:/app/config.json:ro" free-opencode-api:ci
+          for attempt in $(seq 1 60); do
+            status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' gateway-ci-file)
+            echo "attempt ${attempt}: health=$status"
+            case "$status" in
+              healthy) break ;;
+              unhealthy) docker logs gateway-ci-file; exit 1 ;;
+            esac
+            sleep 2
+          done
+          docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' gateway-ci-file | grep -qx healthy
+          code=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-from-file' http://127.0.0.1:8086/v1/models)
+          echo "GET /v1/models with the stored key on the stored port -> $code"
+          test "$code" = "200"
+
+      # The generated file carries the API key: it must be 0600 and owned by the runtime user, and the backend it
+      # starts must listen on loopback (it has no authentication of its own).
+      - name: The generated config is private and keeps the backend on loopback
+        run: |
+          docker rm -f gateway-ci-fresh >/dev/null 2>&1 || true
+          docker run -d --name gateway-ci-fresh free-opencode-api:ci
+          sleep 2
+          mode=$(docker exec gateway-ci-fresh stat -c '%a' /app/config.json)
           echo "mode of /app/config.json inside the container -> $mode"
           test "$mode" = "600"
+          owner=$(docker exec gateway-ci-fresh stat -c '%u' /app/config.json)
+          echo "owner uid of /app/config.json -> $owner"
+          test "$owner" = "1000"
+          bind=$(docker exec gateway-ci-fresh node -p "require('/app/config.json').OPENCODE_BIND_HOST")
+          echo "OPENCODE_BIND_HOST in the generated config -> $bind"
+          test "$bind" = "127.0.0.1"
 
       # The image bundles the CLI that the gateway drives: prove the bundled `opencode serve` still exposes the 1.x
       # session API. A 2.x release serves the web UI instead - it answers /health with HTML (so a readiness probe

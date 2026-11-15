@@ -19,7 +19,10 @@ There is no database, no plugin system, no multi-provider routing layer. Anythin
 These are product decisions, not implementation details. Do not "improve" them without an explicit request:
 
 1. **Authentication is always enforced.** Every route except `OPTIONS`, `/health` and `/` requires
-   `Authorization: Bearer <API_KEY>`. A blank or missing `API_KEY` falls back to the built-in default
+   `Authorization: Bearer <API_KEY>`; the scheme is matched case-insensitively with any amount of whitespace, and
+   `X-Api-Key: <key>` is accepted as an alias when no `Authorization` header is sent (the preflight advertises that
+   header, and clients configured with an api-key header send it) — a present `Authorization` header always decides,
+   so a wrong one is never rescued by the alias. A blank or missing `API_KEY` falls back to the built-in default
    `sk-dummy-123` (`resolveApiKey()` in `src/proxy.js`). Never add a "disable auth" switch, never treat an empty key
    as "no auth". The bearer is compared in **bytes** (`timingSafeEqual` on two `Buffer`s of equal length): a key with
    non-ASCII characters matches in string length while differing in byte length, and comparing strings threw a
@@ -64,7 +67,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 116 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 120 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 

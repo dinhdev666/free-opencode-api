@@ -522,8 +522,25 @@ function createApp(config) {
         return CLIENT_REQUEST_ID_RE.test(trimmed) ? trimmed : null;
     };
 
-    const bearerToken = `Bearer ${resolveApiKey(API_KEY)}`;
-    const bearerTokenBuffer = Buffer.from(bearerToken);
+    const apiKeyToken = resolveApiKey(API_KEY);
+    const apiKeyTokenBuffer = Buffer.from(apiKeyToken);
+    const AUTH_SCHEME_RE = /^Bearer[ \t]+/i;
+    // Pulls the token out of an `Authorization` value; returns '' when the value does not carry one
+    const authorizationToken = (value) => {
+        if (typeof value !== 'string') return '';
+        const trimmed = value.trim();
+        if (!trimmed) return '';
+        const scheme = AUTH_SCHEME_RE.exec(trimmed);
+        return scheme ? trimmed.slice(scheme[0].length) : '';
+    };
+    // `X-Api-Key` carries the bare token (a client that adds the scheme there is read the same way)
+    const apiKeyHeaderToken = (value) => {
+        if (typeof value !== 'string') return '';
+        const trimmed = value.trim();
+        if (!trimmed) return '';
+        const scheme = AUTH_SCHEME_RE.exec(trimmed);
+        return scheme ? trimmed.slice(scheme[0].length) : trimmed;
+    };
 
     // A single onRequest hook does bookkeeping + access log, CORS and authentication: one hook per request costs
     // fewer dispatches than three, and the order (log wiring, CORS, auth) is unchanged.
@@ -572,13 +589,20 @@ function createApp(config) {
         // Constant-time comparison. The length checks are required because timingSafeEqual throws on a size
         // mismatch, and they have to compare bytes: a token with non-ASCII characters can match in string length
         // while differing in byte length, which used to throw and turn a wrong key into a 500 instead of a 401.
-        const matchesBearer = (provided) => {
-            if (typeof provided !== 'string' || provided.length !== bearerToken.length) return false;
+        const matchesToken = (provided) => {
+            if (typeof provided !== 'string' || provided.length !== apiKeyToken.length) return false;
             const providedBuffer = Buffer.from(provided);
-            return providedBuffer.length === bearerTokenBuffer.length && timingSafeEqual(providedBuffer, bearerTokenBuffer);
+            return providedBuffer.length === apiKeyTokenBuffer.length && timingSafeEqual(providedBuffer, apiKeyTokenBuffer);
         };
 
-        if (!matchesBearer(request.headers.authorization)) {
+        // `Authorization: Bearer <key>` is the contract; the scheme is case-insensitive per RFC 7235, and a client
+        // that sends `bearer <key>`, `BEARER <key>` or `Bearer   <key>` (extra whitespace) is not wrong. `X-Api-Key`
+        // is accepted as an alias because the preflight above advertises it and clients configured with an api-key
+        // header send it; an `Authorization` header that is present always wins, so a wrong one is not overridden.
+        const presented = authorizationToken(request.headers.authorization)
+            || apiKeyHeaderToken(request.headers['x-api-key']);
+
+        if (!matchesToken(presented)) {
             reply.code(401).send({ error: { message: 'Unauthorized', type: 'invalid_request_error', code: 'invalid_api_key' } });
             return;
         }

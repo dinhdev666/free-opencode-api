@@ -243,6 +243,36 @@ async function run() {
     const wrongKey = await request('/v1/models', { key: 'sk-wrong' });
     check('a wrong bearer token is rejected', wrongKey.response.status === 401, `status ${wrongKey.response.status}`);
 
+    // The auth scheme is case-insensitive (RFC 7235) and whitespace-padded values are common; none of that is a
+    // reason to reject a correct key, and none of it may accept a wrong one
+    const authVariants = [
+        ['bearer ' + API_KEY, 200, 'lowercase scheme'],
+        ['BEARER ' + API_KEY, 200, 'uppercase scheme'],
+        ['Bearer   ' + API_KEY, 200, 'extra whitespace'],
+        ['Bearer ' + API_KEY + ' ', 200, 'trailing whitespace'],
+        [API_KEY, 401, 'token without a scheme'],
+        ['Bearer ' + API_KEY + '4', 401, 'wrong token']
+    ];
+    const variantStatuses = [];
+    for (const [value, expected, label] of authVariants) {
+        const attempt = await fetch(`${BASE}/v1/models`, { headers: { authorization: value } });
+        variantStatuses.push([label, attempt.status, expected]);
+    }
+    check('the bearer scheme is read case-insensitively and tolerates whitespace',
+        variantStatuses.every(([, actual, expected]) => actual === expected), JSON.stringify(variantStatuses));
+
+    // `X-Api-Key` is advertised in Access-Control-Allow-Headers, so it has to be accepted as an alias; an
+    // Authorization header that is present still wins, so a wrong one cannot be rescued by the alias
+    const viaHeader = await fetch(`${BASE}/v1/models`, { headers: { 'x-api-key': API_KEY } });
+    check('X-Api-Key is accepted as an alias for the bearer token', viaHeader.status === 200, `status ${viaHeader.status}`);
+    const viaHeaderWrong = await fetch(`${BASE}/v1/models`, { headers: { 'x-api-key': 'sk-wrong' } });
+    check('a wrong X-Api-Key is rejected', viaHeaderWrong.status === 401, `status ${viaHeaderWrong.status}`);
+    const bothHeaders = await fetch(`${BASE}/v1/models`, {
+        headers: { authorization: 'Bearer sk-wrong', 'x-api-key': API_KEY }
+    });
+    check('a wrong Authorization header is not rescued by a correct X-Api-Key',
+        bothHeaders.status === 401, `status ${bothHeaders.status}`);
+
     // --- preflight --------------------------------------------------------------------------------------
     const preflight = await fetch(`${BASE}/v1/chat/completions`, { method: 'OPTIONS' });
     check('OPTIONS preflight returns 204', preflight.status === 204, `status ${preflight.status}`);

@@ -3285,11 +3285,13 @@ async function ensureBackend(config, options = {}) {
                 opencodeBin.endsWith('.cmd') || opencodeBin.endsWith('.bat');
             // A shell parses the command line, so the binary has to survive it: quoting keeps spaces intact (an
             // unquoted "C:\Program Files\...opencode.cmd" does not start at all) and turns operators such as `;` or
-            // `&` into literal text. Only what quoting cannot neutralise is refused.
+            // `&` into literal text. Only what quoting cannot neutralise is refused - including a control character,
+            // because quoting does not survive a line break: `"a\nb"` is still two commands, and a path carrying one
+            // ran whatever followed it as a second shell line.
             let spawnTarget = opencodeBin;
             if (useShell) {
-                if (/["$`]/.test(opencodeBin)) {
-                    throw new Error(`OPENCODE_PATH cannot be passed through a shell: ${opencodeBin}`);
+                if (/["$`\u0000-\u001f\u007f]/.test(opencodeBin)) {
+                    throw new Error(`OPENCODE_PATH cannot be passed through a shell: ${loggableConfigValue(opencodeBin)}`);
                 }
                 spawnTarget = `"${opencodeBin}"`;
             }
@@ -3312,7 +3314,7 @@ async function ensureBackend(config, options = {}) {
                 spawnError = err;
                 logger.error(`[Proxy] Failed to spawn OpenCode: ${err.message}`);
                 if (err.code === 'ENOENT') {
-                    logger.error(`[Proxy] Command '${OPENCODE_PATH}' not found. Please ensure OpenCode is installed and in your PATH.`);
+                    logger.error(`[Proxy] Command '${loggableConfigValue(OPENCODE_PATH)}' not found. Please ensure OpenCode is installed and in your PATH.`);
                     logger.error(`[Proxy] You can specify the full path in config.json using 'OPENCODE_PATH'`);
                 }
             });

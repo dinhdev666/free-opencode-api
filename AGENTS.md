@@ -566,7 +566,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   not the graceful one. The 2.x warning it feeds is unchanged, and it now arrives while the gateway is already serving.
 - **The backend command survives the shell it runs in.** `opencodeBin` is quoted whenever the spawn uses a shell
   (`C:\Program Files\...opencode.cmd` does not start unquoted, and `;`/`&` in a path would be read as operators);
-  paths carrying `"`, `$` or a backtick are refused instead, because quoting cannot neutralise them. A configured
+  paths carrying `"`, `$`, a backtick or a control character are refused instead, because quoting cannot neutralise
+  them (a line break splits the command into two). A configured
   `OPENCODE_PATH` that does not exist is warned about rather than silently replaced by whatever the PATH search finds.
 - **The start attempt is claimed before the probe.** `state.isStarting` is set synchronously, before the
   `checkHealth` call that may suspend, and released in a `finally` on every path: claiming it only after that probe

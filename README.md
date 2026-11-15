@@ -99,7 +99,10 @@ summary, CORS headers, bearer auth) and no plugin-level middleware chain. Additi
 - **Polling starts fast, then settles** — the first polls of a completion run at 25/50/100/200 ms and then at the
   normal interval, because an answer that lands a few tens of milliseconds after the prompt returned used to wait a
   full 500 ms interval before it was seen. The "the text stopped growing" guard is measured in time (~1.5 s), not in
-  poll count, so the shorter early polls cannot make it accept a half-written answer.
+  poll count, so the shorter early polls cannot make it accept a half-written answer. It watches the reasoning as well
+  as the text, so a provider that streams reasoning only — and never marks its message finished — is served as soon as
+  it goes quiet instead of answering `504` on the request budget, and only string parts count as answer text (a part
+  carrying a number is not stringified into the reply).
 - **One budget per completion** — session creation, the prompt, the event stream and the polling fallback share the
   request budget (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`) instead of each starting a fresh one, so a stalled stream ends
   within the advertised timeout instead of after roughly twice it, and a request that waited in the queue does not get

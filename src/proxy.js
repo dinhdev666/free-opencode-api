@@ -1563,8 +1563,14 @@ function createApp(config) {
         for (let i = 0; i < parts.length; i += 1) {
             const part = parts[i];
             if (!part) continue;
-            if (part.type === 'text') content += part.text || '';
-            else if (part.type === 'reasoning') reasoning += part.text || '';
+            // Only a string is text. `content += part.text || ''` stringified whatever arrived, so a part carrying a
+            // number or an object (a changed backend shape, a proxy rewriting payloads) was served as assistant text:
+            // `parts: [{text: 42}, {text: ' ok'}]` answered `"42 ok"`, and an object part answered `[object Object]`.
+            // The streaming collector (`typeof part.text === 'string'`) and the request parser (`… .text must be a
+            // string`) already refuse that shape; this was the one reader that did not.
+            if (typeof part.text !== 'string' || part.text === '') continue;
+            if (part.type === 'text') content += part.text;
+            else if (part.type === 'reasoning') reasoning += part.text;
         }
         return { content, reasoning };
     }
@@ -1629,8 +1635,13 @@ function createApp(config) {
         // counting "three identical polls" would have meant 75 ms of silence instead of 1.5 s and started accepting
         // half-written answers; a window keeps the documented behaviour whatever the poll cadence is.
         const stableWindowMs = stablePollsRequired * intervalMs;
-        let lastContent = '';
-        let lastContentAt = 0;
+        // What counts as "the answer is no longer growing": both halves of the visible answer, because a message can
+        // carry reasoning and no text at all. Watching `content` alone left `stableFor` at 0 for a reasoning-only
+        // message, so a provider that never sets `finish` could not be accepted and the completion ended in `504` on
+        // its whole budget (measured 4.4 s of a 4 s budget) for an answer the first poll already held.
+        let lastAnswerContent = '';
+        let lastAnswerReasoning = '';
+        let lastAnswerAt = 0;
         let pollIndex = 0;
         // One failed poll used to end the whole completion: a single 5xx or a reset connection while the backend was
         // busy threw out of the loop, so the client got an error although the answer was one poll away. Polls are
@@ -1696,11 +1707,14 @@ function createApp(config) {
                     const error = info?.error || null;
                     const done = Boolean(info.finish || info.time?.completed || error);
                     let stableFor = 0;
-                    if (content && content === lastContent) {
-                        stableFor = Date.now() - lastContentAt;
+                    // `content || reasoning` keeps the guard the single-field version had: an empty poll is a normal
+                    // "not written yet" answer, never a finished one, so it may only restart the window.
+                    if ((content || reasoning) && content === lastAnswerContent && reasoning === lastAnswerReasoning) {
+                        stableFor = Date.now() - lastAnswerAt;
                     } else {
-                        lastContent = content;
-                        lastContentAt = Date.now();
+                        lastAnswerContent = content;
+                        lastAnswerReasoning = reasoning;
+                        lastAnswerAt = Date.now();
                     }
                     if (done || stableFor >= stableWindowMs || (!requireDone && (content || reasoning))) {
                         if (error) {

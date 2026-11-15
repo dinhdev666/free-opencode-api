@@ -236,6 +236,14 @@ Every response carries an `X-Request-Id` header, and the same id appears in the 
 
 **Chat completions** accepts the usual OpenAI fields; model IDs use the `opencode/<model>` form (for example `opencode/kimi-k2.5-free`).
 
+Fields the gateway respects: `messages` (string content, or an array of parts whose `text` is concatenated), `model`,
+`stream` (a boolean, or one of `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off` — hand-written clients stringify it, and a
+misread `stream` used to answer JSON to a client that was parsing SSE) and `user`/`name` as prompt labels. Sampling
+knobs (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `presence_penalty`, `frequency_penalty`,
+`response_format`, tools) are accepted and **ignored**: the model is served by OpenCode, which owns its own sampling
+settings, so a request that relies on them gets the model's defaults. `n` is ignored too — a completion always
+returns exactly one choice.
+
 ```bash
 curl -X POST http://127.0.0.1:8083/v1/chat/completions \
   -H "Content-Type: application/json" \

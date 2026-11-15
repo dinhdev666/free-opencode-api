@@ -402,6 +402,31 @@ async function run() {
         multiSlashModels.length > 0 && multiSlashModels.every((name) => name === 'vendor/family/version'),
         JSON.stringify(multiSlashModels[0]));
 
+    // `stream` is sent as a boolean by real SDKs, but hand-written clients also send 1/"yes". Anything unrecognised
+    // keeps the non-streaming default instead of guessing at the client's intent.
+    const numericStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'hi' }], stream: 1 },
+        stream: true
+    });
+    check('stream accepts a numeric 1 as true',
+        numericStream.text.includes('data: [DONE]') && numericStream.text.includes('"finish_reason":"stop"'),
+        JSON.stringify(numericStream.text).slice(0, 120));
+    const wordStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'hi' }], stream: 'yes' },
+        stream: true
+    });
+    check('stream accepts "yes" as true', wordStream.text.includes('data: [DONE]'),
+        JSON.stringify(wordStream.text).slice(0, 120));
+    const falseStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'hi' }], stream: 'no' }
+    });
+    check('stream accepts "no" as false',
+        falseStream.json?.object === 'chat.completion' && !falseStream.text.includes('data: [DONE]'),
+        JSON.stringify(falseStream.text).slice(0, 120));
+
     // A provider that ends its message without the literal finish reason "stop" must still end the stream: waiting
     // for the exact word would leave the client hanging until the 8 s idle timeout
     const endOnlyStart = Date.now();

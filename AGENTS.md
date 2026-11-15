@@ -59,7 +59,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 61 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 64 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -114,10 +114,11 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   a final frame with `"finish_reason":"stop"`, then `data: [DONE]\n\n`. Reasoning deltas use `reasoning_content`.
   Before the first delta, a `: keep-alive` comment line is written every 15 s (ignored by OpenAI clients, keeps idle
   proxies from dropping the connection); it stops as soon as real frames flow.
-- Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request, `type: "invalid_request_error"`), `401`
-  (auth, `type: "invalid_request_error"`, `code: "invalid_api_key"`), `404` (unknown route), `502`
-  (upstream/provider error), `503` (`type: "queue_full"`, the wait queue is full), `504` (timeout), `500`
-  (anything else). Every error body carries a `type`.
+- Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request, `type: "invalid_request_error"`, plus
+  Fastify's `code` when it rejected the body), `401` (auth, `type: "invalid_request_error"`,
+  `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error), `503`
+  (`type: "queue_full"`, the wait queue is full), `504` (timeout), `500` (anything else). Every error body carries a
+  `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name.
 - A client that disconnects mid-stream releases its queue slot immediately: the event subscription is aborted and
   the polling fallbacks are skipped (the backend keeps finishing on its own).
 - An error after the first SSE frame is delivered in-band (`data: {"error":…}` then `data: [DONE]`) and closes the

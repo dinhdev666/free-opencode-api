@@ -844,6 +844,9 @@ function createApp(config) {
                         if (!props) continue;
                         if (event.type === 'message.part.updated' && ((props.part && props.part.sessionID) || props.sessionID) === sessionId) {
                             const { part } = props;
+                            // An event that only names the session (no part payload) carries nothing to add: reading
+                            // part.type here would throw and abort a subscription that is still usable
+                            if (!part) continue;
                             /* opencode>=1.19 events carry no delta field: part.text is the part's current full text, so derive the increment by diffing against what has already been accumulated */
                             let delta = props.delta;
                             if (!delta && (part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
@@ -1341,7 +1344,9 @@ function createApp(config) {
                     if (error.message && error.message.includes('ENOENT')) {
                         errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
                     }
-                    const payload = { error: { message: errorMessage, type: error.constructor.name } };
+                    // OpenAI clients branch on the type: a gateway/upstream failure is a server_error, and the
+                    // constructor name of an internal exception is not part of any contract
+                    const payload = { error: { message: errorMessage, type: 'server_error' } };
                     if (!reply.raw.headersSent) {
                         if (hijacked) {
                             reply.raw.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -1368,7 +1373,7 @@ function createApp(config) {
                 return reply;
             }
             logger.error('[Proxy] Request Handler Error:', { message: error.message, stack: error.stack });
-            const payload = { error: { message: error.message, type: error.constructor.name } };
+            const payload = { error: { message: error.message, type: 'server_error' } };
             if (!reply.raw.headersSent) {
                 if (hijacked) {
                     reply.raw.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -1421,7 +1426,9 @@ function createApp(config) {
         reply.code(statusCode).send({
             error: {
                 message: error.message,
-                type: error.code || error.name || 'Error'
+                type: statusCode >= 500 ? 'server_error' : 'invalid_request_error',
+                // Fastify's own identifier (FST_ERR_CTP_INVALID_JSON_BODY, ...) is kept for support tickets
+                code: error.code || error.name || 'Error'
             }
         });
     });

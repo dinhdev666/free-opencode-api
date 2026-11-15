@@ -13,6 +13,8 @@ CONFIG=/app/config.json
 LOG_LEVEL_DISPLAY="${LOG_LEVEL:-info}"
 
 if [ ! -f "$CONFIG" ]; then
+    # config.json carries the API key: create it readable by the container user only
+    umask 077
     node -e '
         const fs = require("fs");
         const env = (k, d) => { const v = process.env[k]; return (v === undefined || v === "") ? d : v; };

@@ -87,6 +87,13 @@ Health probe (`/health` is the only unauthenticated route besides `/`):
 curl http://127.0.0.1:8083/health
 ```
 
+The image also declares a `HEALTHCHECK` that calls the same endpoint (it follows `-e PORT=...`), so
+`docker ps` shows `healthy` once the gateway is listening and `docker inspect` reports the failure count:
+
+```bash
+docker ps --format '{{.Names}}\t{{.Status}}'
+```
+
 Model list:
 
 ```bash

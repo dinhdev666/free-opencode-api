@@ -2,6 +2,7 @@ import Fastify from 'fastify';
 import { spawn } from 'child_process';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 import http from 'http';
+import https from 'https';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -253,15 +254,19 @@ function lock(task, timeout = 120000) {
     });
 }
 
-// Keep-alive socket for backend health probes: a fresh connection per chat request is measurable overhead
+// Keep-alive socket for backend health probes: a fresh connection per chat request is measurable overhead.
+// A remote (https) OPENCODE_SERVER_URL needs its own agent, otherwise the probe cannot even be sent.
 const healthAgent = new http.Agent({ keepAlive: true, maxSockets: 4 });
+const healthAgentSecure = new https.Agent({ keepAlive: true, maxSockets: 4 });
 
 /**
  * Robust Health Check Helper
  */
 function checkHealth(serverUrl) {
+    const secure = String(serverUrl).startsWith('https://');
+    const transport = secure ? https : http;
     return new Promise((resolve, reject) => {
-        const req = http.get(`${serverUrl}/health`, { agent: healthAgent }, (res) => {
+        const req = transport.get(`${serverUrl}/health`, { agent: secure ? healthAgentSecure : healthAgent }, (res) => {
             // Drain the body so the socket goes back to the keep-alive pool
             res.resume();
             if (res.statusCode === 200) resolve(true);

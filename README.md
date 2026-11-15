@@ -245,6 +245,7 @@ Advanced tuning (environment or `config.json`; the environment wins when both se
 | `OPENCODE_PROXY_MAX_QUEUE` | `64` | How many completions may wait for a free slot before the gateway answers `503 queue_full` instead of accepting more work (the queue holds request bodies, so it is bounded). Counts waiting requests only: `0` rejects a completion when no slot is free instead of queueing it. A slot frees as soon as its response is written (the session cleanup that follows does not hold it) |
 | `OPENCODE_PROXY_MAX_BODY_MB` | `50` | Largest accepted request body in MiB (1..200). It is the other half of the memory bound: a waiting completion pins its parsed body, so the worst case is this value times `OPENCODE_PROXY_MAX_QUEUE`. Prompts are small, so lowering it is the cheap way to bound a gateway whose clients are not trusted |
 | `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` (legacy alias; prefer `LOG_LEVEL=debug`) |
+| `DEBUG` | `false` | The same switch as `config.json` spells it (`OPENCODE_PROXY_DEBUG` is the environment name); `LOG_LEVEL=debug` is still the preferred way |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Fallback bind address when `BIND_HOST` is not set |
 
 > `LOG_LEVEL` is read directly from the environment by the Node process, so it always wins over the `LOG_LEVEL` field in `config.json`.

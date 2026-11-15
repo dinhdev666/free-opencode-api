@@ -228,6 +228,13 @@ gateway knows but whose value has the wrong type stops it with the key named
 `API_KEY` would make the literal string `true` the gateway's credential, which every client can guess while the
 startup summary still reports a custom key.
 
+A key the gateway does **not** read is reported and ignored, because a misspelled key used to change nothing at all
+while the gateway ran the default you thought you had replaced:
+
+```
+[Config] config.json has an unknown key 'APIKEY' (did you mean 'API_KEY'?) - it is ignored
+```
+
 `config.json` (see [config.json.example](config.json.example)):
 
 | Key | Default | Description |

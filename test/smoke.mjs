@@ -236,6 +236,50 @@ async function run() {
     check('every configurable key has a row in the README configuration table',
         undocumented.length === 0, `missing=[${undocumented.join(',')}]`);
 
+    // The tuning table publishes the default and the range an operator sizes a host from (`MAX_BODY_MB` times
+    // `MAX_QUEUE` is the memory a burst can pin), and nothing tied those numbers to the resolvers that enforce them: a
+    // cap raised in code left the table promising the old one, and a reader raising it from the table change alone
+    // would find the gateway still enforcing the old value. Both sides are read as text, so a change to either has to
+    // agree with the other.
+    const proxySource = fs.readFileSync(path.join(ROOT, 'src', 'proxy.js'), 'utf8');
+    const numericConstants = new Map(
+        [...proxySource.matchAll(/^const (DEFAULT_[A-Z0-9_]+) = (\d+);$/gm)].map((match) => [match[1], Number(match[2])])
+    );
+    const resolveDefault = (token) => (/^\d+$/.test(token) ? Number(token) : numericConstants.get(token));
+    const tuningDefaults = new Map();
+    for (const match of proxySource.matchAll(/readLimit\('([A-Z0-9_]+)',\s*\{[^}]*?min:\s*(\d+),\s*max:\s*(\d+),\s*fallback:\s*([A-Za-z0-9_]+)/gs)) {
+        tuningDefaults.set(match[1], { value: resolveDefault(match[4]), min: Number(match[2]), max: Number(match[3]) });
+    }
+    for (const match of proxySource.matchAll(/readMilliseconds\('([A-Z0-9_]+)',\s*(\d+)/g)) {
+        if (!tuningDefaults.has(match[1])) tuningDefaults.set(match[1], { value: Number(match[2]) });
+    }
+    // The completion budget has its own reader (a positive number, not a capped limit) and its default is the named
+    // constant its timeout message quotes, so it is resolved from the source as well instead of being listed here.
+    tuningDefaults.set('OPENCODE_PROXY_REQUEST_TIMEOUT_MS', { value: numericConstants.get('DEFAULT_REQUEST_TIMEOUT_MS') });
+    const readmeTuning = new Map();
+    for (const match of readmeSource.matchAll(/^\| `([A-Z][A-Z0-9_]+)` \| `(\d+)` \|(.*)$/gm)) {
+        if (!tuningDefaults.has(match[1])) continue;
+        readmeTuning.set(match[1], { value: Number(match[2]), range: /\((\d+)\.\.(\d+)\)/.exec(match[3]) });
+    }
+    check('the README tuning table documents every default the gateway resolves',
+        [...tuningDefaults.keys()].sort().join(',') === [...readmeTuning.keys()].sort().join(','),
+        `readme=[${[...readmeTuning.keys()].join(',')}] code=[${[...tuningDefaults.keys()].join(',')}]`);
+    const tuningMismatches = [];
+    for (const [key, resolved] of tuningDefaults) {
+        const documented = readmeTuning.get(key);
+        if (!documented) {
+            tuningMismatches.push(`${key}: no row`);
+            continue;
+        }
+        if (documented.value !== resolved.value) tuningMismatches.push(`${key}: table ${documented.value}, code ${resolved.value}`);
+        if (resolved.min !== undefined && documented.range &&
+            (Number(documented.range[1]) !== resolved.min || Number(documented.range[2]) !== resolved.max)) {
+            tuningMismatches.push(`${key}: table ${documented.range[1]}..${documented.range[2]}, code ${resolved.min}..${resolved.max}`);
+        }
+    }
+    check('the defaults and ranges in the README tuning table are the ones the gateway resolves',
+        tuningMismatches.length === 0, tuningMismatches.join('; '));
+
     // The commit-message rules live in two places - the CONTRIBUTING.md tables and test/check-commit-messages.mjs -
     // and CI enforces the second over the commits a push adds. A scope added to the document alone would reject every
     // commit that uses it, and one added to the checker alone documents nothing, so the checker compares the two lists

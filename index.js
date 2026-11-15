@@ -1,10 +1,10 @@
 import {
     startProxy,
     DEFAULT_API_KEY,
-    parseBoolean,
     resolveApiKey,
     getQueueLimits,
-    normalizeBackendUrl
+    normalizeBackendUrl,
+    readFlag
 } from './src/proxy.js';
 import { readConfigFile, envOrFile, findUnknownKeys } from './src/config.js';
 import { logger, maskBackendUrl } from './src/logger.js';
@@ -71,6 +71,24 @@ if (!portIsValid && rawPort !== '') {
     logger.warn(`[Config] PORT '${rawPort}' is not a valid TCP port (1-65535), falling back to ${defaultConfig.PORT}`);
 }
 
+// The raw value of each flag has to survive until it is read: `parseBoolean()` collapses an unusable value into the
+// fallback, so the warning below needs the operator's own text and the name they used (an environment variable or a
+// config.json key). A blank value counts as unset, like every other key.
+const flagSource = (envNames, fileKey) => {
+    for (const name of envNames) {
+        const envValue = process.env[name];
+        if (envValue !== undefined && String(envValue).trim() !== '') return { label: name, value: envValue };
+    }
+    const fileValue = fileConfig[fileKey];
+    if (fileValue !== undefined && fileValue !== null && String(fileValue).trim() !== '') {
+        return { label: `config.json ${fileKey}`, value: fileValue };
+    }
+    return { label: fileKey, value: undefined };
+};
+const disableToolsSource = flagSource(['OPENCODE_DISABLE_TOOLS', 'DISABLE_TOOLS'], 'DISABLE_TOOLS');
+const isolatedHomeSource = flagSource(['OPENCODE_USE_ISOLATED_HOME', 'USE_ISOLATED_HOME'], 'USE_ISOLATED_HOME');
+const debugSource = flagSource(['OPENCODE_PROXY_DEBUG'], 'DEBUG');
+
 const finalConfig = {
     PORT: portIsValid ? parsedPort : defaultConfig.PORT,
     // Never empty: an unset/blank API_KEY falls back to the built-in default (authentication stays on). A blank
@@ -86,22 +104,16 @@ const finalConfig = {
     BIND_HOST: process.env.BIND_HOST || fileConfig.BIND_HOST || process.env.OPENCODE_PROXY_BIND_HOST || defaultConfig.BIND_HOST,
     // The legacy OPENCODE_-prefixed name keeps working; the bare name matches every other key and the container's
     // `-e DISABLE_TOOLS=...` flag
-    DISABLE_TOOLS: parseBoolean(
-        process.env.OPENCODE_DISABLE_TOOLS ?? process.env.DISABLE_TOOLS,
-        parseBoolean(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)
-    ),
+    DISABLE_TOOLS: readFlag(disableToolsSource.label, disableToolsSource.value, defaultConfig.DISABLE_TOOLS),
     // Run the backend under an isolated HOME (a throwaway directory instead of the real one). The legacy
     // OPENCODE_-prefixed environment variable keeps working
-    USE_ISOLATED_HOME: parseBoolean(
-        process.env.OPENCODE_USE_ISOLATED_HOME ?? process.env.USE_ISOLATED_HOME,
-        parseBoolean(fileConfig.USE_ISOLATED_HOME, defaultConfig.USE_ISOLATED_HOME)
-    ),
+    USE_ISOLATED_HOME: readFlag(isolatedHomeSource.label, isolatedHomeSource.value, defaultConfig.USE_ISOLATED_HOME),
     // LOG_LEVEL: env takes precedence over config.json; when neither is explicitly set, undefined is passed
     // through and startProxy falls back to the default info while keeping the legacy DEBUG -> debug level interlock
     LOG_LEVEL: process.env.LOG_LEVEL || fileConfig.LOG_LEVEL || undefined,
     // Legacy switch, still honoured (also read by startProxy); a service manager may set it on a version that predates
     // LOG_LEVEL
-    DEBUG: parseBoolean(process.env.OPENCODE_PROXY_DEBUG, parseBoolean(fileConfig.DEBUG, false)),
+    DEBUG: readFlag(debugSource.label, debugSource.value, false),
     // Tuning keys with no default here: startProxy() resolves them (environment first, then these file values, then its
     // own default) so a value written in config.json takes effect instead of being ignored in silence
     OPENCODE_PROXY_MAX_CONCURRENCY: fileConfig.OPENCODE_PROXY_MAX_CONCURRENCY,

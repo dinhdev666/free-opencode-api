@@ -222,8 +222,8 @@ Additional manual checks that CI cannot cover:
 
 1. Bump `version` in `package.json` (the workflow fails when it does not match the tag) and merge the change.
 2. Tag and push it: `git tag v1.0.1 && git push origin v1.0.1`.
-3. `.github/workflows/docker-publish.yml` builds `linux/amd64` + `linux/arm64` and pushes `<version>`, `<major>.<minor>`
-   and `latest` to `dinhdev666/free-opencode-api`.
+3. `.github/workflows/docker-publish.yml` builds `linux/amd64` + `linux/arm64` and pushes `<version>` and `latest` to
+   `dinhdev666/free-opencode-api`. Only whole versions are published: there is no floating `1` or `1.2` tag.
 4. Confirm the result on [Docker Hub](https://hub.docker.com/r/dinhdev666/free-opencode-api/tags) and in the
    workflow run.
 

@@ -226,7 +226,7 @@ Two OpenCode 1.19.5 compatibility issues are fixed directly in [`src/proxy.js`](
 ## Publishing a Release
 
 The image is published by `.github/workflows/docker-publish.yml`. Pushing a version tag builds
-`linux/amd64` + `linux/arm64` and pushes the version tag, the minor tag and `latest`:
+`linux/amd64` + `linux/arm64` and pushes the version tag and `latest` (whole versions only — no floating `1` or `1.2`):
 
 ```bash
 # package.json version and the tag must match; the workflow fails otherwise

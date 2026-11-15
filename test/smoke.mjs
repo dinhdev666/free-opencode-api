@@ -2303,6 +2303,52 @@ async function run() {
     stopGateway(invalidConfigGateway);
     await waitForExit(invalidConfigGateway);
 
+    // --- a blank environment variable means "not configured" ---------------------------------------------
+    // `PORT` and `API_KEY` were read with `??`, where an empty string is a value: `API_KEY= PORT=` (a unit file's
+    // `Environment=API_KEY=`, an empty Helm value, a shell that exports unconditionally) shadowed config.json, so the
+    // gateway listened on the default port and authenticated with the built-in public key while the file named a
+    // different port and a real secret. Every other key falls through on a blank value; these two now do too.
+    const blankEnvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'free-opencode-api-blank-env-'));
+    try {
+        fs.copyFileSync(path.join(ROOT, 'index.js'), path.join(blankEnvDir, 'index.js'));
+        fs.copyFileSync(path.join(ROOT, 'package.json'), path.join(blankEnvDir, 'package.json'));
+        fs.cpSync(path.join(ROOT, 'src'), path.join(blankEnvDir, 'src'), { recursive: true });
+        // 'junction' on Windows: a plain directory symlink needs Developer Mode or elevation there
+        fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(blankEnvDir, 'node_modules'),
+            process.platform === 'win32' ? 'junction' : 'dir');
+        const blankEnvPort = GATEWAY_PORT + 31;
+        const blankEnvKey = 'sk-from-file-blank-env';
+        fs.writeFileSync(path.join(blankEnvDir, 'config.json'), JSON.stringify({
+            PORT: blankEnvPort,
+            BIND_HOST: '127.0.0.1',
+            API_KEY: blankEnvKey,
+            OPENCODE_SERVER_URL: STUB_URL
+        }));
+        const blankEnvGateway = spawn(process.execPath, ['index.js'], {
+            cwd: blankEnvDir,
+            env: { ...process.env, PORT: '', API_KEY: '', LOG_LEVEL: 'warn' }
+        });
+        children.push(blankEnvGateway);
+        blankEnvGateway.stdout.on('data', () => {});
+        blankEnvGateway.stderr.on('data', () => {});
+        const blankEnvUp = await waitForOk(`http://127.0.0.1:${blankEnvPort}/health`, 10000).then(() => true).catch(() => false);
+        const fileKeyStatus = blankEnvUp
+            ? await fetch(`http://127.0.0.1:${blankEnvPort}/v1/models`, { headers: { authorization: `Bearer ${blankEnvKey}` } })
+                .then((response) => response.status).catch(() => 0)
+            : 0;
+        const builtinKeyStatus = blankEnvUp
+            ? await fetch(`http://127.0.0.1:${blankEnvPort}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
+                .then((response) => response.status).catch(() => 0)
+            : 0;
+        check('a blank environment variable does not hide the port and key from config.json',
+            blankEnvUp && fileKeyStatus === 200 && builtinKeyStatus === 401,
+            `listening=${blankEnvUp} fileKey=${fileKeyStatus} builtinKey=${builtinKeyStatus}`);
+        stopGateway(blankEnvGateway);
+        await waitForExit(blankEnvGateway);
+    } finally {
+        fs.rmSync(blankEnvDir, { recursive: true, force: true });
+    }
+
     // --- the poll fallback shares the request budget instead of buying a second one -----------------------
     // A streaming request whose event stream stalls spent the whole budget waiting for events and then a fresh, full
     // budget polling for an answer nobody had written: the client waited about twice the advertised timeout.

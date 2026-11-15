@@ -210,7 +210,10 @@ curl -X POST http://127.0.0.1:8083/v1/chat/completions \
 
 ## Configuration
 
-Settings are resolved in this order: **environment variables → `config.json` → built-in defaults**.
+Settings are resolved in this order: **environment variables → `config.json` → built-in defaults**. An environment
+variable that is present but **blank** counts as unset, so `PORT= API_KEY= npm start` (a unit file's
+`Environment=API_KEY=`, an empty Helm or compose value) cannot replace the port and the key written in `config.json`
+with the defaults — a blank `API_KEY` used to fall through to the public `sk-dummy-123` while the file named a secret.
 
 A `config.json` that exists but cannot be used stops the gateway (`exit 1`) with the reason logged: falling back to
 the defaults would ignore the port and the key you wrote and serve traffic with the built-in `sk-dummy-123`. A

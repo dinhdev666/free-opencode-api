@@ -247,6 +247,10 @@ knobs (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `presence_penalty`,
 settings, so a request that relies on them gets the model's defaults. `n` is ignored too — a completion always
 returns exactly one choice.
 
+The request body is JSON, but a JSON body sent under another content type (`curl -d '{…}'` without
+`-H "Content-Type: application/json"`, or a client that labels it `text/plain`) is parsed and served all the same;
+only an unparsable body is a `400`, and that message names the header.
+
 ```bash
 curl -X POST http://127.0.0.1:8083/v1/chat/completions \
   -H "Content-Type: application/json" \

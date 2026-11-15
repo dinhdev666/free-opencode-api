@@ -655,6 +655,40 @@ async function run() {
     check('the text around a split tag is preserved',
         toolText.includes('hello') && toolText.trim().endsWith('world'), toolText);
 
+    // --- a non-ASCII key ----------------------------------------------------------------
+    // The bearer check compares bytes: a key with accented characters matching in string length but not in byte
+    // length used to make timingSafeEqual throw, answering 500 instead of 401 for a wrong key
+    // Latin-1 range so the value is a legal header on the wire ('ậ' would be rejected by the client itself)
+    const unicodeKey = 'khoá-bi-mât';
+    const unicodePort = GATEWAY_PORT + 4;
+    await assertPortFree(unicodePort, 'unicode gateway');
+    const unicodeGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(unicodePort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            API_KEY: unicodeKey,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(unicodeGateway);
+    unicodeGateway.stdout.on('data', () => {});
+    unicodeGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${unicodePort}/health`);
+    // Same character count as the real key, different bytes (accented vs plain ASCII), so only the byte comparison
+    // separates the two: this used to make timingSafeEqual throw and answer 500
+    const lookalike = 'khoa-bi-mat';
+    const mismatchStatus = await fetch(`http://127.0.0.1:${unicodePort}/v1/models`, {
+        headers: { authorization: `Bearer ${lookalike}` }
+    }).then((response) => { return response.text().then(() => response.status); });
+    check('a lookalike non-ASCII key is rejected with 401, not 500', mismatchStatus === 401, `status ${mismatchStatus}`);
+    const unicodeStatus = await fetch(`http://127.0.0.1:${unicodePort}/v1/models`, {
+        headers: { authorization: `Bearer ${unicodeKey}` }
+    }).then((response) => { return response.text().then(() => response.status); });
+    check('a non-ASCII key authenticates when it matches exactly', unicodeStatus === 200, `status ${unicodeStatus}`);
+
     // --- graceful shutdown ------------------------------------------------------------------------------
     const exitCode = await new Promise((resolve) => {
         const timer = setTimeout(() => resolve('timeout'), 10000);

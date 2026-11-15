@@ -1183,6 +1183,46 @@ async function run() {
         streamedFailureError?.error?.type === 'server_error' &&
         /ProviderError/.test(streamedFailureError?.error?.message || ''),
         streamedFailure.text.slice(0, 160));
+
+    // A provider error routinely quotes the credential it rejected, and its message has no size of its own. Masking
+    // used to be a property of the streaming path only: the non-streaming body copied the provider's text verbatim, and
+    // with a `?` in it the masking that did exist dropped everything after the parameter - the half that explains the
+    // failure. Both modes now mask and bound the same way.
+    const leakyFailure = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'LEAKYFAIL' }], stream: false }
+    });
+    const leakyMessage = leakyFailure.json?.error?.message || '';
+    check('a provider error message is masked in the non-streaming 502',
+        leakyFailure.response.status === 502 &&
+        leakyMessage.includes('http://***@127.0.0.1:4097/proxy?token=***') &&
+        !leakyMessage.includes('s3cr3t-value'),
+        leakyMessage.slice(0, 160));
+    check('the text after a masked query value survives',
+        leakyMessage.includes('and the upstream answered with a very long explanation'),
+        leakyMessage.slice(-160));
+    check('a provider error message is bounded in the non-streaming 502',
+        leakyMessage.length <= 512 + '…[truncated 0 chars]'.length + 8 &&
+        /…\[truncated \d+ chars\]$/.test(leakyMessage),
+        `${leakyMessage.length} chars`);
+    const leakyStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'LEAKYFAIL' }], stream: true },
+        stream: true
+    });
+    const leakyStreamMessage = (() => {
+        try {
+            return JSON.parse(leakyStream.text)?.error?.message || '';
+        } catch {
+            return '';
+        }
+    })();
+    check('a streaming provider error is masked and bounded the same way',
+        leakyStream.response.status === 502 &&
+        leakyStreamMessage.includes('http://***@127.0.0.1:4097/proxy?token=***') &&
+        !leakyStreamMessage.includes('s3cr3t-value') &&
+        /…\[truncated \d+ chars\]$/.test(leakyStreamMessage),
+        leakyStreamMessage.slice(0, 160));
     check('a streaming provider error is never delivered as model text',
         !/Proxy Error/.test(streamedFailure.text), streamedFailure.text.slice(0, 160));
 
@@ -2682,7 +2722,8 @@ async function run() {
         forgedModel.response.status === 200 && forgedLines.length > 0 &&
         forgedLines.every((line) => /model=opencode\/big-pickle\?\[Security\] FORGED/.test(line)),
         JSON.stringify(forgedLines.slice(0, 2)));
-    const longModelLine = gatewayOutput.split('\n').find((line) => line.includes('xxxxxxxxxx'));
+    const longModelLine = gatewayOutput.split('\n')
+        .find((line) => line.includes('model=opencode/') && line.includes('xxxxxxxxxx'));
     check('a very long model id is truncated in the request log line',
         longModelAnswer.response.status === 200 && Boolean(longModelLine) && longModelLine.length < 400,
         `${longModelLine ? longModelLine.length : 0} chars`);

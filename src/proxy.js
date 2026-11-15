@@ -1415,9 +1415,13 @@ function createApp(config) {
     // log verbatim. The query string is masked for the same reason it is masked on a request URL, and the length is
     // bounded so a backend cannot answer a client with a reason the size of the request body limit.
     const MAX_UPSTREAM_TEXT_CHARS = 512;
+    // Only the URL-shaped words of the text are masked. `maskUrlQuery()` is written for a URL: given a sentence it
+    // read everything after the first `?` as that parameter's value, so `…?x=1: connection refused` answered
+    // `…?x=***` and lost the half of the reason that explains the failure.
+    const maskUrlsInText = (text) => String(text).replace(/\S+:\/\/\S+/g, (url) => maskUrlQuery(maskUrlCredentials(url)));
     const clientFacingText = (value) => {
         if (typeof value !== 'string' || value === '') return '';
-        const masked = maskUrlQuery(maskUrlCredentials(value));
+        const masked = maskUrlsInText(value);
         return masked.length > MAX_UPSTREAM_TEXT_CHARS
             ? `${masked.slice(0, MAX_UPSTREAM_TEXT_CHARS)}…[truncated ${masked.length - MAX_UPSTREAM_TEXT_CHARS} chars]`
             : masked;
@@ -1604,7 +1608,13 @@ function createApp(config) {
                     }
                     if (done || stableFor >= stableWindowMs || (!requireDone && (content || reasoning))) {
                         if (error) {
-                            logger.error('[Proxy] OpenCode assistant error:', { sessionId, error });
+                            // The provider's own text: masked and bounded like every other upstream reason, because a
+                            // provider error can quote the credential it rejected and its message has no size (100 KB
+                            // of padding became a 32 KB log line, and hid the request-log assertion behind it)
+                            logger.error('[Proxy] OpenCode assistant error:', {
+                                sessionId,
+                                error: { name: error.name || null, message: clientFacingText(error.data?.message || error.message) }
+                            });
                         }
                         if (logger.isEnabled('debug')) {
                             logger.debug('Polling completed', {
@@ -2531,7 +2541,11 @@ function createApp(config) {
                             // The session exists by now and must be deleted even though the answer failed
                             reply.code(502).send({
                                 error: {
-                                    message: error.data?.message || error.message || 'OpenCode provider error',
+                                    // The provider's own text, masked and bounded like every other upstream reason: a
+                                    // provider error routinely quotes the credential it rejected, and the streaming
+                                    // path already ran this through clientFacingText(), so the two modes disagreed
+                                    // about the same payload in size and in masking.
+                                    message: clientFacingText(error.data?.message || error.message) || 'OpenCode provider error',
                                     type: 'server_error',
                                     code: error.name || 'OpenCodeError'
                                 }

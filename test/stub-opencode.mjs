@@ -54,6 +54,10 @@ const TAIL_TAG_ANSWER = 'hello world <function_call';
 // renders its tool attempts as text produces: the gateway must strip them in one pass. A lazy regex restarted a
 // closing-tag search at every opener and spent 8.5 s on this 1 MB answer, stalling everything else in the process.
 const TOOL_SPAM_ANSWER = `${'<function_calls>'.repeat(64000)}done`;
+// A provider error whose own message quotes a credential-bearing URL and 2 KB of trailing text (prompt marker
+// LEAKYFAIL): a provider says exactly this when it rejects a key, and both answer modes have to mask and bound it
+// before the text becomes a client-facing body or log line.
+const LEAKY_ERROR_TEXT = `provider rejected http://alice:s3cr3t-value@127.0.0.1:4097/proxy?token=abc123 and the upstream answered with a very long explanation ${'y'.repeat(2000)}`;
 const HOST = process.env.STUB_HOST || '127.0.0.1';
 // Refuse every route without the Basic credential the gateway is configured with (STUB_BASIC_AUTH=user:pass), the way
 // a proxy in front of the backend does: a gateway that hands the userinfo to the SDK as a URL cannot reach it at all,
@@ -323,6 +327,22 @@ const server = http.createServer(async (req, res) => {
                 // 64 000 unclosed tags: the strip has to walk the answer once, so this answers in milliseconds and used
                 // to spend seconds inside the regular expression before the client saw anything
                 return sendJson(res, 200, buildAssistantMessage(id, TOOL_SPAM_ANSWER, ''));
+            }
+            if (session.promptText.includes('LEAKYFAIL')) {
+                // The provider error carries a credential-bearing URL and 2 KB of text. Checked before FAIL, whose
+                // marker is a substring of this one.
+                session.messages.push({
+                    info: {
+                        id: `msg_${id}`,
+                        sessionID: id,
+                        role: 'assistant',
+                        error: { name: 'ProviderError', data: { message: LEAKY_ERROR_TEXT } },
+                        time: { created: Date.now(), completed: Date.now() }
+                    },
+                    parts: []
+                });
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                return;
             }
             if (session.promptText.includes('FAIL')) {
                 // A provider failure: the assistant message carries an error and no content, so a non-streaming

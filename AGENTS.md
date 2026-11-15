@@ -64,7 +64,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 114 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 116 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -135,6 +135,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   chunk and before `[DONE]`: the OpenAI SDK reads the stream's usage from exactly that frame, and ignoring the option
   left it with no numbers at all. It is emitted only when the client asks for it — a stream that did not request it
   must not grow an extra frame.
+- A completion body sent under a non-JSON content type (`curl -d '{…}'` without the header, `text/plain`) reaches the
+  handler as an unparsed string; it is parsed there and served. Answering "messages array is required" blamed a body
+  that was perfectly valid for a missing header. A string that is not JSON answers `400` naming the content type.
 - Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request, `type: "invalid_request_error"`, plus
   Fastify's `code` when it rejected the body), `401` (auth, `type: "invalid_request_error"`,
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error), `503`

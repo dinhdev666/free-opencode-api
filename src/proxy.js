@@ -1096,8 +1096,25 @@ function createApp(config) {
                         });
                     }
                     // A body like `null` or `"text"` is valid JSON but not a completion request: answer 400 instead of
-                    // letting a destructuring TypeError turn into a 500
-                    const body = request.body && typeof request.body === 'object' ? request.body : {};
+                    // letting a destructuring TypeError turn into a 500. A string body means the client sent JSON
+                    // under a non-JSON content type (`curl -d '{...}'` without the header, or `text/plain`), which
+                    // Fastify hands over unparsed - parse it here rather than reject a request whose body is fine.
+                    let body = {};
+                    if (typeof request.body === 'string') {
+                        try {
+                            const parsed = JSON.parse(request.body);
+                            body = parsed && typeof parsed === 'object' ? parsed : {};
+                        } catch (e) {
+                            return reply.code(400).send({
+                                error: {
+                                    message: 'request body is not valid JSON; send Content-Type: application/json',
+                                    type: 'invalid_request_error'
+                                }
+                            });
+                        }
+                    } else if (request.body && typeof request.body === 'object') {
+                        body = request.body;
+                    }
                     const { messages, model, stream } = body;
                     if (!messages || !Array.isArray(messages) || messages.length === 0) {
                         return reply.code(400).send({ error: { message: 'messages array is required', type: 'invalid_request_error' } });

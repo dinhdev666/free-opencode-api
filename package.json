@@ -4,6 +4,15 @@
   "description": "Free OpenCode API — an OpenAI-compatible API gateway for the OpenCode CLI that exposes free models (Kimi, GLM, MiniMax) to any standard OpenAI client.",
   "main": "index.js",
   "type": "module",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dinhdev666/free-opencode-api.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dinhdev666/free-opencode-api/issues"
+  },
+  "homepage": "https://github.com/dinhdev666/free-opencode-api#readme",
   "packageManager": "pnpm@12.18.0",
   "scripts": {
     "start": "node index.js",

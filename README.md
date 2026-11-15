@@ -81,19 +81,21 @@ CORS, auth) and no plugin-level middleware chain. Additional choices that matter
   fixed 100 ms pause, and `OPENCODE_PROXY_MAX_CONCURRENCY` (default `1`, i.e. one completion at a time as before)
   can be raised to run independent sessions in parallel.
 
-Local benchmarks, `autocannon`, same machine (Node.js 26, macOS, loopback), against a stub OpenCode backend so that
-the HTTP layer is what is being measured:
+Local benchmarks, `autocannon`, same machine (Node.js 26, macOS, loopback), against the smoke-test stub
+(`test/stub-opencode.mjs`). The stub answers instantly, so these numbers measure the HTTP layer — not a model:
 
-| Scenario | Before | After |
+| Scenario | Throughput | Avg latency |
 | --- | --- | --- |
-| `GET /health`, `-c 100 -d 10`, throughput | ~74,000 req/s (Express) | ~110,000 req/s (Fastify) |
-| `GET /health`, `-c 100 -d 10`, avg latency | 1.04 ms | 0.12 ms |
-| `POST /v1/chat/completions` non-stream, `-c 10 -d 8` | ~1,900 req/s, 4.7 ms avg | ~3,900 req/s, 2.2 ms avg |
-| `POST /v1/chat/completions` non-stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | — (serialized) | ~5,900 req/s, 1.3 ms avg |
-| `POST /v1/chat/completions` stream, `-c 10 -d 8` | 4,014 ms p50, ~0.4 req/s | 484 ms p50, ~21 req/s |
+| `GET /health`, `-c 100 -d 10` | ~105,000 req/s | 0.2 ms |
+| `POST /v1/chat/completions` non-stream, `-c 10 -d 8` | ~10,300 req/s | 0.3 ms |
+| `POST /v1/chat/completions` non-stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | ~10,200 req/s | 0.3 ms |
+| `POST /v1/chat/completions` stream, `-c 10 -d 8` | ~9,700 req/s | 0.4 ms |
 
-Treat these as relative numbers — real throughput is bounded by the OpenCode backend and model latency, not by the
-HTTP layer.
+Numbers from a stub that answers instantly say little about the queue and nothing about the model: with real
+latency the completion rate is bounded by the OpenCode backend, which is why `OPENCODE_PROXY_MAX_CONCURRENCY`
+(default `1`) matters far more than raw HTTP throughput. For reference, the Express implementation this gateway
+replaced measured ~74,000 req/s on `/health` and ~1,900 req/s on non-streaming completions in the same harness at
+the time.
 
 ---
 

@@ -84,7 +84,7 @@ jobs:
         run: |
           docker run -d --name gateway-ci -p 8083:8083 free-opencode-api:ci
           for attempt in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8083/health >/dev/null; then
+            if curl -fsS --max-time 2 --connect-timeout 1 http://127.0.0.1:8083/health >/dev/null; then
               echo "gateway answered /health after ${attempt}s"
               exit 0
             fi
@@ -102,7 +102,7 @@ jobs:
           docker run -d --name gateway-ci-env -p 8084:8084 -e PORT=8084 -e API_KEY=sk-from-env free-opencode-api:ci
           healthy=0
           for attempt in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8084/health >/dev/null; then
+            if curl -fsS --max-time 2 --connect-timeout 1 http://127.0.0.1:8084/health >/dev/null; then
               echo "gateway answered /health after ${attempt}s"
               healthy=1
               break
@@ -113,10 +113,10 @@ jobs:
             docker logs gateway-ci-env
             exit 1
           fi
-          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8084/v1/models)
+          code=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8084/v1/models)
           echo "GET /v1/models with the built-in key -> $code (expected 401: -e API_KEY won)"
           test "$code" = "401"
-          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-from-env' http://127.0.0.1:8084/v1/models)
+          code=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-from-env' http://127.0.0.1:8084/v1/models)
           echo "GET /v1/models with the -e key -> $code"
           test "$code" = "200"
           mode=$(docker exec gateway-ci-env stat -c '%a' /app/config.json)
@@ -130,13 +130,16 @@ jobs:
       # It runs in its own container rather than through `docker exec`: a detached exec keeps the CLI's output out of
       # `docker logs`, so a failure reported only "fetch failed" with nothing to read, and sharing the gateway
       # container's HOME means sharing its backend state for no reason.
+      # Every curl here carries its own timeout: a CLI that accepts the connection and never answers (a wedged
+      # `opencode serve`) parked the retry loop on a request with no deadline, so the step sat until the job's 20
+      # minute timeout and the retry budget it exists for never ran.
       - name: Bundled CLI exposes the session API
         run: |
           docker run -d --name cli-session-check -p 4599:4599 --entrypoint opencode \
             free-opencode-api:ci serve --port 4599 --hostname 0.0.0.0
           for attempt in $(seq 1 60); do
-            if body=$(curl -fsS -X POST -H 'content-type: application/json' -d '{}' \
-                http://127.0.0.1:4599/session 2>/dev/null); then
+            if body=$(curl -fsS --max-time 3 --connect-timeout 1 -X POST -H 'content-type: application/json' \
+                -d '{}' http://127.0.0.1:4599/session 2>/dev/null); then
               echo "bundled opencode created a session: $body"
               echo "$body" | grep -q '"id"'
               exit 0
@@ -144,19 +147,20 @@ jobs:
             sleep 1
           done
           echo "the bundled opencode CLI did not answer POST /session"
-          docker logs cli-session-check
+          docker ps -a --filter name=cli-session-check
+          docker logs cli-session-check || true
           exit 1
 
       # The image must behave like the source tree: the root index answers without a key and everything else
       # is authenticated with the built-in key
       - name: Container enforces authentication
         run: |
-          root=$(curl -fsS http://127.0.0.1:8083/)
+          root=$(curl -fsS --max-time 10 http://127.0.0.1:8083/)
           echo "GET / -> $root"
           echo "$root" | grep -q 'free-opencode-api'
-          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8083/v1/models)
+          code=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8083/v1/models)
           echo "GET /v1/models without a key -> $code"
           test "$code" = "401"
-          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8083/v1/models)
+          code=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8083/v1/models)
           echo "GET /v1/models with the default key -> $code"
           test "$code" = "200"

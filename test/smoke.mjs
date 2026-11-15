@@ -299,6 +299,28 @@ async function run() {
     check('a JSON null body returns 400', nullBody.status === 400, `status ${nullBody.status}`);
     check('400 for a null body keeps the envelope', typeof nullBodyJson?.error?.message === 'string', JSON.stringify(nullBodyJson));
 
+    // `curl -d '{...}'` without the header (or a client that sends text/plain) hands the gateway an unparsed string
+    // body. Rejecting it with "messages array is required" blames the body for a header problem, though the body is
+    // valid; the gateway parses it instead.
+    const textPlain = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'text/plain' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: false })
+    });
+    const textPlainJson = await textPlain.json().catch(() => null);
+    check('a JSON body sent as text/plain is still served',
+        textPlain.status === 200 && textPlainJson?.choices?.[0]?.message?.content === ANSWER,
+        `status ${textPlain.status} ${JSON.stringify(textPlainJson).slice(0, 120)}`);
+    const textPlainBad = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'text/plain' },
+        body: 'not json at all'
+    });
+    const textPlainBadJson = await textPlainBad.json().catch(() => null);
+    check('an unparsable text/plain body names the real problem',
+        textPlainBad.status === 400 && /Content-Type: application\/json/.test(textPlainBadJson?.error?.message || ''),
+        `${textPlainBad.status} ${JSON.stringify(textPlainBadJson).slice(0, 160)}`);
+
     const badModel = await request('/v1/chat/completions', {
         method: 'POST',
         body: { model: 5, messages: [{ role: 'user', content: 'hi' }] }

@@ -3523,7 +3523,9 @@ async function run() {
     const stalledKeyed = await stalledBody(`Authorization: Bearer ${API_KEY}\r\n`);
     check('an unfinished request body is answered with a timeout instead of being held open',
         stalledKeyed.closedBy === 'gateway' && stalledKeyed.ms < 5000 && /^HTTP\/1\.1 408 /.test(stalledKeyed.raw) &&
-        /Request body was not received within 1200ms/.test(stalledKeyed.raw),
+        /request body was not received within 1200ms; send the declared body or close the connection/.test(
+            stalledKeyed.raw
+        ),
         `${stalledKeyed.closedBy} after ${stalledKeyed.ms}ms ${JSON.stringify(stalledKeyed.raw.slice(0, 160))}`);
     const stalledAnon = await stalledBody('');
     check('the same deadline closes a body sent without a key',

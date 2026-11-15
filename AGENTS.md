@@ -136,8 +136,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   that runs into its deadline, because a silent backend would otherwise never answer the listing at all — fall back to
   a single static model and are not cached, but a served fallback is held for 1 s (`FALLBACK_HOLD_MS`) so a failing
   provider is not asked once per listing. A fresh cache answers with the body built when it was filled
-  (`modelsCacheBody`; by-id answers read `modelsById`), so the serializer no longer re-runs for bytes that cannot
-  change. That model is `opencode/big-pickle` (`DEFAULT_MODEL` in `src/proxy.js`), also the model a chat request
+  (`modelsCacheBody`; by-id answers read `modelsById`). That model is `opencode/big-pickle` (`DEFAULT_MODEL` in `src/proxy.js`), also the model a chat request
   without `model` is sent to (one constant, so the two cannot name different ids). `big-pickle` is an **alias**: OpenCode
   routes it to whichever model it serves and never publishes which, so it is the only id worth hardcoding and its entry
   carries just the four OpenAI fields - do not add capabilities, limits or pricing describing a model the gateway
@@ -216,8 +215,10 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   that sent `Content-Length: 4096` and four bytes held the socket as long as it liked without a credential, because
   the `401` is written from the headers while Node keeps the connection alive to drain a body it will never read. `armBodyDeadline()` in the `onRequest` hook (armed before auth, only when
   the request announces a body, cleared on `end`/`close`/`error`) closes it after `min(30 s, REQUEST_TIMEOUT_MS)`,
-  answering the `408` envelope when nothing has been sent. It closes the **request's** socket, not `reply.raw`: a
-  keep-alive response is detached from the connection once it ends, so destroying that closed nothing.
+  answering the `408` envelope when nothing has been sent, in the gateway's voice and with the deadline in force
+  (`request body was not received within …ms; send the declared body or close the connection`). It closes the
+  **request's** socket, not `reply.raw`: a keep-alive response is detached from the connection once it ends, so
+  destroying that closed nothing.
 - A `model` id whose provider or model half is empty (`"opencode/"`, `"/big-pickle"`) is a `400` in the
   `invalid_request_error` envelope naming the value: sending them to the backend only produced an opaque upstream
 error. An absent or blank `model` means `DEFAULT_MODEL`.
@@ -303,13 +304,13 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, OPTIONS`, `Allow-Headers: Content-Type,
   Authorization, X-Api-Key, X-Request-Id, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`. The
   allow-list lives in one constant (`CORS_ALLOW_HEADERS` in `createApp()`) because three paths write it — the
-  `onRequest` hook, `clientErrorHandler` and `badUrlHandler`. It carries `X-Request-Id` because the gateway echoes that header, and a browser client setting its own trace id had its request refused by its own preflight.
+  `onRequest` hook, `clientErrorHandler` and `badUrlHandler`. It carries `X-Request-Id` because the gateway echoes
+  that header, and a browser client setting its own trace id had it refused by its own preflight.
 - A request the HTTP parser rejects (a malformed request line or header, an oversized header block, a header
   timeout) never reaches a hook, so the `clientErrorHandler` Fastify option answers it: `400` for a parse error,
   `431` for `HPE_HEADER_OVERFLOW`, `408` for `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope
   (`type: "invalid_request_error"`, the parser's code in `code` when it is a plain `[A-Z_]+` token) with CORS headers,
-  an `X-Request-Id` and a `warn` log line, where Fastify's own
-  handler answered a bare `Bad Request`. It writes the envelope,
+  an `X-Request-Id` and a `warn` log line. It writes the envelope,
   then closes with `socket.end()` (`closeSocketAfterFlush()`), never `socket.destroy()`: `destroy()` discards buffered
   writes, so under backpressure the client got a reset instead of its error.
 - A URL the **router** cannot decode (a percent escape that is not valid UTF-8, `GET /v1/models/%E0%A4%A`) never reaches
@@ -319,7 +320,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
   to a log entry. An incoming `X-Request-Id` is echoed when it is a short printable token
   (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a
-  response header, so a header value carrying spaces, newlines or control characters must never be copied through.
+  header, so a value carrying spaces, newlines or control characters must never be copied through.
   `Access-Control-Expose-Headers: X-Request-Id` lets a browser client read it back.
 - **A configured backend URL is masked wherever it is printed.** `OPENCODE_SERVER_URL` can carry a credential
   (`http://user:secret@host:4097` for a proxy in front of the backend); it reached the startup summary, the `[Config]`
@@ -591,8 +592,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `OPENCODE_PROXY_HEALTH_CACHE_MS`, connection failures clear that trust, a spawned process that exits during startup
   aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm. A backend that is known
   to be healthy but whose trust window has expired is re-probed **in the background** (`refreshBackendHealthInBackground()`,
-  at most one probe in flight) and the request proceeds: with the default 2 s window and the serialized queue almost
-  every interactive completion arrived after it and paid a `/health` round trip before `session.create`. A backend that died is still recovered by the request that hits it (`session.create` fails on the
+  at most one probe in flight) and the request proceeds: with the default 2 s window almost every interactive
+  completion arrived after it and paid a `/health` round trip before `session.create`. A backend that died is still recovered by the request that hits it (`session.create` fails on the
   connection error, clears `healthyAt` and calls `ensureBackend()` again), a backend that never answered still takes
   the blocking path, and `OPENCODE_PROXY_HEALTH_CACHE_MS=0` keeps its documented "probe on every request" meaning.
 - **The backend child does not inherit the gateway's credentials.** The `opencode serve` spawn deletes `API_KEY`

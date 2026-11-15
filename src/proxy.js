@@ -982,12 +982,15 @@ function createApp(config) {
             });
             // Nothing has been answered yet, so say why; when a response is already on the wire (the auth check's 401,
             // or the 413 for an oversized body) the socket is simply closed, because the client is not waiting for
-            // another answer. The timeout is an error envelope like every other refusal, not a silent hang-up.
+            // another answer. The timeout is an error envelope like every other refusal, not a silent hang-up, and it
+            // names the deadline in force plus the two things the client can do: a stuck upload (a proxy that buffered
+            // the body, a script that declared `Content-Length` and never wrote it) reads a bare "not received" as an
+            // unexplained hang-up on a connection that is about to be closed underneath it.
             if (!reply.raw.headersSent) {
                 try {
                     reply.code(408).send({
                         error: {
-                            message: `Request body was not received within ${bodyReceiveDeadlineMs}ms`,
+                            message: `request body was not received within ${bodyReceiveDeadlineMs}ms; send the declared body or close the connection`,
                             type: 'invalid_request_error'
                         }
                     });

@@ -42,6 +42,16 @@ const SSE_CLIENT_WRITE_TIMEOUT_MS = 30000;
 // How long an oversized request body is still read and thrown away after it has been refused. Closing the socket at
 // once left the client's remaining bytes unread, and the kernel answers those with RST, so the 413 was lost.
 const BODY_DRAIN_TIMEOUT_MS = 5000;
+// How long a request that announced a body may take to deliver it. Fastify sets `requestTimeout: 0` (Node's own
+// 300 s default is disabled), so without this a client that sends `Content-Length: 4096` and then four bytes holds the
+// socket open for as long as it likes - measured: 20 s with no response and the socket still open, and even without a
+// key, because the 401 is written from the headers while Node keeps the connection to drain a body it will never read.
+// The effective deadline is bounded by the request budget (see createApp): receiving a body is part of receiving the
+// request, so no phase may outlive the budget the operator configured.
+const BODY_RECEIVE_TIMEOUT_MS = 30000;
+// How long a written response may take to leave before its socket is destroyed. `socket.destroy()` discards buffered
+// writes, so a response that is written and then destroyed in the same tick can be lost entirely.
+const SOCKET_CLOSE_TIMEOUT_MS = 250;
 // After the idle timeout the gateway polls for the rest of the answer; this is how many identical polls (a full idle
 // window worth) that recovery tolerates before it accepts a message the backend never marks finished.
 const IDLE_RECOVERY_STALL_POLLS = Math.max(3, Math.ceil(DEFAULT_EVENT_IDLE_TIMEOUT_MS / DEFAULT_POLL_INTERVAL_MS));
@@ -51,6 +61,30 @@ const IDLE_RECOVERY_STALL_POLLS = Math.max(3, Math.ceil(DEFAULT_EVENT_IDLE_TIMEO
 // without a random source, and the millisecond stamp keeps them roughly sortable.
 let completionIdSeq = 0;
 const newCompletionId = () => `chatcmpl-${Date.now().toString(36)}${String(completionIdSeq++).padStart(3, '0')}`;
+
+// `socket.destroy()` throws away whatever is still buffered in userland, so a response that is written and then
+// destroyed in the same tick can be lost: the client sees a reset instead of the envelope. `end()` flushes and closes,
+// and the fallback timer only destroys a socket whose close never completes (a peer that stopped reading).
+const closeSocketAfterFlush = (socket) => {
+    if (!socket || socket.destroyed) return;
+    if (socket.writableEnded) {
+        // Everything was already handed to the kernel by an earlier end(): there is nothing left to flush, and the
+        // socket has to go now because the client is still sending a body that will never be read.
+        socket.destroy();
+        return;
+    }
+    const forceClose = () => {
+        if (!socket.destroyed) socket.destroy();
+    };
+    const timer = setTimeout(forceClose, SOCKET_CLOSE_TIMEOUT_MS);
+    timer.unref();
+    socket.once('close', () => clearTimeout(timer));
+    try {
+        socket.end();
+    } catch (error) {
+        forceClose();
+    }
+};
 
 // One log line is one record. A client-controlled value carrying a newline would be read as a *second* record (a
 // forged request summary, a fake `[Security]` or `[Shutdown]` line), an ANSI escape would reach the operator's
@@ -658,7 +692,9 @@ function createApp(config) {
                 body
             );
         }
-        socket.destroy();
+        // Closing has to flush: destroy() on the next line discarded buffered writes, so under backpressure the client
+        // saw a reset instead of the envelope this handler exists to deliver
+        closeSocketAfterFlush(socket);
     };
 
     // Performance-oriented setup: no built-in logger (we log ourselves, so Fastify's automatic request logging has
@@ -718,6 +754,58 @@ function createApp(config) {
         return scheme ? trimmed.slice(scheme[0].length) : trimmed;
     };
 
+    // A body that never arrives must not hold a socket (BODY_RECEIVE_TIMEOUT_MS): Fastify sets `requestTimeout: 0`, so
+    // nothing else bounds the wait, and the socket is held even for a request the auth check already refused - the 401
+    // is written from the headers while Node keeps the connection alive to drain a body it will never read. The
+    // deadline follows the request budget, so an operator (and the smoke suite) can shorten it without another knob.
+    const bodyReceiveDeadlineMs = Math.max(1, Math.min(BODY_RECEIVE_TIMEOUT_MS, REQUEST_TIMEOUT_MS));
+    const armBodyDeadline = (request, reply, meta) => {
+        const raw = request.raw;
+        // Only an announced body is waited for, so every bodyless request keeps the hook's current cost
+        const announced = raw.headers['transfer-encoding'] !== undefined || Number(raw.headers['content-length']) > 0;
+        // A body that already arrived in full (a small body flushed with the headers) would never emit `end` here, and
+        // the timer would then close the socket of a completion that is being served normally
+        if (!announced || raw.complete) return;
+        // The connection is the request's socket, not `reply.raw`: a keep-alive response is detached from the socket
+        // once it ends (measured: `reply.raw.destroyed` was true, `reply.raw.socket` was null, and the client stayed
+        // connected), so the deadline has to close what the body is arriving on.
+        const socket = raw.socket;
+        const disarm = () => {
+            clearTimeout(timer);
+            raw.off('end', disarm);
+            raw.off('close', disarm);
+            raw.off('error', disarm);
+        };
+        const timer = setTimeout(() => {
+            disarm();
+            logger.warn('[Proxy] Request body did not arrive within its deadline, closing the connection', {
+                reqId: meta.reqId,
+                method: request.method,
+                ms: bodyReceiveDeadlineMs
+            });
+            // Nothing has been answered yet, so say why; when a response is already on the wire (the auth check's 401,
+            // or the 413 for an oversized body) the socket is simply closed, because the client is not waiting for
+            // another answer. The timeout is an error envelope like every other refusal, not a silent hang-up.
+            if (!reply.raw.headersSent) {
+                try {
+                    reply.code(408).send({
+                        error: {
+                            message: `Request body was not received within ${bodyReceiveDeadlineMs}ms`,
+                            type: 'invalid_request_error'
+                        }
+                    });
+                } catch (error) {
+                    // The reply is already owned by someone else: closing the connection is what matters
+                }
+            }
+            closeSocketAfterFlush(socket);
+        }, bodyReceiveDeadlineMs);
+        timer.unref();
+        raw.once('end', disarm);
+        raw.once('close', disarm);
+        raw.once('error', disarm);
+    };
+
     // A single onRequest hook does bookkeeping + access log, CORS and authentication: one hook per request costs
     // fewer dispatches than three, and the order (log wiring, CORS, auth) is unchanged.
     app.addHook('onRequest', (request, reply, done) => {
@@ -728,6 +816,8 @@ function createApp(config) {
         // characters, and this string ends up in the log line and in a response header.
         const meta = { reqId: requestId(request) || `gw-${startedAt.toString(36)}${Math.random().toString(36).slice(2, 6)}`, startedAt, path };
         request.gatewayLog = meta;
+        // Armed first: an unauthenticated client that stalls mid-body is exactly the case this has to cover
+        armBodyDeadline(request, reply, meta);
 
         // The summary is emitted from the raw response's events so hijacked SSE streams (which bypass the normal
         // reply lifecycle) are covered too; whichever event arrives first wins.
@@ -1640,28 +1730,51 @@ function createApp(config) {
                         request.gatewayLog.stream = wantsStream;
                     }
 
+                    // A content part the gateway cannot forward (an image, an audio clip, a file) is named and refused
+                    // instead of dropped: keeping only the text turned a multimodal request into a confident answer to
+                    // half of it, and the client had no way to know the model never saw the image. `text` parts of the
+                    // Responses API (`{type:"input_text", text}`) carry the same field, so they keep working.
                     const normalizeMessageContent = (content) => {
-                        if (typeof content === 'string') return content;
+                        if (typeof content === 'string') return { text: content };
                         if (Array.isArray(content)) {
-                            return content.map((part) => {
-                                if (typeof part === 'string') return part;
-                                if (part && typeof part.text === 'string') return part.text;
-                                return '';
-                            }).join('');
+                            let text = '';
+                            for (let i = 0; i < content.length; i += 1) {
+                                const part = content[i];
+                                if (typeof part === 'string') {
+                                    text += part;
+                                    continue;
+                                }
+                                if (part && typeof part.text === 'string') {
+                                    text += part.text;
+                                    continue;
+                                }
+                                // A part that carries neither a string nor a text field is data the gateway would have
+                                // to drop: name it, with the position the client sent it at
+                                if (part && typeof part === 'object') {
+                                    return { text, unsupported: { index: i, type: typeof part.type === 'string' ? part.type : 'unknown' } };
+                                }
+                                // null/number/boolean parts carry no content at all
+                            }
+                            return { text };
                         }
-                        if (content && typeof content.text === 'string') return content.text;
-                        if (content === null || content === undefined) return '';
-                        if (typeof content === 'number' || typeof content === 'boolean') return String(content);
-                        return '';
+                        if (content && typeof content.text === 'string') return { text: content.text };
+                        if (content === null || content === undefined) return { text: '' };
+                        if (typeof content === 'number' || typeof content === 'boolean') return { text: String(content) };
+                        return { text: '' };
                     };
 
                     const buildPromptParts = (rawMessages) => {
                         const parts = [];
                         const systemChunks = [];
                         const userContents = [];
-                        rawMessages.forEach((m) => {
+                        let unsupported = null;
+                        rawMessages.forEach((m, messageIndex) => {
                             const role = (m?.role || 'user').toLowerCase();
-                            const content = normalizeMessageContent(m?.content);
+                            const parsed = normalizeMessageContent(m?.content);
+                            if (!unsupported && parsed.unsupported) {
+                                unsupported = { messageIndex, partIndex: parsed.unsupported.index, type: parsed.unsupported.type };
+                            }
+                            const content = parsed.text;
                             // `developer` is OpenAI's newer name for the system role: a client that sends it means the
                             // instructions, not a chat turn, and embedding it as "DEVELOPER: …" in the conversation
                             // changed how a model reads it
@@ -1681,7 +1794,8 @@ function createApp(config) {
                         return {
                             parts,
                             system: systemChunks.join('\n\n'),
-                            lastUserMsg: userContents[userContents.length - 1] || ''
+                            lastUserMsg: userContents[userContents.length - 1] || '',
+                            unsupported
                         };
                     };
 
@@ -1701,7 +1815,17 @@ function createApp(config) {
                         }
                     }
 
-                    const { parts, system: systemMsg, lastUserMsg } = buildPromptParts(messages);
+                    const { parts, system: systemMsg, lastUserMsg, unsupported } = buildPromptParts(messages);
+                    // Named before the "no text at all" check: a request whose only part is an image must say that the
+                    // gateway cannot carry images, not that the client forgot to write any text
+                    if (unsupported) {
+                        return reply.code(400).send({
+                            error: {
+                                message: `messages[${unsupported.messageIndex}].content[${unsupported.partIndex}] uses an unsupported content part type "${unsupported.type}"; this gateway forwards text only`,
+                                type: 'invalid_request_error'
+                            }
+                        });
+                    }
                     const systemWithGuard = applyToolGuard(systemMsg);
                     if (!parts.length) {
                         return reply.code(400).send({ error: { message: 'messages must include at least one non-system text message', type: 'invalid_request_error' } });

@@ -42,7 +42,7 @@ Smoke test:
 curl -s http://127.0.0.1:8083/health
 curl -s -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8083/v1/models
 curl -s -H 'Authorization: Bearer sk-dummy-123' -H 'Content-Type: application/json' \
-  -d '{"model":"opencode/kimi-k2.5-free","messages":[{"role":"user","content":"hi"}]}' \
+  -d '{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}]}' \
   http://127.0.0.1:8083/v1/chat/completions
 ```
 

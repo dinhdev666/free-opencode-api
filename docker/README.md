@@ -4,7 +4,7 @@
 
 Container image of [Free OpenCode API](https://github.com/dinhdev666/free-opencode-api), an OpenAI-compatible gateway for the OpenCode CLI.
 
-The image bundles Node.js 22, the project source, and the OpenCode CLI (npm package `opencode-ai`), so nothing needs to be installed on the host. Project dependencies are installed with **pnpm** (enabled through Corepack and pinned by the `packageManager` field in `package.json`) using the committed `pnpm-lock.yaml`. Point any OpenAI client at the published port and start chatting with free models such as Kimi k2.5, GLM 4.7, and MiniMax m2.1.
+The image bundles Node.js 22, the project source, and the OpenCode CLI (npm package `opencode-ai`), so nothing needs to be installed on the host. Project dependencies are installed with **pnpm** (enabled through Corepack and pinned by the `packageManager` field in `package.json`) using the committed `pnpm-lock.yaml`. Point any OpenAI client at the published port and start chatting with the free models your OpenCode installation currently serves: `opencode/big-pickle` is a stable alias that OpenCode routes to whichever model it serves right now (and it is the gateway's default), while the concrete model ids rotate — `GET /v1/models` returns what is live right now.
 
 ---
 
@@ -100,13 +100,14 @@ Model list:
 curl -H "Authorization: Bearer sk-dummy-123" http://127.0.0.1:8083/v1/models
 ```
 
-Chat completion (non-streaming):
+Chat completion (non-streaming), with `opencode/big-pickle` — a stable alias for the model OpenCode currently serves;
+any id from the list above works too:
 
 ```bash
 curl -X POST http://127.0.0.1:8083/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-dummy-123" \
-  -d '{"model":"opencode/kimi-k2.5-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
+  -d '{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
 > `sk-dummy-123` is the built-in default key; the container never runs without authentication.
@@ -191,12 +192,12 @@ Example `docker logs` output per level:
 # info (default: one-line summary per request + startup info)
 [gateway] 2026-11-06T12:00:00.000Z [INFO] Log level: info (source: LOG_LEVEL)
 [gateway] 2026-11-06T12:00:00.123Z [INFO] [Proxy] Active at http://0.0.0.0:8083
-[gateway] 2026-11-06T12:00:05.456Z [INFO] POST /v1/chat/completions -> 200 3210ms [gw-m1abc2x3] model=opencode/kimi-k2.5-free stream=true
-[gateway] 2026-11-06T12:00:12.789Z [INFO] POST /v1/chat/completions -> 200 4822ms [gw-n4def5y6] model=opencode/glm-4.7-free stream=false
+[gateway] 2026-11-06T12:00:05.456Z [INFO] POST /v1/chat/completions -> 200 3210ms [gw-m1abc2x3] model=opencode/example-model-a stream=true
+[gateway] 2026-11-06T12:00:12.789Z [INFO] POST /v1/chat/completions -> 200 4822ms [gw-n4def5y6] model=opencode/example-model-b stream=false
 
 # debug (additionally logs full request bodies and responses; sensitive headers masked)
-[gateway] 2026-11-06T12:00:05.010Z [DEBUG] Incoming OpenAI request {"reqId":"gw-m1abc2x3","headers":{"authorization":"Bear***c9Zw","content-type":"application/json"},"body":{"model":"opencode/kimi-k2.5-free","messages":[...],"stream":true}}
-[gateway] 2026-11-06T12:00:05.032Z [DEBUG] Upstream payload (final request body to opencode serve) {"reqId":"gw-m1abc2x3","sessionId":"ses_...","model":"opencode/kimi-k2.5-free","payload":{"path":{"id":"ses_..."},"body":{"model":{...},"system":"...","parts":[...],"tools":{...}}}}
+[gateway] 2026-11-06T12:00:05.010Z [DEBUG] Incoming OpenAI request {"reqId":"gw-m1abc2x3","headers":{"authorization":"Bear***c9Zw","content-type":"application/json"},"body":{"model":"opencode/example-model-a","messages":[...],"stream":true}}
+[gateway] 2026-11-06T12:00:05.032Z [DEBUG] Upstream payload (final request body to opencode serve) {"reqId":"gw-m1abc2x3","sessionId":"ses_...","model":"opencode/example-model-a","payload":{"path":{"id":"ses_..."},"body":{"model":{...},"system":"...","parts":[...],"tools":{...}}}}
 [gateway] 2026-11-06T12:00:05.460Z [DEBUG] SSE stream summary {"reqId":"gw-m1abc2x3","chunks":12,"contentChars":866,"reasoningChars":0,"finishReason":"stop"}
 [gateway] 2026-11-06T12:00:12.780Z [DEBUG] Upstream response (non-stream full JSON) {"reqId":"gw-n4def5y6","response":{"id":"chatcmpl-...","choices":[{"message":{"content":"..."}}],"finish_reason":"stop"}}
 
@@ -241,7 +242,7 @@ Notes:
 
 Two OpenCode 1.19.5 compatibility issues are fixed directly in [`src/proxy.js`](../src/proxy.js) of the source repository, not patched inside the image. The image builds straight from the repository and the Dockerfile contains no runtime patching step.
 
-**Fix 1 — tool hang.** With opencode ≥ 1.19 and a free zen model (e.g. `opencode/deepseek-v4.1-flash-free`), `DISABLE_TOOLS=true` (the image default) disables every OpenCode tool, and as soon as either `read` or `glob` is disabled the prompt request hangs forever — the gateway never returns content. The fix keeps the two read-only tools `read` and `glob` enabled while still disabling every other tool (bash/edit/write/task/webfetch/question/grep/skill…). Both are read-only with no write or execution capability, and `stripFunctionCalls` output filtering plus the `TOOL_GUARD_MESSAGE` system prompt act as a second line of defense.
+**Fix 1 — tool hang.** With opencode ≥ 1.19 and one of the free zen models the backend serves, `DISABLE_TOOLS=true` (the image default) disables every OpenCode tool, and as soon as either `read` or `glob` is disabled the prompt request hangs forever — the gateway never returns content. The fix keeps the two read-only tools `read` and `glob` enabled while still disabling every other tool (bash/edit/write/task/webfetch/question/grep/skill…). Both are read-only with no write or execution capability, and `stripFunctionCalls` output filtering plus the `TOOL_GUARD_MESSAGE` system prompt act as a second line of defense.
 
 **Fix 2 — streaming SSE compatibility.** In opencode ≥ 1.19, SSE `message.part.updated` events carry no `properties.delta`, and `part.text` holds the part's **current full text**. Reading the increment via `const { part, delta } = event.properties` therefore always yielded `undefined`, so streams carried no content and only a finish chunk; worse, a fast assistant finish delivers `message.updated(finish=stop)` before the 4s first-chunk timer, resolving the collector early with empty content — a path the existing noData/idleTimeout fallbacks never covered (non-streaming responses were unaffected). The fix prefers `properties.delta` when present (older versions) and otherwise derives the increment by diffing `part.text` against what has already been accumulated (`startsWith` check followed by `slice`); when nothing has been streamed at all, it polls `pollForAssistantResponse` once for the full reply (filtered through `stripFunctionCalls`), and emits no delta if polling is also empty.
 

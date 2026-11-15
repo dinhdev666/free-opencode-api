@@ -8,6 +8,7 @@
  */
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import { parseBoolean } from '../src/proxy.js';
 import { readConfigFile } from '../src/config.js';
@@ -1056,6 +1057,68 @@ async function run() {
     check('the spawned backend does not outlive the gateway', backendGone, 'still answering');
     try { fs.unlinkSync(fakeBin); } catch { /* best effort */ }
     try { fs.unlinkSync(fakePidFile); } catch { /* best effort */ }
+
+    // --- a backend that answers /health but nothing else -------------------------------------------------
+    // A wedged opencode process (health OK, /session silent) used to hang the request handler forever: fetch has no
+    // default timeout, so the promise never settled, the client got no answer at all and the queue slot was never
+    // freed - at the default concurrency of 1 that stops the whole gateway. The wedged backend never answers, so the
+    // request can only end if the gateway itself sets a deadline.
+    const wedgedPort = GATEWAY_PORT + 9;
+    const wedgedBackend = http.createServer((request, response) => {
+        if (request.url === '/health') {
+            response.writeHead(200, { 'content-type': 'application/json' });
+            response.end('{"status":"ok"}');
+            return;
+        }
+        // Every other path is accepted and never answered
+    });
+    await new Promise((resolve) => wedgedBackend.listen(wedgedPort, '127.0.0.1', resolve));
+    const wedgedGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(wedgedPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${wedgedPort}`,
+            // Short budget: the assertion is that a deadline exists at all, not how large the default is
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '1500',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(wedgedGateway);
+    wedgedGateway.stdout.on('data', () => {});
+    wedgedGateway.stderr.on('data', () => {});
+    const wedgedUrl = `http://127.0.0.1:${wedgedPort + 1}`;
+    await waitForOk(`${wedgedUrl}/health`);
+    const wedgedStartedAt = Date.now();
+    const wedgedAnswer = await fetch(`${wedgedUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(15000)
+    }).then((r) => r.text().then((body) => ({ status: r.status, body })))
+        .catch((error) => ({ status: 0, body: error.message }));
+    const wedgedMs = Date.now() - wedgedStartedAt;
+    check('a backend that never answers is reported as a gateway timeout',
+        wedgedAnswer.status === 504 && /did not answer within/.test(wedgedAnswer.body),
+        `status ${wedgedAnswer.status} after ${wedgedMs}ms ${wedgedAnswer.body.slice(0, 140)}`);
+    // The slot has to be free again: a second request must reach its own timeout instead of queueing behind the
+    // first one (the queue timeout would otherwise answer 504 only after the full request budget)
+    const wedgedStartedAt2 = Date.now();
+    const wedgedAgain = await fetch(`${wedgedUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi again' }] }),
+        signal: AbortSignal.timeout(15000)
+    }).then((r) => r.text().then((body) => ({ status: r.status, body })))
+        .catch((error) => ({ status: 0, body: error.message }));
+    check('the gateway keeps serving after an upstream timeout',
+        wedgedAgain.status === 504 && Date.now() - wedgedStartedAt2 < 10000,
+        `status ${wedgedAgain.status} after ${Date.now() - wedgedStartedAt2}ms ${wedgedAgain.body.slice(0, 140)}`);
+    stopGateway(wedgedGateway);
+    await waitForExit(wedgedGateway);
+    await new Promise((resolve) => wedgedBackend.close(resolve));
+    if (typeof wedgedBackend.closeAllConnections === 'function') wedgedBackend.closeAllConnections();
 
     // --- graceful shutdown ------------------------------------------------------------------------------
     // The same property on the long-running gateway, whose backend is external and therefore untouched

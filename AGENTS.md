@@ -67,7 +67,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 120 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 122 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -204,6 +204,13 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **A finished message ends the stream, whatever the finish reason.** The collector settles on any non-empty
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.
+- **Every backend call carries a deadline.** `client.session.create`, `client.session.messages`,
+  `client.session.delete` and `client.session.prompt` are all called with an `AbortSignal` (`backendDeadline()`), and
+  an expired one answers `504` ("did not answer within …ms") instead of `500`. Node's `fetch` has no default timeout:
+  a wedged backend that still answers `/health` but never answers `/session` left the handler waiting forever, so the
+  client got no response at all and the queue slot was never released — at the default concurrency of 1 that stops the
+  whole gateway. Session cleanup uses its own shorter budget (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client
+  already has its answer, so it must not hold the slot for the full request budget.
 - **Timeouts and fallbacks are behavioural contracts.** The polling fallback, the shortened first-delta wait, the
   health-probe cache and the backend start-failure cooldown exist because of real OpenCode protocol quirks
   (opencode ≥ 1.19 event payloads, free zen models). Do not remove them without replacing the behaviour they cover.

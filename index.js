@@ -117,27 +117,40 @@ queueLimits.notes.forEach((note) => logger.warn(`[Config] ${note}`));
 try {
     const proxy = startProxy(finalConfig);
 
-    // Graceful shutdown: stop accepting connections, stop the backend, then exit. Long-lived SSE streams can keep
-    // server.close() pending, so in-flight sockets get a short grace period before being dropped and a watchdog
-    // guarantees the process leaves even if a client never disconnects.
+    // Graceful shutdown: stop accepting connections, let the responses in flight finish, then stop the backend and
+    // exit. Long-lived SSE streams can keep server.close() pending, so in-flight sockets get a short grace period
+    // before being dropped and a watchdog guarantees the process leaves even if a client never disconnects.
     let shuttingDown = false;
     const shutdown = (signal) => {
         if (shuttingDown) return;
         shuttingDown = true;
         logger.info(`[Shutdown] Received ${signal}, shutting down gracefully...`);
 
-        const watchdog = setTimeout(() => {
-            logger.warn('[Shutdown] Forcing exit, connections did not close in time');
+        // The backend answers the requests that are still in flight, so it is stopped only once they are gone: it
+        // used to be killed first, which turned a completion the gateway was already serving into an upstream error.
+        let backendStopped = false;
+        const stopBackend = () => {
+            if (backendStopped) return;
+            backendStopped = true;
+            proxy.killBackend();
+        };
+        const finish = (message, warn) => {
+            clearTimeout(watchdog);
+            // The backend must never outlive the gateway, whatever path gets here first
+            stopBackend();
+            if (warn) logger.warn(message);
+            else logger.info(message);
             process.exit(0);
-        }, 6000);
+        };
+
+        const watchdog = setTimeout(
+            () => finish('[Shutdown] Forcing exit, connections did not close in time', true),
+            6000
+        );
         watchdog.unref();
 
-        proxy.killBackend();
-        proxy.server.close(() => {
-            clearTimeout(watchdog);
-            logger.info('[Shutdown] Server closed');
-            process.exit(0);
-        });
+        // Stop accepting new connections; whatever is already being served keeps the backend it depends on
+        proxy.server.close(() => finish('[Shutdown] Server closed', false));
         // Give responses in flight a moment to finish, then drop whatever is still connected (open SSE streams)
         setTimeout(() => {
             try {

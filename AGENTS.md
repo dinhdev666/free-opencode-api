@@ -64,7 +64,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 101 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 110 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -89,8 +89,9 @@ content, so a test can prove both modes report it as an error and the failure pa
 `ENDONLY` (an answer whose finish event carries only `time.completed`, so a test can prove the stream still ends
 without waiting for the idle timeout) and
 `GROW` (an answer that is still being written when the prompt returns, so a test can prove the polled answer is never
-truncated) and `TAILTAG` (an answer whose last delta ends in a tag prefix that never becomes a tag, so a test can
-prove the held fragment is still delivered). Extend that stub and
+truncated) and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
+backend is killed or the gateway is shutting down) and `TAILTAG` (an answer whose last delta ends in a tag prefix that
+never becomes a tag, so a test can prove the held fragment is still delivered). Extend that stub and
 `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
 already taken (a stale process would answer with someone else's build) and SIGKILLs any child that ignores SIGTERM.
 
@@ -134,7 +135,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   Fastify's `code` when it rejected the body), `401` (auth, `type: "invalid_request_error"`,
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error), `503`
   (`type: "queue_full"`, the wait queue is full), `504` (timeout), `500` (anything else). Every error body carries a
-  `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name.
+  `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name. A backend that
+  disappears in the middle of a request is an upstream failure (`502`), not a gateway bug (`500`): the client is told
+  the upstream is gone, and the next request starts the backend again.
 - A provider failure is an upstream error in both modes. Non-streaming answers `502`; a streaming request whose
   provider failed before the first frame answers the same `502` envelope (the stream never started), and one that
   fails after frames are on the wire ends with the in-band error frame. It must never be streamed as assistant text:
@@ -194,8 +197,11 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **Timeouts and fallbacks are behavioural contracts.** The polling fallback, the shortened first-delta wait, the
   health-probe cache and the backend start-failure cooldown exist because of real OpenCode protocol quirks
   (opencode ≥ 1.19 event payloads, free zen models). Do not remove them without replacing the behaviour they cover.
-- **Signals belong to the entry point.** `index.js` owns `SIGINT`/`SIGTERM`: it closes the HTTP server, kills the
-  backend and exits, with a watchdog so an open SSE stream cannot block shutdown. Do not register signal handlers
+- **Signals belong to the entry point.** `index.js` owns `SIGINT`/`SIGTERM`: it closes the HTTP server, lets the
+  responses in flight finish (1.5 s grace), stops the backend and exits, with a watchdog so an open SSE stream cannot
+  block shutdown. The backend is stopped *after* that grace period, not before it: killing it first turned a
+  completion the gateway was already serving into an upstream error, which is the opposite of a graceful shutdown.
+  Every exit path stops the backend exactly once, so it can never outlive the gateway. Do not register signal handlers
   that call `process.exit()` from a module — they win the race and skip backend teardown.
 - **The wait queue is bounded** (`OPENCODE_PROXY_MAX_QUEUE`, default 64) because every waiting request pins its parsed
   body; overflow answers `503 queue_full` instead of growing memory. The cap counts *waiting* requests, so it is only
@@ -213,7 +219,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `OPENCODE_PATH` that does not exist is warned about rather than silently replaced by whatever the PATH search finds.
 - **Backend lifecycle changes** must keep these properties: `ensureBackend()` trusts a successful probe for
   `OPENCODE_PROXY_HEALTH_CACHE_MS`, connection failures clear that trust, a spawned process that exits during startup
-  aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm.
+  aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm. "Exits" means
+  `exitCode !== null || signalCode !== null`: a child killed by a signal reports `exitCode === null`, and testing the
+  exit code alone let a SIGKILLed backend look alive for the whole 60-iteration startup budget while
+  `isStarting` stayed true — every request in that window waited instead of answering. A request waiting on someone
+  else's start attempt falls through to its own attempt when that attempt ends without a reachable backend (the retry
+  cooldown still applies), because the first request after a crash should restart the backend, not report it gone.
 
 ## Performance guardrails
 

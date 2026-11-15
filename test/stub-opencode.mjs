@@ -238,6 +238,22 @@ const server = http.createServer(async (req, res) => {
                 }, 150);
                 return;
             }
+            if (session.promptText.includes('HOLD')) {
+                // Finished only after 400 ms: a non-streaming request is still waiting when the gateway starts
+                // shutting down, so a test can prove the backend outlives the responses it is answering
+                const message = {
+                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
+                    parts: [{ type: 'text', text: ANSWER.slice(0, 12) }]
+                };
+                session.messages.push(message);
+                sendJson(res, 200, { info: message.info, parts: [] });
+                setTimeout(() => {
+                    message.parts[0].text = ANSWER;
+                    message.info.finish = 'stop';
+                    message.info.time = { created: Date.now(), completed: Date.now() };
+                }, 400);
+                return;
+            }
             const toolTag = session.promptText.includes('TOOLTAG');
             const tailTag = session.promptText.includes('TAILTAG');
             if (session.promptText.includes('STALL')) {

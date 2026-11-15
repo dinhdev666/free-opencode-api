@@ -1503,6 +1503,41 @@ async function run() {
         /\[Config\] DISABLE_TOOLS='definitely' is not a boolean .*using false/.test(embedOutput),
         JSON.stringify(embedOutput.slice(0, 240)));
 
+    // --- an operator value stays on one log line -----------------------------------------------------------
+    // `config.json` and the environment are text a script can write, and the path and level warnings quoted the value
+    // verbatim: a newline in `OPENCODE_PATH` started a second record the gateway never wrote, the same forgery class
+    // as a model id (which `loggableModelId()` already normalises). The value is still echoed - it is what tells the
+    // operator which path or level is in force - just on one line.
+    const forgedPort = GATEWAY_PORT + 68;
+    const forgedUrl = `http://127.0.0.1:${forgedPort}`;
+    const forgedGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(forgedPort),
+            BIND_HOST: '127.0.0.1',
+            // A dead backend URL forces the spawn path, which is where the binary is resolved and reported; an empty
+            // PATH keeps the value under test from being replaced by whatever `opencode` the machine happens to have.
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${GATEWAY_PORT + 69}`,
+            PATH: '',
+            OPENCODE_PATH: '/nonexistent/forged\n[Shutdown] Not really shutting down',
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(forgedGateway);
+    let forgedOutput = '';
+    forgedGateway.stdout.on('data', (chunk) => { forgedOutput += chunk; });
+    forgedGateway.stderr.on('data', (chunk) => { forgedOutput += chunk; });
+    await waitForOk(`${forgedUrl}/health`);
+    for (let i = 0; i < 60 && !forgedOutput.includes('OPENCODE_PATH'); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const forgedConfigLines = forgedOutput.split('\n').filter((line) => line.includes('Not really shutting down'));
+    check('a newline in an operator value cannot forge a second log record',
+        forgedConfigLines.length > 0 &&
+            forgedConfigLines.every((line) => line.includes('/nonexistent/forged?[Shutdown]')),
+        JSON.stringify(forgedConfigLines));
+
     // The legacy debug switch loses to an explicit LOG_LEVEL. That used to happen in complete silence: an operator who
     // raised the detail with the documented switch got a warn-only log and a summary line that looked as if the switch
     // had never been needed. Both directions are asserted, so the promotion cannot be dropped either.

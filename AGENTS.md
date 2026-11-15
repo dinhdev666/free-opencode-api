@@ -21,9 +21,9 @@ These are product decisions, not implementation details. Do not "improve" them w
    `Authorization: Bearer <API_KEY>`; the scheme is matched case-insensitively with any amount of whitespace, and
    `X-Api-Key: <key>` is accepted as an alias when no `Authorization` header is sent (the preflight advertises that
    header, and clients configured with an api-key header send it) — a present `Authorization` header always decides,
-   so a wrong one is never rescued by the alias. Presence decides, not the parsed token: a proxy that injects
-   `Authorization: Basic …`, or a bare `Bearer`, sends a header the gateway could not read, and testing the parsed
-   token let the alias rescue it. A blank or missing `API_KEY` falls back to the built-in default
+   so a wrong one is never rescued by the alias. Presence decides, not the parsed token: a proxy injecting
+   `Authorization: Basic …` or a bare `Bearer` sends a header the gateway could not read, and testing the parsed token
+   let the alias rescue it. A blank or missing `API_KEY` falls back to the built-in default
    `sk-dummy-123` (`resolveApiKey()` in `src/proxy.js`). Never add a "disable auth" switch, never treat an empty key
    as "no auth". The bearer is compared in **bytes** (`timingSafeEqual` on two `Buffer`s of equal length): a key with
    non-ASCII characters matches in string length while differing in byte length, and comparing strings threw a
@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 321 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 322 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -104,14 +104,14 @@ block repeated by the answer), `BADPART` (a text part whose `text` is a number, 
 credential-bearing URL behind a long message) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
 `POST /session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 502 whose message quotes a
 credential-bearing URL), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
-list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every session creation after the n-th is accepted and
-never answered), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
+list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every session creation after the n-th goes
+unanswered), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
-body, for the summary bound). Extend that stub and `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is already taken, and SIGKILLs any child that ignores
-SIGTERM.
-The session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting
-the session (a backend round trip with nothing to do with the answer), so one read of `/__sessions` raced it and failed
-with `live: 1`; wait for `live: 0` in a bounded window.
+body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses
+to start on a taken port and SIGKILLs a child that ignores SIGTERM.
+Session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the
+session (a backend round trip of its own), so one read of `/__sessions` raced it and failed with `live: 1`; wait for
+`live: 0` in a bounded window.
 
 For exploratory work, start the stub (or a throwaway one in `/tmp`) on a spare port - `STUB_PORT=4405
 node test/stub-opencode.mjs`, which reads `STUB_PORT` and ignores a positional argument - and point the gateway at
@@ -299,16 +299,15 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - CORS headers are set on the raw response for every request, including hijacked streams:
   `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, OPTIONS`, `Allow-Headers: Content-Type,
   Authorization, X-Api-Key, X-Request-Id, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`. The
-  allow-list lives in one constant (`CORS_ALLOW_HEADERS` in `createApp()`) because it is written on three paths — the
+  allow-list lives in one constant (`CORS_ALLOW_HEADERS` in `createApp()`) because three paths write it — the
   `onRequest` hook, `clientErrorHandler` and `badUrlHandler`. It carries `X-Request-Id` because the gateway reads and
-  echoes that header: a browser client setting its own trace id sent a header its own preflight did not grant, so the
-  browser refused the request before it left the page.
+  echoes that header, and a browser client setting its own trace id had its request refused by its own preflight.
 - A request the HTTP parser rejects (a malformed request line or header, an oversized header block, a header
-  timeout) never reaches a hook, so it is answered by `clientErrorHandler`, registered through the
-  `clientErrorHandler` Fastify option: `400` for a parse error, `431` for `HPE_HEADER_OVERFLOW`, `408` for
-  `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope (`type: "invalid_request_error"`, the parser's code in `code`
-  when it is a plain `[A-Z_]+` token) with CORS headers, an `X-Request-Id` and a `warn` log line. Fastify's own
-  handler answered `{"error":"Bad Request",…}` with no `type`, CORS, request id or log line. It writes the envelope,
+  timeout) never reaches a hook, so the `clientErrorHandler` Fastify option answers it: `400` for a parse error,
+  `431` for `HPE_HEADER_OVERFLOW`, `408` for `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope
+  (`type: "invalid_request_error"`, the parser's code in `code` when it is a plain `[A-Z_]+` token) with CORS headers,
+  an `X-Request-Id` and a `warn` log line, where Fastify's own
+  handler answered `{"error":"Bad Request",…}` with none of those. It writes the envelope,
   then closes with `socket.end()` (`closeSocketAfterFlush()`), never `socket.destroy()`: `destroy()` discards buffered
   writes, so under backpressure the client got a reset instead of the error it was promised.
 - A URL the **router** cannot decode (a percent escape that is not valid UTF-8, `GET /v1/models/%E0%A4%A`) never reaches
@@ -330,9 +329,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   The same applies to **text**: `resolveBackendAuth()` (`src/proxy.js`) splits the userinfo out of the value the SDK is
   given and `maskUrlCredentials()` masks a `scheme://user:pass@` inside any sentence. Both exist because the documented
   shape could not work at all - Node's `fetch` refuses a URL carrying credentials, so every completion answered `502`
-  with `Request cannot be constructed from a URL that includes credentials: http://user:secret@…/session`, the secret
-  inside the client-facing body and the error log. The userinfo now travels as a Basic `Authorization` header (and on
-  `checkHealth()`, which read its `401` as "backend missing"), and every upstream reason that reaches a client or a log
+  quoting `http://user:secret@…/session` at the client and in the error log. The userinfo now travels as a Basic
+  `Authorization` header (and on `checkHealth()`, which read its `401` as "backend missing"), and every upstream reason
+  that reaches a client or a log
   line goes through `clientFacingText()` (`maskUrlCredentials()` + `maskUrlQuery()`, cut at 512 characters): a backend
   or a proxy in front of it can quote a URL in its own error payload.
 - Request log format: `METHOD url -> status Xms [reqId] model=… stream=…` (info for `/v1/*`, debug otherwise).
@@ -340,7 +339,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   (`loggableModelId()`: control characters replaced, 128 characters max; a URL over 512 characters is cut with a
   `…[truncated N chars]` marker): one log line is one record, and a newline in a model id used to start a second,
   attacker-written line (`FORGED [INFO] …`) while a 2 MB id produced a 2 MB line. The backend still receives the id
-  verbatim - the contract does not restrict model ids, only what is logged is normalised.
+  verbatim - the contract does not restrict model ids, only what is logged is normalised, and an **operator** value
+  quoted in a startup line goes through `loggableConfigValue()` for the same reason: `config.json` and the environment
+  are text a script can write.
 
 ## Working rules for code changes
 
@@ -354,7 +355,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **Logging** goes through `src/logger.js` (`logger.info`, `logger.warn`, `logger.error`, `logger.debug`). No
   `console.log` in `src/` or `index.js`. Never log an unmasked `authorization` header, and never print the API key:
   `docker/docker-entrypoint.sh` reports the key it generated as `sk-a***(22 chars)` — nothing but the length up to 16
-  characters — because `docker logs` is collected as often as not (`maskHeaders`/`maskSecret` in `src/logger.js`). Header **names** are matched against
+  characters — because `docker logs` is collected (`maskHeaders`/`maskSecret` in `src/logger.js`). Header **names** are matched against
   `SENSITIVE_HEADER_PATTERN`, built from the exported `SENSITIVE_NAME_ALTERNATIVES` (`auth`, `authorization`,
   `authentication`, `api-key`/`apikey`, `token`, `secret`, `cookie`, `session`, `passw`, `key`, `code`, `sig`,
   `signature`, `credential`, `bearer` as whole name segments) rather than a fixed denylist: `x-goog-api-key`,
@@ -404,8 +405,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   for `DISABLE_TOOLS` it is the one the switch exists to prevent: a typo leaves the model's `<function_calls>` markup in
   the answer while the operator believes it is filtered out. `parseBoolean()`
   stays the only parser (it is also used on request bodies, where a warning would be wrong); `readFlag()` only
-  reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable) and the echoed
-  value is stripped of control characters and cut at 64, because it lands in a log line.
+  reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable); the value goes
+  through `loggableConfigValue()` too, because it lands in a log line.
   `startProxy()` applies the same rule to its own fallbacks (`flagOption()`), for an embedder that calls it directly
   with no entry point to resolve the option first: an option the caller passed is taken as given — `index.js` already
   reported it, and a second line for one value reads like two different settings — while an option that is absent
@@ -416,9 +417,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   directory, because the container writes it next to the app; a `config.json` in the cwd is ignored, so startup warns
   `[Config] config.json is read from …; the file at … is ignored`.
   An environment variable that is present but **blank** counts as unset (`envOrFile()` in `src/config.js`): `PORT` and
-  `API_KEY` were read with `??`, where an empty string is a value, so `API_KEY= PORT=` shadowed `config.json` — the
-  gateway listened on the default port and authenticated with the built-in public key while the file named a
-  different port and a real secret. Every other key falls through on a blank value; keep it that way.
+  `API_KEY` were read with `??`, where an empty string is a value: `API_KEY= PORT=` shadowed `config.json`, so the
+  gateway listened on the default port with the built-in public key while the file named another port and a real
+  secret. Keep every key on that rule.
   A **key nobody reads** is named at startup and ignored (`[Config] config.json has an unknown key 'APIKEY' (did you
   mean 'API_KEY'?) - it is ignored`, via `findUnknownKeys()`): a misspelled key changed nothing at all in complete
   silence, so the gateway ran the default while the operator was sure the value in the file was in force. A
@@ -517,8 +518,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   get the static fallback quickly instead of waiting a completion budget for a silent provider.
 - **A promise that loses a race needs a handler.** `promptWithTimeout` races the prompt against its own timer and the
   losing promise keeps running: a rejection arriving afterwards (the backend dies, the deadline aborts the fetch)
-  reached nothing and became an unhandled rejection, which terminates the process by default — one slow completion
-  could take the whole gateway down. Every raced promise gets a `.catch(() => {})`.
+  reached nothing and became an unhandled rejection, which terminates the process: one slow completion could take the
+  whole gateway down. Every raced promise gets a `.catch(() => {})`.
 - **Timeouts and fallbacks are behavioural contracts.** The polling fallback, the shortened first-delta wait, the
   health-probe cache and the start-failure cooldown exist because of real OpenCode protocol quirks (opencode ≥ 1.19
   event payloads, free zen models). Do not remove them without replacing the behaviour they cover.
@@ -565,7 +566,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   not the graceful one. The 2.x warning it feeds is unchanged, and it now arrives while the gateway is already serving.
 - **The backend command survives the shell it runs in.** `opencodeBin` is quoted whenever the spawn uses a shell
   (`C:\Program Files\...opencode.cmd` does not start unquoted, and `;`/`&` in a path would be read as operators);
-  paths carrying `"`, `$` or a backtick are refused instead, because quoting cannot neutralise them. A configured
+  paths carrying `"`, `$`, a backtick or a control character are refused instead, because quoting cannot neutralise
+  them (a line break splits the command into two). A configured
   `OPENCODE_PATH` that does not exist is warned about rather than silently replaced by whatever the PATH search finds.
 - **The start attempt is claimed before the probe.** `state.isStarting` is set synchronously, before the
   `checkHealth` call that may suspend, and released in a `finally` on every path: claiming it only after that probe
@@ -592,8 +594,8 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   connection error, clears `healthyAt` and calls `ensureBackend()` again), a backend that never answered still takes
   the blocking path, and `OPENCODE_PROXY_HEALTH_CACHE_MS=0` keeps its documented "probe on every request" meaning.
 - **The backend child does not inherit the gateway's credentials.** The `opencode serve` spawn deletes `API_KEY`
-  (and `OPENCODE_PROXY_DEBUG`) from the environment it passes on, and the version probe does the same: the child is an
-  agent runtime that runs model-directed tools, and it authenticates nothing with a key that only guards this gateway.
+  (and `OPENCODE_PROXY_DEBUG`) from the environment it passes on, and the version probe does the same: the child runs
+  model-directed tools and authenticates nothing with a key that guards only this gateway.
   Provider credentials the CLI needs live in its own auth store or under their own names, so they stay. The jail
   directory (`<tmp>/opencode-proxy-jail/<salt>`, the child's cwd and its whole `HOME` under `USE_ISOLATED_HOME`) is
   created `0700`: on a shared `/tmp` the default `0755` let every other local user list and traverse it.
@@ -625,9 +627,9 @@ pnpm dlx autocannon -c 10 -d 8 -m POST -H "content-type: application/json" \
 ```
 
 Measure with the request log off (`LOG_LEVEL=error`): at the default `info` every `/v1/*` request writes a line, and
-a redirected stdout is synchronous, so the log sets the ceiling (`GET /v1/models`: ~104,900 req/s at 0.08 ms quiet,
-~71,600 at 1.02 ms with the line - a before/after mixing log levels compares the logger). Report before/after instead
-of an improvement, and update the README table only with numbers you measured on that machine, naming the conditions.
+a redirected stdout is synchronous, so the log sets the ceiling (`GET /v1/models`: ~104,900 req/s at 0.08 ms quiet vs
+~71,600 at 1.02 ms with the line - mixing log levels compares the logger). Report before/after instead of an
+improvement, and update the README table only with numbers you measured on that machine, naming the conditions.
 Completion requests are serialised by default (`OPENCODE_PROXY_MAX_CONCURRENCY=1`); that default stays `1`.
 
 ## Definition of done
@@ -636,8 +638,8 @@ Before reporting a change as complete:
 
 1. `pnpm run check` passes.
 2. `pnpm test` passes; new behaviour that can be asserted belongs in `test/smoke.mjs`.
-3. `pnpm run check:commits <base>..HEAD` passes for the commits the change adds; a subject that is wrong has to be
-   fixed before it is published, because rewriting published history rewrites every commit after it.
+3. `pnpm run check:commits <base>..HEAD` passes for the commits the change adds; a wrong subject must be fixed
+   before it is published, because rewriting published history rewrites every commit after it.
 4. The gateway boots (`pnpm start` or `node index.js`) and `GET /health` returns `200`; with a real backend,
    `/v1/models` with the key returns `200` and without it `401`, a chat completion works with and without
    `stream: true`, and an invalid body returns `400`.

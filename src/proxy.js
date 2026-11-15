@@ -132,6 +132,20 @@ const echoedValue = (value) => {
         : clean;
 };
 
+// An operator-supplied value on its way into a log line, under the rule `loggableModelId()` applies to client input.
+//
+// `config.json` and the environment are text a script can write, so a value carrying a newline starts a second log
+// record the gateway never wrote - the same forgery class as a model id, and these lines quote the value so the
+// operator can see what was in force (a path typo, a misspelled level). The value is kept; it just stays on one line
+// and bounded.
+const MAX_LOGGED_CONFIG_LENGTH = 128;
+export const loggableConfigValue = (value) => {
+    const clean = String(value).replace(CONTROL_CHARS_RE, '?');
+    return clean.length > MAX_LOGGED_CONFIG_LENGTH
+        ? `${clean.slice(0, MAX_LOGGED_CONFIG_LENGTH)}…[truncated ${clean.length - MAX_LOGGED_CONFIG_LENGTH} chars]`
+        : clean;
+};
+
 /**
  * The type of a value from a request body as a word, for an error message that names what arrived. `Array.isArray`
  * comes first because `typeof []` is 'object': the reader of "found an object" would be told the field they sent is
@@ -188,7 +202,7 @@ export function readFlag(label, value, fallback) {
     if (shown === '') return fallback;
     // The value is operator input and the line is one log record: control characters out, length bounded
     logger.warn(
-        `[Config] ${label}='${shown.replace(/[\u0000-\u001f\u007f]/g, '?').slice(0, 64)}' is not a boolean ` +
+        `[Config] ${label}='${loggableConfigValue(shown)}' is not a boolean ` +
         `(use true/false, yes/no, on/off or 1/0), using ${fallback}`
     );
     return fallback;
@@ -267,7 +281,7 @@ function resolveOpencodePath(requestedPath) {
             if (fs.existsSync(resolved)) return { path: resolved, source: 'config' };
             // A configured path that does not exist is almost always a typo or a moved installation. Say so: the
             // PATH search below would otherwise hide it behind a binary the operator did not choose
-            logger.warn(`[Proxy] OPENCODE_PATH '${input}' does not exist; using the OpenCode found on PATH instead`);
+            logger.warn(`[Proxy] OPENCODE_PATH '${loggableConfigValue(input)}' does not exist; using the OpenCode found on PATH instead`);
         }
     }
 
@@ -3261,9 +3275,9 @@ async function ensureBackend(config, options = {}) {
             const resolved = resolveOpencodePath(OPENCODE_PATH);
             const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;
             if (resolved.path) {
-                logger.info(`[Proxy] Using OpenCode binary: ${opencodeBin} (source: ${resolved.source})`);
+                logger.info(`[Proxy] Using OpenCode binary: ${loggableConfigValue(opencodeBin)} (source: ${resolved.source})`);
             } else {
-                logger.warn(`[Proxy] Unable to resolve OpenCode binary for '${OPENCODE_PATH}'. Using as-is.`);
+                logger.warn(`[Proxy] Unable to resolve OpenCode binary for '${loggableConfigValue(OPENCODE_PATH)}'. Using as-is.`);
             }
 
             // Cross-platform spawn options
@@ -3271,11 +3285,13 @@ async function ensureBackend(config, options = {}) {
                 opencodeBin.endsWith('.cmd') || opencodeBin.endsWith('.bat');
             // A shell parses the command line, so the binary has to survive it: quoting keeps spaces intact (an
             // unquoted "C:\Program Files\...opencode.cmd" does not start at all) and turns operators such as `;` or
-            // `&` into literal text. Only what quoting cannot neutralise is refused.
+            // `&` into literal text. Only what quoting cannot neutralise is refused - including a control character,
+            // because quoting does not survive a line break: `"a\nb"` is still two commands, and a path carrying one
+            // ran whatever followed it as a second shell line.
             let spawnTarget = opencodeBin;
             if (useShell) {
-                if (/["$`]/.test(opencodeBin)) {
-                    throw new Error(`OPENCODE_PATH cannot be passed through a shell: ${opencodeBin}`);
+                if (/["$`\u0000-\u001f\u007f]/.test(opencodeBin)) {
+                    throw new Error(`OPENCODE_PATH cannot be passed through a shell: ${loggableConfigValue(opencodeBin)}`);
                 }
                 spawnTarget = `"${opencodeBin}"`;
             }
@@ -3289,7 +3305,7 @@ async function ensureBackend(config, options = {}) {
             // Backend listen address: OPENCODE_BIND_HOST (default 127.0.0.1; set to 0.0.0.0 inside Docker so port 4097
             // can be exposed)
             const bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
-            logger.info(`[Proxy] Starting OpenCode backend: --port ${port} --hostname ${bindHost}`);
+            logger.info(`[Proxy] Starting OpenCode backend: --port ${loggableConfigValue(port)} --hostname ${loggableConfigValue(bindHost)}`);
             state.process = spawn(spawnTarget, ['serve', '--port', port, '--hostname', bindHost], spawnOptions);
 
             // Handle spawn errors
@@ -3298,7 +3314,7 @@ async function ensureBackend(config, options = {}) {
                 spawnError = err;
                 logger.error(`[Proxy] Failed to spawn OpenCode: ${err.message}`);
                 if (err.code === 'ENOENT') {
-                    logger.error(`[Proxy] Command '${OPENCODE_PATH}' not found. Please ensure OpenCode is installed and in your PATH.`);
+                    logger.error(`[Proxy] Command '${loggableConfigValue(OPENCODE_PATH)}' not found. Please ensure OpenCode is installed and in your PATH.`);
                     logger.error(`[Proxy] You can specify the full path in config.json using 'OPENCODE_PATH'`);
                 }
             });
@@ -3450,7 +3466,7 @@ export function startProxy(options) {
     let levelResolution = logger.setLevel(config.LOG_LEVEL);
     let levelSource = levelResolution.explicit ? 'LOG_LEVEL' : 'default';
     if (!levelResolution.valid) {
-        logger.warn(`Invalid LOG_LEVEL '${levelResolution.requested}', fallback to 'info' (valid values: error/warn/info/debug)`);
+        logger.warn(`Invalid LOG_LEVEL '${loggableConfigValue(levelResolution.requested)}', fallback to 'info' (valid values: error/warn/info/debug)`);
     } else if (!levelResolution.explicit && config.DEBUG) {
         // setLevel() reports the promotion as explicit, so the source has to be recorded here: reading it back from
         // the resolved object claimed the operator had set LOG_LEVEL, which is not where `debug` came from.
@@ -3474,7 +3490,7 @@ export function startProxy(options) {
     app.listen({ port: config.PORT, host: config.BIND_HOST })
         .then(async () => {
             logger.info(`Log level: ${logger.level} (source: ${levelSource})`);
-            logger.info(`[Proxy] Active at http://${config.BIND_HOST}:${config.PORT}`);
+            logger.info(`[Proxy] Active at http://${loggableConfigValue(config.BIND_HOST)}:${config.PORT}`);
             try {
                 await ensureBackend(config, { force: true });
             } catch (error) {

@@ -4,6 +4,7 @@ import {
     resolveApiKey,
     getQueueLimits,
     normalizeBackendUrl,
+    loggableConfigValue,
     readFlag
 } from './src/proxy.js';
 import { readConfigFile, envOrFile, findUnknownKeys } from './src/config.js';
@@ -179,14 +180,14 @@ normalisedBackendUrl.notes.forEach((note) => logger.warn(`[Config] ${note}`));
 
 logger.info('[Config] Starting with configuration:');
 logger.info(`  - Port: ${finalConfig.PORT}`);
-logger.info(`  - Bind Host: ${finalConfig.BIND_HOST}`);
+logger.info(`  - Bind Host: ${loggableConfigValue(finalConfig.BIND_HOST)}`);
 logger.info(`  - Backend: ${maskBackendUrl(finalConfig.OPENCODE_SERVER_URL)}`);
-logger.info(`  - Bind Host for OpenCode backend: ${finalConfig.OPENCODE_BIND_HOST}`);
-logger.info(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
+logger.info(`  - Bind Host for OpenCode backend: ${loggableConfigValue(finalConfig.OPENCODE_BIND_HOST)}`);
+logger.info(`  - OpenCode Path: ${loggableConfigValue(finalConfig.OPENCODE_PATH)}`);
 logger.info(`  - API Key: ${finalConfig.API_KEY === DEFAULT_API_KEY ? `default (${DEFAULT_API_KEY})` : 'custom'} - authentication always enforced`);
 logger.info(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
 logger.info(`  - Isolated HOME for OpenCode: ${finalConfig.USE_ISOLATED_HOME ? 'Yes' : 'No'}`);
-logger.info(`  - Log Level (requested): ${finalConfig.LOG_LEVEL || 'info (default)'}`);
+logger.info(`  - Log Level (requested): ${loggableConfigValue(finalConfig.LOG_LEVEL || 'info (default)')}`);
 const queueLimits = getQueueLimits(finalConfig);
 logger.info(`  - Concurrency: ${queueLimits.concurrency} completion(s) processed in parallel`);
 logger.info(`  - Wait queue: ${queueLimits.queue} waiting completion(s) before 503 queue_full`);
@@ -217,7 +218,7 @@ function probeOpencodeVersion(binPath) {
 
 function reportOpencodeVersion(result) {
     if (result.error) {
-        logger.warn(`[Warning] Cannot verify OpenCode installation: ${finalConfig.OPENCODE_PATH}`);
+        logger.warn(`[Warning] Cannot verify OpenCode installation: ${loggableConfigValue(finalConfig.OPENCODE_PATH)}`);
         logger.warn('[Warning] Please ensure OpenCode is installed (a 1.x release is required):');
         logger.warn('  Windows: npm install -g "opencode-ai@1"');
         logger.warn('  Linux/macOS: curl -fsSL https://opencode.ai/install | bash  (then check `opencode --version`)');

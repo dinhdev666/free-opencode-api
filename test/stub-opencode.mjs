@@ -31,6 +31,9 @@ const FAIL_MESSAGES = Number(process.env.STUB_FAIL_MESSAGES || 0);
 const ALWAYS_FAIL_MESSAGES = process.env.STUB_ALWAYS_FAIL_MESSAGES === '1';
 // Drop the connection on the first N polls, the way a backend that is being restarted does
 const DROP_MESSAGES = Number(process.env.STUB_DROP_MESSAGES || 0);
+// Answer every poll with a 2xx body that is not a message list (an envelope that moved, a proxy in front of the
+// backend), so a test can prove the gateway reports an unreadable payload as such instead of "failed (status 200)"
+const UNREADABLE_MESSAGES = process.env.STUB_UNREADABLE_MESSAGES === '1';
 let failedMessagePolls = 0;
 let droppedMessagePolls = 0;
 // Counts GET /session/:id/message calls, so a test can prove the non-streaming fast path needed no poll at all
@@ -322,6 +325,14 @@ const server = http.createServer(async (req, res) => {
                 }, 400);
                 return;
             }
+            if (session.promptText.includes('SUICIDE')) {
+                // The backend dies the moment it has accepted the prompt: the poll can never race a completed answer
+                // the way a timed SIGKILL from the test could (a slow runner let the kill land after the gateway had
+                // already accepted a stable partial answer), so "the backend disappears mid request" is deterministic
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                setTimeout(() => process.kill(process.pid, 'SIGKILL'), 25);
+                return;
+            }
             if (session.promptText.includes('PAUSE')) {
                 // Silenced for longer than the SSE idle timeout and finished only afterwards: the gateway must recover
                 // through polling instead of ending the stream on the text it already had
@@ -385,6 +396,7 @@ const server = http.createServer(async (req, res) => {
                 req.destroy();
                 return undefined;
             }
+            if (UNREADABLE_MESSAGES) return sendJson(res, 200, { result: 'unexpected', items: null });
             failedMessagePolls += 1;
             if (ALWAYS_FAIL_MESSAGES || failedMessagePolls <= FAIL_MESSAGES) {
                 return sendJson(res, 500, { error: { message: 'transient poll failure' } });

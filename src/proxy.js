@@ -1050,6 +1050,18 @@ function createApp(config) {
         };
     };
 
+    // What actually arrived, for a debug line: the top-level type and a few keys tell an envelope change (a "data" or
+    // "messages" wrapper) from an error body, which is the whole question when a poll answers with a payload nobody
+    // can read.
+    const describePayload = (value) => {
+        if (value === null) return 'null';
+        if (value === undefined) return 'undefined';
+        if (Array.isArray(value)) return `array(${value.length})`;
+        if (typeof value !== 'object') return typeof value;
+        const keys = Object.keys(value);
+        return `object(${keys.slice(0, 6).join(',')}${keys.length > 6 ? ',...' : ''})`;
+    };
+
     function extractFromParts(parts) {
         if (!Array.isArray(parts)) return { content: '', reasoning: '' };
         // Single pass, no intermediate arrays: this runs for every polled message of every request
@@ -1150,10 +1162,24 @@ function createApp(config) {
             if (!messages) {
                 consecutiveFailures += 1;
                 const { status, reason } = upstreamFailureReason(messagesRes);
-                logger.warn('[Proxy] Polling failed', { sessionId, attempt: consecutiveFailures, status });
+                // A 2xx answer whose body is not a message list is not the backend saying "200: failed" - it is a
+                // payload the gateway cannot read (an envelope change, a body from something that is not an OpenCode
+                // backend). The shape is named instead, because `failed ... (status 200)` reads like a gateway bug and
+                // sends the reader looking in the wrong place.
+                const statusPhrase = status !== undefined && status >= 400 ? ` (status ${status})` : '';
+                const unreadable = !reason && !statusPhrase
+                    ? `: the backend answered with a payload that is not a message list (status ${status === undefined ? 'unknown' : status})`
+                    : '';
+                const detail = `${statusPhrase}${reason || unreadable}`;
+                logger.warn('[Proxy] Polling failed', {
+                    sessionId,
+                    attempt: consecutiveFailures,
+                    status: status === undefined ? null : status,
+                    payload: logger.isEnabled('debug') ? describePayload(messagesRes) : undefined
+                });
                 if (consecutiveFailures >= MAX_POLL_FAILURES) {
                     throw new ProviderError(
-                        `OpenCode backend failed while polling the answer${status ? ` (status ${status})` : ''}${reason}`,
+                        `OpenCode backend failed while polling the answer${detail}`,
                         status
                     );
                 }

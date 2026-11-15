@@ -1516,8 +1516,10 @@ function createApp(config) {
                         statusCode = 504;
                     }
                     // A provider failure is an upstream error, whether the client asked for a stream or not: the
-                    // non-streaming path answers 502 for the same condition
-                    if (error.name === 'ProviderError') {
+                    // non-streaming path answers 502 for the same condition. So is a backend that went away mid
+                    // request: a raw `fetch failed` used to be reported as 500, which tells a client "the gateway has
+                    // a bug" instead of "the upstream is gone".
+                    if (error.name === 'ProviderError' || isConnectionError(error)) {
                         statusCode = 502;
                     }
                     if (error.message && error.message.includes('ENOENT')) {
@@ -1656,7 +1658,7 @@ async function ensureBackend(config, options = {}) {
     }
 
     if (state.isStarting) {
-        // Wait for startup to complete
+        // Another request (or the startup warmup) is starting the backend: wait for it instead of starting a second one
         for (let i = 0; i < STARTING_WAIT_ITERATIONS; i++) {
             await new Promise(r => setTimeout(r, STARTING_WAIT_INTERVAL_MS));
             try {
@@ -1664,13 +1666,12 @@ async function ensureBackend(config, options = {}) {
                 state.healthyAt = Date.now();
                 return;
             } catch (e) { }
-            if (!state.isStarting) {
-                // The other request finished its start attempt without the backend becoming reachable: fail now
-                // instead of continuing to wait for a startup that is no longer running
-                throw new Error(`OpenCode backend unavailable (last start attempt failed: ${state.lastStartError || 'unknown error'})`);
-            }
+            // That attempt is over without a reachable backend: fall through and start one here rather than failing
+            // this request - the first request after a backend crash used to answer an error even though a start was
+            // now possible. The start path itself still honours the retry cooldown, so this cannot become a storm.
+            if (!state.isStarting) break;
         }
-        throw new Error('Backend startup timeout');
+        if (state.isStarting) throw new Error('Backend startup timeout');
     }
 
     try {
@@ -1817,9 +1818,15 @@ async function ensureBackend(config, options = {}) {
                 await new Promise(r => setTimeout(r, STARTUP_WAIT_INTERVAL_MS));
                 if (spawnError) break;
                 // Spawned through a shell (missing/unresolved binary) the process exits with a code instead of
-                // emitting 'error'; stop waiting as soon as that happens
-                if (state.process.exitCode !== null) {
-                    spawnError = new Error(`OpenCode backend exited during startup (code ${state.process.exitCode})`);
+                // emitting 'error'; stop waiting as soon as that happens. A child killed by a signal reports
+                // exitCode === null and only sets signalCode, so testing the exit code alone missed every backend that
+                // was killed (OOM, SIGKILL, a supervisor) and kept every request waiting for the full 60-iteration
+                // startup budget while the backend was already gone.
+                if (state.process.exitCode !== null || state.process.signalCode !== null) {
+                    const how = state.process.exitCode !== null
+                        ? `code ${state.process.exitCode}`
+                        : `signal ${state.process.signalCode}`;
+                    spawnError = new Error(`OpenCode backend exited during startup (${how})`);
                     break;
                 }
                 try {

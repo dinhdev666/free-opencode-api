@@ -873,8 +873,123 @@ async function run() {
     }).then((response) => { return response.text().then(() => response.status); });
     check('a non-ASCII key authenticates when it matches exactly', unicodeStatus === 200, `status ${unicodeStatus}`);
 
+    // --- shutdown keeps the backend until the answers are done -------------------------------------------
+    // The gateway spawns its own backend here (a script that starts the stub on the requested port), because only a
+    // backend the gateway owns is killed on shutdown - and that is the one an in-flight completion depends on.
+    const spawnPort = GATEWAY_PORT + 7;
+    const spawnUrl = `http://127.0.0.1:${spawnPort}`;
+    const fakeBin = path.join(os.tmpdir(), `free-opencode-api-fake-opencode-${process.pid}.sh`);
+    const fakePidFile = `${fakeBin}.pid`;
+    fs.writeFileSync(fakeBin, [
+        '#!/bin/sh',
+        '# Test double for `opencode serve`: starts the stub on the port the gateway asked for',
+        'port=4097',
+        'prev=""',
+        'for arg in "$@"; do',
+        '    if [ "$prev" = "--port" ]; then port="$arg"; fi',
+        '    prev="$arg"',
+        'done',
+        `echo $$ > "${fakePidFile}"`,
+        `STUB_PORT="$port" exec "${process.execPath}" "${path.join(ROOT, 'test', 'stub-opencode.mjs')}"`,
+        ''
+    ].join('\n'), { mode: 0o755 });
+    const spawnGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(spawnPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: spawnUrl,
+            OPENCODE_PATH: fakeBin,
+            // Retry immediately after the backend died: the cooldown exists for a start that cannot succeed at all
+            OPENCODE_PROXY_START_RETRY_MS: '0',
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(spawnGateway);
+    spawnGateway.stdout.on('data', () => {});
+    spawnGateway.stderr.on('data', () => {});
+    const gatewayUrl = `http://127.0.0.1:${spawnPort + 1}`;
+    await waitForOk(`${gatewayUrl}/health`);
+    // The first completion is what starts the backend (`/v1/models` falls back to a static list instead)
+    const spawnedCompletion = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+    }).then((r) => r.text().then((body) => ({ status: r.status, body })));
+    check('the gateway starts the backend it was pointed at',
+        spawnedCompletion.status === 200 && spawnedCompletion.body.includes(ANSWER),
+        `status ${spawnedCompletion.status} ${spawnedCompletion.body.slice(0, 120)}`);
+    const backendUp = await fetch(`${spawnUrl}/health`).then((r) => r.status).catch(() => 0);
+    check('the spawned backend is reachable', backendUp === 200, `status ${backendUp}`);
+
+    // A backend that disappears in the middle of a request is an upstream failure (502), not a gateway bug (500),
+    // and the next request must start it again instead of failing until the process is restarted
+    const killInFlight = fetch(`${gatewayUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'HOLD while the backend dies' }] })
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
+    await sleep(250);
+    try {
+        process.kill(Number(fs.readFileSync(fakePidFile, 'utf8').trim()), 'SIGKILL');
+    } catch { /* already gone */ }
+    const killedAnswer = await killInFlight;
+    check('a backend that dies mid request is reported as an upstream error',
+        killedAnswer.status === 502 && killedAnswer.json?.error?.type === 'server_error',
+        `status ${killedAnswer.status} ${JSON.stringify(killedAnswer.json)?.slice(0, 140)}`);
+    const restartStartedAt = Date.now();
+    const afterRestart = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi again' }] }),
+        // A gateway that waits out its whole startup budget instead of noticing the dead child fails here quickly
+        signal: AbortSignal.timeout(10000)
+    }).then((r) => r.text().then((body) => ({ status: r.status, body })))
+        .catch((error) => ({ status: 0, body: error.message }));
+    check('the next request starts the backend again',
+        afterRestart.status === 200 && afterRestart.body.includes(ANSWER),
+        `status ${afterRestart.status} after ${Date.now() - restartStartedAt}ms ${afterRestart.body.slice(0, 140)}`);
+
+    const heldInFlight = fetch(`${gatewayUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'HOLD in flight' }] })
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
+    await sleep(150);
+    const spawnExit = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 15000);
+        spawnGateway.once('exit', (code) => {
+            clearTimeout(timer);
+            resolve(code);
+        });
+        stopGateway(spawnGateway);
+    });
+    const heldAnswer = await heldInFlight;
+    check('a completion in flight is answered while shutting down', heldAnswer.status === 200,
+        `status ${heldAnswer.status} ${JSON.stringify(heldAnswer.json)?.slice(0, 120)}`);
+    check('the answer served during shutdown is complete',
+        heldAnswer.json?.choices?.[0]?.message?.content === ANSWER,
+        JSON.stringify(heldAnswer.json?.choices?.[0]?.message));
+    check('shutdown exits cleanly with a spawned backend', spawnExit === 0, `exit ${spawnExit}`);
+    let backendGone = false;
+    for (let i = 0; i < 20 && !backendGone; i += 1) {
+        backendGone = await fetch(`${spawnUrl}/health`).then(() => false).catch(() => true);
+        if (!backendGone) await sleep(100);
+    }
+    check('the spawned backend does not outlive the gateway', backendGone, 'still answering');
+    try { fs.unlinkSync(fakeBin); } catch { /* best effort */ }
+    try { fs.unlinkSync(fakePidFile); } catch { /* best effort */ }
+
     // --- graceful shutdown ------------------------------------------------------------------------------
-    const exitCode = await new Promise((resolve) => {
+    // The same property on the long-running gateway, whose backend is external and therefore untouched
+    const heldLongLived = fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'HOLD in flight' }] })
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
+    await sleep(150);
+    const longLivedExit = await new Promise((resolve) => {
         const timer = setTimeout(() => resolve('timeout'), 10000);
         gateway.once('exit', (code) => {
             clearTimeout(timer);
@@ -882,7 +997,10 @@ async function run() {
         });
         stopGateway(gateway);
     });
-    check('SIGINT shuts the gateway down cleanly', exitCode === 0, `exit ${exitCode}`);
+    const heldLongLivedAnswer = await heldLongLived;
+    check('SIGINT shuts the gateway down cleanly', longLivedExit === 0, `exit ${longLivedExit}`);
+    check('the shutdown leaves no truncated answer behind', heldLongLivedAnswer.status === 200,
+        `status ${heldLongLivedAnswer.status}`);
 }
 
 const TIMEOUT_MS = 120000;

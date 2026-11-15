@@ -1058,6 +1058,49 @@ async function run() {
     try { fs.unlinkSync(fakeBin); } catch { /* best effort */ }
     try { fs.unlinkSync(fakePidFile); } catch { /* best effort */ }
 
+    // --- a backend that reports no models ---------------------------------------------------------------
+    // A provider payload the gateway cannot read (a changed shape, a version that reports nothing) answers 200 with an
+    // empty list. Serving {"data":[]} leaves a client with no model to choose, so the gateway falls back to its single
+    // static model - exactly as it does when the call fails - and does not cache the empty answer.
+    const emptyStubPort = GATEWAY_PORT + 11;
+    const emptyStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(emptyStubPort), STUB_EMPTY_PROVIDERS: '1' }
+    });
+    children.push(emptyStub);
+    emptyStub.stdout.on('data', () => {});
+    emptyStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${emptyStubPort}/health`);
+    const emptyGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(emptyStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${emptyStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(emptyGateway);
+    emptyGateway.stdout.on('data', () => {});
+    emptyGateway.stderr.on('data', () => {});
+    const emptyUrl = `http://127.0.0.1:${emptyStubPort + 1}`;
+    await waitForOk(`${emptyUrl}/health`);
+    const emptyList = await fetch(`${emptyUrl}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then((r) => r.json()).catch(() => null);
+    check('an empty provider list falls back to the static model',
+        emptyList?.object === 'list' && emptyList.data?.length === 1 && emptyList.data[0].id === 'opencode/kimi-k2.5-free',
+        JSON.stringify(emptyList)?.slice(0, 140));
+    const emptyListAgain = await fetch(`${emptyUrl}/v1/models`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then((r) => r.json()).catch(() => null);
+    check('the empty answer is not cached',
+        emptyListAgain?.data?.length === 1 && emptyListAgain.data[0].id === 'opencode/kimi-k2.5-free',
+        JSON.stringify(emptyListAgain)?.slice(0, 140));
+    stopGateway(emptyGateway);
+    await waitForExit(emptyGateway);
+    stop(emptyStub);
+    await waitForExit(emptyStub);
+
     // --- a backend that answers /health but nothing else -------------------------------------------------
     // A wedged opencode process (health OK, /session silent) used to hang the request handler forever: fetch has no
     // default timeout, so the promise never settled, the client got no answer at all and the queue slot was never

@@ -12,6 +12,7 @@ The image bundles Node.js 22, the project source, and the OpenCode CLI (npm pack
 
 - [Image Tag](#image-tag)
 - [Quick Start](#quick-start)
+- [Running as a Non-Root User](#running-as-a-non-root-user)
 - [OpenCode Authentication](#opencode-authentication)
 - [API Self-Check](#api-self-check)
 - [Configuration](#configuration)
@@ -54,6 +55,31 @@ The service is then reachable at `http://<your-ip>:8083`.
 
 ---
 
+## Running as a Non-Root User
+
+The image does not run as root. [`docker/Dockerfile`](Dockerfile) ends with `USER node`, so the gateway, the
+`opencode serve` backend it spawns and every tool that backend runs are all the unprivileged `node` user of the
+official Node.js base image — **uid/gid `1000`**. The CLI is still installed as root at build time (`npm install -g
+opencode-ai`), and `/app` is handed to `node:node` because the entrypoint writes `/app/config.json` there on first
+boot.
+
+What that changes in practice:
+
+| Situation | Effect |
+| --- | --- |
+| `docker exec free-opencode-api stat -c '%a %U' /app/config.json` | Works — `docker exec` joins the container as `node` as well, and the generated file belongs to that user (`600 node`) |
+| A bind-mounted `config.json` | Must be **readable by uid 1000**. If it is not (a `0600` file owned by your host user, since a bind mount keeps the host uid on Linux), the container stops with `[Config] config.json cannot be read: EACCES: permission denied, open '/app/config.json'` instead of silently starting with the built-in key. Make it readable (`chmod 0644`, or `chown 1000`) — the key it carries is then readable by that uid anyway |
+| A bind-mounted OpenCode credentials/state directory | Must be readable **and writable** by uid 1000, because `opencode` keeps writing there. `chown -R 1000:1000 ~/.local/share/opencode` on the host, or let the container create it (option 1 under [OpenCode Authentication](#opencode-authentication)) |
+| Any other directory you mount | Needs to be writable by uid 1000 (the writable locations inside the image are `HOME` = `/home/node`, `/app` and the temp directory) |
+| `docker exec -u 0 …` | Still possible for a one-off command, but the image always *starts* as `node`; a `--user` override has to own or be able to write `/app` for the first-boot `config.json` write to succeed |
+| `docker run --rm --entrypoint id <image>` | Prints `uid=1000(node) gid=1000(node) groups=1000(node)`; CI fails the build when the uid is `0` |
+
+Home directory: because the user is `node`, `HOME` is **`/home/node`**, not `/root` (the base image already owns that
+directory for this user). `opencode` writes its state under `/home/node/.local/...` — see
+[OpenCode Authentication](#opencode-authentication) for mounting host credentials.
+
+---
+
 ## OpenCode Authentication
 
 The OpenCode CLI inside the container must be authenticated before it can call model providers. Choose one option:
@@ -64,7 +90,10 @@ The OpenCode CLI inside the container must be authenticated before it can call m
 docker exec -it free-opencode-api opencode auth login
 ```
 
-**Option 2 — mount credentials already created on the host** (`~` is the host user's home; the container runs as root):
+**Option 2 — mount credentials already created on the host** (`~` is the host user's home; the container runs as the
+unprivileged `node` user, uid 1000, so `HOME` is `/home/node` and the mounted directory must be readable *and writable*
+by that uid — `sudo chown -R 1000:1000 ~/.local/share/opencode` once, see
+[Running as a Non-Root User](#running-as-a-non-root-user)):
 
 ```bash
 docker run -d \
@@ -73,7 +102,7 @@ docker run -d \
   --name free-opencode-api \
   --privileged \
   -p 8083:8083 \
-  -v ~/.local/share/opencode:/root/.local/share/opencode \
+  -v ~/.local/share/opencode:/home/node/.local/share/opencode \
   dinhdev666/free-opencode-api
 ```
 
@@ -158,8 +187,11 @@ docker run -d --restart=always --network common-all --name free-opencode-api --p
 - **`LOG_LEVEL` is the exception on the write path**: it is never written into `config.json`, so it can only come from
   the environment (default `info`).
 - The first-boot line in `docker logs` shows the generated settings with the **API key masked** (`sup*** (22 chars)`):
-  the file it writes is `0600` and holds the real key, but container logs are usually collected and shipped, so the key
-  must never be printed. The startup `[Security]` warning still tells you when the built-in `sk-dummy-123` is in use.
+  the file it writes is `0600`, owned by the container user (`node`, uid 1000), and holds the real key, but container
+  logs are usually collected and shipped, so the key must never be printed. The startup `[Security]` warning still
+  tells you when the built-in `sk-dummy-123` is in use.
+- A `config.json` you bind-mount yourself has to be **readable by uid 1000**, otherwise the container refuses to start
+  rather than run with the built-in key (see [Running as a Non-Root User](#running-as-a-non-root-user)).
 - A `config.json` that exists but is invalid stops the container with a clear error instead of silently falling back to
   the defaults — otherwise it would run with the built-in `sk-dummy-123` instead of your key.
 - The image's own defaults (used when generating `config.json`) differ from the program defaults for the container:
@@ -278,6 +310,25 @@ its `opencode serve` serves the web UI instead of the session API, so the contai
 `502 … rejected session creation (status 405)` for every completion. Override the pin deliberately with
 `--build-arg OPENCODE_VERSION=<1.x version>`; the version that ended up in a running container is available with
 `docker run --rm <image> opencode --version`.
+
+### Workflow actions are pinned to commit SHAs
+
+Every `uses:` line in `.github/workflows/ci.yml` and `.github/workflows/docker-publish.yml` names a full 40-character
+commit SHA with the release in a trailing comment (`uses: docker/build-push-action@10e90e3… # v6.19.2`), because the
+publishing workflow leaves a Docker Hub token with write scope on the runner: a retagged major (`@v6`) would be code
+nobody reviewed running at a version nobody froze. `ci.yml` enforces this — the step "Workflow actions are pinned to
+commit SHAs" fails when any action reference is not a 40-character SHA.
+
+To update a pin, resolve the commit the tag currently points at (an annotated tag needs one more hop to the commit)
+and replace the SHA plus its comment:
+
+```bash
+repo=docker/build-push-action tag=v6
+sha=$(gh api "repos/$repo/git/ref/tags/$tag" --jq '.object.sha')
+[ "$(gh api "repos/$repo/git/ref/tags/$tag" --jq '.object.type')" = "tag" ] \
+  && sha=$(gh api "repos/$repo/git/tags/$sha" --jq '.object.sha')
+echo "$repo@$tag -> $sha"
+```
 
 ---
 

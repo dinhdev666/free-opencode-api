@@ -2100,7 +2100,15 @@ function createApp(config) {
                                 }
                             });
                         }
-                    } else if (request.body !== undefined && request.body !== null) {
+                    } else if (request.body === undefined || request.body === null) {
+                        // A body of literal `null` decodes to a value indistinguishable from "no body", and this is the
+                        // one non-object the branches around it cannot see: the client was answered "messages array is
+                        // required" about a field it never omitted, the mistake `42`, `true` and `[]` were fixed for.
+                        // The header decides, because only it knows whether anything was sent; a chunked body cannot
+                        // tell an empty stream from `null`, so that shape keeps the missing-field answer.
+                        const announced = Number(request.headers['content-length']);
+                        if (Number.isFinite(announced) && announced > 0) return refuseNonObjectBody(null);
+                    } else {
                         // An array is an object to `typeof`, and it used to reach the `messages` checks: a client that
                         // sent the wrong shape was told about a field it never mentioned
                         if (typeof request.body !== 'object' || Array.isArray(request.body)) {

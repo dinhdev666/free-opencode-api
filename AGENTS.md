@@ -177,10 +177,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   received (`GET /__sessions` → `lastSystemPrompt`) so the suite can assert it.
 - **A body that is not a JSON object is named as one.** Whether a string body still needs parsing is decided by the
   **content type**, not by the value: `"hi"` under `application/json` decoded to a string, and reading it as unparsed
-  text answered "not valid JSON" about a body that parses perfectly, while `42`, `true`, `[]` were answered `messages
+  text answered "not valid JSON" about a body that parses perfectly, while `42`, `true`, `[]`, `null` were answered `messages
   array is required` about a field never sent. All are `request body must be a JSON object, found …`; no body at all
-  keeps `messages array is required`, and an **empty** body (a retry that lost its payload) names the emptiness and
-  the fix (`request body is empty; send a JSON object with a messages array`, code kept) whatever the content type,
+  keeps `messages array is required`, and an **empty** body (a retry that lost its payload) names the fix (`request body is empty; send a JSON object with a messages array`, code kept) whatever the content type,
   not Fastify's sentence about the header the client set correctly.
 - **A missing `messages` is not an unusable one.** Three client mistakes used to share a single message: a body with
   no `messages`, a `messages` that is not an array (`"hi"`, `{}`) and an empty array (`[]`) all answered

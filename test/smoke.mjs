@@ -777,14 +777,28 @@ async function run() {
         /forbidden property name/.test(String(badJsonPayload?.error?.message)),
         JSON.stringify(badJsonPayload?.error?.message));
 
+    // `null` is valid JSON, so the parser hands back a value that looks exactly like "no body", and the client was
+    // answered "messages array is required" - the mistake the other scalars were fixed for. `Content-Length` is what
+    // tells the two apart, so the assertion sends a real body and reads the sentence it earns.
     const nullBody = await fetch(`${BASE}/v1/chat/completions`, {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
         body: 'null'
     });
     const nullBodyJson = await nullBody.json().catch(() => null);
-    check('a JSON null body returns 400', nullBody.status === 400, `status ${nullBody.status}`);
-    check('400 for a null body keeps the envelope', typeof nullBodyJson?.error?.message === 'string', JSON.stringify(nullBodyJson));
+    check('a JSON null body is named as a body that is not an object',
+        nullBody.status === 400 && nullBodyJson?.error?.message === 'request body must be a JSON object, found null',
+        `status ${nullBody.status} ${String(nullBodyJson?.error?.message)}`);
+    // A request that announced nothing keeps its own sentence, so the two are not conflated in the other direction
+    // either: `Content-Length: 0` is emptiness, not a `null` that arrived.
+    const noBody = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json', 'content-length': '0' }
+    });
+    const noBodyJson = await noBody.json().catch(() => null);
+    check('a completion that announced an empty body is named as empty, not as null',
+        noBody.status === 400 && /request body is empty/.test(String(noBodyJson?.error?.message)),
+        `status ${noBody.status} ${String(noBodyJson?.error?.message)}`);
 
     // An empty body under `application/json` is what a retry whose payload went missing sends, and Fastify's own
     // sentence blamed the content type the client had just set: the envelope names the emptiness and the fix instead.

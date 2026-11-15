@@ -1991,6 +1991,12 @@ async function run() {
     check('a body over the configured limit answers 413', oversized.status === 413, `status ${oversized.status}`);
     check('the 413 keeps the OpenAI envelope', oversizedJson?.error?.type === 'invalid_request_error',
         JSON.stringify(oversizedJson)?.slice(0, 160));
+    // The limit is a knob the client cannot see, and the fix (send less, or raise it) depends on the number, so the
+    // refusal names the value this gateway was started with instead of saying only that something was too large
+    check('the 413 names the limit it enforced',
+        oversizedJson?.error?.message === 'request body is too large (limit 1 MiB); send a smaller body or raise '
+            + 'OPENCODE_PROXY_MAX_BODY_MB',
+        JSON.stringify(oversizedJson?.error?.message));
     const withinLimit = await fetch(`${bodyUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },

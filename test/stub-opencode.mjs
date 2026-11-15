@@ -255,6 +255,22 @@ const server = http.createServer(async (req, res) => {
                 }, 150);
                 return;
             }
+            if (session.promptText.includes('SLOWFINISH')) {
+                // Written slowly and only finished after 3 s: a non-streaming request is still running well after a
+                // client that disconnected has given up, so a test can prove the slot was freed for real
+                const message = {
+                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
+                    parts: [{ type: 'text', text: ANSWER.slice(0, 12) }]
+                };
+                session.messages.push(message);
+                sendJson(res, 200, { info: message.info, parts: [] });
+                setTimeout(() => {
+                    message.parts[0].text = ANSWER;
+                    message.info.finish = 'stop';
+                    message.info.time = { created: Date.now(), completed: Date.now() };
+                }, 3000);
+                return;
+            }
             if (session.promptText.includes('HOLD')) {
                 // Finished only after 400 ms: a non-streaming request is still waiting when the gateway starts
                 // shutting down, so a test can prove the backend outlives the responses it is answering

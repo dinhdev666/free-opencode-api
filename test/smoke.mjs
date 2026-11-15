@@ -793,6 +793,58 @@ async function run() {
     check('rejected requests leave the gateway healthy', cappedHealth.status === 200, `status ${cappedHealth.status}`);
     await cappedHealth.text();
 
+    // A client that gives up on a non-streaming completion used to keep its slot until the backend finished: at the
+    // default concurrency of 1 that blocks every other request for an answer nobody will read.
+    const abandonedPort = GATEWAY_PORT + 20;
+    const abandonedGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(abandonedPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            OPENCODE_PROXY_MAX_CONCURRENCY: '1',
+            OPENCODE_PROXY_MAX_QUEUE: '0',
+            REQUEST_TIMEOUT_MS: '20000',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(abandonedGateway);
+    const abandonedUrl = `http://127.0.0.1:${abandonedPort}`;
+    await waitForOk(`${abandonedUrl}/health`);
+    const abandonedCompletion = (content) => fetch(`${abandonedUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content }] })
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
+
+    // A raw request that is destroyed mid-flight is a client that closed the tab: the stub still needs ~2 s for the
+    // SLOW answer, which is longer than this check waits
+    const abandonedRequest = new Promise((resolve) => {
+        const req = http.request({
+            host: '127.0.0.1',
+            port: abandonedPort,
+            path: '/v1/chat/completions',
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' }
+        }, (response) => {
+            response.resume();
+            resolve(response.statusCode);
+        });
+        req.on('error', () => resolve('disconnected'));
+        req.end(JSON.stringify({ messages: [{ role: 'user', content: 'SLOWFINISH abandoned' }] }));
+        setTimeout(() => req.destroy(), 300);
+    });
+    check('a non-streaming client can disconnect mid-request', (await abandonedRequest) === 'disconnected',
+        'the request was not interrupted');
+    // The abandoned completion is still running in the backend; its slot must already be free again
+    await sleep(700);
+    const afterAbandon = await abandonedCompletion('hi');
+    check('a disconnected non-streaming client frees its slot at once', afterAbandon.status === 200,
+        `status ${afterAbandon.status} ${JSON.stringify(afterAbandon.json)}`);
+    stopGateway(abandonedGateway);
+    await waitForExit(abandonedGateway);
+
     // --- a configured limit is reported --------------------------------------------------------------------
     // A clamp or a typo used to be invisible: the gateway silently ran with a different limit than the one configured
     const limitPort = GATEWAY_PORT + 5;

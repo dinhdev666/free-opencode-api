@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 243 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 244 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -294,7 +294,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `GET /__sessions` so the smoke suite can assert `live === 0`.
 - CORS headers are set on the raw response for every request, including hijacked streams:
   `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, OPTIONS`, `Allow-Headers: Content-Type,
-  Authorization, X-Api-Key, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`.
+  Authorization, X-Api-Key, X-Request-Id, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`. The
+  allow-list lives in one constant (`CORS_ALLOW_HEADERS` in `createApp()`) because it is written on three paths — the
+  `onRequest` hook, `clientErrorHandler` and `badUrlHandler` — and three hand-copied lists are three chances to
+  advertise something different. It carries `X-Request-Id` because the gateway reads and echoes that header: a browser
+  client that sets its own trace id sent a header its own preflight did not grant, and the browser refused the request
+  before it left the page (the response side was already exposed).
 - A request the HTTP parser rejects (a malformed request line or header, an oversized header block, a header
   timeout) never reaches a hook, so it is answered by `clientErrorHandler`, registered through the
   `clientErrorHandler` Fastify option: `400` for a parse error, `431` for `HPE_HEADER_OVERFLOW`, `408` for

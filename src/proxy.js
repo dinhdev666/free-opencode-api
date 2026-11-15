@@ -720,10 +720,24 @@ function createApp(config) {
         return { id: requestedId, name, object: 'model', owned_by: provider };
     };
     const modelByIdSchema = { schema: { response: { 200: MODEL_SCHEMA } } };
-    app.get('/v1/models/:modelId', modelByIdSchema, async (request) => describeModel(String(request.params?.modelId || '')));
+    // A blank id (`/v1/models//`, `/v1/models/%20`) reaches this route with an empty param, because a doubled slash is
+    // read as a trailing slash. Describing "" answered 200 with `{"id":"","name":""}` - not a model at all - so a blank
+    // id is a missing route instead. `/v1/models/` itself still answers the listing.
+    app.get('/v1/models/:modelId', modelByIdSchema, async (request, reply) => {
+        const modelId = String(request.params?.modelId || '').trim();
+        if (!modelId) return reply.callNotFound();
+        return describeModel(modelId);
+    });
     // Model ids contain slashes (`opencode/kimi-k2.5-free`), and clients send them unencoded as often as escaped:
     // without the wildcard route the unencoded form hit the 404 handler.
-    app.get('/v1/models/*', modelByIdSchema, async (request) => describeModel(String(request.params?.['*'] || '')));
+    app.get('/v1/models/*', modelByIdSchema, async (request, reply) => {
+        // `/v1/models/` answers the listing (a trailing slash is ignored), so an empty id here means a doubled slash or
+        // a blank segment. Describing "" would answer 200 with `{"id":"","name":""}`, which is not a model at all - the
+        // request addressed a route that does not exist.
+        const modelId = String(request.params?.['*'] || '').trim();
+        if (!modelId) return reply.callNotFound();
+        return describeModel(modelId);
+    });
 
     // Debug logs all go through the logger (visible with LOG_LEVEL=debug; the legacy DEBUG switch is still
     // honoured, startProxy maps DEBUG=true onto the debug level)

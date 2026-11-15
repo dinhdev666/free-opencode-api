@@ -1012,8 +1012,8 @@ function createApp(config) {
         reply.raw.once('close', logSummary);
 
         // CORS headers are written on the raw response so they are present for streamed (hijacked) replies as well.
-        // x-api-key is not read by the gateway, but browsers send it on behalf of clients that do, and a rejected
-        // preflight would break those clients before they ever reach the auth check.
+        // `X-Api-Key` is accepted as an alias for the bearer token below, and a browser only sends it when the
+        // preflight advertises it: a rejected preflight breaks those clients before they ever reach the auth check.
         reply.raw.setHeader('X-Content-Type-Options', NO_SNIFF);
         reply.raw.setHeader('Access-Control-Allow-Origin', '*');
         reply.raw.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');

@@ -16,7 +16,7 @@
   "packageManager": "pnpm@12.18.0",
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check src/proxy.js && node --check src/logger.js && node --check src/config.js && node --check test/smoke.mjs && node --check test/stub-opencode.mjs",
+    "check": "node test/check-syntax.mjs",
     "test": "node test/smoke.mjs"
   },
   "keywords": [

@@ -42,7 +42,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 
 | Path | Responsibility |
 | --- | --- |
-| `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary, calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
+| `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved concurrency/queue capacity and any clamp, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object) stops the gateway, because silently continuing would run with the built-in key instead of the configured one. |
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix and `maskHeaders()` used by debug logging. |
@@ -64,7 +64,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 89 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 92 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -186,10 +186,13 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **The wait queue is bounded** (`OPENCODE_PROXY_MAX_QUEUE`, default 64) because every waiting request pins its parsed
   body; overflow answers `503 queue_full` instead of growing memory. The cap counts *waiting* requests, so it is only
   reached while every slot is busy: `0` means "never queue", not "refuse every completion" (a lone request with a free
-  slot is served, which is what makes a `0` configuration safe to try). A request whose client disconnects while it is
-  still queued is dropped when its turn comes (`reply.raw` 'close'), so it never spends backend time or delays the
-  requests behind it. Do not use `request.raw.destroyed` as the disconnect signal: the request stream is destroyed as
-  soon as its body has been read, which is the normal case.
+  slot is served, which is what makes a `0` configuration safe to try). A slot is released when its response is
+  complete (`release()` in `runQueuedTask`), not when the task promise settles: the session deletion after the answer
+  is a backend round trip, and holding the slot through it made an immediate follow-up request look like a full
+  gateway. `.finally(release)` stays the safety net, so `release()` is idempotent and every path frees the slot. A
+  request whose client disconnects while it is still queued is dropped when its turn comes (`reply.raw` 'close'), so
+  it never spends backend time or delays the requests behind it. Do not use `request.raw.destroyed` as the disconnect
+  signal: the request stream is destroyed as soon as its body has been read, which is the normal case.
 - **The backend command survives the shell it runs in.** `opencodeBin` is quoted whenever the spawn uses a shell
   (`C:\Program Files\...opencode.cmd` does not start unquoted, and `;`/`&` in a path would be read as operators);
   paths carrying `"`, `$` or a backtick are refused instead, because quoting cannot neutralise them. A configured

@@ -202,13 +202,26 @@ function resolveOpencodePath(requestedPath) {
     return { path: null, source: 'not-found' };
 }
 
+// Reads an integer limit from the environment. A value that cannot be used must not look like it took effect: an
+// operator who raises OPENCODE_PROXY_MAX_CONCURRENCY (a throughput knob) and sees no change has no way to tell a typo
+// from a clamp, so every adjustment is kept as a note for the startup summary.
+function readLimit(name, { min, max, fallback }) {
+    const raw = process.env[name];
+    if (raw === undefined || String(raw).trim() === '') return { value: fallback, note: null };
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) {
+        return { value: fallback, note: `${name}='${raw}' is not a number, using ${fallback}` };
+    }
+    const floored = Math.floor(parsed);
+    if (floored < min) return { value: min, note: `${name}=${floored} is below the minimum ${min}, using ${min}` };
+    if (floored > max) return { value: max, note: `${name}=${floored} is above the maximum ${max}, using ${max}` };
+    return { value: floored, note: null };
+}
+
 // How many chat completions may run at the same time. 1 (the default) preserves the historical behaviour of
 // serializing every completions request; raise it to let independent OpenCode sessions run in parallel.
-const MAX_CONCURRENCY = (() => {
-    const raw = Number(process.env.OPENCODE_PROXY_MAX_CONCURRENCY);
-    if (!Number.isFinite(raw) || raw < 1) return 1;
-    return Math.min(Math.floor(raw), 32);
-})();
+const concurrencyLimit = readLimit('OPENCODE_PROXY_MAX_CONCURRENCY', { min: 1, max: 32, fallback: 1 });
+const MAX_CONCURRENCY = concurrencyLimit.value;
 
 let activeTasks = 0;
 
@@ -252,12 +265,16 @@ function processQueue() {
 
 // Every waiting request holds its parsed body (up to the 50 MB body limit), so the wait queue is bounded:
 // past this point new requests are rejected immediately with a 503 instead of growing memory until they time out.
-const MAX_QUEUE_LENGTH = (() => {
-    const raw = Number(process.env.OPENCODE_PROXY_MAX_QUEUE);
-    // A missing or malformed value must never disable the cap (Number('abc') is NaN, which would compare false forever)
-    if (!Number.isFinite(raw) || raw < 0) return 64;
-    return Math.min(Math.floor(raw), 4096);
-})();
+// A missing or malformed value must never disable the cap (Number('abc') is NaN, which would compare false forever)
+const queueLimit = readLimit('OPENCODE_PROXY_MAX_QUEUE', { min: 0, max: 4096, fallback: 64 });
+const MAX_QUEUE_LENGTH = queueLimit.value;
+
+// The resolved capacity, for the entry point's startup summary: an operator who sets a limit must be able to see the
+// value the gateway actually uses (and why it differs from what was asked for).
+export function getQueueLimits() {
+    const notes = [concurrencyLimit.note, queueLimit.note].filter(Boolean);
+    return { concurrency: MAX_CONCURRENCY, queue: MAX_QUEUE_LENGTH, notes };
+}
 
 class QueueFullError extends Error {
     constructor() {

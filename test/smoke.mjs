@@ -602,6 +602,36 @@ async function run() {
     check('rejected requests leave the gateway healthy', cappedHealth.status === 200, `status ${cappedHealth.status}`);
     await cappedHealth.text();
 
+    // --- a configured limit is reported --------------------------------------------------------------------
+    // A clamp or a typo used to be invisible: the gateway silently ran with a different limit than the one configured
+    const limitPort = GATEWAY_PORT + 5;
+    const limitUrl = `http://127.0.0.1:${limitPort}`;
+    let limitOutput = '';
+    const limitGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(limitPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'info',
+            OPENCODE_PROXY_MAX_CONCURRENCY: '99'
+        }
+    });
+    children.push(limitGateway);
+    limitGateway.stdout.on('data', (chunk) => {
+        limitOutput += chunk;
+    });
+    limitGateway.stderr.on('data', (chunk) => {
+        limitOutput += chunk;
+    });
+    await waitForOk(`${limitUrl}/health`);
+    check('the startup summary reports the concurrency actually used',
+        limitOutput.includes('Concurrency: 32 completion(s)'), limitOutput.split('\n').filter((line) => line.includes('Concurrency')).join(' | '));
+    check('a clamped limit is explained instead of applied silently',
+        limitOutput.includes('OPENCODE_PROXY_MAX_CONCURRENCY=99 is above the maximum 32'),
+        limitOutput.split('\n').filter((line) => line.includes('MAX_CONCURRENCY')).join(' | '));
+
     // --- a stalled stream still ends ---------------------------------------------------------------------
     // A backend that goes silent mid-answer used to leave the SSE connection open with no terminator: the client
     // waited for a stream that would never finish. The request timeout is shortened so the case stays fast.

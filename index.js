@@ -1,4 +1,4 @@
-import { startProxy, DEFAULT_API_KEY, parseBoolean, resolveApiKey } from './src/proxy.js';
+import { startProxy, DEFAULT_API_KEY, parseBoolean, resolveApiKey, getQueueLimits } from './src/proxy.js';
 import { readConfigFile } from './src/config.js';
 import { logger } from './src/logger.js';
 import fs from 'fs';
@@ -107,6 +107,11 @@ logger.info(`  - API Key: ${finalConfig.API_KEY === DEFAULT_API_KEY ? `default (
 logger.info(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
 logger.info(`  - Isolated HOME for OpenCode: ${finalConfig.USE_ISOLATED_HOME ? 'Yes' : 'No'}`);
 logger.info(`  - Log Level (requested): ${finalConfig.LOG_LEVEL || 'info (default)'}`);
+const queueLimits = getQueueLimits();
+logger.info(`  - Concurrency: ${queueLimits.concurrency} completion(s) processed in parallel`);
+logger.info(`  - Wait queue: ${queueLimits.queue} waiting completion(s) before 503 queue_full`);
+// A clamp or a typo used to be invisible: the gateway ran with a different limit than the one configured
+queueLimits.notes.forEach((note) => logger.warn(`[Config] ${note}`));
 
 // Start the proxy
 try {

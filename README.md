@@ -246,7 +246,7 @@ while the gateway ran the default you thought you had replaced:
 | `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend. Keep it on loopback: the backend has no authentication of its own, so publishing it bypasses the gateway's key |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Read as the bind address only when `BIND_HOST` is not set |
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
-| `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files. Booleans accept `true`/`false` (JSON) or `1`/`0`, `yes`/`no`, `y`/`n`, `on`/`off` (environment or string) |
+| `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files. Booleans accept `true`/`false` (JSON) or `1`/`0`, `yes`/`no`, `y`/`n`, `on`/`off` (environment or string); a value none of those match is reported in a `[Config]` warning together with the value actually used (`DISABLE_TOOLS='maybe' is not a boolean …, using false`), for `DISABLE_TOOLS`, `USE_ISOLATED_HOME` and `DEBUG` alike |
 | `USE_ISOLATED_HOME` | `false` | Run the backend with a throwaway `HOME` instead of the real one, so it cannot pick up your machine's OpenCode state |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (case-insensitive) |
 

@@ -1169,6 +1169,34 @@ async function run() {
     check('completions work with a trailing-slash backend URL',
         slashCompletion.includes(ANSWER), slashCompletion.slice(0, 160));
 
+    // --- an unusable boolean value -------------------------------------------------------------------------
+    // The numeric tuning keys already name a value they could not use; the flags fell back to the default in silence,
+    // so `DISABLE_TOOLS: "maybe"` (a typo, or a service file written by hand) left the tool-call markup in the answer
+    // while the operator believed it was filtered out.
+    // An offset nothing else uses: +8 is the port the spawned-backend gateway listens on, and two gateways racing
+    // for one port turn every assertion below into a confusing failure
+    const flagPort = GATEWAY_PORT + 40;
+    const flagUrl = `http://127.0.0.1:${flagPort}`;
+    const flagGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(flagPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'warn',
+            DISABLE_TOOLS: 'maybe'
+        }
+    });
+    children.push(flagGateway);
+    let flagOutput = '';
+    flagGateway.stdout.on('data', (chunk) => { flagOutput += chunk; });
+    flagGateway.stderr.on('data', (chunk) => { flagOutput += chunk; });
+    await waitForOk(`${flagUrl}/health`);
+    check('a boolean flag that cannot be read is named with the value it used',
+        /\[Config\] DISABLE_TOOLS='maybe' is not a boolean .*using false/.test(flagOutput),
+        JSON.stringify(flagOutput.slice(0, 240)));
+
     // --- bounded queue -----------------------------------------------------------------------------------
     // OPENCODE_PROXY_MAX_QUEUE=0 removes every waiting slot: a completion is refused only when every slot is busy,
     // never when one is free (the cap counts waiting requests, not all requests)

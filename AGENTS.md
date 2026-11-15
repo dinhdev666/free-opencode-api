@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 251 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 256 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -197,7 +197,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `messages array is required`, which sends the reader looking for a field they did send. They are separated now:
   `messages array is required` (absent or `null`), `messages must be an array of message objects, found a string`
   (`jsonTypeName()`, so the message names what arrived — `Array.isArray` first, because `typeof []` is `'object'`) and
-  `messages must contain at least one message`.
+  `messages must contain at least one message`. An **entry** of that array that is not an object (`"hi"`, `42`,
+  `null`, `[]`) is the same class: `m?.role`/`m?.content` read it as an empty user message, so the client was told
+  `messages must include at least one non-system text message` about text it never sent, and every entry is now named
+  by its position and type (`messages[0] must be a message object, found a string`) before the roles are read.
 - A `messages[].role` that is present but not a string (`5`, `{}`, `[]`, `true`) is a `400`
   (`messages[0].role must be a string`): `(role || 'user').toLowerCase()` threw on a truthy non-string, so a client's
   bad field was answered `500` with the internal expression in the message. A missing or `null` role keeps its lenient

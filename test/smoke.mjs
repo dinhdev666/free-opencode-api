@@ -191,7 +191,12 @@ async function run() {
         ['/v1/models?bearer=secret', '/v1/models?bearer=***', true],
         ['/v1/models?credential=secret', '/v1/models?credential=***', true],
         ['/v1/models?model=codex', '/v1/models?model=codex', true],
-        ['/v1/models?scope=code', '/v1/models?scope=code', true]
+        ['/v1/models?scope=code', '/v1/models?scope=code', true],
+        // A browser and `curl` drop a fragment before sending, but a raw client can put one in the request target: Node
+        // hands the URL over as it arrived, and the gateway logged the credential at the default level
+        ['/v1/models#access_token=secret', '/v1/models#access_token=***', true],
+        ['/v1/models#a=1&token=secret', '/v1/models#a=1&token=***', true],
+        ['/v1/models#model=codex', '/v1/models#model=codex', true]
     ];
     const urlMaskingResults = urlMaskingCases.map(([input, expected]) => [input, maskUrlQuery(input), expected]);
     check('credential query values are masked in a logged URL',

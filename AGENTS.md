@@ -68,7 +68,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 137 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 139 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -99,7 +99,8 @@ incompatible backend is reported as an upstream error with its status and reason
 n message polls answer 500) and `STUB_DROP_MESSAGES=<n>` (the first n message polls drop the connection) — both with
 `STUB_ALWAYS_FAIL_MESSAGES=1` to fail every poll, so a test can prove a completion survives a transient poll failure
 and gives up on a persistent one and `HOLD` (an answer that only finishes after 400 ms, so a test can keep a completion in flight while the
-backend is killed or the gateway is shutting down) and `TAILTAG` (an answer whose last delta ends in a tag prefix that
+backend is killed or the gateway is shutting down), `SLOWFINISH` (an answer that only finishes after 3 s, so a test can
+prove a non-streaming request whose client disconnected stops holding its slot) and `TAILTAG` (an answer whose last delta ends in a tag prefix that
 never becomes a tag, so a test can prove the held fragment is still delivered). Extend that stub and
 `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
 already taken (a stale process would answer with someone else's build) and SIGKILLs any child that ignores SIGTERM.
@@ -171,7 +172,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   fails after frames are on the wire ends with the in-band error frame. It must never be streamed as assistant text:
   `data: {… delta: {content: "[Proxy Error] …"}}` with `finish_reason: "stop"` is a successful answer to every client.
 - A client that disconnects mid-stream releases its queue slot immediately: the event subscription is aborted and
-  the polling fallbacks are skipped (the backend keeps finishing on its own).
+  the polling fallbacks are skipped (the backend keeps finishing on its own). A client that disconnects during a
+  **non-streaming** completion is handled the same way: the closed response socket stops the poll loop, so the slot is
+  free at the next poll tick instead of being held for the whole answer — a client that closed the tab used to block
+  every other request for up to the request budget at the default concurrency of 1.
 - An error after the first SSE frame is delivered in-band (`data: {"error":…}` then `data: [DONE]`) and closes the
   stream. A hijacked response must always be terminated: writing a JSON body into a frame stream (or leaving the
   socket open) breaks or hangs the client.

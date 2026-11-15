@@ -81,6 +81,9 @@ CORS, auth) and no plugin-level middleware chain. Additional choices that matter
 - **Queue drains immediately** — the completion queue starts the next request on the next tick instead of after a
   fixed 100 ms pause, and `OPENCODE_PROXY_MAX_CONCURRENCY` (default `1`, i.e. one completion at a time as before)
   can be raised to run independent sessions in parallel.
+- **A client that gives up frees its slot** — when the client closes the connection, a streaming request aborts its
+  event subscription and a non-streaming one stops polling at the next tick, so the queue moves on instead of
+  holding a slot for an answer nobody will read.
 
 Local benchmarks, `autocannon`, same machine (Node.js 26, macOS 27 on an Apple M4, loopback), against the
 smoke-test stub (`test/stub-opencode.mjs`). The stub answers in ~1 ms and streams its answer with deliberate 5 ms

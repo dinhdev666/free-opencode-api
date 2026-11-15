@@ -1589,6 +1589,15 @@ function createApp(config) {
                             });
                         }
                     } else {
+                        // A client that gives up while a non-streaming completion is still running used to keep its
+                        // queue slot for the whole answer: at the default concurrency of 1, a client that closed the
+                        // tab (or hit its own SDK timeout) blocked every other request for an answer nobody would read.
+                        // The closed response socket is the disconnect signal; the request stream is destroyed as soon
+                        // as its body has been read, which is the normal case and not a disconnect.
+                        let clientGone = false;
+                        reply.raw.on('close', () => {
+                            clientGone = true;
+                        });
                         const promptStart = Date.now();
                         await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                         logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
@@ -1596,9 +1605,17 @@ function createApp(config) {
                             sessionId,
                             REQUEST_TIMEOUT_MS,
                             DEFAULT_POLL_INTERVAL_MS,
-                            null,
+                            () => clientGone,
                             { requireDone: true }
                         );
+                        if (clientGone) {
+                            // Nobody is waiting for this answer: free the slot and the session instead of building a
+                            // body for a closed socket (the backend keeps finishing on its own)
+                            logDebug('Client left before the answer was ready', { sessionId, reqId });
+                            release();
+                            await cleanupSession();
+                            return reply;
+                        }
                         if (error && !content && !reasoning) {
                             // The session exists by now and must be deleted even though the answer failed
                             reply.code(502).send({

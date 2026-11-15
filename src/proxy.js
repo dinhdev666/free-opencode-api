@@ -20,6 +20,9 @@ const STARTUP_WAIT_INTERVAL_MS = 2000;
 const STARTING_WAIT_ITERATIONS = 120;
 const STARTING_WAIT_INTERVAL_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
+// Deleting the OpenCode session that a completion created is cleanup: it must finish quickly or not at all, because the
+// client already has its answer and a wedged delete would otherwise hold a queue slot for the full request budget.
+const SESSION_CLEANUP_TIMEOUT_MS = 10000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
@@ -362,6 +365,14 @@ const BACKEND_START_RETRY_COOLDOWN_MS = (() => {
     const raw = Number(process.env.OPENCODE_PROXY_START_RETRY_MS);
     return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 15000;
 })();
+
+// A wedged backend - one that still answers /health but never answers /session - used to hang the request handler
+// forever: node's fetch has no default timeout, so the SDK promise never settled, the client waited with no answer and
+// the queue slot was never released (at the default concurrency of 1 that stops the whole gateway). Every SDK call
+// now carries a deadline, and an expired one is reported as a gateway timeout.
+const backendDeadline = (timeoutMs) => ({ signal: AbortSignal.timeout(timeoutMs) });
+const isTimeoutError = (error) => error?.name === 'TimeoutError' || error?.name === 'AbortError' ||
+    error?.code === 'ETIMEDOUT';
 
 const isConnectionError = (error) => {
     const message = String(error?.message || '');
@@ -885,7 +896,7 @@ function createApp(config) {
                 logDebug('Polling abandoned', { sessionId, ms: Date.now() - pollStart });
                 return { content: '', reasoning: '', aborted: true };
             }
-            const messagesRes = await client.session.messages({ path: { id: sessionId } });
+            const messagesRes = await client.session.messages({ path: { id: sessionId }, ...backendDeadline(timeoutMs) });
             const messages = messagesRes?.data || messagesRes || [];
             if (Array.isArray(messages) && messages.length) {
                 for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -1228,7 +1239,7 @@ function createApp(config) {
                     await ensureBackend(config);
 
                     // Create session
-                    const sessionRes = await client.session.create();
+                    const sessionRes = await client.session.create(backendDeadline(REQUEST_TIMEOUT_MS));
                     sessionId = sessionRes.data?.id;
                     if (!sessionId) throw new Error('Failed to create OpenCode session');
                     logDebug('Session created', { sessionId });
@@ -1240,7 +1251,7 @@ function createApp(config) {
                         if (!sessionId || sessionCleaned) return;
                         sessionCleaned = true;
                         try {
-                            await client.session.delete({ path: { id: sessionId } });
+                            await client.session.delete({ path: { id: sessionId }, ...backendDeadline(SESSION_CLEANUP_TIMEOUT_MS) });
                             logDebug('Session deleted', { sessionId });
                         } catch (e) {
                             logger.debug('[Proxy] Failed to delete session:', { sessionId, error: e.message });
@@ -1567,6 +1578,12 @@ function createApp(config) {
                     let statusCode = 500;
                     if (error.message && error.message.includes('Request timeout')) {
                         statusCode = 504;
+                    }
+                    // A backend call that ran into its deadline is a gateway timeout, named as one instead of leaking
+                    // an AbortError/timeout message through as a 500
+                    if (isTimeoutError(error)) {
+                        statusCode = 504;
+                        errorMessage = `OpenCode backend did not answer within ${REQUEST_TIMEOUT_MS}ms`;
                     }
                     // A provider failure is an upstream error, whether the client asked for a stream or not: the
                     // non-streaming path answers 502 for the same condition. So is a backend that went away mid

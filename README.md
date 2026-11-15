@@ -385,7 +385,9 @@ Errors follow the OpenAI error envelope (`{"error": {"message": ..., "type": ...
 not be parsed), `401` for a missing or wrong key (`type: "invalid_request_error"`, `code: "invalid_api_key"`; the
 message names which of the three causes it saw — no key at all, a wrong `Authorization` header, a wrong `X-Api-Key`
 header — and never the value that was sent), `404` for
-an unknown route (`type: "not_found"`), `408`/`431` for a request the HTTP parser rejected (a timeout, an oversized
+an unknown route (`type: "not_found"`; the message echoes the method and path and names the endpoints this gateway
+serves with their methods, so a client pointed at `/v1/completions` is told the URL it needs and a client that used
+`PUT` is told it wants `POST`), `408`/`431` for a request the HTTP parser rejected (a timeout, an oversized
 header block; ordinary parse errors are `400`) — those also answer the envelope, with CORS headers and an
 `X-Request-Id`, `413` for a body over `OPENCODE_PROXY_MAX_BODY_MB` (50 MiB by default; the message names the limit it
 enforced, since sending less or raising the knob is the fix), `415` for a content type or content encoding the

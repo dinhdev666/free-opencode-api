@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 236 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 240 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -224,6 +224,14 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   one. A body sent with a `Content-Encoding` other than `identity` (a client that gzips, a compressing proxy) is a
   `415` naming the header: the gateway does not decompress, so the compressed bytes reached the JSON parser and were
   reported as "body is not valid JSON", which blames the one part of the request that was correct.
+- A body carrying a **forbidden property name** (`__proto__`, `constructor`) is refused by Fastify's
+  prototype-poisoning guard before any handler runs, and that refusal arrives as the same
+  `FST_ERR_CTP_INVALID_JSON_BODY` a syntax error produces: the client was told `Body is not valid JSON but
+  content-type is set to 'application/json'` about a body that parses perfectly, which sends the reader looking for a
+  missing comma. The envelope keeps Fastify's `code` for support tickets and names both causes
+  (`request body is not valid JSON, or it carries a forbidden property name (__proto__, constructor); send
+  Content-Type: application/json`). The refusal itself stays: an OpenAI client does not send those names, and
+  `onProtoPoisoning: 'remove'` would silently drop a field the client did send.
 - Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request, `type: "invalid_request_error"`, plus
   Fastify's `code` when it rejected the body), `401` (auth, `type: "invalid_request_error"`,
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error), `503`
@@ -335,6 +343,14 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `?Authorization=…` are a documented OpenAI-compatible client convention, and they reached the default info line
   verbatim. A detail object handed to a debug line is **truncated before it is cloned** (`serializeDetail()`): a 50 MB
   body used to be structured-cloned and re-stringified to produce a 32 KB line (43 ms and +100 MB of heap per line).
+  Masking replaces a value and never drops the key: the copy these helpers build is assigned to with
+  `setOwnProperty()` (a `defineProperty` for exactly the name `__proto__`) because `copy[key] = value` runs the
+  `__proto__` setter — a key of that name vanished from the masked header dump and from the debug detail while nothing
+  else changed, and the detail is the one place an operator looks to see what arrived. Assigning a non-object through
+  that setter is also a silent no-op, so the value disappeared with no trace. A backend payload reaches these helpers
+  through plain `JSON.parse`, so a provider (or a proxy in front of it) can put that key in a body that is then logged;
+  a request body cannot (Fastify's poisoning guard refuses it first, see the API contract), and Node's header parser
+  drops a header of that name. Neither copy's prototype is touched either way (asserted).
   A **closed reader**
   on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream `error` with no listener is
   thrown as an uncaught exception, and `node index.js | head -3` (a log shipper that restarted, `docker logs` closing

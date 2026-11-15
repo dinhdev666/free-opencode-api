@@ -2493,12 +2493,21 @@ function createApp(config) {
 
     app.setErrorHandler((error, request, reply) => {
         const statusCode = error.statusCode && error.statusCode >= 400 ? error.statusCode : 500;
+        // Fastify's content-type parser rejects a body that does not parse **and** one that carries a property name its
+        // prototype-poisoning guard refuses (`__proto__`, `constructor`); both arrive as FST_ERR_CTP_INVALID_JSON_BODY
+        // with the same generic text, so a client whose JSON was perfectly valid - and whose only sin was that key
+        // name - was told its JSON was invalid and had nothing to fix in the syntax. Naming both possible causes
+        // keeps the reader from rewriting a body that parses fine.
+        const errorMessage = error && error.code === 'FST_ERR_CTP_INVALID_JSON_BODY'
+            ? 'request body is not valid JSON, or it carries a forbidden property name (__proto__, constructor); '
+                + 'send Content-Type: application/json'
+            : error.message;
         const detail = {
             method: request.method,
             // Client input: a credential in the query string is masked and a pathological URL is cut, the same way
             // the request summary treats it
             path: loggableUrl(request.url),
-            message: error.message,
+            message: errorMessage,
             code: error.code || error.name
         };
         if (statusCode >= 500) logger.error('[Proxy] Unhandled request error:', detail);
@@ -2509,7 +2518,7 @@ function createApp(config) {
         }
         const sendRefusal = () => reply.code(statusCode).send({
             error: {
-                message: error.message,
+                message: errorMessage,
                 type: statusCode >= 500 ? 'server_error' : 'invalid_request_error',
                 // Fastify's own identifier (FST_ERR_CTP_INVALID_JSON_BODY, ...) is kept for support tickets
                 code: error.code || error.name || 'Error'

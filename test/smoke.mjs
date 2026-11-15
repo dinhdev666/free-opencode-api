@@ -1130,13 +1130,26 @@ async function run() {
             PORT: String(slashPort),
             BIND_HOST: '127.0.0.1',
             OPENCODE_SERVER_URL: `${STUB_URL}/`,
-            LOG_LEVEL: 'warn'
+            // info (not warn): the startup summary is what this gateway is started for below
+            LOG_LEVEL: 'info'
         }
     });
     children.push(slashGateway);
-    slashGateway.stdout.on('data', () => {});
-    slashGateway.stderr.on('data', () => {});
+    let slashOutput = '';
+    slashGateway.stdout.on('data', (chunk) => { slashOutput += chunk; });
+    slashGateway.stderr.on('data', (chunk) => { slashOutput += chunk; });
     await waitForOk(`${slashUrl}/health`);
+    // The summary is where an operator copies the backend value from, so it must show the value the gateway uses and
+    // not the raw one: it printed `http://host:port/` while a note two lines later said the slash was stripped, and a
+    // trailing space was printed verbatim. The correction now comes first, and the summary contradicts nothing.
+    const slashSummaryIndex = slashOutput.indexOf(`  - Backend: ${STUB_URL}`);
+    const slashNoteIndex = slashOutput.indexOf('OPENCODE_SERVER_URL had a trailing slash');
+    check('the startup summary prints the normalised backend URL, below its correction',
+        slashSummaryIndex !== -1 && slashNoteIndex !== -1 && slashNoteIndex < slashSummaryIndex,
+        JSON.stringify(slashOutput.split('\n').filter((line) => /Backend:|trailing slash/.test(line))).slice(0, 240));
+    check('the startup summary never prints a backend URL with a trailing slash',
+        !/  - Backend: \S*\/\s*$/m.test(slashOutput),
+        JSON.stringify(slashOutput.split('\n').find((line) => line.includes('  - Backend:')) || '').slice(0, 160));
     const slashHealth = await fetch(`${slashUrl}/health`).then((r) => r.json()).catch(() => null);
     check('a trailing slash in the backend URL is normalised',
         slashHealth?.backend === STUB_URL, JSON.stringify(slashHealth));

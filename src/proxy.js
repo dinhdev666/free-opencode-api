@@ -284,8 +284,10 @@ function resolveOpencodePath(requestedPath) {
 
 // A backend URL that ends in a slash makes every SDK call a path with a double slash (`//session`), which an
 // OpenCode server answers with 404: the gateway then looks like it cannot start its backend at all. Normalising the
-// value once at startup is cheaper than wondering why nothing works.
-function normalizeBackendUrl(raw) {
+// value once at startup is cheaper than wondering why nothing works. Exported so the entry point can normalise before
+// it prints the startup summary: the summary is where an operator copies the value from, and it used to show the raw
+// form - a trailing slash or a trailing space the gateway never used - right beside a note saying it was corrected.
+export function normalizeBackendUrl(raw) {
     let url = String(raw || '').trim();
     const notes = [];
     if (url === '') return { url: 'http://127.0.0.1:4097', notes };

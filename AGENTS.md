@@ -64,7 +64,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 110 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 114 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -131,6 +131,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   `{id, choices}`: clients that check the object type of each frame rejected a bare terminal chunk.
   Before the first delta, a `: keep-alive` comment line is written every 15 s (ignored by OpenAI clients, keeps idle
   proxies from dropping the connection); it stops as soon as real frames flow.
+  `stream_options.include_usage` adds one more chunk with `choices: []` and a zeroed `usage` block, after the finish
+  chunk and before `[DONE]`: the OpenAI SDK reads the stream's usage from exactly that frame, and ignoring the option
+  left it with no numbers at all. It is emitted only when the client asks for it — a stream that did not request it
+  must not grow an extra frame.
 - Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request, `type: "invalid_request_error"`, plus
   Fastify's `code` when it rejected the body), `401` (auth, `type: "invalid_request_error"`,
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error), `503`

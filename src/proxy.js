@@ -1110,6 +1110,10 @@ function createApp(config) {
                     // stringify booleans) also send "true"/"1"/"yes". Anything unrecognised keeps the historical
                     // non-streaming default instead of guessing.
                     const wantsStream = parseBoolean(stream, false) === true;
+                    // `stream_options: {include_usage: true}` asks for a final chunk that carries the token usage;
+                    // without this the request is honoured only in the sense that nothing rejects it, and a client that
+                    // waits for its usage chunk (the OpenAI SDK does) gets no numbers at all.
+                    const includeUsage = wantsStream && parseBoolean(body.stream_options?.include_usage, false) === true;
 
                     // Split on the first slash only: a model id may itself contain slashes
                     // (`vendor/family/version`), and `split('/')` used to drop everything after the second one
@@ -1247,6 +1251,10 @@ function createApp(config) {
                         // The terminal frame carries the same envelope as every delta: clients that validate each chunk
                         // (`object`, `created`, `model`) treated a bare {id, choices} frame as a different object type.
                         const stopFrame = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${JSON.stringify(`${pID}/${mID}`)},"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`;
+                        // OpenAI sends the usage of a stream in a chunk of its own: empty `choices`, after the
+                        // finish chunk and before [DONE]. The counts are zero because the backend does not report
+                        // token counts, which is the same answer the non-streaming path gives.
+                        const usageFrame = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${JSON.stringify(`${pID}/${mID}`)},"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}\n\n`;
 
                         // A client that disappears mid-stream must not hold the completion queue until the backend
                         // timeout: note the disconnect and abort the collector so the slot is released immediately.
@@ -1418,6 +1426,10 @@ function createApp(config) {
                         if (!clientGone) {
                             await writeFrame(stopFrame);
                             sseChunkCount++;
+                            if (includeUsage) {
+                                await writeFrame(usageFrame);
+                                sseChunkCount++;
+                            }
                             await writeFrame('data: [DONE]\n\n');
                             raw.end();
                         }

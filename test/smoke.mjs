@@ -1163,6 +1163,34 @@ async function run() {
     stop(emptyStub);
     await waitForExit(emptyStub);
 
+    // --- a config.json next to the working directory ------------------------------------------------
+    // config.json is read from the application directory, not from the cwd. A file written next to the shell's cwd used
+    // to be ignored in complete silence, which looks exactly like a broken configuration.
+    const cwdWarnDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-cwd-'));
+    fs.writeFileSync(path.join(cwdWarnDir, 'config.json'), JSON.stringify({ PORT: 1 }));
+    const cwdWarnPort = GATEWAY_PORT + 19;
+    const cwdWarnGateway = spawn(process.execPath, [path.join(ROOT, 'index.js')], {
+        cwd: cwdWarnDir,
+        env: {
+            ...process.env,
+            PORT: String(cwdWarnPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'info'
+        }
+    });
+    children.push(cwdWarnGateway);
+    let cwdWarnOutput = '';
+    cwdWarnGateway.stdout.on('data', (chunk) => { cwdWarnOutput += chunk.toString(); });
+    cwdWarnGateway.stderr.on('data', (chunk) => { cwdWarnOutput += chunk.toString(); });
+    await waitForOk(`http://127.0.0.1:${cwdWarnPort}/health`);
+    check('a config.json ignored because it is not next to the app is reported',
+        /config\.json is read from .*the file at .* is ignored/.test(cwdWarnOutput),
+        cwdWarnOutput.split('\n').find((line) => line.includes('is ignored')) || cwdWarnOutput.slice(0, 160));
+    stopGateway(cwdWarnGateway);
+    await waitForExit(cwdWarnGateway);
+    fs.rmSync(cwdWarnDir, { recursive: true, force: true });
+
     // --- a poll that fails while the answer is being written ---------------------------------------------
     // One failed poll used to end the completion: a 5xx was silently skipped and a dropped connection threw out of the
     // loop, although the answer was one poll away. Polls are retried now, and only a run of consecutive failures is

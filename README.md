@@ -82,29 +82,30 @@ CORS, auth) and no plugin-level middleware chain. Additional choices that matter
   fixed 100 ms pause, and `OPENCODE_PROXY_MAX_CONCURRENCY` (default `1`, i.e. one completion at a time as before)
   can be raised to run independent sessions in parallel.
 
-Local benchmarks, `autocannon`, same machine (Node.js 26, macOS, loopback), against the smoke-test stub
-(`test/stub-opencode.mjs`). The stub answers in ~1 ms and streams its answer with deliberate 5 ms gaps, so these
-numbers measure this gateway plus the stub — never a model:
+Local benchmarks, `autocannon`, same machine (Node.js 26, macOS 27 on an Apple M4, loopback), against the
+smoke-test stub (`test/stub-opencode.mjs`). The stub answers in ~1 ms and streams its answer with deliberate 5 ms
+gaps, so these numbers measure this gateway plus the stub — never a model:
 
 | Scenario | Throughput | Avg latency |
 | --- | --- | --- |
-| `GET /health`, `-c 100 -d 10` | ~98,700 req/s | 0.3 ms |
-| `GET /` (service index), `-c 100 -d 10` | ~104,800 req/s | 0.2 ms |
-| `GET /v1/models` (5 s cache), `-c 100 -d 10` | ~63,700 req/s | 1.1 ms |
-| `POST /v1/chat/completions` non-stream, `-c 10 -d 8` | ~2,100 req/s | 4.3 ms |
-| `POST /v1/chat/completions` non-stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | ~4,500 req/s | 1.7 ms |
-| `POST /v1/chat/completions` stream, `-c 1 -d 6` | ~28 req/s | 35 ms |
-| `POST /v1/chat/completions` stream, `-c 10 -d 8` | ~28 req/s | 350 ms (mostly queue wait) |
-| `POST /v1/chat/completions` stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | ~122 req/s | 81 ms |
+| `GET /health`, `-c 100 -d 10` | ~93,500 req/s | 0.4 ms |
+| `GET /` (service index), `-c 100 -d 10` | ~97,800 req/s | 0.3 ms |
+| `GET /v1/models` (5 s cache), `-c 100 -d 10` | ~88,100 req/s | 0.5 ms |
+| `POST /v1/chat/completions` non-stream, `-c 10 -d 8` | ~2,900 req/s | 3.0 ms |
+| `POST /v1/chat/completions` non-stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | ~3,900 req/s | 2.0 ms |
+| `POST /v1/chat/completions` stream, `-c 1 -d 6` | ~33 req/s | 29 ms |
+| `POST /v1/chat/completions` stream, `-c 10 -d 8` | ~28 req/s | 344 ms (mostly queue wait) |
+| `POST /v1/chat/completions` stream, `OPENCODE_PROXY_MAX_CONCURRENCY=4` | ~137 req/s | 72 ms |
 
 Read the chat rows as "one completion pipeline", not as HTTP overhead: a completion is a session create, a prompt,
-the answer and a session delete, and the queue admits one at a time by default, so throughput is `1 / ≈35 ms` while
-the HTTP layer's own share is about 1 ms. The stub's 5 ms gaps make the streamed answer take ~20 ms on its own, which
-is where most of the 35 ms goes. Raise `OPENCODE_PROXY_MAX_CONCURRENCY` only if your provider tolerates concurrent
+the answer and a session delete, and the queue admits one at a time by default, so throughput is `1 / ≈30 ms` while
+the HTTP layer's own share is about 0.4 ms. The stub's 5 ms gaps make the streamed answer take ~20 ms on its own, which
+is where most of the 29 ms goes. A queue slot is freed as soon as the answer is written, so the session deletion that
+follows does not delay the next completion. Raise `OPENCODE_PROXY_MAX_CONCURRENCY` only if your provider tolerates concurrent
 sessions. Numbers move with machine load; re-measure before drawing conclusions.
 
 For reference, the Express implementation this gateway replaced measured ~74,000 req/s on `/health` in the same
-harness at the time; the Fastify rewrite answers ~99,000 req/s on the same endpoint.
+harness at the time; the Fastify rewrite answers ~94,000 req/s on the same endpoint today.
 
 ---
 

@@ -6,7 +6,8 @@
  * - All output goes to stdout/stderr (visible via `docker logs`), always prefixed with [gateway]:
  *   error/warn -> stderr, info/debug -> stdout
  * - Sensitive data masking: authorization / x-api-key / cookie style headers must pass through
- *   maskHeaders/maskSecret before being written
+ *   maskHeaders/maskSecret before being written, a URL through maskUrlQuery, and a configured outbound URL
+ *   through maskBackendUrl (it can carry userinfo)
  * - Output format: [gateway] <ISO timestamp> [LEVEL] message {"detail":"json"}
  */
 
@@ -169,6 +170,21 @@ export function maskUrlQuery(url) {
         }
         return isSensitiveHeader(decoded.toLowerCase()) ? `${separator}${name}=***` : match;
     });
+}
+
+/**
+ * Mask the credentials a configured **outbound** URL can carry. `OPENCODE_SERVER_URL` is printed in the startup
+ * summary, in the `[Config]` normalisation notes and in `/health` - the last one without a key - so a URL written as
+ * `http://user:secret@host:4097` (a reverse proxy in front of the backend) published that secret to every caller and to
+ * `docker logs`. Only the credential is replaced: the scheme, host and path stay readable, which is what an operator
+ * needs from both lines. The query string goes through `maskUrlQuery()` for the same reason it does on request URLs.
+ * @param {string} url configured backend URL
+ * @returns {string} the URL with userinfo and credential query values masked
+ */
+export function maskBackendUrl(url) {
+    const text = maskUrlQuery(String(url));
+    // Everything between `//` and the last `@` before the path is userinfo (`user:pass`); a host cannot contain `@`
+    return text.replace(/^(\w[\w+.-]*:\/\/)[^/?#]*@/, '$1***@');
 }
 
 /**

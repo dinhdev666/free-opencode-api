@@ -13,7 +13,7 @@ import net from 'node:net';
 import os from 'node:os';
 import { parseBoolean } from '../src/proxy.js';
 import { readConfigFile } from '../src/config.js';
-import { createLogger, maskHeaders, maskSecret, maskUrlQuery, serializeDetail } from '../src/logger.js';
+import { createLogger, maskBackendUrl, maskHeaders, maskSecret, maskUrlQuery, serializeDetail } from '../src/logger.js';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -170,6 +170,26 @@ async function run() {
     const urlMaskingResults = urlMaskingCases.map(([input, expected]) => [input, maskUrlQuery(input), expected]);
     check('credential query values are masked in a logged URL',
         urlMaskingResults.every(([, actual, expected]) => actual === expected), JSON.stringify(urlMaskingResults));
+
+    // A credential can also sit in the configured backend URL (`http://user:secret@host:4097`, a proxy in front of
+    // the backend). That value is printed in the startup summary and returned by `/health`, which needs no key, so it
+    // published the secret to every caller and to `docker logs` - while the scheme, host and path, the parts an
+    // operator reads those two places for, stayed useful.
+    const backendUrlCases = [
+        ['http://127.0.0.1:4097', 'http://127.0.0.1:4097'],
+        ['http://user:secret@10.0.0.5:4097', 'http://***@10.0.0.5:4097'],
+        ['https://user:p%40ss@backend.internal/proxy', 'https://***@backend.internal/proxy'],
+        ['http://10.0.0.5:4097/v1?token=abc&model=x', 'http://10.0.0.5:4097/v1?token=***&model=x'],
+        ['http://user:secret@10.0.0.5:4097/v1?api_key=k', 'http://***@10.0.0.5:4097/v1?api_key=***'],
+        ['10.0.0.5:4097', '10.0.0.5:4097'],
+        ['', '']
+    ];
+    const backendUrlResults = backendUrlCases.map(([input, expected]) => [input, maskBackendUrl(input), expected]);
+    check('a credential in the backend URL is masked', backendUrlResults.every(([, actual, expected]) => actual === expected),
+        JSON.stringify(backendUrlResults.filter(([, actual, expected]) => actual !== expected)));
+    check('a credential-free backend URL is left exactly as configured',
+        maskBackendUrl('http://127.0.0.1:4097/proxy?model=x') === 'http://127.0.0.1:4097/proxy?model=x',
+        maskBackendUrl('http://127.0.0.1:4097/proxy?model=x'));
 
     // Header masking used to be a name denylist, so a credential forwarded under any other name was logged raw
     const forwardedHeaders = {
@@ -1583,6 +1603,35 @@ async function run() {
     check('the gateway starts the backend it was pointed at',
         spawnedCompletion.status === 200 && spawnedCompletion.body.includes(ANSWER),
         `status ${spawnedCompletion.status} ${spawnedCompletion.body.slice(0, 120)}`);
+    // `/health` needs no key, so a credential in the backend URL must not come back out of it (nor out of the
+    // startup summary, which is written from the same helper). The stub is not reached by the probe, so the values
+    // never have to work as a transport.
+    const maskedHealthPort = GATEWAY_PORT + 33;
+    const maskedHealthGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(maskedHealthPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: 'http://ops:s3cr3t-value@127.0.0.1:4199/proxy?token=abc123',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(maskedHealthGateway);
+    let maskedHealthOut = '';
+    maskedHealthGateway.stdout.on('data', (chunk) => { maskedHealthOut += chunk.toString(); });
+    const maskedHealthUrl = `http://127.0.0.1:${maskedHealthPort}`;
+    const maskedHealth = await waitForOk(`${maskedHealthUrl}/health`)
+        .then(() => fetch(`${maskedHealthUrl}/health`).then((r) => r.json()))
+        .catch(() => null);
+    check('GET /health masks a credential in the backend URL',
+        maskedHealth?.status === 'ok' && maskedHealth?.backend === 'http://***@127.0.0.1:4199/proxy?token=***',
+        JSON.stringify(maskedHealth));
+    check('the startup summary masks the backend URL too', !maskedHealthOut.includes('s3cr3t-value'),
+        maskedHealthOut.slice(0, 160));
+    stopGateway(maskedHealthGateway);
+    await waitForExit(maskedHealthGateway);
+
     const backendUp = await fetch(`${spawnUrl}/health`).then((r) => r.status).catch(() => 0);
     check('the spawned backend is reachable', backendUp === 200, `status ${backendUp}`);
 

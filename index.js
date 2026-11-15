@@ -1,6 +1,6 @@
 import { startProxy, DEFAULT_API_KEY, parseBoolean, resolveApiKey, getQueueLimits } from './src/proxy.js';
 import { readConfigFile, envOrFile } from './src/config.js';
-import { logger } from './src/logger.js';
+import { logger, maskBackendUrl } from './src/logger.js';
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
@@ -126,7 +126,7 @@ if (!finalConfig.OPENCODE_PATH) {
 logger.info('[Config] Starting with configuration:');
 logger.info(`  - Port: ${finalConfig.PORT}`);
 logger.info(`  - Bind Host: ${finalConfig.BIND_HOST}`);
-logger.info(`  - Backend: ${finalConfig.OPENCODE_SERVER_URL}`);
+logger.info(`  - Backend: ${maskBackendUrl(finalConfig.OPENCODE_SERVER_URL)}`);
 logger.info(`  - Bind Host for OpenCode backend: ${finalConfig.OPENCODE_BIND_HOST}`);
 logger.info(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
 logger.info(`  - API Key: ${finalConfig.API_KEY === DEFAULT_API_KEY ? `default (${DEFAULT_API_KEY})` : 'custom'} - authentication always enforced`);

@@ -235,7 +235,7 @@ startup summary still reports a custom key.
 | `PORT` | `8083` | Gateway listen port |
 | `BIND_HOST` | `127.0.0.1` | Gateway bind address; use `0.0.0.0` to expose it on all interfaces |
 | `API_KEY` | `sk-dummy-123` | Bearer token clients must send. Authentication is always on — an empty or blank value falls back to `sk-dummy-123` |
-| `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway; a trailing slash is stripped and a missing scheme is read as `http://` (both are reported in the startup log) |
+| `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway; a trailing slash is stripped and a missing scheme is read as `http://` (both are reported in the startup log). A credential in the URL (`http://user:secret@host:4097`) is masked wherever the value is logged or returned (`/health`) |
 | `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend. Keep it on loopback: the backend has no authentication of its own, so publishing it bypasses the gateway's key |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Read as the bind address only when `BIND_HOST` is not set |
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
@@ -288,7 +288,7 @@ Every response carries an `X-Request-Id` header, and the same id appears in the 
 | Endpoint | Method | Description |
 | --- | --- | --- |
 | `/` | GET | Service index (no key required): service name, status and the endpoint paths |
-| `/health` | GET | Liveness probe; returns gateway status and the configured backend URL |
+| `/health` | GET | Liveness probe; returns gateway status and the configured backend URL, with any credentials in it masked (`http://***@host:4097`). The endpoint needs no key, so it must not be a way to read one |
 | `/v1/models` | GET | OpenAI-style model list |
 | `/v1/models/{id}` | GET | Single model; an id the provider list does not contain is still described (the gateway does not restrict models). The slash in `opencode/<model>` may be sent raw or as `%2F`. A blank id (`/v1/models//`) is a `404` |
 | `/v1/chat/completions` | POST | Chat completions; supports `stream: true` for SSE. Every frame is a `chat.completion.chunk` with the same `id`/`object`/`created`/`model` envelope, the first one carrying `delta.role: "assistant"` like OpenAI's, the last one carrying `finish_reason: "stop"` before `data: [DONE]`. Comment-line keep-alives are sent while a stream is open but has not produced its first token, so proxies do not drop the connection. If the backend fails after frames were sent, the error arrives as a `data: {"error":…}` frame and the stream is closed with `data: [DONE]` — a stream always terminates |
@@ -425,7 +425,11 @@ All output goes to stdout/stderr with a `[gateway]` prefix:
 | `info` | Default. Startup information plus a one-line summary per request: method, path, model, streaming, status, latency, request id. The model id in that line is normalised (control characters replaced, length capped): it comes from the request body, and a newline in it must not be able to start a second log line. stdout. |
 | `debug` | Inbound request headers (secrets masked), the final payload sent to the backend, and full responses. stdout. |
 
-Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked before they are logged.
+Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked before they are logged, and so are
+credential values sent in a query string (`?api_key=…`) and a credential carried by the configured backend URL
+(`http://user:secret@host:4097`, a proxy in front of the backend): the startup summary, the `[Config]` notes and
+`/health` show `http://***@host:4097` instead. The container's first-boot line prints the API key as its length and,
+above 16 characters, a 4-character prefix — `docker logs` is collected as often as not.
 
 The startup summary prints the effective port, backend URL, tool filtering, log level and capacity
 (`Concurrency: … completion(s) processed in parallel`, `Wait queue: … waiting completion(s) before 503 queue_full`). The

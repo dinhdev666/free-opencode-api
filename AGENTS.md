@@ -50,7 +50,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved concurrency/queue capacity and any clamp, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; a file that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because silently continuing would run with the built-in key instead of the configured one or with a value nobody wrote. A UTF-8 BOM is tolerated. |
-| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`) plus `serializeDetail()` (bounded, truncate-before-stringify) used by debug logging. |
+| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`) plus `serializeDetail()` (bounded, truncate-before-stringify) used by debug logging. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 228 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 232 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -140,7 +140,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 
 - `GET /` → `200 {"service":"free-opencode-api","status":"ok","endpoints":{"health":"/health","models":"/v1/models","chat_completions":"/v1/chat/completions"}}`
   without a key: the auth hook leaves it open, so it must answer instead of falling through to the 404 handler.
-- `GET /health` → `200 {"status":"ok","backend":"<OPENCODE_SERVER_URL>"}`, never touches the backend. It is open
+- `GET /health` → `200 {"status":"ok","backend":"<OPENCODE_SERVER_URL>"}` with any credentials in it masked
+  (`maskBackendUrl()`: `http://***@host:4097`, `?token=***`), never touches the backend. It is open
   without a key in every form a probe uses it — HEAD, and a trailing slash (`ignoreTrailingSlash` routes `/health/`
   to the same handler, so the open-route test must match it too, otherwise a liveness probe answers 401).
 - `GET /v1/models` → `200 {"object":"list","data":[{id,name,object,owned_by}, …]}`; 5 s cache, and a cold-cache burst
@@ -299,6 +300,13 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a
   response header, so a header value carrying spaces, newlines or control characters must never be copied through.
   `Access-Control-Expose-Headers: X-Request-Id` lets a browser client read it back.
+- **A configured backend URL is masked wherever it is printed.** `OPENCODE_SERVER_URL` can carry a credential
+  (`http://user:secret@host:4097` for a proxy in front of the backend); it reached the startup summary, the `[Config]`
+  normalisation notes, the container's first-boot config dump and `/health` verbatim — and `/health` needs no key, so
+  that published the secret to every caller as well as to `docker logs`. `maskBackendUrl()` in `src/logger.js` masks
+  the userinfo and any credential query value and leaves scheme/host/path readable, which is what those lines are read
+  for. The entrypoint repeats the masking for its own log line (it cannot import the module: it writes the file the
+  module reads), and the stored `config.json` still holds the real value.
 - Request log format: `METHOD url -> status Xms [reqId] model=… stream=…` (info for `/v1/*`, debug otherwise).
   The `model` value and the URL are client-controlled, so both are normalised before they are logged
   (`loggableModelId()`: control characters replaced, 128 characters max; a URL over 512 characters is cut with a

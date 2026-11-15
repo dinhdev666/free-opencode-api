@@ -50,7 +50,8 @@ RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" \
 # RUN curl -fsSL https://opencode.ai/install | bash
 
 # Entry script: on first boot generates /app/config.json from `docker run -e` environment variables
-# (supports PORT/API_KEY/BIND_HOST/DISABLE_TOOLS/OPENCODE_PATH/OPENCODE_SERVER_URL/OPENCODE_BIND_HOST)
+# (supports PORT/API_KEY/BIND_HOST/OPENCODE_PATH/OPENCODE_SERVER_URL/OPENCODE_BIND_HOST, plus DISABLE_TOOLS and
+# USE_ISOLATED_HOME under either their bare or their OPENCODE_-prefixed name)
 # This file lives in docker/ inside the repository, so the COPY below picks it up from the build context
 COPY docker/docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh

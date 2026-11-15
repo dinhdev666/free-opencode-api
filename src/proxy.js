@@ -33,6 +33,9 @@ const SSE_KEEPALIVE_TICK_MS = 5000;
 // How long a streaming write may wait for a client that is not reading before the client is treated as gone. Without
 // a bound, one stalled reader parked the completion in `await drain` forever and held the only completion slot.
 const SSE_CLIENT_WRITE_TIMEOUT_MS = 30000;
+// How long an oversized request body is still read and thrown away after it has been refused. Closing the socket at
+// once left the client's remaining bytes unread, and the kernel answers those with RST, so the 413 was lost.
+const BODY_DRAIN_TIMEOUT_MS = 5000;
 // After the idle timeout the gateway polls for the rest of the answer; this is how many identical polls (a full idle
 // window worth) that recovery tolerates before it accepts a message the backend never marks finished.
 const IDLE_RECOVERY_STALL_POLLS = Math.max(3, Math.ceil(DEFAULT_EVENT_IDLE_TIMEOUT_MS / DEFAULT_POLL_INTERVAL_MS));
@@ -2143,6 +2146,36 @@ function createApp(config) {
 
     // Uniform OpenAI-style error envelope for anything Fastify itself rejects (invalid JSON, body too large,
     // unknown route, ...) instead of the framework's default { statusCode, code, error, message } shape
+    /**
+     * An oversized body is refused while the client is still uploading it. Node ends the socket as soon as a response
+     * finishes with the request body unread (so the leftover bytes cannot be parsed as another request), and that
+     * close carries the kernel's RST for whatever the client is still writing - the client could lose the 413
+     * completely and report a bare connection error (Node 24's fetch said "fetch failed") for a request it would then
+     * retry forever. So the refusal is written only once the body has been read to its end, bounded: a client that
+     * keeps writing is cut off after BODY_DRAIN_TIMEOUT_MS instead of holding the socket.
+     */
+    function refuseOversizedBody(request, send) {
+        const raw = request.raw;
+        if (raw.destroyed || raw.readableEnded) return send();
+        let settled = false;
+        const finish = (destroyAfter) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(cut);
+            raw.off('end', finishBody);
+            raw.off('close', finishBody);
+            send();
+            if (destroyAfter && !raw.destroyed) raw.destroy();
+        };
+        const finishBody = () => finish(false);
+        const cut = setTimeout(() => finish(true), BODY_DRAIN_TIMEOUT_MS);
+        cut.unref();
+        raw.once('error', finishBody);
+        raw.once('end', finishBody);
+        raw.once('close', finishBody);
+        raw.resume();
+    }
+
     app.setErrorHandler((error, request, reply) => {
         const statusCode = error.statusCode && error.statusCode >= 400 ? error.statusCode : 500;
         const detail = {
@@ -2157,7 +2190,7 @@ function createApp(config) {
             if (!reply.raw.writableEnded) reply.raw.end();
             return;
         }
-        reply.code(statusCode).send({
+        const sendRefusal = () => reply.code(statusCode).send({
             error: {
                 message: error.message,
                 type: statusCode >= 500 ? 'server_error' : 'invalid_request_error',
@@ -2165,6 +2198,11 @@ function createApp(config) {
                 code: error.code || error.name || 'Error'
             }
         });
+        if (statusCode === 413) {
+            refuseOversizedBody(request, sendRefusal);
+            return;
+        }
+        sendRefusal();
     });
 
     // Unknown routes use the same OpenAI-style envelope

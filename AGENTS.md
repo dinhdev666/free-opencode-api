@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 177 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 178 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -367,6 +367,11 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   request whose client disconnects while it is still queued is dropped when its turn comes (`reply.raw` 'close'), so
   it never spends backend time or delays the requests behind it. Do not use `request.raw.destroyed` as the disconnect
   signal: the request stream is destroyed as soon as its body has been read, which is the normal case.
+  A body over `OPENCODE_PROXY_MAX_BODY_MB` is still refused with `413`, but the refusal is written only after the body
+  has been read to its end (`refuseOversizedBody()`, bounded by `BODY_DRAIN_TIMEOUT_MS`): Node ends the socket when a
+  response finishes with the request body unread, the kernel answers the client's remaining bytes with RST, and the
+  client could lose the 413 completely - CI on Node 24 aborted the suite with "fetch failed" instead of the envelope.
+  A client that keeps writing is cut off after the drain window rather than holding the socket.
 - **The image pins the CLI, and the pin is the 1.x line.** `docker/Dockerfile` installs `opencode-ai` with
   `ARG OPENCODE_VERSION=1.19.5` (the newest 1.x release, matching the bundled `@opencode-ai/sdk`). `latest` now
   resolves to the 2.x line, whose `opencode serve` serves the web UI — it answers `/health` with HTML (so the readiness

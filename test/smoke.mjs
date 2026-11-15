@@ -9,6 +9,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import { parseBoolean } from '../src/proxy.js';
 import { readConfigFile } from '../src/config.js';
@@ -1128,6 +1129,42 @@ async function run() {
         body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
     });
     check('a body under the configured limit is served', withinLimit.status === 200, `status ${withinLimit.status}`);
+
+    // The refusal is decided while the client is still uploading. Node ends the socket when a response finishes with
+    // the request body unread, and the kernel resets whatever the client is still writing: CI on Node 24 lost the 413
+    // here and the suite aborted with "fetch failed". `fetch` cannot express "still uploading", so this uploads over a
+    // raw socket and keeps writing until the answer arrives.
+    const oversizedUpload = await new Promise((resolve) => {
+        const total = 3 * 1024 * 1024;
+        const head = '{"messages":[{"role":"user","content":"';
+        const tail = '"}]}';
+        const declared = Buffer.byteLength(head) + total + Buffer.byteLength(tail);
+        const socket = net.connect(bodyPort, '127.0.0.1');
+        let answer = '';
+        let writeError = null;
+        socket.on('error', (error) => { writeError = error.code || error.message; });
+        socket.on('data', (chunk) => { answer += chunk.toString('latin1'); });
+        socket.on('close', () => resolve({ answer, writeError }));
+        socket.on('connect', async () => {
+            socket.write('POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+                + `Authorization: Bearer ${API_KEY}\r\nContent-Type: application/json\r\n`
+                + `Content-Length: ${declared}\r\n\r\n` + head);
+            let sent = 0;
+            while (sent < total) {
+                const piece = 'x'.repeat(Math.min(65536, total - sent));
+                if (!socket.write(piece)) {
+                    await new Promise((next) => { socket.once('drain', next); setTimeout(next, 20); });
+                }
+                sent += piece.length;
+                await new Promise((next) => setTimeout(next, 2));
+            }
+            socket.end(tail);
+        });
+    });
+    check('an oversized body that is still uploading still gets its 413',
+        /^HTTP\/1\.1 413/.test(oversizedUpload.answer) && oversizedUpload.writeError === null,
+        `${oversizedUpload.answer.split('\r\n')[0] || 'no answer'}, write error ${oversizedUpload.writeError}`);
+
     stopGateway(bodyGateway);
     await waitForExit(bodyGateway);
 

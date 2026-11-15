@@ -530,7 +530,8 @@ async function run() {
         stubStats && stubStats.deleted > 0 && stubStats.live === 0, JSON.stringify(stubStats));
 
     // --- bounded queue -----------------------------------------------------------------------------------
-    // OPENCODE_PROXY_MAX_QUEUE=0 removes every waiting slot, so a completion is refused instead of queued
+    // OPENCODE_PROXY_MAX_QUEUE=0 removes every waiting slot: a completion is refused only when every slot is busy,
+    // never when one is free (the cap counts waiting requests, not all requests)
     const cappedPort = GATEWAY_PORT + 1;
     const cappedUrl = `http://127.0.0.1:${cappedPort}`;
     const cappedGateway = spawn(process.execPath, ['index.js'], {
@@ -550,13 +551,27 @@ async function run() {
     await waitForOk(`${cappedUrl}/health`);
 
     const cappedBody = JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] });
-    const cappedResponse = await fetch(`${cappedUrl}/v1/chat/completions`, {
+    // A free slot means no waiting, so a queue of 0 must still serve this request (it used to answer 503 to every
+    // completion, i.e. one setting silently switched the gateway off)
+    const loneResponse = await fetch(`${cappedUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
         body: cappedBody
     });
-    check('a full queue is answered with 503', cappedResponse.status === 503, `status ${cappedResponse.status}`);
-    const cappedJson = await cappedResponse.json().catch(() => null);
+    await loneResponse.text();
+    check('a queue of 0 still serves a completion when a slot is free', loneResponse.status === 200,
+        `status ${loneResponse.status}`);
+
+    // Two at once with one slot and no waiting room: the second is refused instead of queued
+    const cappedResults = await Promise.all([1, 2].map(() => fetch(`${cappedUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'SLOW queued behind' }] })
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }))));
+    const cappedStatuses = cappedResults.map((result) => result.status).sort((a, b) => a - b);
+    check('a busy queue of 0 is answered with 503', cappedStatuses[1] === 503, JSON.stringify(cappedStatuses));
+    check('the request that held the slot is still served', cappedStatuses[0] === 200, JSON.stringify(cappedStatuses));
+    const cappedJson = cappedResults.find((result) => result.status === 503)?.json;
     check('503 uses the queue_full envelope', cappedJson?.error?.type === 'queue_full', JSON.stringify(cappedJson));
     const cappedHealth = await fetch(`${cappedUrl}/health`);
     check('rejected requests leave the gateway healthy', cappedHealth.status === 200, `status ${cappedHealth.status}`);

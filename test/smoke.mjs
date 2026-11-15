@@ -7,7 +7,10 @@
  * locally and in CI.
  */
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import { parseBoolean } from '../src/proxy.js';
+import { readConfigFile } from '../src/config.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -134,6 +137,30 @@ async function run() {
         booleanResults.every(([, actual, expected]) => actual === expected), JSON.stringify(booleanResults));
     check('parseBoolean returns the fallback for an unknown value',
         parseBoolean('maybe', 'fallback') === 'fallback' && parseBoolean(undefined, 'fallback') === 'fallback');
+
+    // A config.json that exists but cannot be used must stop the gateway instead of silently running with defaults
+    // (which would serve traffic with the built-in key rather than the one the operator wrote)
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-config-'));
+    try {
+        const goodPath = path.join(configDir, 'good.json');
+        fs.writeFileSync(goodPath, JSON.stringify({ PORT: 8188, API_KEY: 'sk-from-file' }));
+        const good = readConfigFile(goodPath);
+        check('readConfigFile loads an object', good.error === null && good.config.API_KEY === 'sk-from-file', String(good.error));
+
+        check('readConfigFile accepts a missing file', readConfigFile(path.join(configDir, 'absent.json')).error === null);
+
+        const badJsonPath = path.join(configDir, 'bad.json');
+        fs.writeFileSync(badJsonPath, '{ "PORT": 8188, ');
+        check('readConfigFile rejects malformed JSON', Boolean(readConfigFile(badJsonPath).error),
+            String(readConfigFile(badJsonPath).error));
+
+        const arrayPath = path.join(configDir, 'array.json');
+        fs.writeFileSync(arrayPath, '[1, 2]');
+        check('readConfigFile rejects a non-object document', Boolean(readConfigFile(arrayPath).error),
+            String(readConfigFile(arrayPath).error));
+    } finally {
+        fs.rmSync(configDir, { recursive: true, force: true });
+    }
 
     await assertPortFree(STUB_PORT, 'stub');
     await assertPortFree(GATEWAY_PORT, 'gateway');

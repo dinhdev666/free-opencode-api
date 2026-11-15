@@ -1196,6 +1196,32 @@ async function run() {
     check('a boolean flag that cannot be read is named with the value it used',
         /\[Config\] DISABLE_TOOLS='maybe' is not a boolean .*using false/.test(flagOutput),
         JSON.stringify(flagOutput.slice(0, 240)));
+    // index.js resolves the flag and startProxy() takes that resolved value as given, so the same typo must not be
+    // reported twice: two lines for one value read like two different settings.
+    check('the flag warning is written once, not by both layers',
+        flagOutput.split('\n').filter((line) => line.includes('DISABLE_TOOLS=')).length === 1,
+        JSON.stringify(flagOutput.split('\n').filter((line) => line.includes('DISABLE_TOOLS='))));
+    // A module embedder calls startProxy() directly, with no entry point to resolve the option first: the environment
+    // fallback has to report the value too, or the tool guard is off with nothing in the log about it.
+    const embedDriver = [
+        `import { startProxy } from ${JSON.stringify(path.join(ROOT, 'src', 'proxy.js'))};`,
+        `process.env.DISABLE_TOOLS = 'definitely';`,
+        `await startProxy({ PORT: 0, BIND_HOST: '127.0.0.1', OPENCODE_SERVER_URL: ${JSON.stringify(STUB_URL)}, API_KEY: 'sk-embedded' });`,
+        `process.exit(0);`
+    ].join('\n');
+    const embedOutput = await new Promise((resolve) => {
+        const embedChild = spawn(process.execPath, ['--input-type=module', '-e', embedDriver], {
+            cwd: ROOT,
+            env: { ...process.env, LOG_LEVEL: 'warn' }
+        });
+        let output = '';
+        embedChild.stdout.on('data', (chunk) => { output += chunk; });
+        embedChild.stderr.on('data', (chunk) => { output += chunk; });
+        embedChild.on('exit', () => resolve(output));
+    });
+    check('a direct startProxy() caller is told about an unusable flag too',
+        /\[Config\] DISABLE_TOOLS='definitely' is not a boolean .*using false/.test(embedOutput),
+        JSON.stringify(embedOutput.slice(0, 240)));
 
     // --- bounded queue -----------------------------------------------------------------------------------
     // OPENCODE_PROXY_MAX_QUEUE=0 removes every waiting slot: a completion is refused only when every slot is busy,

@@ -19,6 +19,9 @@ import http from 'node:http';
 const PORT = Number(process.env.STUB_PORT || 4199);
 // Serve an empty provider list (see the /config/providers handler)
 const EMPTY_PROVIDERS = process.env.STUB_EMPTY_PROVIDERS === '1';
+// Reject the provider listing with a 500: the SDK resolves that with an error tuple instead of throwing, so a test can
+// prove the gateway inspects it instead of reporting a refused call as "the backend reported no models"
+const FAIL_PROVIDERS = process.env.STUB_FAIL_PROVIDERS === '1';
 // Reject POST /session (an incompatible backend, a proxy in front of it) so a test can prove the gateway reports the
 // upstream status and reason instead of a bare 500
 const FAIL_SESSION = process.env.STUB_FAIL_SESSION === '1';
@@ -108,6 +111,22 @@ async function stallAfterTwoDeltas(sessionID) {
     sendEvent(partUpdate(sessionID, { type: 'text', text: 'partial answer that never ends, still going' }));
 }
 
+// Emit two deltas and then close every event subscriber (a FIN, not a reset) without ever reporting a finish, while the
+// stored message is already complete: what a backend that restarts mid-answer, or a proxy in front of it that drops an
+// idle SSE connection, looks like from the gateway's side.
+async function cutStreamMidAnswer(sessionID, snapshots) {
+    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
+    // `snapshots` are cumulative texts (the shape opencode >= 1.19 sends), not increments
+    for (const snapshot of snapshots) {
+        sendEvent(partUpdate(sessionID, { type: 'text', text: snapshot }));
+        await sleep(10);
+    }
+    for (const client of eventClients) {
+        client.end();
+        eventClients.delete(client);
+    }
+}
+
 // Wait (briefly) for the gateway to be subscribed before emitting, then replay the answer as incremental updates.
 // `pieces`/`delayMs` let a test ask for a deliberately slow answer (a prompt containing SLOW) so it can abort a
 // stream while the backend is still working.
@@ -179,7 +198,15 @@ const readBody = async (req) => {
 };
 
 const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || HOST}`);
+    // A `Host` header that is not a valid host (a raw client, a test that sets a placeholder) made `new URL` throw
+    // inside an async handler, which Node reports as an unhandled rejection and exits: one harness mistake took the
+    // whole stub down and every later assertion failed for an unrelated reason.
+    let url;
+    try {
+        url = new URL(req.url, `http://${req.headers.host || HOST}`);
+    } catch {
+        return sendJson(res, 400, { error: 'stub: unreadable request target' });
+    }
     const path = url.pathname;
 
     if (path === '/health') return sendJson(res, 200, { healthy: true });
@@ -199,6 +226,7 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/config/providers') {
         providerCalls += 1;
+        if (FAIL_PROVIDERS) return sendJson(res, 500, { error: { message: 'provider listing unavailable' } });
         // A backend version whose payload the gateway cannot read answers with nothing to choose from; a listing with
         // no models at all is as useless to a client as a failed call, so a test can prove the gateway falls back
         // instead of serving []. The first call reports an empty provider list and every later one a provider whose
@@ -356,6 +384,17 @@ const server = http.createServer(async (req, res) => {
                     .catch(() => {});
                 return;
             }
+            if (session.promptText.includes('CUTSTREAM')) {
+                // The event stream is closed mid-answer without a finish event, but the stored message is already the
+                // complete answer: the gateway has to recover through polling instead of waiting out its budget and
+                // answering an in-band error. The deltas sent before the cut are prefixes of ANSWER, so a fallback that
+                // re-sends the whole message duplicates the text and one that appends nothing truncates it.
+                session.messages.push(buildAssistantMessage(id, ANSWER, REASONING));
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                const cut = Math.ceil(ANSWER.length / 2);
+                cutStreamMidAnswer(id, [ANSWER.slice(0, Math.ceil(cut / 2)), ANSWER.slice(0, cut)]).catch(() => {});
+                return;
+            }
             const toolTag = session.promptText.includes('TOOLTAG');
             const tailTag = session.promptText.includes('TAILTAG');
             if (session.promptText.includes('STALL')) {
@@ -391,14 +430,17 @@ const server = http.createServer(async (req, res) => {
 
         if (isMessage && req.method === 'GET') {
             messagePolls += 1;
-            droppedMessagePolls += 1;
-            if (droppedMessagePolls <= DROP_MESSAGES) {
+            // The two failure counters used to be incremented together on every poll, so the "drop the connection"
+            // and "answer 500" knobs counted each other's polls and could not be combined in one test. Each counter now
+            // counts only the polls it actually failed.
+            if (droppedMessagePolls < DROP_MESSAGES) {
+                droppedMessagePolls += 1;
                 req.destroy();
                 return undefined;
             }
             if (UNREADABLE_MESSAGES) return sendJson(res, 200, { result: 'unexpected', items: null });
-            failedMessagePolls += 1;
-            if (ALWAYS_FAIL_MESSAGES || failedMessagePolls <= FAIL_MESSAGES) {
+            if (ALWAYS_FAIL_MESSAGES || failedMessagePolls < FAIL_MESSAGES) {
+                failedMessagePolls += 1;
                 return sendJson(res, 500, { error: { message: 'transient poll failure' } });
             }
             return sendJson(res, 200, session ? session.messages : []);

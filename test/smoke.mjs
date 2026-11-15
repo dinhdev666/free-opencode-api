@@ -6,15 +6,16 @@
  * Run with `pnpm test`. No external dependency and no real OpenCode CLI is required, so the same command works
  * locally and in CI.
  */
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import { parseBoolean } from '../src/proxy.js';
 import { readConfigFile } from '../src/config.js';
+import { createLogger, maskHeaders, maskSecret, maskUrlQuery, serializeDetail } from '../src/logger.js';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const STUB_PORT = Number(process.env.SMOKE_STUB_PORT || 4199);
@@ -155,6 +156,97 @@ async function run() {
     check('parseBoolean returns the fallback for an unknown value',
         parseBoolean('maybe', 'fallback') === 'fallback' && parseBoolean(undefined, 'fallback') === 'fallback');
 
+    // --- log hygiene ---------------------------------------------------------------------------------------
+    // A credential sent in the query string (`?api_key=…`, an OpenAI-compatible convention some clients still use)
+    // used to reach `docker logs` verbatim at the default level; the URL is kept, only credential values are masked
+    const urlMaskingCases = [
+        ['/v1/models?api_key=secret', '/v1/models?api_key=***', true],
+        ['/v1/models?a=1&token=secret&b=2', '/v1/models?a=1&token=***&b=2', true],
+        ['/v1/models?Authorization=secret', '/v1/models?Authorization=***', true],
+        ['/v1/models?%61pi_key=secret', '/v1/models?%61pi_key=***', true],
+        ['/v1/models?model=opencode/big-pickle', '/v1/models?model=opencode/big-pickle', true],
+        ['/v1/models?author=someone', '/v1/models?author=someone', true]
+    ];
+    const urlMaskingResults = urlMaskingCases.map(([input, expected]) => [input, maskUrlQuery(input), expected]);
+    check('credential query values are masked in a logged URL',
+        urlMaskingResults.every(([, actual, expected]) => actual === expected), JSON.stringify(urlMaskingResults));
+
+    // Header masking used to be a name denylist, so a credential forwarded under any other name was logged raw
+    const forwardedHeaders = {
+        authorization: 'Bearer sk-dummy-1234567890',
+        'x-goog-api-key': 'AIzaSySECRETSECRETSECRET',
+        'x-auth-token': 'token-1234567890123456',
+        'openai-api-key': 'sk-openai-1234567890123',
+        authentication: 'very-secret-value-12345',
+        'x-forwarded-authorization': 'Bearer forwarded-value-123',
+        'content-type': 'application/json',
+        'user-agent': 'curl/8.7.1'
+    };
+    const maskedHeaders = maskHeaders(forwardedHeaders);
+    const leakedHeaders = Object.keys(forwardedHeaders)
+        .filter((name) => !['content-type', 'user-agent'].includes(name))
+        .filter((name) => maskedHeaders[name] === forwardedHeaders[name]);
+    check('a credential forwarded under another header name is still masked', leakedHeaders.length === 0,
+        `unmasked: ${leakedHeaders.join(', ')}`);
+    check('masking a header leaves the request headers untouched',
+        forwardedHeaders.authorization === 'Bearer sk-dummy-1234567890' &&
+        maskedHeaders['content-type'] === 'application/json' && maskedHeaders['user-agent'] === 'curl/8.7.1',
+        JSON.stringify(maskedHeaders));
+    check('a short key reveals nothing but its length',
+        maskSecret('sk-dummy-123') === '***(12 chars)' && maskSecret('short') === '***(5 chars)',
+        `${maskSecret('sk-dummy-123')} / ${maskSecret('short')}`);
+    check('a long key reveals only its prefix',
+        maskSecret('sk-abcdefghijklmnopqrstuvwxyz') === 'sk-a***(29 chars)', maskSecret('sk-abcdefghijklmnopqrstuvwxyz'));
+
+    // The 32 KiB cap must be applied before the payload is cloned and stringified: a 50 MB detail used to allocate
+    // roughly twice that and block the event loop for tens of milliseconds on one debug line
+    const bigDetailStarted = Date.now();
+    const bigDetailText = serializeDetail({ body: 'x'.repeat(50 * 1024 * 1024) });
+    const bigDetailMs = Date.now() - bigDetailStarted;
+    check('an oversized debug detail is truncated cheaply',
+        bigDetailText.length <= 33 * 1024 && bigDetailMs < 500, `${bigDetailText.length} bytes in ${bigDetailMs} ms`);
+    check('the truncation is annotated for the reader', /truncated/i.test(bigDetailText),
+        bigDetailText.slice(-80));
+
+    // The logger writes to the process's own streams, so the level filter, the prefix and the stamp are observed
+    // through a child process. A detail that cannot be serialised (a cycle, a BigInt, a function) and a non-string
+    // message must never throw out of a logging call.
+    const loggerProbe = await new Promise((resolve) => {
+        const loggerScript = `
+            import { createLogger } from ${JSON.stringify(pathToFileURL(path.join(ROOT, 'src', 'logger.js')).href)};
+            const log = createLogger({ level: 'warn' });
+            log.debug('debug-line');
+            log.info('info-line');
+            log.warn('warn-line', { status: 500 });
+            log.error('error-line', new Error('boom'));
+            const circular = { name: 'circular' };
+            circular.self = circular;
+            log.warn('hostile-line', { circular, big: 10n, fn: () => 1 });
+            log.warn(Symbol('symbol-message'));
+        `;
+        const child = spawn(process.execPath, ['--input-type=module', '-e', loggerScript], { cwd: ROOT });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (chunk) => { stdout += chunk; });
+        child.stderr.on('data', (chunk) => { stderr += chunk; });
+        child.on('close', (code) => resolve({ code, stdout, stderr }));
+    });
+    check('the configured level filters the quieter lines',
+        loggerProbe.code === 0 && loggerProbe.stdout === '' && /warn-line/.test(loggerProbe.stderr) &&
+        /error-line/.test(loggerProbe.stderr) && !/info-line|debug-line/.test(loggerProbe.stdout + loggerProbe.stderr),
+        `stdout ${JSON.stringify(loggerProbe.stdout.slice(0, 120))} stderr ${JSON.stringify(loggerProbe.stderr.slice(0, 160))}`);
+    const loggerLines = loggerProbe.stderr.split('\n').filter(Boolean);
+    check('every line carries the [gateway] prefix and a millisecond stamp',
+        loggerLines.length >= 4 && loggerLines.every((line) =>
+            /^\[gateway\] \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z \[(WARN|ERROR|INFO|DEBUG)\] /.test(line)),
+        JSON.stringify(loggerLines.slice(0, 2)));
+    check('a hostile detail is rendered instead of thrown',
+        loggerProbe.code === 0 && /\[Circular\]/.test(loggerProbe.stderr) && /"10n"|10n/.test(loggerProbe.stderr),
+        JSON.stringify(loggerProbe.stderr.split('\n').find((line) => line.includes('hostile-line')) || '').slice(0, 200));
+    check('a non-string message is logged instead of crashing the caller',
+        loggerProbe.code === 0 && /Symbol\(symbol-message\)/.test(loggerProbe.stderr),
+        JSON.stringify(loggerProbe.stderr.split('\n').pop() || '').slice(0, 160));
+
     // A config.json that exists but cannot be used must stop the gateway instead of silently running with defaults
     // (which would serve traffic with the built-in key rather than the one the operator wrote)
     const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-config-'));
@@ -175,6 +267,53 @@ async function run() {
         fs.writeFileSync(arrayPath, '[1, 2]');
         check('readConfigFile rejects a non-object document', Boolean(readConfigFile(arrayPath).error),
             String(readConfigFile(arrayPath).error));
+
+        // A UTF-8 BOM is what a Windows editor or PowerShell 5.1 writes, and JSON.parse rejects the first character of
+        // an otherwise valid file: the gateway refused to start over an invisible character
+        const bomPath = path.join(configDir, 'bom.json');
+        fs.writeFileSync(bomPath, `\uFEFF${JSON.stringify({ API_KEY: 'sk-bom' })}`);
+        const bom = readConfigFile(bomPath);
+        check('readConfigFile accepts a UTF-8 BOM', bom.error === null && bom.config.API_KEY === 'sk-bom', String(bom.error));
+
+        // A known key with the wrong type is refused rather than coerced: `resolveApiKey()` on a boolean `true` makes
+        // the literal string "true" the gateway's credential - guessable by every client - while the startup summary
+        // still claims a custom key is in force
+        const boolKeyPath = path.join(configDir, 'bool-key.json');
+        fs.writeFileSync(boolKeyPath, JSON.stringify({ API_KEY: true }));
+        const boolKey = readConfigFile(boolKeyPath);
+        check('readConfigFile refuses a non-string API_KEY', Boolean(boolKey.error) && /API_KEY/.test(boolKey.error),
+            String(boolKey.error));
+        const objectKeyPath = path.join(configDir, 'object-key.json');
+        fs.writeFileSync(objectKeyPath, JSON.stringify({ LOG_LEVEL: { level: 'debug' } }));
+        check('readConfigFile refuses an object value for a known key',
+            /LOG_LEVEL/.test(String(readConfigFile(objectKeyPath).error)), String(readConfigFile(objectKeyPath).error));
+        const flagKeyPath = path.join(configDir, 'flag-key.json');
+        fs.writeFileSync(flagKeyPath, JSON.stringify({ DISABLE_TOOLS: 'yes', USE_ISOLATED_HOME: false }));
+        check('readConfigFile accepts the documented flag values',
+            readConfigFile(flagKeyPath).error === null, String(readConfigFile(flagKeyPath).error));
+        const unknownKeyPath = path.join(configDir, 'unknown-key.json');
+        fs.writeFileSync(unknownKeyPath, JSON.stringify({ FUTURE_KEY: { nested: true } }));
+        check('readConfigFile keeps keys it does not know',
+            readConfigFile(unknownKeyPath).config.FUTURE_KEY?.nested === true, 'unknown keys are dropped');
+
+        // A directory at the config path used to surface as a bare EISDIR, and a FIFO blocked the read forever
+        const dirPath = path.join(configDir, 'as-directory');
+        fs.mkdirSync(dirPath);
+        check('readConfigFile refuses a directory', /regular file/.test(String(readConfigFile(dirPath).error)),
+            String(readConfigFile(dirPath).error));
+        if (process.platform !== 'win32') {
+            const fifoPath = path.join(configDir, 'as-fifo');
+            execFileSync('mkfifo', [fifoPath]);
+            const fifoStarted = Date.now();
+            const fifo = readConfigFile(fifoPath);
+            check('readConfigFile refuses a FIFO instead of blocking',
+                /regular file/.test(String(fifo.error)) && Date.now() - fifoStarted < 1000,
+                `${Date.now() - fifoStarted} ms, ${String(fifo.error)}`);
+        }
+        const hugePath = path.join(configDir, 'huge.json');
+        fs.writeFileSync(hugePath, `{"PAD":"${'x'.repeat(1024 * 1024)}"}`);
+        check('readConfigFile refuses a file over the size cap', /maximum is/.test(String(readConfigFile(hugePath).error)),
+            String(readConfigFile(hugePath).error));
     } finally {
         fs.rmSync(configDir, { recursive: true, force: true });
     }
@@ -1218,6 +1357,43 @@ async function run() {
     check('the client sees an error frame', stallResponse !== 'timeout' && stallResponse.includes('"error"'),
         String(stallResponse).slice(0, 200));
 
+    // --- a backend that closes its event stream in the middle of the answer -----------------------------
+    // The stream ends without a finish event (a backend restart, a proxy dropping an idle SSE connection) while the
+    // stored message is already the complete answer. The collector used to stay silent until the whole request budget
+    // was spent and then answer an in-band error, although the finished answer had been pollable the entire time.
+    // This reuses the 3 s budget of the gateway above, so a regression fails fast instead of hanging the suite.
+    const cutStartedAt = Date.now();
+    const cutResponse = await fetch(`${stallUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'CUTSTREAM please' }], stream: true })
+    }).then((response) => response.text());
+    const cutMs = Date.now() - cutStartedAt;
+    const cutFrames = parseSseFrames(cutResponse);
+    const cutChunks = cutFrames
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        })
+        .filter(Boolean);
+    const cutContent = cutChunks.map((chunk) => chunk.choices?.[0]?.delta?.content || '').join('');
+    const cutErrors = cutChunks.filter((chunk) => chunk.error);
+    check('a stream closed mid-answer recovers through polling',
+        cutContent === ANSWER && cutErrors.length === 0,
+        `content ${JSON.stringify(cutContent)} errors ${JSON.stringify(cutErrors.slice(0, 1))}`);
+    check('the recovered answer is neither duplicated nor truncated',
+        cutContent === ANSWER && cutChunks.filter((chunk) => chunk.choices?.[0]?.finish_reason).length === 1,
+        `${cutContent.length} chars, frames ${cutFrames.length}`);
+    check('the recovered stream is terminated like any other',
+        cutFrames[cutFrames.length - 1] === '[DONE]' &&
+        cutChunks.some((chunk) => chunk.choices?.[0]?.finish_reason === 'stop'),
+        JSON.stringify(cutFrames.slice(-2)));
+    check('the recovery does not wait out the request budget', cutMs < 2500, `${cutMs} ms`);
+
     // --- a silent gap longer than the idle timeout ---------------------------------------------------------
     // The stub goes quiet for 12.5 s - longer than the 8 s idle timeout - and only then finishes writing. The gateway
     // falls back to polling on that silence, and giving up 1.5 s into it ended the stream with `finish_reason: "stop"`
@@ -1598,6 +1774,49 @@ async function run() {
     stop(emptyStub);
     await waitForExit(emptyStub);
 
+    // --- a backend that refuses the provider listing -----------------------------------------------------
+    // The SDK resolves a non-2xx answer with `{ error, response }` instead of throwing, so a gateway that reads only
+    // `.data` reports the refusal as "the backend reported no models" - a wrong diagnosis for an upstream failure, and
+    // the one SDK call in the gateway that did not inspect its error tuple.
+    const failProvidersStubPort = GATEWAY_PORT + 29;
+    const failProvidersStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(failProvidersStubPort), STUB_FAIL_PROVIDERS: '1' }
+    });
+    children.push(failProvidersStub);
+    failProvidersStub.stdout.on('data', () => {});
+    failProvidersStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${failProvidersStubPort}/health`);
+    let failProvidersOutput = '';
+    const failProvidersGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(failProvidersStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${failProvidersStubPort}`,
+            LOG_LEVEL: 'info'
+        }
+    });
+    children.push(failProvidersGateway);
+    failProvidersGateway.stdout.on('data', (chunk) => { failProvidersOutput += chunk; });
+    failProvidersGateway.stderr.on('data', (chunk) => { failProvidersOutput += chunk; });
+    await waitForOk(`http://127.0.0.1:${failProvidersStubPort + 1}/health`);
+    const failProvidersList = await fetch(`http://127.0.0.1:${failProvidersStubPort + 1}/v1/models`, {
+        headers: { authorization: `Bearer ${API_KEY}` }
+    }).then((r) => r.json()).catch(() => null);
+    check('a refused provider listing falls back to the static model',
+        failProvidersList?.data?.length === 1 && failProvidersList.data[0].id === 'opencode/big-pickle',
+        JSON.stringify(failProvidersList)?.slice(0, 140));
+    check('a refused provider listing is reported as a refused call, not as an empty one',
+        /rejected the provider listing \(status 500\)/.test(failProvidersOutput) &&
+        !/reported no models/.test(failProvidersOutput),
+        JSON.stringify(failProvidersOutput.split('\n').find((line) => line.includes('provider listing')) || '').slice(0, 200));
+    stopGateway(failProvidersGateway);
+    await waitForExit(failProvidersGateway);
+    stop(failProvidersStub);
+    await waitForExit(failProvidersStub);
+
     // --- a config.json next to the working directory ------------------------------------------------
     // config.json is read from the application directory, not from the cwd. A file written next to the shell's cwd used
     // to be ignored in complete silence, which looks exactly like a broken configuration.
@@ -1875,6 +2094,22 @@ async function run() {
     check('a very long model id is truncated in the request log line',
         longModelAnswer.response.status === 200 && Boolean(longModelLine) && longModelLine.length < 400,
         `${longModelLine ? longModelLine.length : 0} chars`);
+
+    // The built-in key is always announced. Its value is public and stated in the docs; a *configured* key is never
+    // printed (see the docker/README examples and the entrypoint's mask)
+    const securityLine = gatewayOutput.split('\n').find((line) => line.includes('[Security]'));
+    check('the built-in key is announced at startup',
+        /\[Security\]/.test(gatewayOutput) && /built-in/.test(securityLine || ''),
+        securityLine || 'no [Security] line');
+
+    // The URL is part of the request log line, so a key sent in the query string used to be written into it verbatim
+    const queryKeyAnswer = await request('/v1/models?api_key=sk-in-the-query-string-123456');
+    await sleep(200);
+    const queryKeyLine = gatewayOutput.split('\n').find((line) => line.includes('api_key='));
+    check('a credential in the query string is masked in the request log',
+        queryKeyAnswer.response.status === 200 && Boolean(queryKeyLine) &&
+        /api_key=\*\*\*/.test(queryKeyLine) && !gatewayOutput.includes('sk-in-the-query-string-123456'),
+        JSON.stringify(queryKeyLine || '').slice(0, 200));
 
     // A request the HTTP parser rejects never reaches a hook (hooks run after routing), so Fastify's own handler used
     // to answer `{"error":"Bad Request","message":"Client Error","statusCode":400}`: no type, no CORS headers, no
@@ -2190,6 +2425,27 @@ const afterClosedPipe = await fetch(`http://127.0.0.1:${pipePort}/v1/chat/comple
 check('a closed log pipe does not stop the gateway',
     afterClosedPipe.status === 200 && afterClosedPipe.body.includes(ANSWER),
     `status ${afterClosedPipe.status} ${afterClosedPipe.body.slice(0, 120)}`);
+
+// Warnings and errors go to stderr, so a closed reader there is the same class of failure; the request below is a
+// rejected body (400), which logs a warning on that stream before the gateway answers
+pipeGateway.stderr.destroy();
+await sleep(400);
+const rejectedWhileSilent = await fetch(`http://127.0.0.1:${pipePort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 5, content: 'hi' }] }),
+    signal: AbortSignal.timeout(30000)
+}).then((r) => r.status).catch(() => 0);
+const afterClosedErrorPipe = await fetch(`http://127.0.0.1:${pipePort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    signal: AbortSignal.timeout(30000)
+}).then((r) => r.text().then((body) => ({ status: r.status, body })))
+    .catch((error) => ({ status: 0, body: error.message }));
+check('a closed error pipe does not stop the gateway',
+    rejectedWhileSilent === 400 && afterClosedErrorPipe.status === 200 && afterClosedErrorPipe.body.includes(ANSWER),
+    `rejected ${rejectedWhileSilent}, next ${afterClosedErrorPipe.status} ${afterClosedErrorPipe.body.slice(0, 120)}`);
 stopGateway(pipeGateway);
 await waitForExit(pipeGateway);
 stop(pipeStub);

@@ -504,8 +504,9 @@ function createApp(config) {
         reply.raw.setHeader('X-Request-Id', meta.reqId);
 
         if (request.method === 'OPTIONS') return done();
-        // /health and / stay open; every other route always requires the bearer token
-        if (path === '/health' || path === '/') return done();
+        // /health and / stay open (the router tolerates a trailing slash, and probes often use HEAD); every other
+        // route always requires the bearer token
+        if (path === '/' || path === '/health' || path === '/health/') return done();
 
         const provided = request.headers.authorization;
         // Constant-time comparison (the length check is required because timingSafeEqual throws on size mismatch)

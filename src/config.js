@@ -27,6 +27,34 @@ const STRING_OR_NUMBER_KEYS = [
 // Flags are parsed by parseBoolean(), which accepts booleans as well as their string/number spellings
 const FLAG_KEYS = ['DISABLE_TOOLS', 'USE_ISOLATED_HOME', 'DEBUG', 'OPENCODE_PROXY_DEBUG'];
 
+// Every key the entry point reads. A key outside this list is reported and ignored: a typo (`APIKEY`,
+// `OPENCODE_PROXY_MAX_CONCURENCY`) used to change nothing at all, and the gateway then ran the default while the
+// operator was sure the value in the file was in force - the same silent fallback the `[Config]` warnings for an
+// unusable limit exist to prevent. Nothing is merged generically, so an unknown key cannot reach the running config.
+const KNOWN_KEYS = new Set([...STRING_OR_NUMBER_KEYS, ...FLAG_KEYS]);
+
+// Case and separators are what a typo usually gets wrong (`APIKEY`, `api-key`, `openCodePath`), so the suggestion
+// compares the names with everything but the letters and digits removed
+const keyShape = (name) => String(name).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+/**
+ * The keys of a parsed config.json that the gateway does not read, with the known key each one most likely meant. Only
+ * a case/separator difference is suggested: `OPENCODE_PROXY_MAX_CONCURENCY` is a misspelling the code cannot recognise
+ * without guessing, and a wrong guess sends the reader to the wrong key.
+ * @param {object} parsed parsed config.json value
+ * @returns {{ key: string, suggestion: string | null }[]}
+ */
+export function findUnknownKeys(parsed) {
+    const known = [...KNOWN_KEYS];
+    return Object.keys(parsed || {})
+        .filter((key) => !KNOWN_KEYS.has(key))
+        .map((key) => {
+            const shape = keyShape(key);
+            const match = known.find((candidate) => keyShape(candidate) === shape);
+            return { key, suggestion: match || null };
+        });
+}
+
 function describeType(value) {
     if (value === null) return 'null';
     if (Array.isArray(value)) return 'an array';

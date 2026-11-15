@@ -112,6 +112,8 @@ async function streamAssistantReply(sessionID, text, reasoning, { pieces = 3, de
         sendEvent(partUpdate(sessionID, { type: 'text', text: snapshot }));
         // A message.updated for something the gateway does not care about, with no `info` at all
         sendEvent({ type: 'message.updated', properties: {} });
+        // A part event that names the session but carries no part: same class of noise the gateway must skip
+        sendEvent({ type: 'message.part.updated', properties: { sessionID } });
         await sleep(delayMs);
     }
     await sleep(delayMs);

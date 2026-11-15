@@ -214,6 +214,17 @@ async function run() {
     check('400 carries the invalid_request_error type', invalid.json?.error?.type === 'invalid_request_error',
         invalid.text.slice(0, 120));
 
+    // Fastify rejects the body before the handler runs; its error must use the same envelope as ours
+    const badJson = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: '{"messages": ['
+    });
+    const badJsonPayload = await badJson.json().catch(() => null);
+    check('malformed JSON returns 400', badJson.status === 400, `status ${badJson.status}`);
+    check('malformed JSON uses the invalid_request_error type',
+        badJsonPayload?.error?.type === 'invalid_request_error', JSON.stringify(badJsonPayload).slice(0, 160));
+
     const nullBody = await fetch(`${BASE}/v1/chat/completions`, {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
@@ -470,6 +481,19 @@ async function run() {
     ]);
     const stallMs = Date.now() - stallStartedAt;
     check('a stalled stream is closed instead of hanging', stallResponse !== 'timeout', `${stallMs} ms`);
+    const stallErrorFrame = String(stallResponse)
+        .split('\n\n')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame.replace(/^data: /, ''));
+            } catch {
+                return null;
+            }
+        })
+        .find((frame) => frame?.error);
+    check('a timeout is reported as a server_error', stallErrorFrame?.error?.type === 'server_error',
+        JSON.stringify(stallErrorFrame || null).slice(0, 160));
+
     check('the closed stream ends with [DONE]',
         stallResponse !== 'timeout' && stallResponse.includes('data: [DONE]'), String(stallResponse).slice(0, 200));
     check('the client sees an error frame', stallResponse !== 'timeout' && stallResponse.includes('"error"'),

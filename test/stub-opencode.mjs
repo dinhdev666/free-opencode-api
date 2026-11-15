@@ -19,6 +19,9 @@ import http from 'node:http';
 const PORT = Number(process.env.STUB_PORT || 4199);
 // Serve an empty provider list (see the /config/providers handler)
 const EMPTY_PROVIDERS = process.env.STUB_EMPTY_PROVIDERS === '1';
+// Reject POST /session (an incompatible backend, a proxy in front of it) so a test can prove the gateway reports the
+// upstream status and reason instead of a bare 500
+const FAIL_SESSION = process.env.STUB_FAIL_SESSION === '1';
 // An answer with a tool-call block whose tags are cut in the middle by the delta boundaries (prompt marker TOOLTAG)
 const TOOL_TAG_ANSWER = 'hello <function_calls>secret</function_calls> world';
 // An answer whose last delta ends with a fragment that looks like the start of a tool-call tag but never becomes
@@ -184,6 +187,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === '/session' && req.method === 'POST') {
+        if (FAIL_SESSION) return sendJson(res, 405, { error: { message: 'session creation is not supported by this build' } });
         const id = `ses_smoke_${(sessionSeq += 1)}`;
         sessions.set(id, { messages: [] });
         return sendJson(res, 200, { id });

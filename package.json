@@ -1,7 +1,7 @@
 {
   "name": "free-opencode-api",
   "version": "2.0.0",
-  "description": "Free OpenCode API — an OpenAI-compatible API gateway for the OpenCode CLI that exposes free models (Kimi, GLM, MiniMax) to any standard OpenAI client.",
+  "description": "Free OpenCode API — an OpenAI-compatible API gateway for the OpenCode CLI that exposes the free models OpenCode serves (stable alias: opencode/big-pickle) to any standard OpenAI client.",
   "main": "index.js",
   "type": "module",
   "private": true,
@@ -27,9 +27,8 @@
     "llm-gateway",
     "proxy",
     "rest-api",
-    "kimi",
-    "glm",
-    "minimax",
+    "free-llm",
+    "llm-api",
     "free-models",
     "nodejs"
   ],

@@ -981,6 +981,27 @@ async function run() {
     // `code` is the machine-readable half of the envelope, and it is carried where there is something stable to carry:
     // an upstream failure (502) always has one below, a 404 has nothing to add to its type
     check('a 404 carries no code of its own', unknownRoute.json?.error?.code === undefined, JSON.stringify(unknownRoute.json?.error));
+    // A client pointed at the wrong OpenAI endpoint (a `/v1/completions`, an `/v1/embeddings`) learns nothing from the
+    // status alone: the message names the paths this gateway does serve, so the fix is a URL it can copy.
+    check('404 names the endpoints the gateway serves, with their methods',
+        /not found; this gateway serves POST \/v1\/chat\/completions, GET \/v1\/models and GET \/health$/.test(
+            unknownRoute.json?.error?.message ?? ''
+        ), unknownRoute.json?.error?.message);
+    const wrongEndpoint = await request('/v1/completions', {
+        method: 'POST',
+        body: { model: 'opencode/big-pickle', prompt: 'hi' }
+    });
+    check('an OpenAI endpoint this gateway does not serve is a 404 naming the ones it does',
+        wrongEndpoint.response.status === 404 && /Route POST \/v1\/completions not found; this gateway serves/.test(
+            wrongEndpoint.json?.error?.message ?? ''
+        ), wrongEndpoint.text.slice(0, 160));
+    // The same handler answers a correct path with the wrong method; naming the paths alone would have called the path
+    // missing in the same sentence that lists it, so each served endpoint is named with its method.
+    const wrongMethod = await request('/v1/chat/completions', { method: 'PUT', body: { messages: [] } });
+    check('a served path with the wrong method names the method it takes',
+        wrongMethod.response.status === 404 && /this gateway serves POST \/v1\/chat\/completions/.test(
+            wrongMethod.json?.error?.message ?? ''
+        ), wrongMethod.text.slice(0, 160));
 
     // --- non-streaming completion -----------------------------------------------------------------------
     const completion = await request('/v1/chat/completions', {

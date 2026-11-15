@@ -132,6 +132,11 @@ const urlPath = (url) => {
 // value through verbatim, so a 4,000-character content-part type produced a 4,000-character error body, and a value
 // carrying a newline put a second line into a body the client reads as one record. The marker matches
 // `loggableUrl()`, so a truncated value reads the same wherever it appears.
+// The endpoints a client that hit the wrong path is looking for, in one place: the 404 message names them and the
+// smoke suite asserts the message carries this exact list. Each entry carries its method, because the same request
+// reaches this handler when the path is right and the method is not (`PUT /v1/chat/completions`), and a list without
+// methods answered that case with the path it had just declared missing.
+const SERVED_ROUTES = 'POST /v1/chat/completions, GET /v1/models and GET /health';
 const MAX_ECHOED_VALUE_LENGTH = 64;
 const echoedValue = (value) => {
     const clean = String(value).replace(CONTROL_CHARS_RE, '?');
@@ -3126,12 +3131,15 @@ function createApp(config) {
         sendRefusal();
     });
 
-    // Unknown routes use the same OpenAI-style envelope
+    // Unknown routes use the same OpenAI-style envelope. The answer names the paths a confused client most likely
+    // meant: an OpenAI client pointed at `/v1/completions`, `/v1/embeddings` or `/v1/responses` gets a 404 with no way
+    // to learn that this gateway serves chat completions only, and the fix is a different URL, not a different body.
+    // The list is one constant so the sentence and the smoke assertion cannot drift apart.
     app.setNotFoundHandler((request, reply) => {
         reply.code(404).send({
             error: {
                 // The path is echoed back, so it is the client's own input: no query string, no control characters
-                message: `Route ${request.method} ${loggableUrl(urlPath(request.url))} not found`,
+                message: `Route ${request.method} ${loggableUrl(urlPath(request.url))} not found; this gateway serves ${SERVED_ROUTES}`,
                 type: 'not_found'
             }
         });

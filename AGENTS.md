@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 347 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 350 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -228,7 +228,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `curl -d` actually labels the body `application/x-www-form-urlencoded` (not `text/plain`), so that type is handed
   over as the same string by an explicit `addContentTypeParser` — Fastify answered it with a bare `415`, so the
   documented header-free path did not work for the most common hand-written client. Other content types keep the `415`
-  media-type error, because a gateway that parses every type cannot tell a malformed client from an unsupported one. A
+  media-type error (below). A
   body sent with a `Content-Encoding` other than `identity` is a `415` naming the header: the gateway does not
   decompress, so the compressed bytes reached the JSON parser and were reported as "body is not valid JSON", which
   blames the one part of the request that was correct. A UTF-8 BOM in front of that text (PowerShell 5.1, Windows
@@ -297,9 +297,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - Every completion deletes the OpenCode session it created — on the success path, the error path and after a client
   abort. The backend must never accumulate one session per served request; `test/stub-opencode.mjs` exposes
   `GET /__sessions` so the smoke suite can assert `live === 0`.
-- Every response carries `X-Content-Type-Options: nosniff` (`NO_SNIFF`, `createApp()`), on the same three paths as the
-  CORS set - `onRequest` (hijacked streams included), `clientErrorHandler`, `badUrlHandler`: the gateway writes only
-  JSON and SSE, which a browser must not re-read as something else.
+- Every response carries `X-Content-Type-Options: nosniff` (`NO_SNIFF`, `createApp()`) on the same three paths as the
+  CORS set (`onRequest` hijacked streams included, `clientErrorHandler`, `badUrlHandler`): the gateway writes only JSON
+  and SSE, which a browser must not re-read as something else.
 - CORS headers are set on the raw response for every request, including hijacked streams:
   `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, OPTIONS`, `Allow-Headers: Content-Type,
   Authorization, X-Api-Key, X-Request-Id, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`. The
@@ -321,7 +321,6 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   to a log entry. An incoming `X-Request-Id` is echoed when it is a short printable token
   (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a
   header, so a value carrying spaces, newlines or control characters must never be copied through.
-  `Access-Control-Expose-Headers: X-Request-Id` lets a browser client read it back.
 - **A configured backend URL is masked wherever it is printed.** `OPENCODE_SERVER_URL` can carry a credential
   (`http://user:secret@host:4097` for a proxy in front of the backend); it reached the startup summary, the `[Config]`
   notes, the container's first-boot config dump and `/health` verbatim — and `/health` needs no key, so that published

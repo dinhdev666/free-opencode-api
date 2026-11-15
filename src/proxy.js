@@ -524,11 +524,26 @@ function createApp(config) {
     let modelsCacheAt = 0;
 
     // Shared by /v1/models and /v1/models/:modelId so both answer from the same cache
+    let modelsInFlight = null;
     const loadModels = async () => {
         const now = Date.now();
         if (modelsCache && now - modelsCacheAt < MODELS_CACHE_TTL_MS) {
             return modelsCache.data;
         }
+        // A cold cache under a burst (an autoscaler probe, a client retrying a startup listing) would otherwise put
+        // one provider round trip behind every request in that burst; the first caller does the work and the rest
+        // await the same promise
+        if (modelsInFlight) return modelsInFlight;
+        modelsInFlight = fetchModels();
+        try {
+            return await modelsInFlight;
+        } finally {
+            modelsInFlight = null;
+        }
+    };
+
+    const fetchModels = async () => {
+        const now = Date.now();
         try {
             const providersRes = await client.config.providers();
             const providersRaw = providersRes.data?.providers || [];

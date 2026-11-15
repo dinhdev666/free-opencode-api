@@ -30,6 +30,8 @@ const eventClients = new Set();
 let sessionSeq = 0;
 let deletedSessions = 0;
 let promptedSessions = 0;
+// Counts /config/providers calls, so a test can prove the gateway collapses a cold-cache burst into one round trip
+let providerCalls = 0;
 
 const sendJson = (res, statusCode, body) => {
     const payload = JSON.stringify(body);
@@ -151,16 +153,22 @@ const server = http.createServer(async (req, res) => {
             live: sessions.size,
             created: sessionSeq,
             deleted: deletedSessions,
-            prompts: promptedSessions
+            prompts: promptedSessions,
+            providerCalls
         });
     }
 
     if (path === '/config/providers') {
+        providerCalls += 1;
         return sendJson(res, 200, {
             providers: [
                 {
                     id: 'opencode',
-                    models: { 'kimi-k2.5-free': { name: 'Kimi K2.5 Free' } }
+                    // Two models, so a test can tell the provider list apart from the gateway's single-model fallback
+                    models: {
+                        'kimi-k2.5-free': { name: 'Kimi K2.5 Free' },
+                        'gpt-5-mini-free': { name: 'GPT-5 Mini Free' }
+                    }
                 }
             ]
         });

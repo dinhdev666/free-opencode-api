@@ -508,10 +508,16 @@ function createApp(config) {
         // route always requires the bearer token
         if (path === '/' || path === '/health' || path === '/health/') return done();
 
-        const provided = request.headers.authorization;
-        // Constant-time comparison (the length check is required because timingSafeEqual throws on size mismatch)
-        if (provided === undefined || provided.length !== bearerToken.length ||
-            !timingSafeEqual(Buffer.from(provided), bearerTokenBuffer)) {
+        // Constant-time comparison. The length checks are required because timingSafeEqual throws on a size
+        // mismatch, and they have to compare bytes: a token with non-ASCII characters can match in string length
+        // while differing in byte length, which used to throw and turn a wrong key into a 500 instead of a 401.
+        const matchesBearer = (provided) => {
+            if (typeof provided !== 'string' || provided.length !== bearerToken.length) return false;
+            const providedBuffer = Buffer.from(provided);
+            return providedBuffer.length === bearerTokenBuffer.length && timingSafeEqual(providedBuffer, bearerTokenBuffer);
+        };
+
+        if (!matchesBearer(request.headers.authorization)) {
             reply.code(401).send({ error: { message: 'Unauthorized', type: 'invalid_request_error', code: 'invalid_api_key' } });
             return;
         }

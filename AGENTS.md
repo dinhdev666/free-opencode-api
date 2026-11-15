@@ -21,7 +21,9 @@ These are product decisions, not implementation details. Do not "improve" them w
 1. **Authentication is always enforced.** Every route except `OPTIONS`, `/health` and `/` requires
    `Authorization: Bearer <API_KEY>`. A blank or missing `API_KEY` falls back to the built-in default
    `sk-dummy-123` (`resolveApiKey()` in `src/proxy.js`). Never add a "disable auth" switch, never treat an empty key
-   as "no auth".
+   as "no auth". The bearer is compared in **bytes** (`timingSafeEqual` on two `Buffer`s of equal length): a key with
+   non-ASCII characters matches in string length while differing in byte length, and comparing strings threw a
+   `RangeError` that turned a wrong key into a `500` instead of a `401`.
 2. **The default key stays visible and warned about.** `index.js` logs a `[Security]` warning when the built-in key is
    in use; the startup summary states that authentication is enforced.
 3. **OpenAI wire format is the contract.** Success and error bodies, SSE frames, status codes and header names must
@@ -60,7 +62,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file
-pnpm test                        # smoke suite: stub backend + gateway, 81 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 83 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 

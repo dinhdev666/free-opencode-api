@@ -288,6 +288,12 @@ async function run() {
     check('an aborted stream releases its queue slot before the backend finishes', afterAbortMs < 1200,
         `${afterAbortMs} ms (the slow reply takes ~2000 ms)`);
 
+    // --- session lifecycle -------------------------------------------------------------------------------
+    // One session is created and must be deleted per completion; a leak would grow the backend without bound
+    const stubStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    check('every completion deletes the session it created',
+        stubStats && stubStats.deleted > 0 && stubStats.live === 0, JSON.stringify(stubStats));
+
     // --- bounded queue -----------------------------------------------------------------------------------
     // OPENCODE_PROXY_MAX_QUEUE=0 removes every waiting slot, so a completion is refused instead of queued
     const cappedPort = GATEWAY_PORT + 1;

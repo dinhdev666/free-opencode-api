@@ -26,6 +26,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sessions = new Map();
 const eventClients = new Set();
 let sessionSeq = 0;
+let deletedSessions = 0;
 
 const sendJson = (res, statusCode, body) => {
     const payload = JSON.stringify(body);
@@ -111,6 +112,11 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/health') return sendJson(res, 200, { healthy: true });
 
+    // Test-only introspection (not part of the OpenCode API): proves the gateway deletes the session it created
+    if (path === '/__sessions') {
+        return sendJson(res, 200, { live: sessions.size, created: sessionSeq, deleted: deletedSessions });
+    }
+
     if (path === '/config/providers') {
         return sendJson(res, 200, {
             providers: [
@@ -135,7 +141,7 @@ const server = http.createServer(async (req, res) => {
         const session = sessions.get(id);
 
         if (!isMessage && req.method === 'DELETE') {
-            sessions.delete(id);
+            if (sessions.delete(id)) deletedSessions += 1;
             return sendJson(res, 200, {});
         }
 

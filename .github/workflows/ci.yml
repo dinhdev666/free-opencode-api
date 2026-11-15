@@ -93,3 +93,17 @@ jobs:
           echo "gateway did not become healthy in 30s"
           docker logs gateway-ci
           exit 1
+
+      # The image must behave like the source tree: the root index answers without a key and everything else
+      # is authenticated with the built-in key
+      - name: Container enforces authentication
+        run: |
+          root=$(curl -fsS http://127.0.0.1:8083/)
+          echo "GET / -> $root"
+          echo "$root" | grep -q 'free-opencode-api'
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8083/v1/models)
+          echo "GET /v1/models without a key -> $code"
+          test "$code" = "401"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8083/v1/models)
+          echo "GET /v1/models with the default key -> $code"
+          test "$code" = "200"

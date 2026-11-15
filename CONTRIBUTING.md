@@ -198,14 +198,18 @@ Example: `fix/stream-first-delta-fallback`.
 ## Testing
 
 `pnpm test` runs `test/smoke.mjs`, which boots `test/stub-opencode.mjs` (a minimal `opencode serve` stand-in) plus the
-gateway and asserts the contract: health, auth (401 with a missing or wrong key), CORS/preflight, model listing, 400
-validation, 404 envelope, non-streaming completion, SSE frames (valid JSON, streamed content and reasoning, stop
-frame, `[DONE]`), no stalled stream requests, and clean `SIGINT` shutdown. No OpenCode CLI and no network access are
-required. The stub listens on port 4199 and the gateway on 8199 by default; override with `SMOKE_STUB_PORT` /
-`SMOKE_PORT` if those are taken.
+gateway and asserts the contract: the root index and health, auth (401 with a missing or wrong key, with a `type` and
+`code`), CORS/preflight, the request-id header, model listing (both routes, including an id with several slashes),
+400 validation, 404 envelope, non-streaming completion, SSE frames (valid JSON, streamed content and reasoning, stop
+frame, `[DONE]`), that unrelated backend events do not corrupt a stream, that a stalled stream is closed, that an
+abandoned stream frees its slot, that a request abandoned while queued never reaches the backend, that every
+completion deletes its session, that a full queue answers `503 queue_full`, and clean `SIGINT` shutdown. No OpenCode
+CLI and no network access are required. The stub listens on port 4199 and the gateway on 8199 by default; override
+with `SMOKE_STUB_PORT` / `SMOKE_PORT` if those are taken.
 
 CI (`.github/workflows/ci.yml`) runs `pnpm run check`, the container entrypoint shell check and `pnpm test` on Node
-20, 22 and 24, then builds the Docker image and checks that the container answers `/health`.
+20, 22 and 24, then builds the Docker image, checks that the container answers `/health`, and checks that the image
+enforces authentication (`/` open, `/v1/models` 401 without a key and 200 with the built-in key).
 
 When adding behaviour worth protecting, extend `test/stub-opencode.mjs` and `test/smoke.mjs` instead of writing a
 one-off script. For exploratory checks a throwaway stub in `/tmp` is fine.

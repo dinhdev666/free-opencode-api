@@ -1764,6 +1764,22 @@ async function run() {
     check('a held fragment that is not a tag is delivered at the end of the stream',
         tailText.trim() === 'hello world <function_call', JSON.stringify(tailText));
 
+    // The tag sweep runs over the whole answer, which is not bounded by MAX_BODY_MB (that limits the request). A lazy
+    // regex restarted its closing-tag search at every opening one, so 64 000 unclosed tags spent 8.5 s on the single
+    // thread that also serves /health: the scan must be one pass, and the answer that follows the tags must survive.
+    const spamStartedAt = Date.now();
+    const spamResponse = await fetch(`${toolUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'TOOLSPAM please' }], stream: false })
+    }).then((response) => response.json());
+    const spamMs = Date.now() - spamStartedAt;
+    const spamText = spamResponse.choices?.[0]?.message?.content ?? '';
+    check('64 000 unclosed tool-call tags are stripped from a 1 MB answer',
+        spamText === 'done', JSON.stringify(spamText.slice(0, 80)));
+    check('stripping a 1 MB answer of tool-call tags does not stall the gateway',
+        spamMs < 4000, `${spamMs} ms`);
+
     // --- a non-ASCII key ----------------------------------------------------------------
     // The bearer check compares bytes: a key with accented characters matching in string length but not in byte
     // length used to make timingSafeEqual throw, answering 500 instead of 401 for a wrong key

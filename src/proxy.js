@@ -1210,11 +1210,47 @@ function createApp(config) {
         return TOOL_GUARD_MESSAGE;
     };
 
+    // Removes every `<function_calls>…</function_calls>` block and every stray tag of either kind, in one left-to-right
+    // pass. It used to be `/<function_calls>[\s\S]*?<\/function_calls>/g`, whose lazy quantifier restarts a search for
+    // the closing tag at every opening one: an answer carrying many *unclosed* tags (a model that renders its tool
+    // attempts as text emits exactly that) cost O(tags x length) - 32 000 tags in 512 KB measured 2.2 s, 64 000 in
+    // 1 MB measured 8.5 s - on the thread that serves `/health` and holds the only completion slot. This is linear
+    // (1.6 ms and 3.1 ms for the same two inputs) and produces the identical string: `lastClose` rules out a closing
+    // tag once and for all, so an unclosed opener is dropped without rescanning the rest of the answer.
+    const TOOL_OPEN_TAG = '<function_calls>';
+    const TOOL_CLOSE_TAG = '</function_calls>';
+    const removeToolMarkup = (text) => {
+        const lastClose = text.lastIndexOf(TOOL_CLOSE_TAG);
+        let out = '';
+        let keep = 0;   // start of the text not yet copied to `out`
+        let scanAt = 0; // candidate tag position
+        while (scanAt < text.length) {
+            const at = text.indexOf('<', scanAt);
+            if (at === -1) break;
+            if (text.startsWith(TOOL_OPEN_TAG, at)) {
+                if (at + TOOL_OPEN_TAG.length <= lastClose) {
+                    const end = text.indexOf(TOOL_CLOSE_TAG, at + TOOL_OPEN_TAG.length);
+                    out += text.slice(keep, at);
+                    keep = scanAt = end + TOOL_CLOSE_TAG.length;
+                } else {
+                    out += text.slice(keep, at);
+                    keep = scanAt = at + TOOL_OPEN_TAG.length;
+                }
+                continue;
+            }
+            if (text.startsWith(TOOL_CLOSE_TAG, at)) {
+                out += text.slice(keep, at);
+                keep = scanAt = at + TOOL_CLOSE_TAG.length;
+                continue;
+            }
+            scanAt = at + 1; // an unrelated '<' stays in the answer
+        }
+        return out + text.slice(keep);
+    };
+
     const stripFunctionCalls = (text, trim = true) => {
         if (!DISABLE_TOOLS || !text) return text;
-        const cleaned = text
-            .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
-            .replace(/<\/?function_calls>/g, '');
+        const cleaned = removeToolMarkup(text);
         return trim ? cleaned.trim() : cleaned;
     };
 

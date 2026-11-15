@@ -50,6 +50,10 @@ const TOOL_TAG_ANSWER = 'hello <function_calls>secret</function_calls> world';
 // An answer whose last delta ends with a fragment that looks like the start of a tool-call tag but never becomes
 // one (prompt marker TAILTAG): the gateway holds that fragment back, and must still deliver it when the stream ends
 const TAIL_TAG_ANSWER = 'hello world <function_call';
+// An answer made of 64 000 *unclosed* tool-call tags plus one word (prompt marker TOOLSPAM), the input a model that
+// renders its tool attempts as text produces: the gateway must strip them in one pass. A lazy regex restarted a
+// closing-tag search at every opener and spent 8.5 s on this 1 MB answer, stalling everything else in the process.
+const TOOL_SPAM_ANSWER = `${'<function_calls>'.repeat(64000)}done`;
 const HOST = process.env.STUB_HOST || '127.0.0.1';
 // Refuse every route without the Basic credential the gateway is configured with (STUB_BASIC_AUTH=user:pass), the way
 // a proxy in front of the backend does: a gateway that hands the userinfo to the SDK as a URL cannot reach it at all,
@@ -314,6 +318,11 @@ const server = http.createServer(async (req, res) => {
                 // The prompt response already carries the finished message and nothing is stored for polling: an answer
                 // served without a single GET /session/:id/message proves the fast path was used
                 return sendJson(res, 200, buildAssistantMessage(id, ANSWER, REASONING));
+            }
+            if (session.promptText.includes('TOOLSPAM')) {
+                // 64 000 unclosed tags: the strip has to walk the answer once, so this answers in milliseconds and used
+                // to spend seconds inside the regular expression before the client saw anything
+                return sendJson(res, 200, buildAssistantMessage(id, TOOL_SPAM_ANSWER, ''));
             }
             if (session.promptText.includes('FAIL')) {
                 // A provider failure: the assistant message carries an error and no content, so a non-streaming

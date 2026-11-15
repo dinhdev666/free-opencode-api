@@ -1361,18 +1361,14 @@ async function run() {
 
     // A backend that disappears in the middle of a request is an upstream failure (502), not a gateway bug (500),
     // and the next request must start it again instead of failing until the process is restarted
-    const killInFlight = fetch(`${gatewayUrl}/v1/chat/completions`, {
+    // The stub kills itself as soon as it has accepted the prompt, so this needs no timer of its own: a SIGKILL from
+    // the test after a sleep raced the gateway's "three identical polls is an answer" rule, and a loaded runner let
+    // the kill land after a partial answer had been accepted (the test then read a 200 for a dead backend).
+    const killedAnswer = await fetch(`${gatewayUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
-        // SLOWFINISH keeps the answer unfinished for 3 s, so the SIGKILL below cannot race a completed answer the
-        // way the 400 ms hold it used to use could (~250 ms of margin, which a loaded runner eats)
-        body: JSON.stringify({ messages: [{ role: 'user', content: 'SLOWFINISH while the backend dies' }] })
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'SUICIDE while the backend dies' }] })
     }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
-    await sleep(250);
-    try {
-        process.kill(Number(fs.readFileSync(fakePidFile, 'utf8').trim()), 'SIGKILL');
-    } catch { /* already gone */ }
-    const killedAnswer = await killInFlight;
     check('a backend that dies mid request is reported as an upstream error',
         killedAnswer.status === 502 && killedAnswer.json?.error?.type === 'server_error',
         `status ${killedAnswer.status} ${JSON.stringify(killedAnswer.json)?.slice(0, 140)}`);
@@ -1683,6 +1679,52 @@ async function run() {
     await waitForExit(failPollGateway);
     stop(failPollStub);
     await waitForExit(failPollStub);
+
+    // A poll that answers 2xx with something that is not a message list is an unreadable upstream, not the backend
+    // saying "200: failed": the message has to name the shape, because `failed ... (status 200)` sends the reader
+    // looking for a gateway bug instead of an envelope change (or a proxy in front of the backend).
+    const oddPollStubPort = GATEWAY_PORT + 19;
+    const oddPollStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(oddPollStubPort), STUB_UNREADABLE_MESSAGES: '1' }
+    });
+    children.push(oddPollStub);
+    oddPollStub.stdout.on('data', () => {});
+    oddPollStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${oddPollStubPort}/health`);
+    const oddPollGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(oddPollStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${oddPollStubPort}`,
+            OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '8000',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(oddPollGateway);
+    oddPollGateway.stdout.on('data', () => {});
+    oddPollGateway.stderr.on('data', () => {});
+    const oddPollUrl = `http://127.0.0.1:${oddPollStubPort + 1}`;
+    await waitForOk(`${oddPollUrl}/health`);
+    const oddPolled = await fetch(`${oddPollUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(30000)
+    }).then((r) => r.json().then((json) => ({ status: r.status, json })))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    const oddPollMessage = String(oddPolled.json?.error?.message || '');
+    check('a poll answer that is not a message list is reported as unreadable',
+        oddPolled.status === 502 && /payload that is not a message list/.test(oddPollMessage),
+        `status ${oddPolled.status} ${oddPollMessage.slice(0, 160)}`);
+    check('the unreadable poll message does not read like a failed request that succeeded',
+        !/failed while polling the answer \(status 200\)/.test(oddPollMessage), oddPollMessage.slice(0, 160));
+    stopGateway(oddPollGateway);
+    await waitForExit(oddPollGateway);
+    stop(oddPollStub);
+    await waitForExit(oddPollStub);
 
     // --- a backend that answers /health but nothing else -------------------------------------------------
     // A wedged opencode process (health OK, /session silent) used to hang the request handler forever: fetch has no

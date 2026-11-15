@@ -178,6 +178,10 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   still queued is dropped when its turn comes (`reply.raw` 'close'), so it never spends backend time or delays the
   requests behind it. Do not use `request.raw.destroyed` as the disconnect signal: the request stream is destroyed as
   soon as its body has been read, which is the normal case.
+- **The backend command survives the shell it runs in.** `opencodeBin` is quoted whenever the spawn uses a shell
+  (`C:\Program Files\...opencode.cmd` does not start unquoted, and `;`/`&` in a path would be read as operators);
+  paths carrying `"`, `$` or a backtick are refused instead, because quoting cannot neutralise them. A configured
+  `OPENCODE_PATH` that does not exist is warned about rather than silently replaced by whatever the PATH search finds.
 - **Backend lifecycle changes** must keep these properties: `ensureBackend()` trusts a successful probe for
   `OPENCODE_PROXY_HEALTH_CACHE_MS`, connection failures clear that trust, a spawned process that exits during startup
   aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm.

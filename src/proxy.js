@@ -124,6 +124,9 @@ function resolveOpencodePath(requestedPath) {
             if (fs.existsSync(input)) return { path: input, source: 'config' };
             const resolved = path.resolve(process.cwd(), input);
             if (fs.existsSync(resolved)) return { path: resolved, source: 'config' };
+            // A configured path that does not exist is almost always a typo or a moved installation. Say so: the
+            // PATH search below would otherwise hide it behind a binary the operator did not choose
+            logger.warn(`[Proxy] OPENCODE_PATH '${input}' does not exist; using the OpenCode found on PATH instead`);
         }
     }
 
@@ -1583,7 +1586,7 @@ async function ensureBackend(config, options = {}) {
             const isWindows = process.platform === 'win32';
             const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
                 ? USE_ISOLATED_HOME
-                : parseBoolean(process.env.OPENCODE_USE_ISOLATED_HOME, false);
+                : parseBoolean(process.env.OPENCODE_USE_ISOLATED_HOME ?? process.env.USE_ISOLATED_HOME, false);
 
             // On Windows, don't use isolated fake-home to avoid path issues
             // On Unix-like systems, use jail for isolation
@@ -1655,6 +1658,16 @@ async function ensureBackend(config, options = {}) {
             // Cross-platform spawn options
             const useShell = process.platform === 'win32' || !resolved.path ||
                 opencodeBin.endsWith('.cmd') || opencodeBin.endsWith('.bat');
+            // A shell parses the command line, so the binary has to survive it: quoting keeps spaces intact (an
+            // unquoted "C:\Program Files\...opencode.cmd" does not start at all) and turns operators such as `;` or
+            // `&` into literal text. Only what quoting cannot neutralise is refused.
+            let spawnTarget = opencodeBin;
+            if (useShell) {
+                if (/["$`]/.test(opencodeBin)) {
+                    throw new Error(`OPENCODE_PATH cannot be passed through a shell: ${opencodeBin}`);
+                }
+                spawnTarget = `"${opencodeBin}"`;
+            }
             const spawnOptions = {
                 stdio: 'inherit',
                 cwd: cwd,
@@ -1666,7 +1679,7 @@ async function ensureBackend(config, options = {}) {
             // can be exposed)
             const bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
             logger.info(`[Proxy] Starting OpenCode backend: --port ${port} --hostname ${bindHost}`);
-            state.process = spawn(opencodeBin, ['serve', '--port', port, '--hostname', bindHost], spawnOptions);
+            state.process = spawn(spawnTarget, ['serve', '--port', port, '--hostname', bindHost], spawnOptions);
 
             // Handle spawn errors
             let spawnError = null;

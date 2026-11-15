@@ -7,10 +7,8 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { timingSafeEqual } from 'crypto';
-import { fileURLToPath } from 'url';
 import { logger, maskHeaders } from './logger.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // --- Mutex Logic with Timeout ---
 const queue = [];

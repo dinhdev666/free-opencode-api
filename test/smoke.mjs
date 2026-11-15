@@ -13,7 +13,9 @@ import net from 'node:net';
 import os from 'node:os';
 import { parseBoolean } from '../src/proxy.js';
 import { readConfigFile, findUnknownKeys } from '../src/config.js';
-import { createLogger, maskBackendUrl, maskHeaders, maskSecret, maskUrlQuery, serializeDetail } from '../src/logger.js';
+import {
+    createLogger, maskBackendUrl, maskHeaders, maskSecret, maskUrlQuery, serializeDetail, SENSITIVE_NAME_ALTERNATIVES
+} from '../src/logger.js';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -165,11 +167,29 @@ async function run() {
         ['/v1/models?Authorization=secret', '/v1/models?Authorization=***', true],
         ['/v1/models?%61pi_key=secret', '/v1/models?%61pi_key=***', true],
         ['/v1/models?model=opencode/big-pickle', '/v1/models?model=opencode/big-pickle', true],
-        ['/v1/models?author=someone', '/v1/models?author=someone', true]
+        ['/v1/models?author=someone', '/v1/models?author=someone', true],
+        // The spellings other clients use for the same secret: Google's `?key=`, an OAuth `?code=`, an Azure SAS
+        // `?sig=`/`?signature=`. Each of them was logged verbatim, because the pattern only knew the OpenAI names.
+        ['/v1/models?key=AIzaSySECRET', '/v1/models?key=***', true],
+        ['/v1/models?code=oauth-code-123', '/v1/models?code=***', true],
+        ['/v1/models?sig=azure-signature', '/v1/models?sig=***', true],
+        ['/v1/models?X-Amz-Signature=azure-signature', '/v1/models?X-Amz-Signature=***', true],
+        ['/v1/models?bearer=secret', '/v1/models?bearer=***', true],
+        ['/v1/models?credential=secret', '/v1/models?credential=***', true],
+        ['/v1/models?model=codex', '/v1/models?model=codex', true],
+        ['/v1/models?scope=code', '/v1/models?scope=code', true]
     ];
     const urlMaskingResults = urlMaskingCases.map(([input, expected]) => [input, maskUrlQuery(input), expected]);
     check('credential query values are masked in a logged URL',
         urlMaskingResults.every(([, actual, expected]) => actual === expected), JSON.stringify(urlMaskingResults));
+
+    // docker/docker-entrypoint.sh prints the first-boot config from `docker logs` and cannot import this module, so it
+    // repeats the name list. A name added to one copy only leaves the secret in one of the two dumps, which is exactly
+    // how three hand-copied CORS lists drifted once already.
+    const entrypointSource = fs.readFileSync(path.join(ROOT, 'docker', 'docker-entrypoint.sh'), 'utf8');
+    check('the entrypoint masks the same credential names as the logger',
+        entrypointSource.includes(`(${SENSITIVE_NAME_ALTERNATIVES})`),
+        JSON.stringify(SENSITIVE_NAME_ALTERNATIVES));
 
     // A credential can also sit in the configured backend URL (`http://user:secret@host:4097`, a proxy in front of
     // the backend). That value is printed in the startup summary and returned by `/health`, which needs no key, so it

@@ -62,10 +62,14 @@ if [ ! -f "$CONFIG" ]; then
         const masked = (key.length <= 16 ? "***" : key.slice(0, 4) + "***") + ` (${key.length} chars)`;
         // The backend URL can carry credentials too (`http://user:secret@host:4097`, a proxy in front of the backend),
         // and this line is collected from `docker logs`: userinfo and credential query values are masked the same way
-        // maskBackendUrl()/maskUrlQuery() in src/logger.js do it, and for the same reason.
+        // maskBackendUrl()/maskUrlQuery() in src/logger.js do it, and for the same reason. This script cannot import
+        // that module, so the alternation is repeated verbatim from SENSITIVE_NAME_ALTERNATIVES there - the smoke suite
+        // compares the two, and a name added in one place only would leave a secret in one of the two dumps.
         const maskUrl = (value) => String(value)
             .replace(/([?&])([^=&#]+)=([^&#]*)/gi,
-                (match, sep, name, v) => /auth|token|secret|cookie|session|passw|api[-_]?key/i.test(name) ? `${sep}${name}=***` : match)
+                (match, sep, name, v) => /(^|[-_])(auth|token|secret|cookie|session|passw|key|code|sig|signature|credential|bearer)([-_]|$)|authorization|authentication|api[-_]?key/i.test(name)
+                    ? `${sep}${name}=***`
+                    : match)
             .replace(/^(\w[\w+.-]*:\/\/)[^/?#]*@/, "$1***@");
         const shown = Object.assign({}, cfg, { API_KEY: masked, OPENCODE_SERVER_URL: maskUrl(cfg.OPENCODE_SERVER_URL) });
         console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(shown));

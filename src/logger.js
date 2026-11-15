@@ -168,7 +168,17 @@ const SENSITIVE_HEADER_NAMES = new Set([
     'cookie',
     'set-cookie'
 ]);
-const SENSITIVE_HEADER_PATTERN = /(^|[-_])(auth|token|secret|cookie|session|passw)([-_]|$)|authorization|authentication|api[-_]?key/i;
+// Name segments that carry a credential in a header **or** in a query string. Shared as a string rather than written
+// into the pattern directly because `docker/docker-entrypoint.sh` cannot import this module and repeats it verbatim for
+// its own first-boot config dump: the smoke suite compares the two copies, so they cannot drift apart. `key`, `code`,
+// `sig`, `signature`, `credential` and `bearer` were missing, and those are exactly the spellings other clients use for
+// the same secret: Google's `?key=AIza…`, an OAuth `?code=…`, an Azure SAS `?sig=…`, `?access_token=`'s relatives
+// (`?bearer=…`, `?credential=…`). A request URL is logged at the default level, so each of them reached `docker logs`.
+export const SENSITIVE_NAME_ALTERNATIVES = 'auth|token|secret|cookie|session|passw|key|code|sig|signature|credential|bearer';
+const SENSITIVE_HEADER_PATTERN = new RegExp(
+    `(^|[-_])(${SENSITIVE_NAME_ALTERNATIVES})([-_]|$)|authorization|authentication|api[-_]?key`,
+    'i'
+);
 
 const isSensitiveHeader = (lowerName) => SENSITIVE_HEADER_NAMES.has(lowerName) || SENSITIVE_HEADER_PATTERN.test(lowerName);
 

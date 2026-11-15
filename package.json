@@ -17,6 +17,7 @@
   "scripts": {
     "start": "node index.js",
     "check": "node test/check-syntax.mjs",
+    "check:commits": "node test/check-commit-messages.mjs",
     "test": "node test/smoke.mjs"
   },
   "keywords": [

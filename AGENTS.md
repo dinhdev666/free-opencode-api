@@ -56,6 +56,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
 | `test/smoke.mjs` | End-to-end contract checks: boots the stub and the gateway, asserts status codes, envelopes, SSE frames and clean shutdown. |
 | `test/check-syntax.mjs` | Walks the repository and runs `node --check` on every `.js`/`.mjs` file, so a new source file is checked without editing a list. |
+| `test/check-commit-messages.mjs` | Applies the CONTRIBUTING.md commit-message rules to every commit in a range; CI runs it over the commits a push or pull request adds, because a subject cannot be corrected after it is published. |
 | `.github/workflows/ci.yml` | CI: `pnpm run check`, shell check, `pnpm test` on Node 20/22/24, plus a Docker build with a container health check. |
 | `.github/workflows/docker-publish.yml` | Publishes `linux/amd64` + `linux/arm64` images to Docker Hub when a `v*.*.*` tag is pushed (secrets `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`). |
 | `README.md` | User-facing documentation: features, configuration tables, API reference, client examples, performance, troubleshooting. |
@@ -70,14 +71,15 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
+pnpm run check:commits           # commit subjects in the last commits against CONTRIBUTING.md (test/check-commit-messages.mjs)
 pnpm test                        # smoke suite: stub backend + gateway, 260 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
 `pnpm test` needs no OpenCode CLI and no network: it starts `test/stub-opencode.mjs` on port 4199 and the gateway on
 port 8199 (override with `SMOKE_STUB_PORT` / `SMOKE_PORT`). CI runs `pnpm run check` and `pnpm test` on Node 20, 22
-and 24. There is still no linter or formatter, so style is a review concern. Do not claim checks passed if they were
-not run.
+and 24, and `test/check-commit-messages.mjs` over the commits a push or pull request adds. There is still no linter or
+formatter, so style is a review concern. Do not claim checks passed if they were not run.
 
 Releases are published from tags, not from a laptop: bump `version` in `package.json`, then `git tag vX.Y.Z` and push
 the tag. `docker-publish.yml` refuses a tag that does not match `package.json`, builds both architectures and pushes to
@@ -626,13 +628,15 @@ Before reporting a change as complete:
 
 1. `pnpm run check` passes (syntax check for every JavaScript file).
 2. `pnpm test` passes; new behaviour that can be asserted belongs in `test/smoke.mjs`.
-3. The gateway boots (`pnpm start` or `node index.js`) and `GET /health` returns `200`; with a real backend,
+3. `pnpm run check:commits <base>..HEAD` passes for the commits the change adds; a subject that is wrong has to be
+   fixed before it is published, because rewriting published history rewrites every commit after it.
+4. The gateway boots (`pnpm start` or `node index.js`) and `GET /health` returns `200`; with a real backend,
    `/v1/models` with the key returns `200` and without it `401`, a chat completion works with and without
    `stream: true`, and an invalid body returns `400`.
-4. Documentation that describes the changed behaviour is updated in the same change (README tables, Docker README,
+5. Documentation that describes the changed behaviour is updated in the same change (README tables, Docker README,
    this file when invariants or commands change).
-5. Shutdown is clean (`SIGINT` logs `[Shutdown]` and exits) when backend lifecycle code was touched.
-6. The report states exactly what was run and what was not (for example: "Docker image not built — no Docker here").
+6. Shutdown is clean (`SIGINT` logs `[Shutdown]` and exits) when backend lifecycle code was touched.
+7. The report states exactly what was run and what was not (for example: "Docker image not built — no Docker here").
 
 ## Reporting
 

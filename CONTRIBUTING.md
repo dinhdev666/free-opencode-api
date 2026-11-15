@@ -163,6 +163,22 @@ instead of disabling authentication.
 - Rebase or squash into meaningful commits before opening a pull request; "fix typo" and "wip" commits should not
   survive review.
 
+### Enforcement
+
+`test/check-commit-messages.mjs` (`pnpm run check:commits`) applies the rules above to the subject line of every
+commit in a range — the type and scope lists, the 72-character limit, a lowercase imperative subject and no trailing
+period — and CI runs it on the commits a push or pull request adds. It fails on the commits, not on the process, so a
+message over the limit or a scope that is not in the list has to be reworded (`git rebase -i <base>`) before it is
+published: rewriting published history also rewrites every commit after it.
+
+A merge commit is checked like any other, because that is where a pull request title lands in `main`. GitHub's
+generated `Merge pull request #123 from …` title therefore fails the check; merge with an explicit subject, or squash:
+
+```bash
+gh pr merge 123 --squash                                          # subject becomes <pr title> (#123)
+gh pr merge 123 --merge --subject "feat(proxy): add the thing (#123)"
+```
+
 ## Branch naming
 
 ```

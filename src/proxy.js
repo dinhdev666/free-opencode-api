@@ -118,6 +118,14 @@ const loggableUrl = (url) => {
         : masked;
 };
 
+// The request target without its query string, which the access log and the 404 body want. `url.split('?')[0]`
+// allocated an array plus a second string on every request - including the ones that carry no query at all - where an
+// index scan answers the same value with no allocation in the common `no '?'` case.
+const urlPath = (url) => {
+    const query = url.indexOf('?');
+    return query === -1 ? url : url.slice(0, query);
+};
+
 // A client-supplied value on its way into a response body, under one rule.
 //
 // The `415` media-type message already replaced control characters and cut the echoed type; the other sites copied the
@@ -858,7 +866,7 @@ function createApp(config) {
     const badUrlHandler = (path, rawRequest, rawResponse) => {
         const reqId = `gw-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
         // The path is the client's own bytes: truncated and stripped of anything that could forge a log line
-        logger.warn(`[Proxy] Rejected a URL that cannot be decoded: ${loggableUrl(String(path ?? '').split('?')[0])}`);
+        logger.warn(`[Proxy] Rejected a URL that cannot be decoded: ${loggableUrl(urlPath(String(path ?? '')))}`);
         const body = JSON.stringify({
             error: {
                 message: 'The request URL could not be decoded',
@@ -1010,7 +1018,7 @@ function createApp(config) {
     // fewer dispatches than three, and the order (log wiring, CORS, auth) is unchanged.
     app.addHook('onRequest', (request, reply, done) => {
         const startedAt = Date.now();
-        const path = request.url.split('?')[0];
+        const path = urlPath(request.url);
         // A client that supplies its own trace id keeps it, so its logs and ours can be joined. Anything that is not a
         // short, printable token is ignored instead of being echoed: a header value can carry newlines or control
         // characters, and this string ends up in the log line and in a response header.
@@ -3123,7 +3131,7 @@ function createApp(config) {
         reply.code(404).send({
             error: {
                 // The path is echoed back, so it is the client's own input: no query string, no control characters
-                message: `Route ${request.method} ${loggableUrl(request.url.split('?')[0])} not found`,
+                message: `Route ${request.method} ${loggableUrl(urlPath(request.url))} not found`,
                 type: 'not_found'
             }
         });

@@ -763,6 +763,11 @@ function createApp(config) {
     // browser client that sets its own trace id sent a header its own preflight did not allow, and the browser refused
     // the request before it left the page. `X-Requested-With` stays for jQuery-era clients that send it unasked.
     const CORS_ALLOW_HEADERS = 'Content-Type, Authorization, X-Api-Key, X-Request-Id, X-Requested-With';
+    // Every body this gateway writes is JSON or SSE, and a browser that navigates to an endpoint has nothing useful to
+    // render. `nosniff` is the one security header that costs a single write and applies to an API: it stops a browser
+    // from re-interpreting a JSON body as HTML or script when its own guess disagree with the Content-Type. Set beside
+    // the CORS set, on the same three paths, for the same reason.
+    const NO_SNIFF = 'nosniff';
 
     const CLIENT_ERROR_STATUS = {
         ERR_HTTP_REQUEST_TIMEOUT: { status: 408, reason: 'Request timeout' },
@@ -785,6 +790,7 @@ function createApp(config) {
                 `HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\n` +
                 'Content-Type: application/json; charset=utf-8\r\n' +
                 `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+                'X-Content-Type-Options: nosniff\r\n' +
                 'Access-Control-Allow-Origin: *\r\n' +
                 'Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n' +
                 `Access-Control-Allow-Headers: ${CORS_ALLOW_HEADERS}\r\n` +
@@ -819,6 +825,7 @@ function createApp(config) {
         rawResponse.writeHead(400, {
             'Content-Type': 'application/json; charset=utf-8',
             'Content-Length': Buffer.byteLength(body),
+            'X-Content-Type-Options': NO_SNIFF,
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
             'Access-Control-Allow-Headers': CORS_ALLOW_HEADERS,
@@ -992,6 +999,7 @@ function createApp(config) {
         // CORS headers are written on the raw response so they are present for streamed (hijacked) replies as well.
         // x-api-key is not read by the gateway, but browsers send it on behalf of clients that do, and a rejected
         // preflight would break those clients before they ever reach the auth check.
+        reply.raw.setHeader('X-Content-Type-Options', NO_SNIFF);
         reply.raw.setHeader('Access-Control-Allow-Origin', '*');
         reply.raw.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         reply.raw.setHeader('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS);

@@ -70,7 +70,7 @@ prompt then polling (non-streaming) → OpenAI response → session cleanup.
 pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check for every JavaScript source file (test/check-syntax.mjs walks the tree)
-pnpm test                        # smoke suite: stub backend + gateway, 176 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 177 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -274,7 +274,12 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **Logging** goes through `src/logger.js` (`logger.info`, `logger.warn`, `logger.error`, `logger.debug`). No
   `console.log` in `src/` or `index.js`. Never log an unmasked `authorization` header, and never print the API key:
   `docker/docker-entrypoint.sh` reports the key it generated as `sup*** (22 chars)`, because `docker logs` is collected
-  as often as not (`maskHeaders`/`maskSecret` in `src/logger.js` are the in-process equivalents).
+  as often as not (`maskHeaders`/`maskSecret` in `src/logger.js` are the in-process equivalents). A **closed reader**
+  on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream `error` with no listener is
+  thrown as an uncaught exception, and `node index.js | head -3` (a log shipper that restarted, `docker logs` closing
+  mid-write) killed a gateway that was still serving requests. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that
+  log line is lost, the process keeps answering. The smoke suite destroys the read end of the child's stdout to
+  assert it.
 - **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
   boundary can fall inside either of them; the held fragment is flushed at end of stream. The flush must write the

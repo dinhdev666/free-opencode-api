@@ -13,6 +13,18 @@
 const PREFIX = '[gateway]';
 const DEFAULT_LEVEL = 'info';
 
+// A closed reader on the other end of stdout/stderr (a pipe into `head`, a log shipper that restarted, `docker logs`
+// closing mid-write) makes the next write emit EPIPE. A stream 'error' with no listener is thrown as an uncaught
+// exception, so `node index.js | head -3` killed a gateway that was still serving requests: the log line is lossy by
+// then, the process must not be. Nothing else is swallowed - a real stream failure stays visible.
+const IGNORED_STREAM_ERRORS = new Set(['EPIPE', 'ERR_STREAM_DESTROYED']);
+const ignoreClosedReader = (error) => {
+    if (error && IGNORED_STREAM_ERRORS.has(error.code)) return;
+    throw error;
+};
+process.stdout.on('error', ignoreClosedReader);
+process.stderr.on('error', ignoreClosedReader);
+
 // Level values: higher means more verbose; the output check is "current level value >= target level value"
 // (both sides are numbers, not a string comparison)
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };

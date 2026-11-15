@@ -1876,6 +1876,52 @@ if (process.platform !== 'win32') {
         `spawned pid ${spawnedPid}`);
     await new Promise((resolve) => silent.close(resolve));
     fs.rmSync(shutdownDir, { recursive: true, force: true });
+
+// --- a closed log reader does not take the gateway down ---------------------------------------------------
+// `node index.js | head -3`, a log shipper that restarts, `docker logs` closing mid-write: the next write emits EPIPE
+// on stdout, an unhandled stream 'error' is thrown as an uncaught exception, and it killed a gateway that was still
+// serving. Destroying the read end of the child's stdout is exactly that pipe closing.
+// The main stub is long gone by this point, so this needs a backend of its own
+const pipeStubPort = GATEWAY_PORT + 22;
+const pipeStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+    cwd: ROOT,
+    env: { ...process.env, STUB_PORT: String(pipeStubPort) }
+});
+children.push(pipeStub);
+pipeStub.stdout.on('data', () => {});
+pipeStub.stderr.on('data', () => {});
+await waitForOk(`http://127.0.0.1:${pipeStubPort}/health`);
+const pipePort = GATEWAY_PORT + 21;
+const pipeGateway = spawn(process.execPath, ['index.js'], {
+    cwd: ROOT,
+    env: {
+        ...process.env,
+        PORT: String(pipePort),
+        BIND_HOST: '127.0.0.1',
+        OPENCODE_SERVER_URL: `http://127.0.0.1:${pipeStubPort}`,
+        LOG_LEVEL: 'info'
+    }
+});
+children.push(pipeGateway);
+pipeGateway.stdout.on('data', () => {});
+pipeGateway.stderr.on('data', () => {});
+await waitForOk(`http://127.0.0.1:${pipePort}/health`);
+pipeGateway.stdout.destroy();
+await sleep(400);
+const afterClosedPipe = await fetch(`http://127.0.0.1:${pipePort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    signal: AbortSignal.timeout(30000)
+}).then((r) => r.text().then((body) => ({ status: r.status, body })))
+    .catch((error) => ({ status: 0, body: error.message }));
+check('a closed log pipe does not stop the gateway',
+    afterClosedPipe.status === 200 && afterClosedPipe.body.includes(ANSWER),
+    `status ${afterClosedPipe.status} ${afterClosedPipe.body.slice(0, 120)}`);
+stopGateway(pipeGateway);
+await waitForExit(pipeGateway);
+stop(pipeStub);
+await waitForExit(pipeStub);
 }
 
 const TIMEOUT_MS = 120000;

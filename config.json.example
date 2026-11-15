@@ -8,6 +8,7 @@
     "OPENCODE_PATH": "opencode",
     "USE_ISOLATED_HOME": false,
     "LOG_LEVEL": "info",
+    "DEBUG": false,
     "OPENCODE_PROXY_MAX_CONCURRENCY": 1,
     "OPENCODE_PROXY_MAX_QUEUE": 64,
     "OPENCODE_PROXY_MAX_BODY_MB": 50,

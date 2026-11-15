@@ -112,6 +112,10 @@ it, so both shapes of an unreadable payload are covered, and `STUB_FAIL_EVENTS=1
 can prove a streaming request still answers through the polling fallback when the event stream is refused). Extend that stub and
 `test/smoke.mjs` when you add behaviour worth protecting. The suite refuses to start when the stub or gateway port is
 already taken (a stale process would answer with someone else's build) and SIGKILLs any child that ignores SIGTERM.
+The session-cleanup assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting
+the session (the delete is a backend round trip that has nothing to do with the answer), so a single read of
+`/__sessions` raced with it and failed with `live: 1` on a slow runner. Wait for `live: 0` within a bounded window
+instead of sampling one instant.
 
 For exploratory work, start the stub (or a throwaway one in `/tmp`) on a spare port and point the gateway at it:
 
@@ -304,7 +308,8 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
   (a 5xx while the backend is busy) or throws (a connection reset while it restarts): one bad poll used to lose an
   answer that was one poll away - the thrown case surfaced as `502 "fetch failed"`. Only `MAX_POLL_FAILURES` (5)
   consecutive failures give up, and they report an upstream error with the status and reason
-  (`OpenCode backend failed while polling the answer (status 500): …`) in ~2 s instead of burning the whole request
+  (`OpenCode backend failed while polling the answer (status 500): …`, or `… : the backend is not reachable
+  (fetch failed)` for a connection failure - the runtime's own wording names no cause) in ~2 s instead of burning the whole request
   budget and answering `504`. An empty list is a normal "not written yet" poll, not a failure, and an expired
   deadline still surfaces as the timeout it is.
 - **An idle stream is recovered, not ended.** When the event stream goes silent for `DEFAULT_EVENT_IDLE_TIMEOUT_MS`

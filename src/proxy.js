@@ -1030,9 +1030,14 @@ function createApp(config) {
         const candidate = typeof raw === 'string'
             ? raw
             : (raw?.data?.message ?? raw?.message ?? (typeof raw?.error === 'string' ? raw.error : raw?.error?.message));
+        // A thrown call carries the runtime's own wording (`fetch failed` for a dead or refused backend), which names
+        // no cause at all; the same phrase a client would read from the top-level handler is used here.
+        const reason = typeof candidate === 'string' && candidate && isConnectionError({ message: candidate })
+            ? `the backend is not reachable (${candidate})`
+            : candidate;
         return {
             status,
-            reason: typeof candidate === 'string' && candidate ? `: ${candidate}` : ''
+            reason: typeof reason === 'string' && reason ? `: ${reason}` : ''
         };
     };
 
@@ -2007,6 +2012,12 @@ function createApp(config) {
                     // a bug" instead of "the upstream is gone".
                     if (error.name === 'ProviderError' || isConnectionError(error)) {
                         statusCode = 502;
+                    }
+                    // The connection branch says what happened instead of forwarding Node's own wording: `fetch failed`
+                    // is what a dead or refused backend produces, and a client reading it cannot tell whether the
+                    // gateway, the backend or its own request is at fault.
+                    if (error.name !== 'ProviderError' && isConnectionError(error)) {
+                        errorMessage = `OpenCode backend is not reachable (${error.message})`;
                     }
                     if (error.message && error.message.includes('ENOENT')) {
                         errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';

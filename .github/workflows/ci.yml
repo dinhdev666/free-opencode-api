@@ -127,37 +127,25 @@ jobs:
       # session API. A 2.x release serves the web UI instead - it answers /health with HTML (so a readiness probe
       # passes) and 405 for POST /session (so every completion fails), and no other step here would notice: this is
       # what a `latest` CLI install shipped. Needs no provider credentials, only the local backend.
+      # It runs in its own container rather than through `docker exec`: a detached exec keeps the CLI's output out of
+      # `docker logs`, so a failure reported only "fetch failed" with nothing to read, and sharing the gateway
+      # container's HOME means sharing its backend state for no reason.
       - name: Bundled CLI exposes the session API
         run: |
-          docker exec -d gateway-ci opencode serve --port 4599 --hostname 127.0.0.1
-          docker exec gateway-ci node -e '
-            (async () => {
-              const deadline = Date.now() + 60000;
-              let last = "no answer";
-              while (Date.now() < deadline) {
-                try {
-                  const res = await fetch("http://127.0.0.1:4599/session", {
-                    method: "POST",
-                    headers: { "content-type": "application/json" },
-                    body: "{}"
-                  });
-                  last = `status ${res.status}`;
-                  if (res.status === 200) {
-                    const body = await res.json();
-                    if (body && typeof body.id === "string") {
-                      console.log(`bundled opencode created session ${body.id}`);
-                      process.exit(0);
-                    }
-                  }
-                } catch (error) {
-                  last = error.message;
-                }
-                await new Promise((resolve) => setTimeout(resolve, 500));
-              }
-              console.error(`the bundled opencode CLI did not expose POST /session (last: ${last})`);
-              process.exit(1);
-            })();
-          '
+          docker run -d --name cli-session-check -p 4599:4599 --entrypoint opencode \
+            free-opencode-api:ci serve --port 4599 --hostname 0.0.0.0
+          for attempt in $(seq 1 60); do
+            if body=$(curl -fsS -X POST -H 'content-type: application/json' -d '{}' \
+                http://127.0.0.1:4599/session 2>/dev/null); then
+              echo "bundled opencode created a session: $body"
+              echo "$body" | grep -q '"id"'
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the bundled opencode CLI did not answer POST /session"
+          docker logs cli-session-check
+          exit 1
 
       # The image must behave like the source tree: the root index answers without a key and everything else
       # is authenticated with the built-in key

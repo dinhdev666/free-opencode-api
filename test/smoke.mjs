@@ -14,7 +14,8 @@ import os from 'node:os';
 import { clientFacingText, parseBoolean, resolveBackendAuth, timeoutMessage } from '../src/proxy.js';
 import { readConfigFile, findUnknownKeys, CONFIG_FILE_KEYS } from '../src/config.js';
 import {
-    createLogger, maskBackendUrl, maskHeaders, maskSecret, maskUrlCredentials, maskUrlQuery, serializeDetail,
+    createLogger, maskBackendUrl, maskHeaders, maskQuotedCredentials, maskSecret, maskUrlCredentials, maskUrlQuery,
+    serializeDetail,
     SENSITIVE_NAME_ALTERNATIVES
 } from '../src/logger.js';
 import path from 'node:path';
@@ -352,6 +353,28 @@ async function run() {
         maskUrlCredentials(undefined) === 'undefined' && maskUrlCredentials('plain text') === 'plain text',
         `${maskUrlCredentials(undefined)} / ${maskUrlCredentials('plain text')}`);
 
+    // A URL is not the only credential an upstream can quote. The gateway sends the credential it lifted out of
+    // OPENCODE_SERVER_URL as a Basic header, and a proxy in front of the backend can echo the header it refused in its
+    // own error payload, which is copied into a client-facing 502 body and into the error log. The value after the
+    // scheme word is masked; ordinary prose that happens to use the word is not.
+    const quotedCredentials = [
+        ['the proxy refused: Authorization: Basic b3BzOnMzY3IzdC12YWx1ZQ==',
+            'the proxy refused: Authorization: Basic ***'],
+        ['invalid bearer sk-abcdefghijklmnop1234', 'invalid bearer ***'],
+        ['Authorization: basic dXNlcjpwYXNzd29yZA==', 'Authorization: basic ***'],
+        ['basic setup needs a key', 'basic setup needs a key'],
+        ['Bearer of good news', 'Bearer of good news'],
+        ['authorization: none', 'authorization: none']
+    ];
+    const quotedResults = quotedCredentials.map(([input, expected]) => [input, maskQuotedCredentials(input), expected]);
+    check('a credential quoted as an authorization header value is masked',
+        quotedResults.every(([, actual, expected]) => actual === expected),
+        JSON.stringify(quotedResults.filter(([, actual, expected]) => actual !== expected)));
+    check('masking a quoted credential leaves ordinary prose alone',
+        maskQuotedCredentials('a basic guide') === 'a basic guide' &&
+        maskQuotedCredentials(undefined) === 'undefined',
+        `${maskQuotedCredentials('a basic guide')} / ${maskQuotedCredentials(undefined)}`);
+
     // Every upstream sentence the gateway writes goes through `clientFacingText()`; the top-level error handler was
     // the one path that did not, and a 5xx sentence there is the only message nobody in the gateway wrote - it comes
     // from whatever threw, and an error raised while talking to a backend behind a credential-bearing URL can quote
@@ -362,6 +385,8 @@ async function run() {
             'connect ECONNREFUSED http://***@127.0.0.1:4097/session?token=***'],
         ['request to http://host:4097/session?api_key=k failed: ECONNRESET',
             'request to http://host:4097/session?api_key=*** failed: ECONNRESET'],
+        ['the proxy refused: Authorization: Basic b3BzOnMzY3IzdC12YWx1ZQ==',
+            'the proxy refused: Authorization: Basic ***'],
         ['boom', 'boom'],
         ['', ''],
         [undefined, '']
@@ -380,6 +405,13 @@ async function run() {
     check('the top-level error handler sends a 5xx sentence through the masking',
         proxySource.includes('const errorMessage = statusCode >= 500 ? clientFacingText(rawMessage)'),
         'src/proxy.js no longer masks the message a 5xx body carries');
+    // The route handler's own catch writes its 500 body itself, so the top-level handler never sees it - and that catch
+    // is the one an error thrown inside a completion reaches. Asserted on the source for the same reason: no accepted
+    // request makes a handler throw.
+    check('the handler catch sends its 500 sentence through the masking too',
+        proxySource.includes('const handlerMessage = clientFacingText(rawMessage) || rawMessage;') &&
+        proxySource.includes("message: handlerMessage, stack: error.stack"),
+        'src/proxy.js no longer masks the sentence or the log line its own catch writes');
 
     // `http://user:secret@host:4097` was documented as supported and could not work: the SDK calls every endpoint
     // through Node's fetch, which refuses a URL carrying credentials, so every completion answered 502 and the
@@ -3048,6 +3080,55 @@ async function run() {
     await waitForExit(urlErrorGateway);
     stop(urlErrorStub);
     await waitForExit(urlErrorStub);
+
+    // --- an upstream reason that echoes the credential it refused ------------------------------------
+    // A proxy in front of the backend reports the header it rejected. That header carries the credential the gateway
+    // lifted out of OPENCODE_SERVER_URL (`resolveBackendAuth()`), so the reason reaches a client-facing 502 body and
+    // the error log with a live secret in it unless the quoted value is masked too.
+    const echoAuthStubPort = GATEWAY_PORT + 36;
+    const echoAuthStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(echoAuthStubPort), STUB_ECHO_AUTH: '1' }
+    });
+    children.push(echoAuthStub);
+    echoAuthStub.stdout.on('data', () => {});
+    echoAuthStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${echoAuthStubPort}/health`);
+    const echoAuthPort = GATEWAY_PORT + 37;
+    const echoAuthGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(echoAuthPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://ops:s3cr3t-value@127.0.0.1:${echoAuthStubPort}`,
+            LOG_LEVEL: 'info'
+        }
+    });
+    children.push(echoAuthGateway);
+    let echoAuthOutput = '';
+    echoAuthGateway.stdout.on('data', (chunk) => { echoAuthOutput += chunk.toString(); });
+    echoAuthGateway.stderr.on('data', (chunk) => { echoAuthOutput += chunk.toString(); });
+    await waitForOk(`http://127.0.0.1:${echoAuthPort}/health`);
+    const echoAuthAnswer = await fetch(`http://127.0.0.1:${echoAuthPort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'echoed credential' }] })
+    }).then(async (response) => ({ status: response.status, text: await response.text() }));
+    // The base64 form is what would leak, so both the encoded header value and the raw password are checked
+    const encodedCredential = Buffer.from('ops:s3cr3t-value').toString('base64');
+    check('an upstream reason that echoes the credential it refused is masked in the client answer',
+        echoAuthAnswer.status === 502 && echoAuthAnswer.text.includes('Basic ***') &&
+        !echoAuthAnswer.text.includes(encodedCredential) && !echoAuthAnswer.text.includes('s3cr3t-value'),
+        `${echoAuthAnswer.status} ${echoAuthAnswer.text.slice(0, 220)}`);
+    check('the echoed credential is masked in the error log too',
+        !echoAuthOutput.includes(encodedCredential) && !echoAuthOutput.includes('s3cr3t-value') &&
+        echoAuthOutput.includes('Basic ***'),
+        (echoAuthOutput.split('\n').find((line) => line.includes('upstream call failed')) || '').slice(0, 240));
+    stopGateway(echoAuthGateway);
+    await waitForExit(echoAuthGateway);
+    stop(echoAuthStub);
+    await waitForExit(echoAuthStub);
 
     // --- a config.json next to the working directory ------------------------------------------------
     // config.json is read from the application directory, not from the cwd. A file written next to the shell's cwd used

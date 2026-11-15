@@ -241,6 +241,25 @@ export function maskUrlCredentials(text) {
 }
 
 /**
+ * Mask a credential that is quoted as an authorization header value inside arbitrary text.
+ *
+ * The gateway lifts the credential out of `OPENCODE_SERVER_URL` and sends it as a Basic header
+ * (`resolveBackendAuth()`). A backend, or a proxy in front of the backend, can echo the header it rejected in its own
+ * error payload - `invalid credentials: Authorization: Basic b3BzOnMzY3JldA==` - and that payload is copied into a
+ * client-facing `502` body and into the error log. Masking a URL inside a sentence does not cover a bare encoded
+ * token, so the value after the scheme word is replaced too.
+ *
+ * Only a token that looks like one is replaced: the word has to be followed by whitespace and at least 16 characters
+ * of the base64/URL-safe alphabet, so ordinary prose ("basic setup", "Bearer of good news") is left alone and a
+ * reader still sees which header was refused.
+ * @param {*} text any text (non-strings are stringified the way `maskUrlQuery` does it)
+ * @returns {string} the text with `Basic <token>` / `Bearer <token>` reduced to `Basic ***` / `Bearer ***`
+ */
+export function maskQuotedCredentials(text) {
+    return String(text).replace(/(\bbasic\s+|\bbearer\s+)([A-Za-z0-9+/=_.~-]{16,})/gi, '$1***');
+}
+
+/**
  * Copy a request-header object and mask sensitive headers (authorization/api-key/cookie/token etc.)
  * @param {object} headers original request headers
  * @returns {object} masked copy (the original object is left untouched)

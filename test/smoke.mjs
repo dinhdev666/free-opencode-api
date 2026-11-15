@@ -210,6 +210,25 @@ async function run() {
         entrypointSource.includes(`(${SENSITIVE_NAME_ALTERNATIVES})`),
         JSON.stringify(SENSITIVE_NAME_ALTERNATIVES));
 
+    // The commit-message rules live in two places - the CONTRIBUTING.md tables and test/check-commit-messages.mjs -
+    // and CI enforces the second over the commits a push adds. A scope added to the document alone would reject every
+    // commit that uses it, and one added to the checker alone documents nothing, so the checker compares the two lists
+    // and fails on a difference. Run it the way CI does: a documented scope passes, an undocumented one does not.
+    const commitCheck = (subject) => {
+        try {
+            execFileSync(process.execPath, ['test/check-commit-messages.mjs', '--subject', subject], {
+                cwd: ROOT,
+                stdio: 'pipe'
+            });
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    check('the commit-message check accepts a documented scope and rejects an unknown one',
+        commitCheck('docs(config): describe the rule (#1)') && !commitCheck('docs(nonsense): describe the rule (#1)'),
+        'docs(config) accepted, docs(nonsense) rejected');
+
     // A credential can also sit in the configured backend URL (`http://user:secret@host:4097`, a proxy in front of
     // the backend). That value is printed in the startup summary and returned by `/health`, which needs no key, so it
     // published the secret to every caller and to `docker logs` - while the scheme, host and path, the parts an

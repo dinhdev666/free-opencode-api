@@ -54,7 +54,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
 | `test/smoke.mjs` | End-to-end contract checks: boots stub and gateway, asserts status codes, envelopes, SSE frames and clean shutdown. |
 | `test/check-syntax.mjs` | Walks the repository and runs `node --check` on every `.js`/`.mjs` file, so a new source file is checked without editing a list. |
-| `test/check-commit-messages.mjs` | Applies the CONTRIBUTING.md commit-message rules to every commit in a range; CI runs it over the commits a push or pull request adds, because a published subject cannot be corrected. |
+| `test/check-commit-messages.mjs` | Applies the CONTRIBUTING.md rules to every commit in a range, and fails when its own type/scope lists and the document's tables disagree; CI runs it over a push's added commits, because a published subject cannot be corrected. |
 | `.github/workflows/ci.yml` | CI: `pnpm run check`, shell check, `pnpm test` on Node 20/22/24, plus a Docker build with a container health check. |
 | `.github/workflows/docker-publish.yml` | Publishes `linux/amd64` + `linux/arm64` to Docker Hub on a `v*.*.*` tag (secrets `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`). |
 | `README.md` | User-facing documentation: features, configuration tables, API reference, client examples, performance, troubleshooting. |
@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 316 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 317 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -539,7 +539,7 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   A body over `OPENCODE_PROXY_MAX_BODY_MB` is still refused with `413`, but only after the body has been read to its
   end (`refuseOversizedBody()`, bounded by `BODY_DRAIN_TIMEOUT_MS`): Node ends the socket when a response finishes with
   the request body unread, and the kernel answers the client's remaining bytes with RST, so the client could lose the
-  413 entirely (CI on Node 24 saw "fetch failed"). A client that keeps writing is cut off after the drain window.
+  413 entirely. A client that keeps writing is cut off after the drain window.
 - **The container runs as the unprivileged `node` user.** `docker/Dockerfile` chowns `/app` and declares
   `USER node` (uid/gid 1000) after the CLI install, so the gateway, the backend it spawns and every tool it runs are
   not UID 0. The entrypoint still writes `/app/config.json` (0600, owned by that user) on first boot, so a bind mount

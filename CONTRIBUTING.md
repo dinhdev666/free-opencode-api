@@ -23,7 +23,7 @@ purpose is to disable authentication.
 | --- | --- | --- |
 | Node.js | `>=20` (developed on Node 26) | ESM-only project, no build step |
 | pnpm | `>=12` (`packageManager: pnpm@12.18.0`) | use pnpm, never npm, for this repository |
-| OpenCode CLI | current release | `npm install -g opencode-ai`, or `curl -fsSL https://opencode.ai/install \| bash`; authenticate with `opencode auth login` |
+| OpenCode CLI | **1.x** release | `npm install -g "opencode-ai@1"` (the 2.x `serve` is a different server), or `curl -fsSL https://opencode.ai/install \| bash` followed by `opencode --version`; authenticate with `opencode auth login` |
 
 ## Local setup
 
@@ -100,7 +100,7 @@ messages are written in English, in the imperative mood, and describe the behavi
 | `refactor` | Internal restructuring without behaviour change |
 | `docs` | README, `AGENTS.md`, `CONTRIBUTING.md`, comments, examples |
 | `build` | Dependencies, `pnpm-lock.yaml`, Docker image, packaging |
-| `ci` | Automated checks (currently none configured) |
+| `ci` | CI workflow changes (`.github/workflows/`) |
 | `test` | Adding or fixing tests or verification harnesses |
 | `chore` | Maintenance that fits nowhere else (gitignore, formatting) |
 | `revert` | Reverting a previous commit, referencing its hash |
@@ -198,15 +198,16 @@ Example: `fix/stream-first-delta-fallback`.
 ## Testing
 
 `pnpm test` runs `test/smoke.mjs`, which boots `test/stub-opencode.mjs` (a minimal `opencode serve` stand-in) plus the
-gateway and asserts the contract: the root index and health, auth (401 with a missing or wrong key, with a `type` and
-`code`), CORS/preflight, the request-id header, model listing (both routes, including an id with several slashes),
-400 validation, 404 envelope, non-streaming completion, SSE frames (valid JSON, streamed content and reasoning, stop
-frame, `[DONE]`), that unrelated backend events do not corrupt a stream, that a tool-call block split across deltas
-never leaks into the answer, that a stalled stream is closed, that an
-abandoned stream frees its slot, that a request abandoned while queued never reaches the backend, that every
-completion deletes its session, that a full queue answers `503 queue_full`, and clean `SIGINT` shutdown. No OpenCode
-CLI and no network access are required. The stub listens on port 4199 and the gateway on 8199 by default; override
-with `SMOKE_STUB_PORT` / `SMOKE_PORT` if those are taken.
+gateway and asserts the HTTP contract end to end: the root index and health, auth (401 with a missing or wrong key,
+with a `type` and `code`), CORS and preflight, the request-id header, model listing and by-id answers (including ids
+with several slashes and ids that are not models), 400 validation, the 404 envelope, non-streaming completions, SSE
+frames (valid JSON, streamed content and reasoning, the stop and usage frames, `[DONE]`), the failure and fallback
+paths (a rejected session, prompt, message poll or event stream), tool-call filtering across delta boundaries, the
+queue (a full queue answers `503 queue_full`; an abandoned or stalled stream frees its slot; a request abandoned while
+queued never reaches the backend), session cleanup on every path, and clean `SIGINT` shutdown. No OpenCode CLI and no
+network access are required. The stub listens on port 4199 and the gateway on 8199 by default; override with
+`SMOKE_STUB_PORT` / `SMOKE_PORT` if those are taken. `AGENTS.md` lists the stub's test markers, which is where to
+look before adding a case for a new behaviour.
 
 CI (`.github/workflows/ci.yml`) runs `pnpm run check`, the container entrypoint shell check and `pnpm test` on Node
 20, 22 and 24, then builds the Docker image, checks that the container answers `/health`, and checks that the image

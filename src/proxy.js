@@ -108,6 +108,22 @@ const loggableUrl = (url) => {
         : masked;
 };
 
+/**
+ * The type of a value from a request body as a word, for an error message that names what arrived. `Array.isArray`
+ * comes first because `typeof []` is 'object': the reader of "found an object" would be told the field they sent is
+ * the wrong kind of object without ever learning what it actually was.
+ */
+function jsonTypeName(value) {
+    if (value === null) return 'null';
+    if (Array.isArray(value)) return 'an array';
+    const type = typeof value;
+    if (type === 'object') return 'an object';
+    if (type === 'number') return 'a number';
+    if (type === 'boolean') return 'a boolean';
+    if (type === 'string') return 'a string';
+    return type;
+}
+
 // Authentication is mandatory by design: when API_KEY is missing or blank the gateway falls back to this
 // built-in key instead of running without authentication.
 export const DEFAULT_API_KEY = 'sk-dummy-123';
@@ -1750,8 +1766,22 @@ function createApp(config) {
                         body = request.body;
                     }
                     const { messages, model, stream } = body;
-                    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+                    // Three different client mistakes used to share one message: a body with no `messages`, a body
+                    // whose `messages` is not an array, and an empty array all answered "messages array is required",
+                    // which sends the reader looking for a field they did send.
+                    if (messages === undefined || messages === null) {
                         return reply.code(400).send({ error: { message: 'messages array is required', type: 'invalid_request_error' } });
+                    }
+                    if (!Array.isArray(messages)) {
+                        return reply.code(400).send({
+                            error: {
+                                message: `messages must be an array of message objects, found ${jsonTypeName(messages)}`,
+                                type: 'invalid_request_error'
+                            }
+                        });
+                    }
+                    if (messages.length === 0) {
+                        return reply.code(400).send({ error: { message: 'messages must contain at least one message', type: 'invalid_request_error' } });
                     }
                     if (typeof model !== 'undefined' && typeof model !== 'string') {
                         return reply.code(400).send({ error: { message: 'model must be a string', type: 'invalid_request_error' } });

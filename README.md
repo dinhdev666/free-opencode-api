@@ -445,8 +445,9 @@ cannot forge a second conversation line.
 
 **A body must arrive.** A request that announces a body (`Content-Length`, `Transfer-Encoding: chunked`) has to
 deliver it within 30 s or the shared request budget, whichever is shorter. On expiry the client receives the `408`
-envelope (`Request body was not received within …ms`) and the connection is closed; a request that was already refused
-(an unauthenticated one, for example) is simply disconnected, because the client is not waiting for another answer.
+envelope (`request body was not received within …ms; send the declared body or close the connection`) and the
+connection is closed; a request that was already refused (an unauthenticated one, for example) is simply
+disconnected, because the client is not waiting for another answer.
 Without that deadline a client could send `Content-Length: 4096`, write four bytes and hold the socket open for as long
 as it liked — no credential required, since the `401` is written from the headers alone while the connection stays
 alive to drain a body that will never arrive.

@@ -45,7 +45,8 @@
   environment (it authenticates nothing with it), and its throwaway working directory is created with mode `0700`, so
   neither the credential nor the backend's sandbox is exposed to other local users.
 - **Structured logging** — `error` / `warn` / `info` / `debug` levels, one-line request summaries, secrets masked.
-- **Production friendly** — configurable bind host, request timeouts, graceful shutdown, Docker image available.
+- **Production friendly** — configurable bind host, request timeouts (a body that never arrives is cut off, not held open),
+  graceful shutdown, Docker image available.
 - **Fast HTTP stack** — built on Fastify 5 with precompiled response schemas and no per-request middleware chain.
 
 ---
@@ -257,7 +258,7 @@ Advanced tuning (environment or `config.json`; the environment wins when both se
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `300000` | Upstream request timeout in milliseconds, shared by every phase of a completion (prompt, event stream, poll fallback) |
+| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `300000` | Upstream request timeout in milliseconds, shared by every phase of a completion (prompt, event stream, poll fallback). It also bounds how long a request body may take to arrive, up to 30 s (see [Request bodies](#request-bodies)) |
 | `OPENCODE_PROXY_HEALTH_CACHE_MS` | `2000` | How long a successful backend health probe is trusted before the next one (`0` probes on every request). An expired-but-known-healthy backend is re-probed in the background, so a request after a quiet period does not wait for it |
 | `OPENCODE_PROXY_START_RETRY_MS` | `15000` | Cooldown after a failed backend start attempt; requests fail fast instead of retrying immediately |
 | `OPENCODE_PROXY_MAX_CONCURRENCY` | `1` | Number of chat completions processed in parallel (1..32). `1` keeps the historical serialized behaviour; raise it only if the backend/provider tolerates concurrent sessions |
@@ -298,7 +299,8 @@ is a stable alias that OpenCode routes to the model it currently serves (the tar
 gateway's built-in default, used when `model` is omitted; every other id is one that `GET /v1/models` lists for your
 installation right now.
 
-Fields the gateway respects: `messages` (string content, or an array of parts whose `text` is concatenated), `model`,
+Fields the gateway respects: `messages` (string content, or an array of parts whose `text` is concatenated — see
+[Request bodies](#request-bodies) for the parts that are refused), `model`,
 `stream` (a boolean, or one of `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off` — hand-written clients stringify it, and a
 misread `stream` used to answer JSON to a client that was parsing SSE), `stream_options.include_usage` (adds the
 OpenAI usage chunk — `choices: []` plus a zeroed `usage` block — as the last frame before `data: [DONE]`; the counts
@@ -349,6 +351,27 @@ client without a response). Everything the gateway or the backend failed at carr
 `type: "server_error"` and the upstream message (`code` keeps the upstream error name for a `502`); an internal
 exception's class name is never exposed. Once a stream has started, errors are delivered in-band
 (`data: {"error": …}` then `data: [DONE]`) — never as assistant text.
+
+### Request bodies
+
+**Content parts must be text.** A `content` array may carry strings and parts that have a `text` field (`text`, and
+the Responses-API spelling `input_text`). Any other part — `image_url`, `input_audio`, `file` — is refused with a `400`
+that names its position and type, because the gateway forwards text to a CLI session and cannot carry an image:
+
+```json
+{"error":{"message":"messages[0].content[1] uses an unsupported content part type \"image_url\"; this gateway forwards text only","type":"invalid_request_error"}}
+```
+
+Dropping those parts instead (the previous behaviour) answered a question the backend never received, and a request
+whose only part was an image was reported as missing text it had never been asked for.
+
+**A body must arrive.** A request that announces a body (`Content-Length`, `Transfer-Encoding: chunked`) has to
+deliver it within 30 s or the shared request budget, whichever is shorter. On expiry the client receives the `408`
+envelope (`Request body was not received within …ms`) and the connection is closed; a request that was already refused
+(an unauthenticated one, for example) is simply disconnected, because the client is not waiting for another answer.
+Without that deadline a client could send `Content-Length: 4096`, write four bytes and hold the socket open for as long
+as it liked — no credential required, since the `401` is written from the headers alone while the connection stays
+alive to drain a body that will never arrive.
 
 ---
 

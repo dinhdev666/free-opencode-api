@@ -387,6 +387,30 @@ async function run() {
         stopChunk?.object === 'chat.completion.chunk' && typeof stopChunk?.created === 'number' &&
         stopChunk?.model === 'opencode/kimi-k2.5-free', JSON.stringify(stopChunk));
 
+    // `stream_options.include_usage` asks for the OpenAI usage chunk: empty choices, sent after the finish chunk and
+    // before [DONE]. A client that reads it (the OpenAI SDK does) otherwise ends up without token numbers
+    check('a plain stream carries no usage chunk',
+        chunks.every((chunk) => !chunk?.usage), JSON.stringify(chunks.filter((chunk) => chunk?.usage)[0] || null));
+    const withUsage = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'hi' }], stream: true, stream_options: { include_usage: true } },
+        stream: true
+    });
+    const usageChunks = parseSseFrames(withUsage.text)
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => { try { return JSON.parse(frame); } catch { return null; } })
+        .filter(Boolean);
+    const usageChunk = usageChunks.find((chunk) => chunk?.usage);
+    check('stream_options.include_usage is answered with a usage chunk',
+        Boolean(usageChunk) && Array.isArray(usageChunk.choices) && usageChunk.choices.length === 0,
+        JSON.stringify(usageChunk));
+    check('the usage chunk carries the same envelope as the other chunks',
+        usageChunk?.object === 'chat.completion.chunk' && usageChunk?.model === 'opencode/kimi-k2.5-free' &&
+        typeof usageChunk?.usage?.total_tokens === 'number', JSON.stringify(usageChunk));
+    check('the usage chunk comes after the finish chunk and before [DONE]',
+        usageChunks.indexOf(usageChunk) > usageChunks.findIndex((chunk) => chunk?.choices?.[0]?.finish_reason === 'stop') &&
+        withUsage.text.trimEnd().endsWith('data: [DONE]'), withUsage.text.slice(-120));
+
     // A model id can contain more than one slash; only the first one separates provider from model
     const multiSlash = await request('/v1/chat/completions', {
         method: 'POST',

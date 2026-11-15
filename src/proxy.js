@@ -1201,7 +1201,9 @@ function createApp(config) {
                         const chunkHead = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${JSON.stringify(`${pID}/${mID}`)},"choices":[{"index":0,"delta":{"`;
                         // Closes the delta object and the chunk envelope: `"<field>":<value>},"finish_reason":null}]}`
                         const chunkTail = '},"finish_reason":null}]}\n\n';
-                        const stopFrame = `data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`;
+                        // The terminal frame carries the same envelope as every delta: clients that validate each chunk
+                        // (`object`, `created`, `model`) treated a bare {id, choices} frame as a different object type.
+                        const stopFrame = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${JSON.stringify(`${pID}/${mID}`)},"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`;
 
                         // A client that disappears mid-stream must not hold the completion queue until the backend
                         // timeout: note the disconnect and abort the collector so the slot is released immediately.

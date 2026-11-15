@@ -181,7 +181,9 @@ Throwaway stubs used for one-off exploration stay in `/tmp`; anything worth keep
 - **New routes need an explicit registration.** Fastify runs hooks after routing, so a wildcard `OPTIONS` handler
   (`app.options('/*')`) is required for preflight; `onRequest` hooks alone do not answer unmatched paths.
 - **Logging** goes through `src/logger.js` (`logger.info`, `logger.warn`, `logger.error`, `logger.debug`). No
-  `console.log` in `src/` or `index.js`. Never log an unmasked `authorization` header.
+  `console.log` in `src/` or `index.js`. Never log an unmasked `authorization` header, and never print the API key:
+  `docker/docker-entrypoint.sh` reports the key it generated as `sup*** (22 chars)`, because `docker logs` is collected
+  as often as not (`maskHeaders`/`maskSecret` in `src/logger.js` are the in-process equivalents).
 - **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
   boundary can fall inside either of them; the held fragment is flushed at end of stream. The flush must write the

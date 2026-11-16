@@ -3199,14 +3199,19 @@ function createApp(config) {
         const raw = request.raw;
         if (raw.destroyed || raw.readableEnded) return send();
         let settled = false;
-        const finish = (destroyAfter) => {
+        // `closeConnection` is set by the drain budget expiring, i.e. the client is still uploading: answer now and
+        // close the connection behind the response. `destroy()` did that here and discarded a buffered body under
+        // backpressure - the failure `closeSocketAfterFlush()` exists for ("under backpressure the client saw a reset
+        // instead of the envelope this handler exists to deliver") - so the timeout path uses the helper the
+        // parser-error handler already uses.
+        const finish = (closeConnection) => {
             if (settled) return;
             settled = true;
             clearTimeout(cut);
             raw.off('end', finishBody);
             raw.off('close', finishBody);
             send();
-            if (destroyAfter && !raw.destroyed) raw.destroy();
+            if (closeConnection && !raw.destroyed) closeSocketAfterFlush(raw.socket || raw);
         };
         const finishBody = () => finish(false);
         const cut = setTimeout(() => finish(true), BODY_DRAIN_TIMEOUT_MS);

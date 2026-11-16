@@ -8,7 +8,7 @@ import path from 'path';
 import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
 import {
-    logger, loggableError, maskBackendUrl, maskDetail, maskFreeText, maskHeaders, maskUrlQuery,
+    logger, loggableError, maskBackendUrl, maskDetail, maskFreeText, maskHeaders, maskUrlCredentials, maskUrlQuery,
     MAX_LOGGED_STACK_CHARS, setOwnProperty
 } from './logger.js';
 
@@ -108,14 +108,22 @@ const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
 const MAX_LOGGED_MODEL_LENGTH = 128;
 const MAX_LOGGED_URL_LENGTH = 512;
 const loggableModelId = (id) => {
-    const clean = String(id).replace(CONTROL_CHARS_RE, '?');
-    return clean.length > MAX_LOGGED_MODEL_LENGTH ? `${clean.slice(0, MAX_LOGGED_MODEL_LENGTH)}…` : clean;
+    // The bound is applied *before* the replace: the regex is per character, so the output is identical, and a client
+    // value at the 50 MiB body limit is no longer transformed in full (measured 3.9 ms for 5 MiB) just to keep 128
+    // characters of it.
+    const raw = String(id);
+    const clean = (raw.length > MAX_LOGGED_MODEL_LENGTH ? raw.slice(0, MAX_LOGGED_MODEL_LENGTH) : raw)
+        .replace(CONTROL_CHARS_RE, '?');
+    return raw.length > MAX_LOGGED_MODEL_LENGTH ? `${clean}…` : clean;
 };
 // The same treatment for the request URL, which every log site used to copy raw: credential query values are masked
 // (`?api_key=…` is an OpenAI-compatible convention some clients still send) and an unbounded URL is cut, because the
 // URL is client input bounded only by the HTTP parser's header limit.
+// A URL can carry credentials in its userinfo as well, which `maskUrlQuery()` does not touch: an HTTP client may send
+// an **absolute-form** request target (`GET http://user:secret@host:4097/v1/models HTTP/1.1`), Node hands that target
+// over verbatim, and the string reaches a log line and a 404 body. The chain is the same one `maskFreeText()` uses.
 const loggableUrl = (url) => {
-    const masked = maskUrlQuery(url);
+    const masked = maskUrlCredentials(maskUrlQuery(url));
     return masked.length > MAX_LOGGED_URL_LENGTH
         ? `${masked.slice(0, MAX_LOGGED_URL_LENGTH)}…[truncated ${masked.length - MAX_LOGGED_URL_LENGTH} chars]`
         : masked;
@@ -142,7 +150,22 @@ const urlPath = (url) => {
 // The chain itself lives in `src/logger.js` (`maskFreeText()`), because the same sentence is written to a response
 // body *and* to a log line, and a second copy of it here is how the two drifted apart: the 500 body was masked while
 // the `stack` field of the same log record printed it verbatim.
-export const clientFacingText = (value) => (typeof value === 'string' && value !== '' ? maskFreeText(value) : '');
+/**
+ * @param {*} value any text (non-strings become '')
+ * @returns {string} the masked, bounded text
+ */
+export const clientFacingText = (value) => {
+    if (typeof value !== 'string' || value === '') return '';
+    const masked = maskFreeText(value);
+    // The one credential this process actually holds is removed by value as well. `maskQuotedCredentials()` needs 16
+    // characters to tell a token from prose ("basic setup"), and `base64("user:pass")` is 12: a proxy in front of the
+    // backend that echoes the `Authorization` header it refused published the gateway's backend credential in a `502`
+    // body and in the error log. The token is a substring of a string already bounded to 512 characters, so the scan
+    // is bounded too, and it leaves every other sentence alone.
+    if (!BACKEND_AUTHORIZATION) return masked;
+    const token = BACKEND_AUTHORIZATION.slice(BACKEND_AUTHORIZATION.indexOf(' ') + 1);
+    return token ? masked.split(token).join('***') : masked;
+};
 
 /**
  * The sentence a failed completion shows a client and logs, read from whatever the route handler caught.
@@ -172,9 +195,13 @@ export const handlerFailureMessage = (error) => {
 const SERVED_ROUTES = 'POST /v1/chat/completions, GET /v1/models and GET /health';
 const MAX_ECHOED_VALUE_LENGTH = 64;
 const echoedValue = (value) => {
-    const clean = String(value).replace(CONTROL_CHARS_RE, '?');
-    return clean.length > MAX_ECHOED_VALUE_LENGTH
-        ? `${clean.slice(0, MAX_ECHOED_VALUE_LENGTH)}…[truncated ${clean.length - MAX_ECHOED_VALUE_LENGTH} chars]`
+    // Bound first, transform second (see `loggableModelId()`): the replace runs on at most 64 characters of a value a
+    // client can send 50 MiB of, and the output is unchanged because the regex is per character.
+    const raw = String(value);
+    const clean = (raw.length > MAX_ECHOED_VALUE_LENGTH ? raw.slice(0, MAX_ECHOED_VALUE_LENGTH) : raw)
+        .replace(CONTROL_CHARS_RE, '?');
+    return raw.length > MAX_ECHOED_VALUE_LENGTH
+        ? `${clean}…[truncated ${raw.length - MAX_ECHOED_VALUE_LENGTH} chars]`
         : clean;
 };
 
@@ -226,7 +253,14 @@ export function parseBoolean(value, fallback = undefined) {
     if (typeof value === 'boolean') return value;
     if (typeof value === 'number') return value === 1;
     if (typeof value === 'string') {
-        const normalized = value.trim().toLowerCase();
+        // The longest accepted spelling is five characters, so anything longer is rejected without being normalised: a
+        // request body is bounded by `OPENCODE_PROXY_MAX_BODY_MB`, and `{"stream": "aaaa…"}` (50 MiB) was copied and
+        // lowercased twice per completion - 10 ms per call on the single serving thread, ~100 MB of garbage - to answer
+        // a question the length already answers. `readableFlag()` in the handler calls this once to validate and once to
+        // read, so the cost was paid twice per field.
+        const trimmed = value.length > 64 ? '' : value.trim();
+        if (!trimmed) return fallback;
+        const normalized = trimmed.toLowerCase();
         if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) return true;
         if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) return false;
     }
@@ -680,9 +714,23 @@ const isConnectionError = (error) => {
         error?.cause?.code === 'ECONNREFUSED';
 };
 
+// A backend that could not be reached, or could not be started, is an upstream failure and not a bug in the gateway:
+// the sentences below ("the CLI is missing", "it exited during startup", "the port is taken", "a start is still
+// running") described a cause the *operator* must fix, and they were answered as `500 server_error` with no `code`,
+// which is what this gateway says about its own defect. The tag is what the handler's catch maps to `502`; it travels
+// on the error instead of matching the message text, so a future sentence cannot silently fall back to `500`.
+const backendUnavailable = (message) => Object.assign(new Error(message), { backendUnavailable: true });
+
 // Jail directories this process created. Another gateway (a second instance, or one in a container sharing /tmp)
 // may be using the same parent directory, so the exit hook must never delete a directory it does not own.
 const ownedJailRoots = new Set();
+
+// Sessions this process created and has not deleted yet. Every completion deletes its own (success, error, client
+// abort), but a SIGTERM in the middle bypasses all three: the HTTP server closes, `stopBackend()` runs and the process
+// exits while the task is still parked in the collector or the poll. A managed child takes its sessions with it, but an
+// external backend (`OPENCODE_SERVER_URL`) keeps them in its store forever - one per restart. `killBackend()` drains
+// this set, so shutdown leaves the backend as it found it.
+const liveSessions = new Set();
 
 /**
  * Removes the jail directories this process created. This runs on process exit, so it cannot rely on
@@ -1002,6 +1050,12 @@ function createApp(config) {
     // is written from the headers while Node keeps the connection alive to drain a body it will never read. The
     // deadline follows the request budget, so an operator (and the smoke suite) can shorten it without another knob.
     const bodyReceiveDeadlineMs = Math.max(1, Math.min(BODY_RECEIVE_TIMEOUT_MS, REQUEST_TIMEOUT_MS));
+    // How long a body that *is* arriving may take in total. The window below answers "the client declared a body and
+    // sent nothing"; it was applied as a hard cap on the whole upload, so a slow link (anything under ~1.7 MB/s for the
+    // 50 MiB default limit) was cut off mid-body and told to send the body it was already sending. The deadline is
+    // renewed while bytes arrive, and the arrival phase gets its own window before the completion budget starts (it is
+    // spent before anything is queued), so a client that drizzles forever still cannot hold the socket.
+    const bodyUploadBudgetMs = bodyReceiveDeadlineMs + REQUEST_TIMEOUT_MS;
     const armBodyDeadline = (request, reply, meta) => {
         const raw = request.raw;
         // Only an announced body is waited for, so every bodyless request keeps the hook's current cost
@@ -1013,18 +1067,27 @@ function createApp(config) {
         // once it ends (measured: `reply.raw.destroyed` was true, `reply.raw.socket` was null, and the client stayed
         // connected), so the deadline has to close what the body is arriving on.
         const socket = raw.socket;
+        const armedAt = Date.now();
+        let timer = null;
         const disarm = () => {
-            clearTimeout(timer);
+            if (timer) clearTimeout(timer);
+            timer = null;
             raw.off('end', disarm);
             raw.off('close', disarm);
             raw.off('error', disarm);
         };
-        const timer = setTimeout(() => {
+        // `progressed` separates the two refusals: nothing arrived at all (a client that declared `Content-Length` and
+        // never wrote it, a proxy that buffered the body) or bytes kept arriving but the upload outlived the budget.
+        const expire = (progressed) => {
             disarm();
-            logger.warn('[Proxy] Request body did not arrive within its deadline, closing the connection', {
+            const ms = Date.now() - armedAt;
+            logger.warn('[Proxy] Request body did not finish arriving, closing the connection', {
                 reqId: meta.reqId,
                 method: request.method,
-                ms: bodyReceiveDeadlineMs
+                ms,
+                windowMs: bodyReceiveDeadlineMs,
+                budgetMs: bodyUploadBudgetMs,
+                progressed
             });
             // Nothing has been answered yet, so say why; when a response is already on the wire (the auth check's 401,
             // or the 413 for an oversized body) the socket is simply closed, because the client is not waiting for
@@ -1036,7 +1099,9 @@ function createApp(config) {
                 try {
                     reply.code(408).send({
                         error: {
-                            message: `request body was not received within ${bodyReceiveDeadlineMs}ms; send the declared body or close the connection`,
+                            message: progressed
+                                ? `request body was still arriving after ${ms}ms and the upload budget is ${bodyUploadBudgetMs}ms; send the body faster or in fewer bytes`
+                                : `request body was not received within ${bodyReceiveDeadlineMs}ms; send the declared body or close the connection`,
                             type: 'invalid_request_error'
                         }
                     });
@@ -1045,8 +1110,28 @@ function createApp(config) {
                 }
             }
             closeSocketAfterFlush(socket);
-        }, bodyReceiveDeadlineMs);
-        timer.unref();
+        };
+        // The window is re-armed as long as the socket makes progress. `socket.bytesRead` is the only signal needed:
+        // it counts this connection's reads, so a pipelined follow-up request cannot be mistaken for body progress
+        // (`raw.complete` is announced-body specific, and a keep-alive response detaches `reply.raw` from the socket).
+        let lastBytes = socket ? socket.bytesRead : 0;
+        const arm = () => {
+            timer = setTimeout(() => {
+                const read = socket ? socket.bytesRead : 0;
+                if (read > lastBytes) {
+                    lastBytes = read;
+                    if (Date.now() - armedAt < bodyUploadBudgetMs) {
+                        arm();
+                        return;
+                    }
+                    expire(true);
+                    return;
+                }
+                expire(false);
+            }, bodyReceiveDeadlineMs);
+            timer.unref();
+        };
+        arm();
         raw.once('end', disarm);
         raw.once('close', disarm);
         raw.once('error', disarm);
@@ -1344,7 +1429,13 @@ function createApp(config) {
 
     // Debug logs all go through the logger (visible with LOG_LEVEL=debug; the legacy DEBUG switch is still
     // honoured, startProxy maps DEBUG=true onto the debug level)
-    const logDebug = (...args) => logger.debug(...args);
+    // Debug lines are guarded here rather than at each call site: a disabled level must not pay for the call, and the
+    // fixed two-argument form keeps the rest array out of the hot path (`logger.debug(...args)` allocated one per
+    // call). Call sites that build an expensive value (`loggableUrl()`) still guard themselves, because their argument
+    // is evaluated before this function runs.
+    const logDebug = (message, detail) => {
+        if (logger.isEnabled('debug')) logger.debug(message, detail);
+    };
 
     const TOOL_GUARD_MESSAGE = 'Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge. If external or real-time data is required, say so and ask the user to enable tools.';
     const applyToolGuard = (systemMsg) => {
@@ -1519,7 +1610,11 @@ function createApp(config) {
             const overrides = {};
             ids.forEach((id) => {
                 /* With opencode>=1.19 + a free zen model, disabling either read or glob makes the prompt request hang forever, so these two read-only tools stay enabled while all other tools remain disabled */
-                overrides[id] = ["read","glob"].includes(String(id).toLowerCase()) ? true : false;
+                // `setOwnProperty()` for the same reason the masking helpers use it: the id is backend-supplied (an MCP
+                // server names its own tools), and `overrides['__proto__'] = false` runs the prototype setter as a
+                // silent no-op - that tool stayed enabled while DISABLE_TOOLS was on, the failure this switch exists to
+                // prevent.
+                setOwnProperty(overrides, id, ["read","glob"].includes(String(id).toLowerCase()));
             });
             cachedToolOverrides = overrides;
             cachedToolAt = Date.now();
@@ -1885,6 +1980,18 @@ function createApp(config) {
             timeoutId = setTimeout(() => {
                 if (finished) return;
                 finished = true;
+                // The rejection path has to release the same timers `settle()` does: this is the one exit that does not
+                // go through it (it rejects rather than resolving a result), and leaving the first-delta/idle timers
+                // armed kept this collector's closure - the accumulated text and the stream buffers - alive for
+                // another 4 s or 8 s after the request had already been answered with its budget error.
+                if (firstDeltaTimer) {
+                    clearTimeout(firstDeltaTimer);
+                    firstDeltaTimer = null;
+                }
+                if (idleTimer) {
+                    clearTimeout(idleTimer);
+                    idleTimer = null;
+                }
                 controller.abort();
                 reject(new Error(timeoutMessage(timeoutMs)));
             }, timeoutMs);
@@ -2030,7 +2137,9 @@ function createApp(config) {
                 // Nothing to answer and no reason to run the completion: it would spend backend time (and tokens) for
                 // nobody while delaying the requests still waiting behind this one.
                 if (clientDisconnected) {
-                    logDebug('Abandoned while queued, skipping completion', { url: loggableUrl(request.url) });
+                    if (logger.isEnabled('debug')) {
+                        logDebug('Abandoned while queued, skipping completion', { url: loggableUrl(request.url) });
+                    }
                     if (!reply.raw.writableEnded) reply.raw.end();
                     return reply;
                 }
@@ -2319,8 +2428,13 @@ function createApp(config) {
                             // `USER([object Object]): …` in the prompt, and a name carrying a newline forged another
                             // conversation line inside the text the model reads. A string is kept - it is a documented
                             // OpenAI field - sanitised the same way every other value that lands in a prompt line is.
-                            const nameLabel = typeof m?.name === 'string' ? m.name.replace(CONTROL_CHARS_RE, '?').trim() : '';
-                            const nameSuffix = nameLabel ? `(${nameLabel.slice(0, MAX_ECHOED_VALUE_LENGTH)})` : '';
+                            // The input is bounded before it is transformed (a 50 MiB name cost 34 ms of replace to keep
+                            // 64 characters), at a window wide enough that trimming still sees every character the
+                            // label can be built from.
+                            const nameLabel = typeof m?.name === 'string'
+                                ? m.name.slice(0, MAX_ECHOED_VALUE_LENGTH).replace(CONTROL_CHARS_RE, '?').trim()
+                                : '';
+                            const nameSuffix = nameLabel ? `(${nameLabel})` : '';
                             parts.push({
                                 type: 'text',
                                 text: `${roleLabel}${nameSuffix}: ${content}`
@@ -2460,6 +2574,7 @@ function createApp(config) {
                             upstreamStatus
                         );
                     }
+                    liveSessions.add(sessionId);
                     logDebug('Session created', { sessionId });
 
                     // A session is created per completion, so it must also be deleted per completion: otherwise the
@@ -2484,6 +2599,11 @@ function createApp(config) {
                             }
                         } catch (e) {
                             logger.debug('[Proxy] Failed to delete session:', { sessionId, error: e.message });
+                        } finally {
+                            // Bookkeeping for the shutdown drain, not the cleanup itself: a delete that failed (an
+                            // already-gone session, a rejected call) must not be retried at exit, and the set must not
+                            // grow per request.
+                            liveSessions.delete(sessionId);
                         }
                     };
 
@@ -2723,8 +2843,20 @@ function createApp(config) {
                                 }
                                 let safe = stripFunctionCalls(text, false) || '';
                                 const filteredSeen = isReasoning ? streamedReasoning : streamedContent;
-                                if (appendOnly && filteredSeen && safe.startsWith(filteredSeen)) {
-                                    safe = safe.slice(filteredSeen.length);
+                                if (appendOnly && filteredSeen) {
+                                    if (safe.startsWith(filteredSeen)) {
+                                        safe = safe.slice(filteredSeen.length);
+                                    } else if (filteredSeen.startsWith(safe)) {
+                                        // The backend's copy is *behind* what the SSE frames already delivered: a message
+                                        // store written behind the broadcast, a part the backend rewrote shorter, a stale
+                                        // snapshot read after the restart that ended the stream. Nothing here is new, and
+                                        // writing it re-sent the head of the answer the client already has ("abcdef…" 500
+                                        // characters, then the first 50 again, with `finish_reason: "stop"`). The opposite
+                                        // direction - a polled answer that *extends* what was sent - is the normal case
+                                        // above; a genuinely divergent answer (neither is a prefix) keeps the rewrite path
+                                        // below.
+                                        return;
+                                    }
                                 }
                                 if (!safe) return;
                                 // Written around the filter, not through it: this text is already tag-free, and a held
@@ -2926,10 +3058,17 @@ function createApp(config) {
                     // A provider failure is an upstream error, whether the client asked for a stream or not: the
                     // non-streaming path answers 502 for the same condition. So is a backend that went away mid
                     // request: a raw `fetch failed` used to be reported as 500, which tells a client "the gateway has
-                    // a bug" instead of "the upstream is gone".
-                    if (error.name === 'ProviderError' || isConnectionError(error)) {
+                    // a bug" instead of "the upstream is gone". A backend that could not be started at all is the same
+                    // class (`backendUnavailable`, tagged at the throw): the whole "CLI missing, wrong OPENCODE_PATH,
+                    // 2.x CLI, port taken, start cooldown" set was answered `500 server_error` with no `code`, i.e. as
+                    // a defect in this gateway, for a cause the client can only retry elsewhere.
+                    if (error.name === 'ProviderError' || error.backendUnavailable || isConnectionError(error)) {
                         statusCode = 502;
                     }
+                    // A gateway that is going away refuses with 503 and the retry hint the queue already uses: it is
+                    // temporary and the client should come back, not conclude that its request was wrong.
+                    const retryAfter = error.gatewayShuttingDown === true;
+                    if (retryAfter) statusCode = 503;
                     // The connection branch says what happened instead of forwarding Node's own wording: `fetch failed`
                     // is what a dead or refused backend produces, and a client reading it cannot tell whether the
                     // gateway, the backend or its own request is at fault.
@@ -2949,15 +3088,21 @@ function createApp(config) {
                     if (statusCode === 502) {
                         // The connection case is tested first: a backend that dies mid-request surfaces as a
                         // ProviderError whose message carries `fetch failed`, and `backend_unreachable` is the answer
-                        // a client can act on
-                        payload.error.code = isConnectionError(error)
+                        // a client can act on. A start failure is unreachable with no ambiguity at all - nothing was
+                        // connected to - and it is named the same way, so a client does not have to parse prose to
+                        // learn that its model request never reached the backend.
+                        payload.error.code = (isConnectionError(error) || error.backendUnavailable)
                             ? 'backend_unreachable'
                             : (error.name === 'ProviderError' ? 'ProviderError' : 'upstream_error');
+                    } else if (retryAfter) {
+                        payload.error.code = 'gateway_shutting_down';
                     }
                     if (!reply.raw.headersSent) {
                         if (hijacked) {
                             reply.raw.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
                             reply.raw.end(JSON.stringify(payload));
+                        } else if (retryAfter) {
+                            reply.code(statusCode).header('Retry-After', '1').send(payload);
                         } else {
                             reply.code(statusCode).send(payload);
                         }
@@ -3008,11 +3153,19 @@ function createApp(config) {
                     type: 'server_error'
                 }
             };
-            const statusCode = timedOut ? 504 : 500;
+            // The same lifecycle refusal as the inner catch: a backend that cannot be started is an upstream failure
+            // (502), a gateway that is going away is a temporary 503. This catch covers the paths that never reached
+            // the backend work (validation, the queue timer), so the mapping is repeated here rather than assumed.
+            const lifecycleStatus = error?.gatewayShuttingDown ? 503 : (error?.backendUnavailable ? 502 : 0);
+            const statusCode = timedOut ? 504 : (lifecycleStatus || 500);
+            if (lifecycleStatus === 502) payload.error.code = 'backend_unreachable';
+            if (lifecycleStatus === 503) payload.error.code = 'gateway_shutting_down';
             if (!reply.raw.headersSent) {
                 if (hijacked) {
                     reply.raw.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
                     reply.raw.end(JSON.stringify(payload));
+                } else if (lifecycleStatus === 503) {
+                    reply.code(statusCode).header('Retry-After', '1').send(payload);
                 } else {
                     reply.code(statusCode).send(payload);
                 }
@@ -3058,14 +3211,19 @@ function createApp(config) {
         const raw = request.raw;
         if (raw.destroyed || raw.readableEnded) return send();
         let settled = false;
-        const finish = (destroyAfter) => {
+        // `closeConnection` is set by the drain budget expiring, i.e. the client is still uploading: answer now and
+        // close the connection behind the response. `destroy()` did that here and discarded a buffered body under
+        // backpressure - the failure `closeSocketAfterFlush()` exists for ("under backpressure the client saw a reset
+        // instead of the envelope this handler exists to deliver") - so the timeout path uses the helper the
+        // parser-error handler already uses.
+        const finish = (closeConnection) => {
             if (settled) return;
             settled = true;
             clearTimeout(cut);
             raw.off('end', finishBody);
             raw.off('close', finishBody);
             send();
-            if (destroyAfter && !raw.destroyed) raw.destroy();
+            if (closeConnection && !raw.destroyed) closeSocketAfterFlush(raw.socket || raw);
         };
         const finishBody = () => finish(false);
         const cut = setTimeout(() => finish(true), BODY_DRAIN_TIMEOUT_MS);
@@ -3232,7 +3390,7 @@ async function ensureBackend(config, options = {}) {
     const state = backendState.get(stateKey);
 
     // The gateway is going away: never start (or restart) a backend from here
-    if (state.shuttingDown) throw new Error('The gateway is shutting down');
+    if (state.shuttingDown) throw Object.assign(new Error('The gateway is shutting down'), { gatewayShuttingDown: true });
 
     // A recent successful probe is trusted for BACKEND_HEALTH_CACHE_MS so a burst of chat requests shares one
     // health round trip instead of one per request; connection failures reset the timestamp (see chat error path)
@@ -3268,7 +3426,7 @@ async function ensureBackend(config, options = {}) {
             if (!state.isStarting) break;
             await new Promise(r => setTimeout(r, STARTING_WAIT_INTERVAL_MS));
         }
-        if (state.isStarting) throw new Error('Backend startup timeout');
+        if (state.isStarting) throw backendUnavailable('Backend startup timeout');
     }
 
     // Claim the start attempt *before* the probe that may suspend: the claim used to happen only after that probe
@@ -3285,10 +3443,10 @@ async function ensureBackend(config, options = {}) {
         } catch (err) {
             // Recent start attempt already failed: answer immediately instead of retrying the whole startup wait
             if (state.lastStartFailureAt && Date.now() - state.lastStartFailureAt < BACKEND_START_RETRY_COOLDOWN_MS) {
-                throw new Error(`OpenCode backend unavailable (last start attempt failed: ${state.lastStartError || 'unknown error'})`);
+                throw backendUnavailable(`OpenCode backend unavailable (last start attempt failed: ${state.lastStartError || 'unknown error'})`);
             }
             // The probe above suspended for up to its timeout, which is exactly the window a shutdown can land in
-            if (state.shuttingDown) throw new Error('The gateway is shutting down');
+            if (state.shuttingDown) throw Object.assign(new Error('The gateway is shutting down'), { gatewayShuttingDown: true });
             // Masked: the URL can carry a credential (see resolveBackendAuth), and this line is the one an operator
             // reads in `docker logs`
             logger.info(`[Proxy] OpenCode backend not found at ${maskBackendUrl(OPENCODE_SERVER_URL)}. Starting...`);
@@ -3341,7 +3499,7 @@ async function ensureBackend(config, options = {}) {
 
             // Last checkpoint before the spawn below, which has no suspension of its own: the wait for the previous
             // child (up to 3 s) can end with the process already shutting down.
-            if (state.shuttingDown) throw new Error('The gateway is shutting down');
+            if (state.shuttingDown) throw Object.assign(new Error('The gateway is shutting down'), { gatewayShuttingDown: true });
 
             const isWindows = process.platform === 'win32';
             const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
@@ -3510,14 +3668,14 @@ async function ensureBackend(config, options = {}) {
             if (spawnError) {
                 state.lastStartError = spawnError.message;
                 state.lastStartFailureAt = Date.now();
-                throw new Error(`Failed to start OpenCode backend: ${spawnError.message}`);
+                throw backendUnavailable(`Failed to start OpenCode backend: ${spawnError.message}`);
             }
 
             if (!started) {
                 logger.warn('[Proxy] Backend start timed out.');
                 state.lastStartError = 'Backend start timeout';
                 state.lastStartFailureAt = Date.now();
-                throw new Error('Backend start timeout');
+                throw backendUnavailable('Backend start timeout');
             }
         }
     } finally {
@@ -3645,7 +3803,7 @@ export function startProxy(options) {
     backendUrl.notes.forEach((note) => logger.warn(`[Config] ${note}`));
     config.LOG_LEVEL = logger.level;
 
-    const { app } = createApp(config);
+    const { app, client } = createApp(config);
 
     // Fastify resolves listen() once the server is bound; log and warm the backend from the continuation.
     // No await here so startProxy stays synchronous for callers that need the server handle immediately.
@@ -3663,6 +3821,23 @@ export function startProxy(options) {
             logger.error('[Fatal] Failed to start HTTP server:', loggableError(error));
             process.exit(1);
         });
+
+    // Deletes the sessions still in `liveSessions` (a completion interrupted by shutdown). Bounded by its own budget so
+    // it fits inside the 5 s hard exit in `index.js`, and every call is best effort: a delete that fails or times out
+    // must not delay the exit.
+    const SHUTDOWN_SESSION_TIMEOUT_MS = 3000;
+    const drainLiveSessions = async () => {
+        if (liveSessions.size === 0) return;
+        const ids = [...liveSessions];
+        liveSessions.clear();
+        await Promise.all(ids.map((id) => client.session.delete({
+            path: { id },
+            ...backendDeadline(SHUTDOWN_SESSION_TIMEOUT_MS)
+        }).catch(() => { })));
+        if (logger.isEnabled('debug')) {
+            logger.debug('[Shutdown] Deleted the sessions left by interrupted completions', { count: ids.length });
+        }
+    };
 
     // Expose the Fastify instance as `server`: it implements close(cb), which index.js uses for shutdown
     return {
@@ -3727,6 +3902,11 @@ export function startProxy(options) {
                 // at its next checkpoint and throws instead.
                 state.shuttingDown = true;
                 if (state.isStarting) await waitForPendingStart(state);
+                // Before the child goes, and before this process exits: a completion interrupted by shutdown never
+                // reached its `cleanupSession()`, so its session is still in the backend's store. Deleting it here is
+                // the only chance there is (an external backend outlives the gateway), and it is best effort with the
+                // shutdown budget below - a backend that is already unhealthy must not turn shutdown into a wait.
+                await drainLiveSessions();
                 const child = state.process;
                 if (child && child.exitCode === null && child.signalCode === null) await terminate(child);
                 removeJail();

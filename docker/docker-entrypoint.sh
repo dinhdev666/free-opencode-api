@@ -71,7 +71,7 @@ if [ ! -f "$CONFIG" ]; then
         // compares the two, and a name added in one place only would leave a secret in one of the two dumps.
         const maskUrl = (value) => String(value)
             .replace(/([?&])([^=&#]+)=([^&#]*)/gi,
-                (match, sep, name, v) => /(^|[-_])(auth|token|secret|cookie|session|passw|key|code|sig|signature|credential|bearer)([-_]|$)|authorization|authentication|api[-_]?key/i.test(name)
+                (match, sep, name, v) => /(^|[-_])(auth|token|secret|cookie|session|passw|password|passwd|pwd|key|code|sig|signature|credential|bearer)([-_]|$)|authorization|authentication|api[-_]?key/i.test(name)
                     ? `${sep}${name}=***`
                     : match)
             .replace(/^(\w[\w+.-]*:\/\/)[^/?#]*@/, "$1***@");

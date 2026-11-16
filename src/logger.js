@@ -176,7 +176,11 @@ const SENSITIVE_HEADER_NAMES = new Set([
 // `sig`, `signature`, `credential` and `bearer` were missing, and those are exactly the spellings other clients use for
 // the same secret: Google's `?key=AIza…`, an OAuth `?code=…`, an Azure SAS `?sig=…`, `?access_token=`'s relatives
 // (`?bearer=…`, `?credential=…`). A request URL is logged at the default level, so each of them reached `docker logs`.
-export const SENSITIVE_NAME_ALTERNATIVES = 'auth|token|secret|cookie|session|passw|key|code|sig|signature|credential|bearer';
+// `passw` alone was a prefix rather than a name: the anchors around the alternation require a whole segment, so it only
+// ever matched a name spelled exactly `passw`, and the ordinary spellings (`?password=…`, an `x-db-password` header)
+// went out in clear. The full words are listed next to it, and a segment separator (`_`, `-`) is what makes
+// `db_password` match.
+export const SENSITIVE_NAME_ALTERNATIVES = 'auth|token|secret|cookie|session|passw|password|passwd|pwd|key|code|sig|signature|credential|bearer';
 const SENSITIVE_HEADER_PATTERN = new RegExp(
     `(^|[-_])(${SENSITIVE_NAME_ALTERNATIVES})([-_]|$)|authorization|authentication|api[-_]?key`,
     'i'
@@ -238,8 +242,15 @@ export function maskBackendUrl(url) {
  */
 export function maskUrlCredentials(text) {
     // Not anchored: the URL can sit anywhere in the sentence, and a `@` in a path or query is not userinfo (the
-    // authority is everything up to the first `/`, `?` or `#`, which the character class excludes)
-    return String(text).replace(/(\w[\w+.-]*:\/\/)[^\s/?#@]*@/g, '$1***@');
+    // authority is everything up to the first `/`, `?` or `#`, which the character class excludes).
+    //
+    // The scheme run is bounded (`{0,31}`): no real scheme is longer, and an unbounded one made this quadratic in the
+    // length of a whitespace-free token. `[\w+.-]*` swallowed the whole token before `://`, then the authority class
+    // scanned it again and failed at every `@`-less offset - 32 000 characters measured 1.9 s on the serving thread,
+    // reachable through the debug dump of a request body (each string up to 32 KiB) and through an upstream error
+    // sentence quoted into a 502. With the bound, a start position can only be a candidate when `://` follows within
+    // 32 characters, so the scan is linear (1 MiB measured ~70 ms).
+    return String(text).replace(/(\w[\w+.-]{0,31}:\/\/)[^\s/?#@]*@/g, '$1***@');
 }
 
 /**

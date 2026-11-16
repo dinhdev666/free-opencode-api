@@ -250,7 +250,10 @@ try {
     // before being dropped and a watchdog guarantees the process leaves even if a client never disconnects.
     let shuttingDown = false;
     let finishing = false;
-    const shutdown = (signal) => {
+    // The status the process leaves with. A signal is a clean stop (0); an uncaught exception is a crash, and reporting
+    // it as 0 told a supervisor (`Restart=on-failure`, a Kubernetes restart policy, exit-code alerting) that the gateway
+    // had stopped on purpose - it was never restarted, and nothing alerted.
+    const shutdown = (signal, exitCode = 0) => {
         if (shuttingDown) return;
         shuttingDown = true;
         logger.info(`[Shutdown] Received ${signal}, shutting down gracefully...`);
@@ -271,9 +274,9 @@ try {
             // The backend is awaited before exiting: SIGTERM used to be followed by process.exit() on the next line, so
             // the SIGKILL escalation inside killBackend() never ran and a backend that ignores SIGTERM outlived the
             // gateway that owns it. A second watchdog bounds the teardown itself.
-            const hardExit = setTimeout(() => process.exit(0), 5000);
+            const hardExit = setTimeout(() => process.exit(exitCode), 5000);
             hardExit.unref();
-            stopBackend().then(() => process.exit(0));
+            stopBackend().then(() => process.exit(exitCode));
         };
 
         const watchdog = setTimeout(
@@ -304,7 +307,8 @@ try {
     });
     process.on('uncaughtException', (err) => {
         logger.error('[Fatal] Uncaught exception:', loggableError(err));
-        shutdown('uncaughtException');
+        // Status 1: the state is unknown, so this is a crash and every supervisor should see one
+        shutdown('uncaughtException', 1);
     });
 } catch (error) {
     logger.error('[Fatal] Failed to start proxy:', loggableError(error));

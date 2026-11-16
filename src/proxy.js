@@ -150,7 +150,22 @@ const urlPath = (url) => {
 // The chain itself lives in `src/logger.js` (`maskFreeText()`), because the same sentence is written to a response
 // body *and* to a log line, and a second copy of it here is how the two drifted apart: the 500 body was masked while
 // the `stack` field of the same log record printed it verbatim.
-export const clientFacingText = (value) => (typeof value === 'string' && value !== '' ? maskFreeText(value) : '');
+/**
+ * @param {*} value any text (non-strings become '')
+ * @returns {string} the masked, bounded text
+ */
+export const clientFacingText = (value) => {
+    if (typeof value !== 'string' || value === '') return '';
+    const masked = maskFreeText(value);
+    // The one credential this process actually holds is removed by value as well. `maskQuotedCredentials()` needs 16
+    // characters to tell a token from prose ("basic setup"), and `base64("user:pass")` is 12: a proxy in front of the
+    // backend that echoes the `Authorization` header it refused published the gateway's backend credential in a `502`
+    // body and in the error log. The token is a substring of a string already bounded to 512 characters, so the scan
+    // is bounded too, and it leaves every other sentence alone.
+    if (!BACKEND_AUTHORIZATION) return masked;
+    const token = BACKEND_AUTHORIZATION.slice(BACKEND_AUTHORIZATION.indexOf(' ') + 1);
+    return token ? masked.split(token).join('***') : masked;
+};
 
 /**
  * The sentence a failed completion shows a client and logs, read from whatever the route handler caught.
@@ -698,6 +713,13 @@ const isConnectionError = (error) => {
         message.includes('socket hang up') ||
         error?.cause?.code === 'ECONNREFUSED';
 };
+
+// A backend that could not be reached, or could not be started, is an upstream failure and not a bug in the gateway:
+// the sentences below ("the CLI is missing", "it exited during startup", "the port is taken", "a start is still
+// running") described a cause the *operator* must fix, and they were answered as `500 server_error` with no `code`,
+// which is what this gateway says about its own defect. The tag is what the handler's catch maps to `502`; it travels
+// on the error instead of matching the message text, so a future sentence cannot silently fall back to `500`.
+const backendUnavailable = (message) => Object.assign(new Error(message), { backendUnavailable: true });
 
 // Jail directories this process created. Another gateway (a second instance, or one in a container sharing /tmp)
 // may be using the same parent directory, so the exit hook must never delete a directory it does not own.
@@ -2950,10 +2972,17 @@ function createApp(config) {
                     // A provider failure is an upstream error, whether the client asked for a stream or not: the
                     // non-streaming path answers 502 for the same condition. So is a backend that went away mid
                     // request: a raw `fetch failed` used to be reported as 500, which tells a client "the gateway has
-                    // a bug" instead of "the upstream is gone".
-                    if (error.name === 'ProviderError' || isConnectionError(error)) {
+                    // a bug" instead of "the upstream is gone". A backend that could not be started at all is the same
+                    // class (`backendUnavailable`, tagged at the throw): the whole "CLI missing, wrong OPENCODE_PATH,
+                    // 2.x CLI, port taken, start cooldown" set was answered `500 server_error` with no `code`, i.e. as
+                    // a defect in this gateway, for a cause the client can only retry elsewhere.
+                    if (error.name === 'ProviderError' || error.backendUnavailable || isConnectionError(error)) {
                         statusCode = 502;
                     }
+                    // A gateway that is going away refuses with 503 and the retry hint the queue already uses: it is
+                    // temporary and the client should come back, not conclude that its request was wrong.
+                    const retryAfter = error.gatewayShuttingDown === true;
+                    if (retryAfter) statusCode = 503;
                     // The connection branch says what happened instead of forwarding Node's own wording: `fetch failed`
                     // is what a dead or refused backend produces, and a client reading it cannot tell whether the
                     // gateway, the backend or its own request is at fault.
@@ -2973,15 +3002,21 @@ function createApp(config) {
                     if (statusCode === 502) {
                         // The connection case is tested first: a backend that dies mid-request surfaces as a
                         // ProviderError whose message carries `fetch failed`, and `backend_unreachable` is the answer
-                        // a client can act on
-                        payload.error.code = isConnectionError(error)
+                        // a client can act on. A start failure is unreachable with no ambiguity at all - nothing was
+                        // connected to - and it is named the same way, so a client does not have to parse prose to
+                        // learn that its model request never reached the backend.
+                        payload.error.code = (isConnectionError(error) || error.backendUnavailable)
                             ? 'backend_unreachable'
                             : (error.name === 'ProviderError' ? 'ProviderError' : 'upstream_error');
+                    } else if (retryAfter) {
+                        payload.error.code = 'gateway_shutting_down';
                     }
                     if (!reply.raw.headersSent) {
                         if (hijacked) {
                             reply.raw.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
                             reply.raw.end(JSON.stringify(payload));
+                        } else if (retryAfter) {
+                            reply.code(statusCode).header('Retry-After', '1').send(payload);
                         } else {
                             reply.code(statusCode).send(payload);
                         }
@@ -3032,11 +3067,19 @@ function createApp(config) {
                     type: 'server_error'
                 }
             };
-            const statusCode = timedOut ? 504 : 500;
+            // The same lifecycle refusal as the inner catch: a backend that cannot be started is an upstream failure
+            // (502), a gateway that is going away is a temporary 503. This catch covers the paths that never reached
+            // the backend work (validation, the queue timer), so the mapping is repeated here rather than assumed.
+            const lifecycleStatus = error?.gatewayShuttingDown ? 503 : (error?.backendUnavailable ? 502 : 0);
+            const statusCode = timedOut ? 504 : (lifecycleStatus || 500);
+            if (lifecycleStatus === 502) payload.error.code = 'backend_unreachable';
+            if (lifecycleStatus === 503) payload.error.code = 'gateway_shutting_down';
             if (!reply.raw.headersSent) {
                 if (hijacked) {
                     reply.raw.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
                     reply.raw.end(JSON.stringify(payload));
+                } else if (lifecycleStatus === 503) {
+                    reply.code(statusCode).header('Retry-After', '1').send(payload);
                 } else {
                     reply.code(statusCode).send(payload);
                 }
@@ -3256,7 +3299,7 @@ async function ensureBackend(config, options = {}) {
     const state = backendState.get(stateKey);
 
     // The gateway is going away: never start (or restart) a backend from here
-    if (state.shuttingDown) throw new Error('The gateway is shutting down');
+    if (state.shuttingDown) throw Object.assign(new Error('The gateway is shutting down'), { gatewayShuttingDown: true });
 
     // A recent successful probe is trusted for BACKEND_HEALTH_CACHE_MS so a burst of chat requests shares one
     // health round trip instead of one per request; connection failures reset the timestamp (see chat error path)
@@ -3292,7 +3335,7 @@ async function ensureBackend(config, options = {}) {
             if (!state.isStarting) break;
             await new Promise(r => setTimeout(r, STARTING_WAIT_INTERVAL_MS));
         }
-        if (state.isStarting) throw new Error('Backend startup timeout');
+        if (state.isStarting) throw backendUnavailable('Backend startup timeout');
     }
 
     // Claim the start attempt *before* the probe that may suspend: the claim used to happen only after that probe
@@ -3309,10 +3352,10 @@ async function ensureBackend(config, options = {}) {
         } catch (err) {
             // Recent start attempt already failed: answer immediately instead of retrying the whole startup wait
             if (state.lastStartFailureAt && Date.now() - state.lastStartFailureAt < BACKEND_START_RETRY_COOLDOWN_MS) {
-                throw new Error(`OpenCode backend unavailable (last start attempt failed: ${state.lastStartError || 'unknown error'})`);
+                throw backendUnavailable(`OpenCode backend unavailable (last start attempt failed: ${state.lastStartError || 'unknown error'})`);
             }
             // The probe above suspended for up to its timeout, which is exactly the window a shutdown can land in
-            if (state.shuttingDown) throw new Error('The gateway is shutting down');
+            if (state.shuttingDown) throw Object.assign(new Error('The gateway is shutting down'), { gatewayShuttingDown: true });
             // Masked: the URL can carry a credential (see resolveBackendAuth), and this line is the one an operator
             // reads in `docker logs`
             logger.info(`[Proxy] OpenCode backend not found at ${maskBackendUrl(OPENCODE_SERVER_URL)}. Starting...`);
@@ -3365,7 +3408,7 @@ async function ensureBackend(config, options = {}) {
 
             // Last checkpoint before the spawn below, which has no suspension of its own: the wait for the previous
             // child (up to 3 s) can end with the process already shutting down.
-            if (state.shuttingDown) throw new Error('The gateway is shutting down');
+            if (state.shuttingDown) throw Object.assign(new Error('The gateway is shutting down'), { gatewayShuttingDown: true });
 
             const isWindows = process.platform === 'win32';
             const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
@@ -3534,14 +3577,14 @@ async function ensureBackend(config, options = {}) {
             if (spawnError) {
                 state.lastStartError = spawnError.message;
                 state.lastStartFailureAt = Date.now();
-                throw new Error(`Failed to start OpenCode backend: ${spawnError.message}`);
+                throw backendUnavailable(`Failed to start OpenCode backend: ${spawnError.message}`);
             }
 
             if (!started) {
                 logger.warn('[Proxy] Backend start timed out.');
                 state.lastStartError = 'Backend start timeout';
                 state.lastStartFailureAt = Date.now();
-                throw new Error('Backend start timeout');
+                throw backendUnavailable('Backend start timeout');
             }
         }
     } finally {

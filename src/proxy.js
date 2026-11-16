@@ -1050,6 +1050,12 @@ function createApp(config) {
     // is written from the headers while Node keeps the connection alive to drain a body it will never read. The
     // deadline follows the request budget, so an operator (and the smoke suite) can shorten it without another knob.
     const bodyReceiveDeadlineMs = Math.max(1, Math.min(BODY_RECEIVE_TIMEOUT_MS, REQUEST_TIMEOUT_MS));
+    // How long a body that *is* arriving may take in total. The window below answers "the client declared a body and
+    // sent nothing"; it was applied as a hard cap on the whole upload, so a slow link (anything under ~1.7 MB/s for the
+    // 50 MiB default limit) was cut off mid-body and told to send the body it was already sending. The deadline is
+    // renewed while bytes arrive, and the arrival phase gets its own window before the completion budget starts (it is
+    // spent before anything is queued), so a client that drizzles forever still cannot hold the socket.
+    const bodyUploadBudgetMs = bodyReceiveDeadlineMs + REQUEST_TIMEOUT_MS;
     const armBodyDeadline = (request, reply, meta) => {
         const raw = request.raw;
         // Only an announced body is waited for, so every bodyless request keeps the hook's current cost
@@ -1061,18 +1067,27 @@ function createApp(config) {
         // once it ends (measured: `reply.raw.destroyed` was true, `reply.raw.socket` was null, and the client stayed
         // connected), so the deadline has to close what the body is arriving on.
         const socket = raw.socket;
+        const armedAt = Date.now();
+        let timer = null;
         const disarm = () => {
-            clearTimeout(timer);
+            if (timer) clearTimeout(timer);
+            timer = null;
             raw.off('end', disarm);
             raw.off('close', disarm);
             raw.off('error', disarm);
         };
-        const timer = setTimeout(() => {
+        // `progressed` separates the two refusals: nothing arrived at all (a client that declared `Content-Length` and
+        // never wrote it, a proxy that buffered the body) or bytes kept arriving but the upload outlived the budget.
+        const expire = (progressed) => {
             disarm();
-            logger.warn('[Proxy] Request body did not arrive within its deadline, closing the connection', {
+            const ms = Date.now() - armedAt;
+            logger.warn('[Proxy] Request body did not finish arriving, closing the connection', {
                 reqId: meta.reqId,
                 method: request.method,
-                ms: bodyReceiveDeadlineMs
+                ms,
+                windowMs: bodyReceiveDeadlineMs,
+                budgetMs: bodyUploadBudgetMs,
+                progressed
             });
             // Nothing has been answered yet, so say why; when a response is already on the wire (the auth check's 401,
             // or the 413 for an oversized body) the socket is simply closed, because the client is not waiting for
@@ -1084,7 +1099,9 @@ function createApp(config) {
                 try {
                     reply.code(408).send({
                         error: {
-                            message: `request body was not received within ${bodyReceiveDeadlineMs}ms; send the declared body or close the connection`,
+                            message: progressed
+                                ? `request body was still arriving after ${ms}ms and the upload budget is ${bodyUploadBudgetMs}ms; send the body faster or in fewer bytes`
+                                : `request body was not received within ${bodyReceiveDeadlineMs}ms; send the declared body or close the connection`,
                             type: 'invalid_request_error'
                         }
                     });
@@ -1093,8 +1110,28 @@ function createApp(config) {
                 }
             }
             closeSocketAfterFlush(socket);
-        }, bodyReceiveDeadlineMs);
-        timer.unref();
+        };
+        // The window is re-armed as long as the socket makes progress. `socket.bytesRead` is the only signal needed:
+        // it counts this connection's reads, so a pipelined follow-up request cannot be mistaken for body progress
+        // (`raw.complete` is announced-body specific, and a keep-alive response detaches `reply.raw` from the socket).
+        let lastBytes = socket ? socket.bytesRead : 0;
+        const arm = () => {
+            timer = setTimeout(() => {
+                const read = socket ? socket.bytesRead : 0;
+                if (read > lastBytes) {
+                    lastBytes = read;
+                    if (Date.now() - armedAt < bodyUploadBudgetMs) {
+                        arm();
+                        return;
+                    }
+                    expire(true);
+                    return;
+                }
+                expire(false);
+            }, bodyReceiveDeadlineMs);
+            timer.unref();
+        };
+        arm();
         raw.once('end', disarm);
         raw.once('close', disarm);
         raw.once('error', disarm);

@@ -30,6 +30,9 @@ const STUB_URL = `http://127.0.0.1:${STUB_PORT}`;
 const BASE = `http://127.0.0.1:${GATEWAY_PORT}`;
 const API_KEY = 'sk-dummy-123';
 const ANSWER = 'Hello from the smoke test stub.';
+// Kept in step with LAGSTORE_ANSWER in test/stub-opencode.mjs (the stub is a separate process, so the suite carries its
+// own copy of every marker answer)
+const LAGSTORE_ANSWER = 'The frames carry the whole answer, but the stored message lags behind them by a wide margin.';
 const REASONING = 'Thinking about the request.';
 
 const results = [];
@@ -163,6 +166,15 @@ async function run() {
         booleanResults.every(([, actual, expected]) => actual === expected), JSON.stringify(booleanResults));
     check('parseBoolean returns the fallback for an unknown value',
         parseBoolean('maybe', 'fallback') === 'fallback' && parseBoolean(undefined, 'fallback') === 'fallback');
+    // The longest accepted spelling is five characters, so a client-sized value is rejected on its length alone instead
+    // of being trimmed and lowercased first (a 50 MiB `stream` value cost 10 ms per call on the serving thread, and the
+    // handler reads each boolean field twice)
+    const hugeBooleanValue = 'x'.repeat(1024 * 1024);
+    const hugeBooleanStartedAt = process.hrtime.bigint();
+    const hugeBoolean = parseBoolean(hugeBooleanValue, 'fallback');
+    const hugeBooleanMs = Number(process.hrtime.bigint() - hugeBooleanStartedAt) / 1e6;
+    check('a client-sized boolean value is rejected without being normalised',
+        hugeBoolean === 'fallback' && hugeBooleanMs < 5, `${hugeBooleanMs.toFixed(2)} ms`);
 
     // A phase handed the 1 ms floor of `remainingBudget()` has no budget left to wait with: the message must say that
     // instead of reporting the floor as if it were the budget ("Request timeout after 1ms" told a client and the log
@@ -352,6 +364,38 @@ async function run() {
     check('a credential-free message is left exactly as it was',
         maskUrlCredentials(undefined) === 'undefined' && maskUrlCredentials('plain text') === 'plain text',
         `${maskUrlCredentials(undefined)} / ${maskUrlCredentials('plain text')}`);
+    // ...but masking must not be a place to spend the event loop. The scheme run was unbounded, so a whitespace-free
+    // token containing `://` and no `@` was rescanned from every position: O(n²), measured 8 ms at 2 000 characters,
+    // 1.85 s at 32 000 - reachable through the debug dump of a request body (each string is cut at 32 KiB, after
+    // masking) and through an upstream error sentence, both on the single serving thread. The bound is a 32-character
+    // scheme (no real one is longer), which makes a candidate start position impossible unless `://` follows nearby.
+    const quadraticProbe = `${'a'.repeat(32000)}://${'b'.repeat(32000)}`;
+    const quadraticStartedAt = process.hrtime.bigint();
+    const quadraticMasked = maskUrlCredentials(quadraticProbe);
+    const quadraticMs = Number(process.hrtime.bigint() - quadraticStartedAt) / 1e6;
+    check('masking a long credential-free token stays linear',
+        quadraticMasked === quadraticProbe && quadraticMs < 100, `${quadraticMs.toFixed(1)} ms for 64 KB`);
+    check('the scheme bound still masks a real credential-bearing URL',
+        maskUrlCredentials('see http://user:s3cr3t@host:4097/x') === 'see http://***@host:4097/x',
+        maskUrlCredentials('see http://user:s3cr3t@host:4097/x'));
+
+    // The credential-name list has to carry the spellings clients use. `passw` was a *prefix*, and the anchors around
+    // the alternation require a whole name segment, so it matched nothing but the literal `passw`: `?password=…` and an
+    // `x-db-password` header were written to `docker logs` in clear while `?passw=` was masked.
+    const passwordHeaderNames = ['x-password', 'x-passwd', 'x-pwd', 'x-db-password'];
+    const passwordHeaderMasked = passwordHeaderNames.every((name) => {
+        const masked = maskHeaders({ [name]: 'hunter2' });
+        return masked[name] !== 'hunter2' && String(masked[name]).includes('***');
+    });
+    check('a password named in full is masked like any other credential', passwordHeaderMasked,
+        JSON.stringify(maskHeaders({ 'x-password': 'hunter2' })));
+    check('the password rule does not swallow an unrelated name',
+        maskHeaders({ 'compass-word': 'keep-me' })['compass-word'] === 'keep-me',
+        JSON.stringify(maskHeaders({ 'compass-word': 'keep-me' })));
+    check('a password query value is masked',
+        maskUrlQuery('/v1/models?password=hunter2&model=x') === '/v1/models?password=***&model=x' &&
+        maskUrlQuery('/v1/models?db_password=hunter2') === '/v1/models?db_password=***',
+        maskUrlQuery('/v1/models?password=hunter2&model=x'));
 
     // A URL is not the only credential an upstream can quote. The gateway sends the credential it lifted out of
     // OPENCODE_SERVER_URL as a Basic header, and a proxy in front of the backend can echo the header it refused in its
@@ -2452,6 +2496,37 @@ async function run() {
         JSON.stringify(cutFrames.slice(-2)));
     check('the recovery does not wait out the request budget', cutMs < 2500, `${cutMs} ms`);
 
+    // --- a stored message that lags the stream it already delivered --------------------------------------
+    // The message store is behind the broadcast: the frames carried the whole answer, the stored copy keeps only its
+    // first characters, and the stream then ends without a finish event, so the recovery poll reads the short copy. It
+    // holds nothing the client does not have - both prefix guards were false (the polled text is shorter than what was
+    // sent) and the short copy was written again, so the client received the head of the answer twice under
+    // `finish_reason: "stop"` (550 characters for a 500-character answer).
+    const lagResponse = await fetch(`${stallUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'LAGSTORE please' }], stream: true })
+    }).then((response) => response.text());
+    const lagFrames = parseSseFrames(lagResponse);
+    const lagChunks = lagFrames
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        })
+        .filter(Boolean);
+    const lagContent = lagChunks.map((chunk) => chunk.choices?.[0]?.delta?.content || '').join('');
+    check('a stored message that lags the stream does not re-send the head of the answer',
+        lagContent === LAGSTORE_ANSWER,
+        `${lagContent.length} chars ${JSON.stringify(lagContent.slice(0, 80))}`);
+    check('the lagging-store recovery still finishes once and terminates',
+        lagChunks.filter((chunk) => chunk.choices?.[0]?.finish_reason === 'stop').length === 1 &&
+        lagFrames[lagFrames.length - 1] === '[DONE]',
+        JSON.stringify(lagFrames.slice(-2)));
+
     // --- a silent gap longer than the idle timeout ---------------------------------------------------------
     // The stub goes quiet for 12.5 s - longer than the 8 s idle timeout - and only then finishes writing. The gateway
     // falls back to polling on that silence, and giving up 1.5 s into it ended the stream with `finish_reason: "stop"`
@@ -2721,6 +2796,48 @@ async function run() {
     check('a 502 from the top-level handler carries a stable code',
         killedAnswer.json?.error?.code === 'backend_unreachable',
         JSON.stringify(killedAnswer.json?.error)?.slice(0, 160));
+
+    // --- a backend the gateway cannot start at all ----------------------------------------------------
+    // The "CLI missing, wrong OPENCODE_PATH, 2.x CLI, port taken, start cooldown" set answered `500 server_error` with
+    // no `code`: that is what this gateway says about its own defect, so a client had no way to tell a retryable
+    // upstream failure from a bug in the gateway, and the README's own troubleshooting rows promised a backend problem.
+    // A backend URL nothing listens on plus a CLI that exits during startup reaches the start-failure branch. The CLI is
+    // a script of our own rather than a missing path: a configured `OPENCODE_PATH` that does not exist falls back to
+    // the PATH search on some setups, and a real 2.x `opencode` there answers `405` for `POST /session` - a different
+    // failure (that one has its own block below).
+    const deadBackendScript = path.join(os.tmpdir(), `free-opencode-api-dead-backend-${process.pid}.sh`);
+    fs.writeFileSync(deadBackendScript, ['#!/usr/bin/env node', 'process.exit(1);', ''].join('\n'));
+    fs.chmodSync(deadBackendScript, 0o755);
+    const deadBackendPort = GATEWAY_PORT + 31;
+    const deadBackendGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(deadBackendPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${GATEWAY_PORT + 41}`,
+            OPENCODE_PATH: deadBackendScript,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(deadBackendGateway);
+    deadBackendGateway.stdout.on('data', () => {});
+    deadBackendGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${deadBackendPort}/health`);
+    const unstartableAnswer = await fetch(`http://127.0.0.1:${deadBackendPort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
+    check('a backend that cannot be started is an upstream failure, not a gateway bug',
+        unstartableAnswer.status === 502 && unstartableAnswer.json?.error?.type === 'server_error',
+        `status ${unstartableAnswer.status} ${JSON.stringify(unstartableAnswer.json)?.slice(0, 160)}`);
+    check('a start failure carries the same stable code as an unreachable backend',
+        unstartableAnswer.json?.error?.code === 'backend_unreachable',
+        JSON.stringify(unstartableAnswer.json?.error)?.slice(0, 160));
+    stopGateway(deadBackendGateway);
+    await waitForExit(deadBackendGateway);
+    try { fs.unlinkSync(deadBackendScript); } catch { /* best effort */ }
     const restartStartedAt = Date.now();
     const afterRestart = await fetch(`${gatewayUrl}/v1/chat/completions`, {
         method: 'POST',
@@ -3217,6 +3334,40 @@ async function run() {
         !echoAuthOutput.includes(encodedCredential) && !echoAuthOutput.includes('s3cr3t-value') &&
         echoAuthOutput.includes('Basic ***'),
         (echoAuthOutput.split('\n').find((line) => line.includes('upstream call failed')) || '').slice(0, 240));
+    // The quoted-credential masker needs 16 characters to tell a token from prose ("basic setup needs a key"), and
+    // base64("u:pw") is 8: the gateway's own backend credential still went out in the same 502 body. It is removed by
+    // value instead (the one credential this process holds), so the length no longer decides.
+    const shortCredPort = GATEWAY_PORT + 38;
+    const shortCredGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(shortCredPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://u:pw@127.0.0.1:${echoAuthStubPort}`,
+            LOG_LEVEL: 'info'
+        }
+    });
+    children.push(shortCredGateway);
+    let shortCredOutput = '';
+    shortCredGateway.stdout.on('data', (chunk) => { shortCredOutput += chunk.toString(); });
+    shortCredGateway.stderr.on('data', (chunk) => { shortCredOutput += chunk.toString(); });
+    await waitForOk(`http://127.0.0.1:${shortCredPort}/health`);
+    const shortCredAnswer = await fetch(`http://127.0.0.1:${shortCredPort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'echoed short credential' }] })
+    }).then(async (response) => ({ status: response.status, text: await response.text() }));
+    const shortEncoded = Buffer.from('u:pw').toString('base64');
+    check('a backend credential shorter than the quoted-credential floor is masked too',
+        shortCredAnswer.status === 502 && shortCredAnswer.text.includes('Basic ***') &&
+        !shortCredAnswer.text.includes(shortEncoded),
+        `${shortCredAnswer.status} ${JSON.stringify(shortCredAnswer.text.slice(0, 220))}`);
+    check('the short credential is masked in the error log as well',
+        !shortCredOutput.includes(shortEncoded),
+        (shortCredOutput.split('\n').find((line) => line.includes('upstream call failed')) || '').slice(0, 240));
+    stopGateway(shortCredGateway);
+    await waitForExit(shortCredGateway);
     stopGateway(echoAuthGateway);
     await waitForExit(echoAuthGateway);
     stop(echoAuthStub);
@@ -3852,6 +4003,46 @@ async function run() {
     check('the same deadline closes a body sent without a key',
         stalledAnon.closedBy === 'gateway' && stalledAnon.ms < 5000 && /^HTTP\/1\.1 401 /.test(stalledAnon.raw),
         `${stalledAnon.closedBy} after ${stalledAnon.ms}ms ${JSON.stringify(stalledAnon.raw.slice(0, 160))}`);
+    // ...and a body that *is* arriving is not a stalled one. The deadline was a hard cap on the whole upload, so a slow
+    // client was cut off mid-body and told to send the body it was sending. It now renews while the socket makes
+    // progress: this body is spread over ~1.6 s (more than the 1200 ms window, less than the 1200 + 1200 ms budget)
+    // with gaps below the window, so it has to be served.
+    const pacedBody = JSON.stringify({ messages: [{ role: 'user', content: 'paced upload' }] });
+    const pacedBytes = Buffer.from(pacedBody);
+    const paced = await new Promise((resolve) => {
+        const startedAt = Date.now();
+        let data = '';
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            resolve({ ms: Date.now() - startedAt, raw: data });
+        };
+        const socket = net.connect(deadlinePort, '127.0.0.1', () => {
+            socket.write('POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n' +
+                `Authorization: Bearer ${API_KEY}\r\nContent-Type: application/json\r\n` +
+                `Content-Length: ${pacedBytes.length}\r\n\r\n`);
+            const step = Math.ceil(pacedBytes.length / 4);
+            let sent = 0;
+            const pump = () => {
+                if (sent >= pacedBytes.length || socket.destroyed) return;
+                socket.write(pacedBytes.subarray(sent, sent + step));
+                sent += step;
+                setTimeout(pump, 400);
+            };
+            pump();
+        });
+        socket.on('data', (chunk) => { data += chunk.toString('latin1'); });
+        socket.on('close', finish);
+        socket.on('error', finish);
+        setTimeout(() => {
+            socket.destroy();
+            finish();
+        }, 9000);
+    });
+    check('a body that keeps arriving is served instead of being cut off with the stall deadline',
+        /^HTTP\/1\.1 200 /.test(paced.raw) && paced.ms > 1200,
+        `${paced.ms}ms ${JSON.stringify(paced.raw.slice(0, 200))}`);
     stopGateway(deadlineGateway);
     await waitForExit(deadlineGateway);
 
@@ -3875,6 +4066,52 @@ async function run() {
     check('SIGINT shuts the gateway down cleanly', longLivedExit === 0, `exit ${longLivedExit}`);
     check('the shutdown leaves no truncated answer behind', heldLongLivedAnswer.status === 200,
         `status ${heldLongLivedAnswer.status}`);
+
+    // --- a session left behind by an interrupted completion ---------------------------------------------
+    // A completion that shutdown interrupts never reaches its `cleanupSession()`: the process exits while the task is
+    // still parked in the collector. With a managed backend the child takes its sessions with it, but an external one
+    // (`OPENCODE_SERVER_URL`) kept them forever, one per restart. The entry point drains what it created before it
+    // stops the backend.
+    const drainPort = GATEWAY_PORT + 39;
+    const drainGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(drainPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(drainGateway);
+    drainGateway.stdout.on('data', () => {});
+    drainGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${drainPort}/health`);
+    // STALL never finishes, so this completion is still in flight when the signal arrives - and it owns the only
+    // completion slot, so nothing else can create a session behind it
+    const interruptedCompletion = fetch(`http://127.0.0.1:${drainPort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'STALL while shutting down' }] })
+    }).then(() => null).catch(() => null);
+    await sleep(400);
+    const sessionsDuringShutdown = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    const drainStoppedAt = Date.now();
+    const drainExitCode = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 12000);
+        drainGateway.once('exit', (code) => {
+            clearTimeout(timer);
+            resolve(code);
+        });
+        stopGateway(drainGateway);
+    });
+    const sessionsAfterShutdown = await sessionsAfterCleanup(STUB_URL, 3000);
+    await interruptedCompletion;
+    check('a completion interrupted by shutdown deletes its session',
+        sessionsDuringShutdown?.live === 1 && drainExitCode === 0 &&
+        sessionsAfterShutdown?.live === 0,
+        `live ${sessionsDuringShutdown?.live} -> ${sessionsAfterShutdown?.live}, exit ${drainExitCode}, ` +
+        `${Date.now() - drainStoppedAt}ms`);
 
     // --- a tuning value that cannot be used is named, not silently replaced -------------------------------
     // These three keys fell back to their default without a word, so an operator who typo'd the request budget ran a
@@ -4368,6 +4605,47 @@ stopGateway(pipeGateway);
 await waitForExit(pipeGateway);
 stop(pipeStub);
 await waitForExit(pipeStub);
+}
+
+// --- a crash leaves a crash status behind ---------------------------------------------------------------
+// An uncaught exception goes through the graceful shutdown path, which ended in `process.exit(0)`: a supervisor
+// (`Restart=on-failure`, a Kubernetes restart policy, exit-status alerting) read a crashed gateway as a deliberate stop,
+// so nothing restarted it and nothing alerted. The throw is injected by a module imported before the entry point, which
+// is the only way to raise one inside a child process from here; no backend is needed, because index.js starts serving
+// without one.
+{
+    const crashPort = GATEWAY_PORT + 42;
+    const crashModule = path.join(os.tmpdir(), `free-opencode-api-crash-${process.pid}.mjs`);
+    fs.writeFileSync(crashModule, [
+        "// Loaded with --import, so this runs before index.js installs its handlers",
+        "setTimeout(() => { throw new Error('smoke test crash'); }, 900);",
+        ''
+    ].join('\n'));
+    const crashGateway = spawn(process.execPath, ['--import', pathToFileURL(crashModule).href, 'index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(crashPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${GATEWAY_PORT + 43}`,
+            LOG_LEVEL: 'info'
+        }
+    });
+    children.push(crashGateway);
+    let crashOutput = '';
+    crashGateway.stdout.on('data', (chunk) => { crashOutput += chunk.toString(); });
+    crashGateway.stderr.on('data', (chunk) => { crashOutput += chunk.toString(); });
+    const crashExit = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 15000);
+        crashGateway.once('exit', (code) => {
+            clearTimeout(timer);
+            resolve(code);
+        });
+    });
+    check('an uncaught exception exits with a crash status, not a clean one',
+        crashExit === 1 && crashOutput.includes('[Fatal] Uncaught exception'),
+        `exit ${crashExit} ${JSON.stringify(crashOutput.split('\n').slice(0, 3).join(' | ').slice(0, 200))}`);
+    try { fs.unlinkSync(crashModule); } catch { /* best effort */ }
 }
 
 const TIMEOUT_MS = 120000;

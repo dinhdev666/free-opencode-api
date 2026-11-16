@@ -79,6 +79,11 @@ const BASIC_HEADER = BASIC_AUTH ? `Basic ${Buffer.from(BASIC_AUTH, 'utf8').toStr
 // The snapshots the SHRINK marker sends: the second one is shorter, so it carries no derivable increment
 const SHRINK_SNAPSHOTS = ['alpha beta gamma', 'alpha beta'];
 const SHRINK_LAST = 'alpha beta';
+// The answer the LAGSTORE marker delivers on the event stream, and how much of it the stored message keeps: a store
+// written behind the broadcast (or a part the backend rewrote shorter) leaves the polled copy *behind* what the client
+// already has, so the recovery poll carries nothing new.
+const LAGSTORE_ANSWER = 'The frames carry the whole answer, but the stored message lags behind them by a wide margin.';
+const LAGSTORE_STORED_CHARS = 13;
 // The two halves of the MULTIPART answer, each sent as its own cumulative snapshots by streamTwoParts()
 const MULTIPART_FIRST = 'alpha beta gamma';
 const MULTIPART_SECOND = 'ALPHA BETA GAMMA';
@@ -593,6 +598,19 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
                 const cut = Math.ceil(ANSWER.length / 2);
                 cutStreamMidAnswer(id, [ANSWER.slice(0, Math.ceil(cut / 2)), ANSWER.slice(0, cut)]).catch(() => {});
+                return;
+            }
+            if (session.promptText.includes('LAGSTORE')) {
+                // The stored message is behind the event stream, and the stream is then cut without a finish event, so
+                // the recovery poll reads the short copy. It holds nothing the client does not already have: appending
+                // it repeated the head of the answer (`LAGSTORE_ANSWER` plus its first characters again) under
+                // `finish_reason: "stop"`.
+                session.messages.push(buildAssistantMessage(id, LAGSTORE_ANSWER.slice(0, LAGSTORE_STORED_CHARS), ''));
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                cutStreamMidAnswer(id, [
+                    LAGSTORE_ANSWER.slice(0, Math.ceil(LAGSTORE_ANSWER.length / 2)),
+                    LAGSTORE_ANSWER
+                ]).catch(() => {});
                 return;
             }
             if (session.promptText.includes('MULTIPART')) {

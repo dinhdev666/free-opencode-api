@@ -1933,6 +1933,18 @@ function createApp(config) {
             timeoutId = setTimeout(() => {
                 if (finished) return;
                 finished = true;
+                // The rejection path has to release the same timers `settle()` does: this is the one exit that does not
+                // go through it (it rejects rather than resolving a result), and leaving the first-delta/idle timers
+                // armed kept this collector's closure - the accumulated text and the stream buffers - alive for
+                // another 4 s or 8 s after the request had already been answered with its budget error.
+                if (firstDeltaTimer) {
+                    clearTimeout(firstDeltaTimer);
+                    firstDeltaTimer = null;
+                }
+                if (idleTimer) {
+                    clearTimeout(idleTimer);
+                    idleTimer = null;
+                }
                 controller.abort();
                 reject(new Error(timeoutMessage(timeoutMs)));
             }, timeoutMs);

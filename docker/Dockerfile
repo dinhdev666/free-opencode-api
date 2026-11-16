@@ -99,9 +99,14 @@ ENV NODE_ENV=production
 
 # Health check uses the same /health endpoint the CI smoke suite asserts. The port comes from PORT when it is set and
 # from /app/config.json otherwise, because that file is the documented fallback for `-e PORT` (an image whose probe only
-# looked at the environment reported a healthy gateway as unhealthy forever when the port came from the file).
+# looked at the environment reported a healthy gateway as unhealthy forever when the port came from the file). It is
+# read through the entry point's own rule - trimmed, digits only, 1-65535 - because the gateway trims `PORT` before it
+# listens: `PORT=' 8083'` made the gateway bind 8083 while the probe built `http://127.0.0.1: 8083/health`, which curl
+# refuses (exit 3), so the container was restarted in a loop for a value the gateway accepted. The digit class is
+# spelled `[0-9]`: a `\d` here reaches the shell-embedded program as a literal backslash and a `d`, so every port read
+# as invalid and the probe fell back to 8083 - a container configured for another port reported itself unhealthy.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:$(node -p 'process.env.PORT || (() => { try { return JSON.parse(require("fs").readFileSync("/app/config.json", "utf8")).PORT } catch (e) { return null } })() || 8083')/health" || exit 1
+    CMD port=$(node -e 'const fs=require("fs");const ok=(v)=>/^[0-9]{1,5}$/.test(v)&&Number(v)>0&&Number(v)<65536;const raw=String(process.env.PORT??"").trim();if(ok(raw)){process.stdout.write(raw);process.exit(0)}let fromFile="";try{fromFile=String(JSON.parse(fs.readFileSync("/app/config.json","utf8")).PORT??"").trim()}catch(e){}process.stdout.write(ok(fromFile)?fromFile:"8083")') && curl -fsS "http://127.0.0.1:${port}/health" || exit 1
 
 # Log level: one of error/warn/info/debug, case-insensitive; invalid values fall back to info with a warning. The
 # precedence is the project-wide one - env > config.json > default - so no ENV line is set here: an image-level

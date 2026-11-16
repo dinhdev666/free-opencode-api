@@ -80,6 +80,11 @@ const newCompletionId = () => `chatcmpl-${Date.now().toString(36)}${String(compl
 // and the fallback timer only destroys a socket whose close never completes (a peer that stopped reading).
 const closeSocketAfterFlush = (socket) => {
     if (!socket || socket.destroyed) return;
+    // The parser sees the body of this request end in the middle of what the client announced (the gateway hung up on
+    // purpose), raises HPE_INVALID_EOF_STATE and hands it to `clientErrorHandler`, which logged a warn line reading
+    // "the client sent garbage" and wrote a `400` nobody would read on top of the answer that had just gone out. The
+    // flag is what tells the two causes apart: this socket was closed by the gateway, not by a broken peer.
+    socket.gatewayClosed = true;
     if (socket.writableEnded) {
         // Everything was already handed to the kernel by an earlier end(): there is nothing left to flush, and the
         // socket has to go now because the client is still sending a body that will never be read.
@@ -737,9 +742,9 @@ const liveSessions = new Set();
  * killBackend() having been called.
  */
 function cleanupTempDirs() {
-    // On Windows no jail is used (path issues), so there is nothing to remove
-    if (process.platform === 'win32') return;
-
+    // The jail is created on every platform (Windows included: `spawnBackend()` builds the workspace before it branches
+    // on `isWindows`), so skipping `win32` here left one directory per run behind for good. Removal is best effort;
+    // a directory the child still holds answers EBUSY and the next exit tries again.
     for (const jailRoot of ownedJailRoots) {
         try {
             fs.rmSync(jailRoot, { recursive: true, force: true });
@@ -914,6 +919,9 @@ function createApp(config) {
     const clientErrorHandler = (error, socket) => {
         // Node reports a reset connection with a socket that is already gone: there is nothing to answer
         if (error?.code === 'ECONNRESET' || socket.destroyed) return;
+        // `closeSocketAfterFlush()` already answered this socket (a body deadline, an oversized body): the parse error
+        // is the gateway's own close arriving back as an event, not a malformed request
+        if (socket.gatewayClosed) return;
         const mapped = CLIENT_ERROR_STATUS[error?.code];
         const status = mapped ? mapped.status : 400;
         const reason = mapped ? mapped.reason : 'Malformed HTTP request';
@@ -1530,6 +1538,10 @@ function createApp(config) {
         const MAX_HELD = Math.max(OPEN_TAG.length, CLOSE_TAG.length) - 1;
         let inBlock = false;
         let held = '';
+        // The text seen since the opening tag that is still open. A closed block is dropped whole, so this is only
+        // read by `flush()`: `removeToolMarkup()` drops an *unclosed* opening tag and keeps the text after it, and the
+        // streaming filter used to return `''` there, losing the rest of the answer.
+        let pending = '';
         // Splits text into the part that can be written out and the suffix that could still become a tag
         const splitAtPossibleTag = (text) => {
             for (let length = Math.min(text.length, MAX_HELD); length > 0; length -= 1) {
@@ -1549,15 +1561,29 @@ function createApp(config) {
                 if (inBlock) {
                     const endIdx = buffer.indexOf(CLOSE_TAG);
                     if (endIdx === -1) {
-                        // Inside a block the text is dropped; only a partial closing tag is worth keeping
-                        held = splitAtPossibleTag(buffer)[1];
+                        // Still inside a block: the text is not written out, but it is kept for `flush()` (the block
+                        // may turn out never to close). Only a fragment that could still become a tag is held back, so
+                        // a closing tag split across two deltas is still recognised by the next call.
+                        const [emit, tail] = splitAtPossibleTag(buffer);
+                        pending += emit;
+                        held = tail;
                         return output;
                     }
+                    // The block closed: everything inside it was markup, and `removeToolMarkup()` drops it
+                    pending = '';
                     buffer = buffer.slice(endIdx + CLOSE_TAG.length);
                     inBlock = false;
                     continue;
                 }
+                // A stray closing tag is markup too. Looking only for the opening one wrote `</function_calls>` to the
+                // client verbatim, while the non-streaming scan removes both kinds.
                 const startIdx = buffer.indexOf(OPEN_TAG);
+                const strayCloseIdx = buffer.indexOf(CLOSE_TAG);
+                if (strayCloseIdx !== -1 && (startIdx === -1 || strayCloseIdx < startIdx)) {
+                    output += buffer.slice(0, strayCloseIdx);
+                    buffer = buffer.slice(strayCloseIdx + CLOSE_TAG.length);
+                    continue;
+                }
                 if (startIdx === -1) {
                     const [emit, tail] = splitAtPossibleTag(buffer);
                     held = tail;
@@ -1566,14 +1592,21 @@ function createApp(config) {
                 output += buffer.slice(0, startIdx);
                 buffer = buffer.slice(startIdx + OPEN_TAG.length);
                 inBlock = true;
+                pending = '';
             }
             return output;
         };
-        // End of stream: a held fragment turned out not to be a tag
+        // End of stream: a held fragment turned out not to be a tag, and a block that never closed released the text
+        // after its opening tag - the same two shapes `removeToolMarkup()` answers.
         filter.flush = () => {
-            if (inBlock) return '';
             const rest = held;
             held = '';
+            if (inBlock) {
+                inBlock = false;
+                const text = (pending + rest).split(OPEN_TAG).join('');
+                pending = '';
+                return text;
+            }
             return rest;
         };
         return filter;
@@ -1723,6 +1756,18 @@ function createApp(config) {
     }
 
     /**
+     * A provider failure as one client-facing sentence: the provider's name and its own text, masked and bounded.
+     *
+     * Both answer modes end with this sentence - the 502 body, the in-band error frame, the log line - because it is
+     * provider-controlled text that routinely quotes the credential it rejected. One helper keeps the two modes from
+     * disagreeing about the same payload (they did: the streaming path masked it, the non-streaming one did not).
+     */
+    const describeProviderFailure = (error) => {
+        const detail = clientFacingText(error?.data?.message || error?.message) || 'Unknown error';
+        return `${error?.name || 'OpenCodeError'}: ${detail}`;
+    };
+
+    /**
      * The assistant message `client.session.prompt` already returned, when the provider is done writing it.
      *
      * The backend answers `POST /session/:id/message` with the message it produced, so a finished message *is* the
@@ -1846,11 +1891,21 @@ function createApp(config) {
                 // failures. Counting total ones ended a completion that was busy writing its answer - five hiccups
                 // spread over a minute reported the upstream as gone while the answer was one poll away.
                 consecutiveFailures = 0;
+                // Only the newest assistant message can be the answer. The backend writes one per step, so a
+                // tool-using completion holds several - the step that asked for the tool ends with
+                // `finish: "tool-calls"`, and the real answer is written after it. Walking further back to find a
+                // message that was already finished returned that earlier step as the answer (and the streaming
+                // recovery appended it to what the client had), under `finish_reason: "stop"`.
+                let newest = null;
                 for (let i = messages.length - 1; i >= 0; i -= 1) {
-                    const entry = messages[i];
-                    const info = entry?.info;
-                    if (info?.role !== 'assistant') continue;
-                    const { content, reasoning } = extractFromParts(entry?.parts || []);
+                    if (messages[i]?.info?.role === 'assistant') {
+                        newest = messages[i];
+                        break;
+                    }
+                }
+                if (newest) {
+                    const info = newest.info;
+                    const { content, reasoning } = extractFromParts(newest.parts || []);
                     const error = info?.error || null;
                     const done = Boolean(info.finish || info.time?.completed || error);
                     let stableFor = 0;
@@ -2057,10 +2112,15 @@ function createApp(config) {
                                 logger.debug('SSE completed', {
                                     sessionId,
                                     ms: Date.now() - startedAt,
-                                    deltaChars
+                                    deltaChars,
+                                    error: props.info?.error?.name || null
                                 });
                             }
-                            settle({ content, reasoning });
+                            // A provider failure is marked on the same event that ends the message (`error` next to
+                            // `time.completed`). It used to be dropped here, so a completion that failed after two
+                            // deltas ended with `finish_reason: "stop"` and no error frame - the truncated text was
+                            // reported as a successful answer.
+                            settle({ content, reasoning, error: props.info?.error || null });
                             break;
                         }
                     }
@@ -2522,6 +2582,13 @@ function createApp(config) {
 
                     // Ensure backend is running
                     await ensureBackend(config);
+                    // The backend was trusted before shutdown began, so `ensureBackend()` returned without reaching its
+                    // own check: a session created now would land in `liveSessions` after the drain read it, and nobody
+                    // would delete it (an external backend keeps it for good). The request is answered `503
+                    // gateway_shutting_down`, the same answer the shutdown refusal gives everywhere else.
+                    if (backendState.get(OPENCODE_SERVER_URL)?.shuttingDown) {
+                        throw Object.assign(new Error('The gateway is shutting down'), { gatewayShuttingDown: true });
+                    }
 
                     // Create session
                     let sessionRes;
@@ -2805,6 +2872,12 @@ function createApp(config) {
                         const collector = await collectDeferred.catch(() => null);
                         if (collector) collector.endFirstDeltaWait();
                         const collected = await safeCollect;
+                        // The provider failed on the event that ended the message: this must end the stream in-band,
+                        // with the frames already written or as the 502 envelope when none were. Serving the text it
+                        // managed to write under `finish_reason: "stop"` is a successful answer to every client.
+                        if (collected && collected.error) {
+                            throw new ProviderError(describeProviderFailure(collected.error));
+                        }
 
                         // One place that turns a polled assistant message into deltas. `appendOnly` trims the part that
                         // was already streamed over SSE, so an idle-timeout fallback never repeats itself.
@@ -2832,7 +2905,7 @@ function createApp(config) {
                             if (error && !content && !reasoning) {
                                 // The prompt succeeded but the provider reported an error and no text: terminate the
                                 // stream with an error frame instead of streaming the message back as model output
-                                throw new ProviderError(`${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
+                                throw new ProviderError(describeProviderFailure(error));
                             }
                             const emitPolledKind = async (text, kind, isReasoning) => {
                                 if (!text) return;
@@ -2868,6 +2941,10 @@ function createApp(config) {
                             };
                             await emitPolledKind(reasoning, 'reasoning', true);
                             await emitPolledKind(content, 'content', false);
+                            // A polled message that carries a provider error is a failure even when it also carries
+                            // text: the text was emitted above, so the client gets what there was and then the error
+                            // frame, instead of a "stop" that reads as a complete answer.
+                            if (error) throw new ProviderError(describeProviderFailure(error));
                         };
 
                         let polled = false;
@@ -2974,7 +3051,10 @@ function createApp(config) {
                             await cleanupSession();
                             return reply;
                         }
-                        if (error && !content && !reasoning) {
+                        if (error) {
+                            // A provider failure is an upstream error in this mode too, whether or not the provider
+                            // had written some text: answering `200` with the truncated text told the client a
+                            // failed completion succeeded.
                             // The session exists by now and must be deleted even though the answer failed
                             reply.code(502).send({
                                 error: {
@@ -3334,9 +3414,10 @@ function createApp(config) {
 const backendState = new Map();
 
 // Waits (bounded) for a start attempt that was still in flight when the gateway began shutting down, so a child it
-// spawned a moment later is tracked instead of orphaned. The attempt aborts at its next checkpoint and the wait only
-// has to cover what it is already inside: a health probe (2 s timeout) or the SIGTERM/SIGKILL escalation of the
-// previous child (3 s). It stays under the 5 s hard exit `index.js` keeps as a backstop.
+// spawned a moment later is tracked instead of orphaned. The attempt aborts at its next checkpoint - the readiness
+// loop checks `state.shuttingDown` every iteration - and the wait only has to cover what it is already inside: a health
+// probe (2 s timeout) or the SIGTERM/SIGKILL escalation of the previous child (3 s). It fits inside the teardown budget
+// below, which is what `index.js` bounds its own hard exit against.
 const PENDING_START_WAIT_MS = 3500;
 async function waitForPendingStart(state) {
     const deadline = Date.now() + PENDING_START_WAIT_MS;
@@ -3558,8 +3639,17 @@ async function ensureBackend(config, options = {}) {
                     const storageDir = path.join(opencodeDir, 'storage');
                     const messageDir = path.join(storageDir, 'message');
                     const sessionDir = path.join(storageDir, 'session');
+                    // The store above is only the default location: the CLI resolves `XDG_DATA_HOME` first, and a
+                    // desktop session, a systemd unit or an image that sets the XDG variables sent the isolated run
+                    // straight back to the real user's store, config and cache - outside the 0700 jail this directory
+                    // exists to provide. They point inside it here, and `TMPDIR` follows the same rule.
+                    const xdgData = path.join(fakeHome, '.local', 'share');
+                    const xdgConfig = path.join(fakeHome, '.config');
+                    const xdgCache = path.join(fakeHome, '.cache');
+                    const xdgState = path.join(fakeHome, '.local', 'state');
+                    const jailTmp = path.join(jailRoot, 'tmp');
 
-                    [fakeHome, opencodeDir, storageDir, messageDir, sessionDir].forEach(d => {
+                    [fakeHome, opencodeDir, storageDir, messageDir, sessionDir, xdgConfig, xdgCache, xdgState, jailTmp].forEach(d => {
                         if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
                     });
 
@@ -3567,6 +3657,13 @@ async function ensureBackend(config, options = {}) {
                         ...process.env,
                         HOME: fakeHome,
                         USERPROFILE: fakeHome,
+                        XDG_DATA_HOME: xdgData,
+                        XDG_CONFIG_HOME: xdgConfig,
+                        XDG_CACHE_HOME: xdgCache,
+                        XDG_STATE_HOME: xdgState,
+                        TMPDIR: jailTmp,
+                        TMP: jailTmp,
+                        TEMP: jailTmp,
                         OPENCODE_PROJECT_DIR: workspace
                     };
                     logger.info('[Proxy] Using isolated home for OpenCode');
@@ -3585,6 +3682,10 @@ async function ensureBackend(config, options = {}) {
             // Provider credentials the CLI needs live in its own auth store or under their own names and stay.
             delete envVars.API_KEY;
             delete envVars.OPENCODE_PROXY_DEBUG;
+            // This one names a credential as well: `OPENCODE_SERVER_URL` can carry `user:pass@` for a proxy in front of
+            // the backend, and the child had no use for it - it *is* the backend (`opencode serve`), it does not
+            // connect to one. Passing it on published a credential to a process that runs model-directed tools.
+            delete envVars.OPENCODE_SERVER_URL;
 
             let port = '4097';
             try {
@@ -3645,6 +3746,14 @@ async function ensureBackend(config, options = {}) {
             for (let i = 0; i < STARTUP_WAIT_ITERATIONS; i++) {
                 await new Promise(r => setTimeout(r, STARTUP_WAIT_INTERVAL_MS));
                 if (spawnError) break;
+                // Shutdown began while this attempt was waiting for the backend: stop here instead of holding
+                // `state.isStarting` for the rest of the startup budget. That flag is what `killBackend()` waits for,
+                // so a full budget left the escalation too little room (the child was spawned already, and the
+                // teardown below reaps it).
+                if (state.shuttingDown) {
+                    spawnError = new Error('gateway is shutting down');
+                    break;
+                }
                 // Spawned through a shell (missing/unresolved binary) the process exits with a code instead of
                 // emitting 'error'; stop waiting as soon as that happens. A child killed by a signal reports
                 // exitCode === null and only sets signalCode, so testing the exit code alone missed every backend that
@@ -3823,19 +3932,35 @@ export function startProxy(options) {
         });
 
     // Deletes the sessions still in `liveSessions` (a completion interrupted by shutdown). Bounded by its own budget so
-    // it fits inside the 5 s hard exit in `index.js`, and every call is best effort: a delete that fails or times out
-    // must not delay the exit.
+    // it fits inside the teardown budget below, and every call is best effort: a delete that fails or times out must not
+    // delay the exit.
     const SHUTDOWN_SESSION_TIMEOUT_MS = 3000;
-    const drainLiveSessions = async () => {
-        if (liveSessions.size === 0) return;
-        const ids = [...liveSessions];
-        liveSessions.clear();
-        await Promise.all(ids.map((id) => client.session.delete({
-            path: { id },
-            ...backendDeadline(SHUTDOWN_SESSION_TIMEOUT_MS)
-        }).catch(() => { })));
-        if (logger.isEnabled('debug')) {
-            logger.debug('[Shutdown] Deleted the sessions left by interrupted completions', { count: ids.length });
+    // The whole teardown - a pending start attempt, this drain, and the SIGTERM/SIGKILL escalation of the child - gets
+    // one budget. Every step used to spend its own, so the sum (3.5 s + 3 s + 3 s + 1 s) outlasted the hard exit in
+    // `index.js`, which is a backstop meant to fire after the escalation had run: a backend that ignores SIGTERM
+    // survived the gateway (measured: exit 0 at 5 008 ms, child still listening on the backend port).
+    const SHUTDOWN_TEARDOWN_BUDGET_MS = 8000;
+    // The escalation itself: SIGTERM, then SIGKILL once the grace has passed, then a bounded wait for the reaped child
+    const SIGTERM_GRACE_MS = 3000;
+    const SIGKILL_REAP_MS = 1000;
+    const drainLiveSessions = async (budgetMs = SHUTDOWN_SESSION_TIMEOUT_MS) => {
+        const deadline = Date.now() + budgetMs;
+        let deleted = 0;
+        // One snapshot missed a session whose `session.create` answered after it was taken (a slow or busy backend, a
+        // proxy in front of one): the completion added its id to a set nobody read again, and its own cleanup never
+        // ran, so an external backend kept that session for good. The set is re-read while it is non-empty.
+        while (liveSessions.size && Date.now() < deadline) {
+            const ids = [...liveSessions];
+            await Promise.all(ids.map((id) => client.session.delete({
+                path: { id },
+                ...backendDeadline(Math.max(1, Math.min(SHUTDOWN_SESSION_TIMEOUT_MS, deadline - Date.now())))
+            }).then(() => {
+                liveSessions.delete(id);
+                deleted += 1;
+            }).catch(() => { })));
+        }
+        if (deleted && logger.isEnabled('debug')) {
+            logger.debug('[Shutdown] Deleted the sessions left by interrupted completions', { count: deleted });
         }
     };
 
@@ -3850,16 +3975,18 @@ export function startProxy(options) {
             if (!state) return Promise.resolve();
             // The jail directory is the child's cwd, so it goes only after the child is gone
             const removeJail = () => {
-                if (!state.jailRoot || process.platform === 'win32') return;
+                if (!state.jailRoot) return;
                 const jail = state.jailRoot;
                 try {
                     fs.rmSync(jail, { recursive: true, force: true });
                     ownedJailRoots.delete(jail);
                 } catch (e) { }
             };
-            // SIGTERM, then SIGKILL after 3 s: a backend that ignores SIGTERM must not survive the gateway. Both timers
-            // are unref'd so they cannot hold the process open, and the child keeps the loop alive while it still runs.
-            const terminate = (child) => new Promise((resolve) => {
+            // SIGTERM, then SIGKILL after the grace: a backend that ignores SIGTERM must not survive the gateway. Both
+            // timers are unref'd so they cannot hold the process open, and the child keeps the loop alive while it still
+            // runs. The grace shrinks when the steps before it used up the teardown budget, so the escalation always
+            // runs before `index.js` gives up on it.
+            const terminate = (child, graceMs = SIGTERM_GRACE_MS) => new Promise((resolve) => {
                 let settled = false;
                 let killTimer = null;
                 let graceTimer = null;
@@ -3890,9 +4017,9 @@ export function startProxy(options) {
                         return;
                     }
                     // A killed child still has to be reaped; stop waiting if the exit event does not arrive
-                    graceTimer = setTimeout(finish, 1000);
+                    graceTimer = setTimeout(finish, SIGKILL_REAP_MS);
                     graceTimer.unref();
-                }, 3000);
+                }, Math.max(0, graceMs));
                 killTimer.unref();
             });
             return (async () => {
@@ -3901,14 +4028,20 @@ export function startProxy(options) {
                 // exited, leaving an orphaned `opencode serve` that holds the backend port. The attempt notices the flag
                 // at its next checkpoint and throws instead.
                 state.shuttingDown = true;
+                const deadline = Date.now() + SHUTDOWN_TEARDOWN_BUDGET_MS;
+                const remaining = () => Math.max(0, deadline - Date.now());
                 if (state.isStarting) await waitForPendingStart(state);
                 // Before the child goes, and before this process exits: a completion interrupted by shutdown never
                 // reached its `cleanupSession()`, so its session is still in the backend's store. Deleting it here is
                 // the only chance there is (an external backend outlives the gateway), and it is best effort with the
                 // shutdown budget below - a backend that is already unhealthy must not turn shutdown into a wait.
-                await drainLiveSessions();
+                await drainLiveSessions(Math.min(SHUTDOWN_SESSION_TIMEOUT_MS, remaining()));
                 const child = state.process;
-                if (child && child.exitCode === null && child.signalCode === null) await terminate(child);
+                if (child && child.exitCode === null && child.signalCode === null) {
+                    // Whatever the steps above left, minus the bounded wait for the reaped child: SIGKILL is scheduled
+                    // inside the budget even when a slow drain ate most of it.
+                    await terminate(child, Math.min(SIGTERM_GRACE_MS, remaining() - SIGKILL_REAP_MS));
+                }
                 removeJail();
             })();
         }

@@ -142,5 +142,10 @@ export function envOrFile(env, name, fileValue) {
     const fromEnv = env?.[name];
     if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv;
     if (typeof fromEnv === 'number') return fromEnv;
+    // An empty value in `config.json` is as unusable as an empty variable, and it must not shadow the default either:
+    // the container's entrypoint writes `OPENCODE_PATH: ""` when the image sets no path, and returning that empty
+    // string here ended the chain (`??` catches only nullish), so a container that had always started failed with
+    // "OPENCODE_PATH is not set".
+    if (typeof fileValue === 'string' && fileValue.trim() === '') return undefined;
     return fileValue === undefined || fileValue === null ? undefined : fileValue;
 }

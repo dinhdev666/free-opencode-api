@@ -16,7 +16,7 @@ import { readConfigFile, findUnknownKeys, CONFIG_FILE_KEYS } from '../src/config
 import {
     createLogger, loggableError, maskBackendUrl, maskDetail, maskHeaders, maskQuotedCredentials, maskSecret,
     maskUrlCredentials, maskUrlQuery, serializeDetail,
-    SENSITIVE_NAME_ALTERNATIVES
+    MAX_SERIALIZED_LENGTH, SENSITIVE_NAME_ALTERNATIVES
 } from '../src/logger.js';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -479,6 +479,20 @@ async function run() {
         maskedEndpoint.endpoint === 'http://***@host:4097/session?token=***' &&
         maskedEndpoint.messages[0].content === 'hi',
         JSON.stringify(maskedEndpoint));
+    // The masking above walks a body, and a body can be at the 50 MiB limit. `serializeDetail()` cuts the finished line
+    // at 32 KB, so a string past that can never be printed - masking it first cost what the body cost: one 48 MB
+    // message measured 688 ms of event loop and +375 MB of heap churn per debug line, against 0.5 ms once the string
+    // is bounded before it is masked.
+    const hugeDump = maskDetail({
+        messages: [{ role: 'user', content: `https://user:secret@host:4097/?token=abc ${'x'.repeat(20 * 1024 * 1024)}` }]
+    });
+    const hugeContent = hugeDump.messages[0].content;
+    check('a debug dump bounds a string before it masks it',
+        hugeContent.length <= MAX_SERIALIZED_LENGTH &&
+        hugeContent.startsWith('https://***@host:4097/?token=*** x') &&
+        !hugeContent.includes('secret'),
+        `${hugeContent.length} chars`);
+
     // The wiring, on the source: every fatal line logs the masked pair, and none of them prints a raw stack.
     const indexSource = fs.readFileSync(path.join(ROOT, 'index.js'), 'utf8');
     check('no fatal handler prints a raw error sentence or stack',

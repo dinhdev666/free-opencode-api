@@ -32,7 +32,7 @@ const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
 
 // Maximum length of a single serialized detail value (full request/response bodies at debug level can be
 // large; overlong values are truncated and annotated)
-const MAX_SERIALIZED_LENGTH = 32 * 1024;
+export const MAX_SERIALIZED_LENGTH = 32 * 1024;
 // Maximum recursion depth and array/object member limits, to keep deeply nested payloads from exploding the log
 const MAX_DEPTH = 8;
 const MAX_ARRAY_ITEMS = 500;
@@ -352,7 +352,15 @@ export function maskDetail(value, seen = new WeakSet(), depth = 0) {
     // A string is masked too, and by content rather than by key: a client that forwards
     // `{"endpoint":"http://user:secret@host:4097/session?token=abc"}` in a field named something ordinary wrote that
     // credential to `docker logs` at debug level, because only values whose *key* looked like a credential were masked.
-    if (typeof value === 'string') return maskFreeText(value, MAX_SERIALIZED_LENGTH);
+    //
+    // It is cut **before** it is masked, because `serializeDetail()` cuts the finished line at the same 32 KB: nothing
+    // past it can be printed, so walking the rest only to throw it away cost what the body cost - one 48 MB message
+    // (the default body limit is 50 MiB) measured 688 ms and +375 MB of heap churn per debug line, against 0.1 ms for
+    // the line itself. Masking the first 32 KB of it costs the same as masking a 32 KB string.
+    if (typeof value === 'string') {
+        return maskFreeText(value.length > MAX_SERIALIZED_LENGTH ? value.slice(0, MAX_SERIALIZED_LENGTH) : value,
+            MAX_SERIALIZED_LENGTH);
+    }
     if (value === null || typeof value !== 'object') return value;
     if (seen.has(value)) return '[Circular]';
     if (depth >= 8) return '[MaxDepthExceeded]';

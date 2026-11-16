@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 371 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 372 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -110,8 +110,8 @@ body, for the summary bound). Extend it and `test/smoke.mjs` when you add behavi
 assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the session (its own
 backend round trip), so one read of `/__sessions` raced it and failed with `live: 1`; wait for `live: 0`.
 
-For exploratory work, start a throwaway stub on a spare port (`STUB_PORT=4405 node test/stub-opencode.mjs`; it
-reads `STUB_PORT` and ignores a positional argument) and point the gateway at it:
+For exploratory work, start a throwaway stub on a spare port (`STUB_PORT=4405 node test/stub-opencode.mjs`) and point the
+gateway at it:
 
 ```bash
 OPENCODE_SERVER_URL=http://127.0.0.1:4096 PORT=8080 LOG_LEVEL=debug node index.js
@@ -223,7 +223,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - A completion body sent under a non-JSON content type (`curl -d '{…}'` without the header, `text/plain`) reaches the
   handler as an unparsed string; it is parsed there and served. Answering "messages array is required" blamed a body
   valid for a missing header. A string that is not JSON answers `400` naming the content type.
-  `curl -d` actually labels the body `application/x-www-form-urlencoded` (not `text/plain`), so that type is handed
+  `curl -d` labels the body `application/x-www-form-urlencoded` (not `text/plain`), so that type is handed
   over as the same string by an explicit `addContentTypeParser` — Fastify answered it with a bare `415`, so the
   documented header-free path did not work for the most common hand-written client. Other content types keep the `415`
   media-type error (below). A
@@ -372,8 +372,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   list is one exported string because
   `docker/docker-entrypoint.sh` cannot import this module and repeats it for its own first-boot dump; the smoke suite
   asserts the two copies are identical.
-  A request body reaches the debug dump through `maskDetail()` (the same name list on a bounded copy), and the
-  model-fetch error line uses the same helpers for `error.message` and the upstream body. A detail object handed to a
+  A request body reaches the debug dump through `maskDetail()` (the same name list on a bounded copy, each string cut
+  at `MAX_SERIALIZED_LENGTH` before it is masked: the line is cut to that length too, so a body at the 50 MiB limit no
+  longer costs 688 ms per debug line), and the model-fetch error line uses the same helpers. A detail object handed to a
   debug line is **truncated before it is cloned** (`serializeDetail()`): a 50 MB body used to be cloned and
   re-stringified into a 32 KB line (43 ms and +100 MB of heap per line).
   Masking replaces a value and never drops the key: the copy these helpers build is assigned to with
@@ -384,7 +385,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   body cannot (Fastify's poisoning guard refuses it first) and Node's header parser drops it. Neither copy's prototype
   is touched either way (asserted).
   A **closed reader** on stdout or stderr is tolerated: the logger installs an `EPIPE` handler, because a stream `error` with no
-  listener is an uncaught exception: `node index.js | head -3` killed a gateway that was still serving. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that line is lost, the process keeps answering (asserted).
+  listener is an uncaught exception: `node index.js | head -3` killed a live gateway. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that line is lost, the process keeps answering (asserted).
 - **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
   boundary can fall inside either of them; the held fragment is flushed at end of stream. The filter is one
@@ -412,7 +413,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   SSE, and `stream_options` must be an object); `readFlag()` only reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable); the value goes
   through `loggableConfigValue()` too, because it lands in a log line.
   `startProxy()` applies the same rule to its own fallbacks (`flagOption()`), for an embedder with no
-  entry point to resolve the option first: an option the caller passed is taken as given — `index.js` already
+  entry point to resolve it first: an option the caller passed is taken as given — `index.js` already
   reported it — while an absent option reads the environment through `readFlag()`.
 - **Configuration** follows the precedence env > `config.json` > default, and every new key must be added to
   `config.json.example`, the README configuration table and — for container-relevant keys — `docker/docker-entrypoint.sh`.
@@ -529,8 +530,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   module — they win the race and skip backend teardown.
 - **The wait queue is bounded** (`OPENCODE_PROXY_MAX_QUEUE`, default 64) because every waiting request pins its parsed
   body; overflow answers `503 queue_full` instead of growing memory. The other half is `OPENCODE_PROXY_MAX_BODY_MB`
-  (default 50, the Fastify `bodyLimit`): together they allow 3.2 GiB of pinned bodies, which no small host plans for,
-  so both are documented knobs. The cap counts *waiting* requests, so it is reached only while every slot is busy: `0`
+  (default 50, the Fastify `bodyLimit`): together they allow 3.2 GiB of pinned bodies, so both are documented
+  knobs. The cap counts *waiting* requests, so it is reached only while every slot is busy: `0`
   means "never queue", not "refuse every completion" (a lone request with a free slot is served). A slot is released
   when its response is complete (`release()` in `runQueuedTask`), not when the task promise settles: the session
   deletion after the answer is a backend round trip, and holding the slot through it made a follow-up request look like

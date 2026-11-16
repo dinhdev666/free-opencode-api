@@ -519,7 +519,9 @@ by the configured backend URL
 front of the backend reporting the `Authorization: Basic …` header it refused — is masked as `Basic ***` before it
 reaches a `502` body or a log line. The same sentence is masked in a **stack trace** and in a debug dump of a request
 body: a stack's first line is the message it repeats, so a record that masked `message` and printed `stack` verbatim
-published the credential the masking had just removed. The container's first-boot line prints the API key as its
+published the credential the masking had just removed. A string in that dump is cut at 32 KB *before* it is masked,
+the length the finished line is cut to: a body at the 50 MiB limit cost 688 ms of event loop per debug line while
+only the first 32 KB of it could ever be printed. The container's first-boot line prints the API key as its
 length and, above 16 characters, a 4-character prefix — `docker logs` is collected as often as not. Masking replaces
 the value of a header or key and never drops it: an odd name such as `__proto__` is still shown (masked like any
 other), because the debug dump is what you read to see what a client actually sent.

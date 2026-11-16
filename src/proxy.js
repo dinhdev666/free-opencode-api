@@ -725,6 +725,13 @@ const backendUnavailable = (message) => Object.assign(new Error(message), { back
 // may be using the same parent directory, so the exit hook must never delete a directory it does not own.
 const ownedJailRoots = new Set();
 
+// Sessions this process created and has not deleted yet. Every completion deletes its own (success, error, client
+// abort), but a SIGTERM in the middle bypasses all three: the HTTP server closes, `stopBackend()` runs and the process
+// exits while the task is still parked in the collector or the poll. A managed child takes its sessions with it, but an
+// external backend (`OPENCODE_SERVER_URL`) keeps them in its store forever - one per restart. `killBackend()` drains
+// this set, so shutdown leaves the backend as it found it.
+const liveSessions = new Set();
+
 /**
  * Removes the jail directories this process created. This runs on process exit, so it cannot rely on
  * killBackend() having been called.
@@ -2506,6 +2513,7 @@ function createApp(config) {
                             upstreamStatus
                         );
                     }
+                    liveSessions.add(sessionId);
                     logDebug('Session created', { sessionId });
 
                     // A session is created per completion, so it must also be deleted per completion: otherwise the
@@ -2530,6 +2538,11 @@ function createApp(config) {
                             }
                         } catch (e) {
                             logger.debug('[Proxy] Failed to delete session:', { sessionId, error: e.message });
+                        } finally {
+                            // Bookkeeping for the shutdown drain, not the cleanup itself: a delete that failed (an
+                            // already-gone session, a rejected call) must not be retried at exit, and the set must not
+                            // grow per request.
+                            liveSessions.delete(sessionId);
                         }
                     };
 
@@ -3712,7 +3725,7 @@ export function startProxy(options) {
     backendUrl.notes.forEach((note) => logger.warn(`[Config] ${note}`));
     config.LOG_LEVEL = logger.level;
 
-    const { app } = createApp(config);
+    const { app, client } = createApp(config);
 
     // Fastify resolves listen() once the server is bound; log and warm the backend from the continuation.
     // No await here so startProxy stays synchronous for callers that need the server handle immediately.
@@ -3730,6 +3743,23 @@ export function startProxy(options) {
             logger.error('[Fatal] Failed to start HTTP server:', loggableError(error));
             process.exit(1);
         });
+
+    // Deletes the sessions still in `liveSessions` (a completion interrupted by shutdown). Bounded by its own budget so
+    // it fits inside the 5 s hard exit in `index.js`, and every call is best effort: a delete that fails or times out
+    // must not delay the exit.
+    const SHUTDOWN_SESSION_TIMEOUT_MS = 3000;
+    const drainLiveSessions = async () => {
+        if (liveSessions.size === 0) return;
+        const ids = [...liveSessions];
+        liveSessions.clear();
+        await Promise.all(ids.map((id) => client.session.delete({
+            path: { id },
+            ...backendDeadline(SHUTDOWN_SESSION_TIMEOUT_MS)
+        }).catch(() => { })));
+        if (logger.isEnabled('debug')) {
+            logger.debug('[Shutdown] Deleted the sessions left by interrupted completions', { count: ids.length });
+        }
+    };
 
     // Expose the Fastify instance as `server`: it implements close(cb), which index.js uses for shutdown
     return {
@@ -3794,6 +3824,11 @@ export function startProxy(options) {
                 // at its next checkpoint and throws instead.
                 state.shuttingDown = true;
                 if (state.isStarting) await waitForPendingStart(state);
+                // Before the child goes, and before this process exits: a completion interrupted by shutdown never
+                // reached its `cleanupSession()`, so its session is still in the backend's store. Deleting it here is
+                // the only chance there is (an external backend outlives the gateway), and it is best effort with the
+                // shutdown budget below - a backend that is already unhealthy must not turn shutdown into a wait.
+                await drainLiveSessions();
                 const child = state.process;
                 if (child && child.exitCode === null && child.signalCode === null) await terminate(child);
                 removeJail();

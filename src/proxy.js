@@ -2794,8 +2794,20 @@ function createApp(config) {
                                 }
                                 let safe = stripFunctionCalls(text, false) || '';
                                 const filteredSeen = isReasoning ? streamedReasoning : streamedContent;
-                                if (appendOnly && filteredSeen && safe.startsWith(filteredSeen)) {
-                                    safe = safe.slice(filteredSeen.length);
+                                if (appendOnly && filteredSeen) {
+                                    if (safe.startsWith(filteredSeen)) {
+                                        safe = safe.slice(filteredSeen.length);
+                                    } else if (filteredSeen.startsWith(safe)) {
+                                        // The backend's copy is *behind* what the SSE frames already delivered: a message
+                                        // store written behind the broadcast, a part the backend rewrote shorter, a stale
+                                        // snapshot read after the restart that ended the stream. Nothing here is new, and
+                                        // writing it re-sent the head of the answer the client already has ("abcdef…" 500
+                                        // characters, then the first 50 again, with `finish_reason: "stop"`). The opposite
+                                        // direction - a polled answer that *extends* what was sent - is the normal case
+                                        // above; a genuinely divergent answer (neither is a prefix) keeps the rewrite path
+                                        // below.
+                                        return;
+                                    }
                                 }
                                 if (!safe) return;
                                 // Written around the filter, not through it: this text is already tag-free, and a held

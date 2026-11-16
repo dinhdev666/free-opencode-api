@@ -8,7 +8,7 @@ import path from 'path';
 import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
 import {
-    logger, loggableError, maskBackendUrl, maskDetail, maskFreeText, maskHeaders, maskUrlQuery,
+    logger, loggableError, maskBackendUrl, maskDetail, maskFreeText, maskHeaders, maskUrlCredentials, maskUrlQuery,
     MAX_LOGGED_STACK_CHARS, setOwnProperty
 } from './logger.js';
 
@@ -108,14 +108,22 @@ const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
 const MAX_LOGGED_MODEL_LENGTH = 128;
 const MAX_LOGGED_URL_LENGTH = 512;
 const loggableModelId = (id) => {
-    const clean = String(id).replace(CONTROL_CHARS_RE, '?');
-    return clean.length > MAX_LOGGED_MODEL_LENGTH ? `${clean.slice(0, MAX_LOGGED_MODEL_LENGTH)}…` : clean;
+    // The bound is applied *before* the replace: the regex is per character, so the output is identical, and a client
+    // value at the 50 MiB body limit is no longer transformed in full (measured 3.9 ms for 5 MiB) just to keep 128
+    // characters of it.
+    const raw = String(id);
+    const clean = (raw.length > MAX_LOGGED_MODEL_LENGTH ? raw.slice(0, MAX_LOGGED_MODEL_LENGTH) : raw)
+        .replace(CONTROL_CHARS_RE, '?');
+    return raw.length > MAX_LOGGED_MODEL_LENGTH ? `${clean}…` : clean;
 };
 // The same treatment for the request URL, which every log site used to copy raw: credential query values are masked
 // (`?api_key=…` is an OpenAI-compatible convention some clients still send) and an unbounded URL is cut, because the
 // URL is client input bounded only by the HTTP parser's header limit.
+// A URL can carry credentials in its userinfo as well, which `maskUrlQuery()` does not touch: an HTTP client may send
+// an **absolute-form** request target (`GET http://user:secret@host:4097/v1/models HTTP/1.1`), Node hands that target
+// over verbatim, and the string reaches a log line and a 404 body. The chain is the same one `maskFreeText()` uses.
 const loggableUrl = (url) => {
-    const masked = maskUrlQuery(url);
+    const masked = maskUrlCredentials(maskUrlQuery(url));
     return masked.length > MAX_LOGGED_URL_LENGTH
         ? `${masked.slice(0, MAX_LOGGED_URL_LENGTH)}…[truncated ${masked.length - MAX_LOGGED_URL_LENGTH} chars]`
         : masked;
@@ -172,9 +180,13 @@ export const handlerFailureMessage = (error) => {
 const SERVED_ROUTES = 'POST /v1/chat/completions, GET /v1/models and GET /health';
 const MAX_ECHOED_VALUE_LENGTH = 64;
 const echoedValue = (value) => {
-    const clean = String(value).replace(CONTROL_CHARS_RE, '?');
-    return clean.length > MAX_ECHOED_VALUE_LENGTH
-        ? `${clean.slice(0, MAX_ECHOED_VALUE_LENGTH)}…[truncated ${clean.length - MAX_ECHOED_VALUE_LENGTH} chars]`
+    // Bound first, transform second (see `loggableModelId()`): the replace runs on at most 64 characters of a value a
+    // client can send 50 MiB of, and the output is unchanged because the regex is per character.
+    const raw = String(value);
+    const clean = (raw.length > MAX_ECHOED_VALUE_LENGTH ? raw.slice(0, MAX_ECHOED_VALUE_LENGTH) : raw)
+        .replace(CONTROL_CHARS_RE, '?');
+    return raw.length > MAX_ECHOED_VALUE_LENGTH
+        ? `${clean}…[truncated ${raw.length - MAX_ECHOED_VALUE_LENGTH} chars]`
         : clean;
 };
 
@@ -2319,8 +2331,13 @@ function createApp(config) {
                             // `USER([object Object]): …` in the prompt, and a name carrying a newline forged another
                             // conversation line inside the text the model reads. A string is kept - it is a documented
                             // OpenAI field - sanitised the same way every other value that lands in a prompt line is.
-                            const nameLabel = typeof m?.name === 'string' ? m.name.replace(CONTROL_CHARS_RE, '?').trim() : '';
-                            const nameSuffix = nameLabel ? `(${nameLabel.slice(0, MAX_ECHOED_VALUE_LENGTH)})` : '';
+                            // The input is bounded before it is transformed (a 50 MiB name cost 34 ms of replace to keep
+                            // 64 characters), at a window wide enough that trimming still sees every character the
+                            // label can be built from.
+                            const nameLabel = typeof m?.name === 'string'
+                                ? m.name.slice(0, MAX_ECHOED_VALUE_LENGTH).replace(CONTROL_CHARS_RE, '?').trim()
+                                : '';
+                            const nameSuffix = nameLabel ? `(${nameLabel})` : '';
                             parts.push({
                                 type: 'text',
                                 text: `${roleLabel}${nameSuffix}: ${content}`

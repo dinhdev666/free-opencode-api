@@ -1429,7 +1429,13 @@ function createApp(config) {
 
     // Debug logs all go through the logger (visible with LOG_LEVEL=debug; the legacy DEBUG switch is still
     // honoured, startProxy maps DEBUG=true onto the debug level)
-    const logDebug = (...args) => logger.debug(...args);
+    // Debug lines are guarded here rather than at each call site: a disabled level must not pay for the call, and the
+    // fixed two-argument form keeps the rest array out of the hot path (`logger.debug(...args)` allocated one per
+    // call). Call sites that build an expensive value (`loggableUrl()`) still guard themselves, because their argument
+    // is evaluated before this function runs.
+    const logDebug = (message, detail) => {
+        if (logger.isEnabled('debug')) logger.debug(message, detail);
+    };
 
     const TOOL_GUARD_MESSAGE = 'Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge. If external or real-time data is required, say so and ask the user to enable tools.';
     const applyToolGuard = (systemMsg) => {
@@ -2131,7 +2137,9 @@ function createApp(config) {
                 // Nothing to answer and no reason to run the completion: it would spend backend time (and tokens) for
                 // nobody while delaying the requests still waiting behind this one.
                 if (clientDisconnected) {
-                    logDebug('Abandoned while queued, skipping completion', { url: loggableUrl(request.url) });
+                    if (logger.isEnabled('debug')) {
+                        logDebug('Abandoned while queued, skipping completion', { url: loggableUrl(request.url) });
+                    }
                     if (!reply.raw.writableEnded) reply.raw.end();
                     return reply;
                 }

@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 387 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 411 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -295,6 +295,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   provider failed before the first frame answers the same `502` envelope (the stream never started), and one that
   fails after frames are on the wire ends with the in-band error frame. It must never be streamed as assistant text:
   `data: {… delta: {content: "[Proxy Error] …"}}` with `finish_reason: "stop"` is a successful answer to every client.
+  The failure can arrive **on the event that finishes the message** (`error` next to `time.completed`), after text was
+  already written: `collectFromEvents` carries it out and both modes fail (the in-band frame with the text so far, or
+  the `502`), where dropping it served the truncated text as `finish_reason: "stop"`. Both modes describe it through
+  `describeProviderFailure()` (masked and bounded, like every other upstream sentence), so they cannot disagree.
 - A client that disconnects mid-stream releases its queue slot immediately: the event subscription is aborted and
   the polling fallbacks are skipped (the backend keeps finishing on its own). A reader that stops reading without
   closing the connection (a tab that stops consuming, a buffering proxy, a stalled phone link) is treated the same
@@ -313,7 +317,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   reaches that cleanup, so every created session id is also tracked in the module-level `liveSessions` set (removed in
   `cleanupSession()`'s `finally`) and `killBackend()` drains what is left before the child is stopped
   (`SHUTDOWN_SESSION_TIMEOUT_MS`, 3 s, best effort): with an external backend those orphans outlive the gateway, one
-  per restart.
+  per restart. The drain **loops** while the set is non-empty inside that budget (one snapshot missed a creation that
+  answered after it was read: `/__sessions` reported `{"live":1,"created":1,"deleted":0}`), and a completion that has
+  not created its session yet when shutdown began answers `503 gateway_shutting_down` instead of adding one the teardown
+  has already counted.
 - Every response carries `X-Content-Type-Options: nosniff` (`NO_SNIFF`, `createApp()`) on the same three paths as the
   CORS set (`onRequest` hijacked streams included, `clientErrorHandler`, `badUrlHandler`): it writes only JSON
   and SSE, which a browser must not re-read as something else.
@@ -417,6 +424,11 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   already-stripped answer: handing tag-free text to a filter that still holds the interrupted stream's state leaked the
   held tag prefix, or dropped everything after it (a cut inside a block answered `hello ` with
   `finish_reason: "stop"`). An answer the backend rewrote is written around the filter (`sendReleasedDelta`) instead.
+  The streaming filter must drop exactly what `removeToolMarkup()` drops, because the same answer served either way has
+  to read the same: a **stray closing tag** with no block is dropped (the text around it kept), and an **opening tag
+  that never closes** drops the tag but keeps the text after it (`createToolCallFilter()`'s `pending` buffer). It used
+  to forward the stray tag and to swallow everything after an unclosed one - 2 800 of 3 905 fuzzed tag-soup answers
+  disagreed with the non-streaming scan.
   `DISABLE_TOOLS` is read
   from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`. The per-tool override map is
   built with `setOwnProperty()` for the same reason the masking helpers are: a backend tool id of `__proto__` assigned
@@ -443,10 +455,17 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `config.json` is read from the **application directory** (`path.join(__dirname, 'config.json')`), not the working
   directory, because the container writes it next to the app; a `config.json` in the cwd is ignored, so startup warns
   `[Config] config.json is read from …; the file at … is ignored`.
-  An environment variable that is present but **blank** counts as unset (`envOrFile()` in `src/config.js`): `PORT` and
-  `API_KEY` were read with `??`, where an empty string is a value, so `API_KEY= PORT=` shadowed `config.json` and the
-  gateway listened on the default port with the built-in public key while the file named another port and a real
-  secret. Keep every key on that rule.
+  An environment variable that is present but **blank or only whitespace** counts as unset (`envOrFile()` in
+  `src/config.js`): `PORT` and `API_KEY` were read with `??`, where an empty string is a value, so `API_KEY= PORT=`
+  shadowed `config.json` and the gateway listened on the default port with the built-in public key while the file named
+  another port and a real secret. Whitespace is the same mistake with a trailing space left in (a unit file, a rendered
+  template): `BIND_HOST=' '` failed to bind with `ENOTFOUND` and `OPENCODE_SERVER_URL=' '` pointed every completion at
+  `http:// `. `index.js` reads `OPENCODE_SERVER_URL`, `OPENCODE_BIND_HOST`, `OPENCODE_PATH`, `BIND_HOST` and `LOG_LEVEL`
+  through it too, so every key that can come from either place follows the rule; `BIND_HOST` falls back
+  `BIND_HOST` → `OPENCODE_PROXY_BIND_HOST` → default, so a blank alias does not hide the other spelling. A blank value
+  in **`config.json`** is the same: the container's entrypoint writes `OPENCODE_PATH: ""` when the image sets no path, and
+  returning that empty string ended the chain (`??` catches only nullish), so a container that had always started
+  refused to run. Keep every key on that rule.
   A **key nobody reads** is named at startup and ignored (`[Config] config.json has an unknown key 'APIKEY' (did you
   mean 'API_KEY'?) - it is ignored`, via `findUnknownKeys()`): a misspelled key changed nothing, so the default ran
   while the operator trusted the file. A
@@ -471,6 +490,11 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS='0' is not a positive number, using 300000`, `… HEALTH_CACHE_MS='abc' is not a
   number, using 2000`): a silent fallback left the operator convinced a value was in force while the gateway ran the
   default.
+- **Polling watches the newest assistant message.** A tool-using completion has more than one: the step that asked for
+  the tool is finished (`finish: "tool-calls"`) while the step that answers is still being written. The poll reads the
+  last assistant message in the list and evaluates only that one; walking back to the first message that looked
+  finished answered the earlier step under `finish_reason: "stop"` (measured: `STEP ONE TEXT` in 29 ms, the real answer
+  570 ms later).
 - **Polling answers with the finished message.** `pollForAssistantResponse` is called with `requireDone: true` on
   every path that emits the final answer: the poll loop can start while the answer is still being written, and
   returning the first non-empty message truncated it. A message whose
@@ -580,11 +604,16 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   there must be readable — and a credentials directory writable — by uid 1000 (`docker/README.md`); CI asserts the uid
   is not 0. It writes that file through a temporary file and an atomic `rename` (a container killed mid-write must not
   leave a truncated `config.json`, which made every later start exit with "is not valid JSON"), and it keeps
-  `OPENCODE_BIND_HOST` on `127.0.0.1`: publishing 4097 would bypass the gateway's key.
-- **Workflow actions are pinned to commit SHAs.** Every `uses:` in `.github/workflows/` names a 40-character commit
-  with the release in a trailing comment (`actions/checkout@<sha> # v4.4.0`), and a CI step fails the build when a
+  `OPENCODE_BIND_HOST` on `127.0.0.1`: publishing 4097 would bypass the gateway's key. The image's `HEALTHCHECK`
+  resolves the port itself (`PORT`, else the stored `config.json`, else 8083) and validates it the way the gateway trims
+  it, so `PORT=' 8083'` does not build `http://127.0.0.1: 8083/health`; the digit class is spelled `[0-9]` because a
+  `\d` inside the shell-quoted program arrives as a literal backslash and a `d`, which made every port read as invalid
+  and probed 8083 for a container listening elsewhere (`test/smoke.mjs` runs the embedded expression).
+- **Workflow actions are pinned to commit SHAs.** Every `uses:` in `.github/workflows/` (any depth) names a 40-character
+  commit with the release in a trailing comment (`actions/checkout@<sha> # v4.4.0`), and a CI step fails the build when a
   movable ref reappears: `docker-publish.yml` leaves a write-scoped registry token on the runner, so an action resolved
-  through a retagged major tag is code nobody froze.
+  through a retagged major tag is code nobody froze. The check skips the comment itself (a comment explains the rule in
+  those words) and requires the `# vX` marker, so `@v4`, `@main` and a `docker://` image reference all fail.
 - **The image pins the CLI, and the pin is the 1.x line.** `docker/Dockerfile` installs `opencode-ai` with
   `ARG OPENCODE_VERSION=1.19.5` (the newest 1.x release, matching the bundled `@opencode-ai/sdk`). `latest` now
   resolves to the 2.x line, whose `opencode serve` serves the web UI — it answers `/health` with HTML (so the readiness
@@ -609,12 +638,16 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - **`killBackend()` returns a promise that settles when the child is gone** (SIGTERM, then SIGKILL after 3 s), and
   `index.js` awaits it before `process.exit(exitCode)`; the jail directory is removed only after the child is gone, because it
   is the child's cwd. Exiting right after SIGTERM skipped the escalation, so a backend that ignores SIGTERM outlived
-  the gateway that owns it. It also sets `state.shuttingDown`, which every `ensureBackend()` path checks before it
-  spawns: an attempt still inside its health probe (or waiting for the previous child) used to spawn `opencode serve`
-  *after* the promise resolved, leaving a running caller with an untracked
-  backend holding the port. A pending attempt is waited for
-  (`waitForPendingStart()`, bounded by the largest step it can be inside and the 5 s hard exit in `index.js`), and each
-  respawn deletes its predecessor's path from `ownedJailRoots` before replacing it.
+  the gateway that owns it. The whole teardown shares **one** budget (`SHUTDOWN_TEARDOWN_BUDGET_MS`, 8 s: a pending
+  start, the session drain, the 3 s grace and the reap), each step taking what is left of it, and the entry point's
+  hard exit sits above that budget (10 s) because it is a backstop, not the budget: with one budget per step their sum
+  (3.5 + 3 + 3 + 1 s) outlasted the hard exit, and a SIGTERM-ignoring child survived the gateway (measured: exit 0 at
+  5 008 ms, child alive and holding the port). It also sets `state.shuttingDown`, which every `ensureBackend()` path
+  checks before it spawns and which the readiness loop checks every iteration, so a pending start aborts instead of
+  spending the startup budget: an attempt still inside its health probe (or waiting for the previous child) used to
+  spawn `opencode serve` *after* the promise resolved, leaving a running caller with an untracked backend holding the
+  port. A pending attempt is waited for (`waitForPendingStart()`, bounded by the largest step it can be inside and the
+  teardown budget), and each respawn deletes its predecessor's path from `ownedJailRoots` before replacing it.
 - **Backend lifecycle changes** must keep these properties: `ensureBackend()` trusts a successful probe for
   `OPENCODE_PROXY_HEALTH_CACHE_MS`, connection failures clear that trust, a spawned process that exits during startup
   aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm. A backend that is known
@@ -626,9 +659,14 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - **The backend child does not inherit the gateway's credentials.** The `opencode serve` spawn deletes `API_KEY`
   (and `OPENCODE_PROXY_DEBUG`) from the environment it passes on, and the version probe does the same: the child runs
   model-directed tools and authenticates nothing with a key that guards only this gateway.
+  `OPENCODE_SERVER_URL` goes the same way: it is the gateway's own configuration, and it can carry a credential.
   Provider credentials the CLI needs live in its own auth store or under their own names, so they stay. The jail
   directory (`<tmp>/opencode-proxy-jail/<salt>`, the child's cwd and its whole `HOME` under `USE_ISOLATED_HOME`) is
-  created `0700`: on a shared `/tmp` the default `0755` let every other local user list and traverse it.
+  created `0700`: on a shared `/tmp` the default `0755` let every other local user list and traverse it, and it is
+  removed on every platform (a Windows skip left the directory behind for good). Under `USE_ISOLATED_HOME` the child's
+  `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`, `TMPDIR`, `TMP` and `TEMP` all point inside
+  that jail: the CLI resolves them before `HOME`, so an inherited value (a desktop session, a systemd unit, an image)
+  sent the "isolated" run straight back to the real user's store, config and cache.
 - **A cached healthy answer does not fail the request it was wrong about.** `session.create` that throws a connection
   error (the backend died within `OPENCODE_PROXY_HEALTH_CACHE_MS` of the trusted probe) drops that trust, calls
   `ensureBackend()` again and retries the call once; the crash-recovery then happens for the request that hit it

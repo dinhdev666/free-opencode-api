@@ -12,7 +12,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import { clientFacingText, handlerFailureMessage, parseBoolean, resolveBackendAuth, timeoutMessage } from '../src/proxy.js';
-import { readConfigFile, findUnknownKeys, CONFIG_FILE_KEYS } from '../src/config.js';
+import { readConfigFile, findUnknownKeys, envOrFile, CONFIG_FILE_KEYS } from '../src/config.js';
 import {
     createLogger, loggableError, maskBackendUrl, maskDetail, maskHeaders, maskQuotedCredentials, maskSecret,
     maskUrlCredentials, maskUrlQuery, serializeDetail,
@@ -244,6 +244,38 @@ async function run() {
         writtenKeys.length >= 8 && unreadKeys.length === 0,
         `written=[${writtenKeys.join(',')}] unread=[${unreadKeys.join(',')}]`);
 
+    // The image's own HEALTHCHECK resolves the port itself, and the program it embeds is a shell single-quoted string:
+    // a `\d` in it arrives at the interpreter as a literal backslash and a `d`, so every port read as invalid and a
+    // container configured for 8086 probed 8083 and reported itself unhealthy for its whole life. The expression is
+    // run here against a stand-in for /app/config.json, so the escaping is checked instead of assumed.
+    const dockerfileSource = fs.readFileSync(path.join(ROOT, 'docker', 'Dockerfile'), 'utf8');
+    const healthcheckMatch = dockerfileSource.match(/CMD port=\$\(node -e '([^']+)'\)/);
+    check('the Dockerfile health check carries its port expression',
+        Boolean(healthcheckMatch), String(dockerfileSource.match(/HEALTHCHECK[^\n]*/)));
+    if (healthcheckMatch) {
+        const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-probe-'));
+        const probeConfig = path.join(probeDir, 'config.json');
+        const probeExpression = healthcheckMatch[1].replaceAll('"/app/config.json"', JSON.stringify(probeConfig));
+        const probePort = (envPort, fileValue) => {
+            if (fileValue === null) fs.rmSync(probeConfig, { force: true });
+            else fs.writeFileSync(probeConfig, JSON.stringify({ PORT: fileValue }));
+            const env = { PATH: process.env.PATH };
+            if (envPort !== null) env.PORT = envPort;
+            return execFileSync(process.execPath, ['-e', probeExpression], { env, encoding: 'utf8' });
+        };
+        check('the health check probes the port the environment names', probePort('8085', '8086') === '8085',
+            probePort('8085', '8086'));
+        check('the health check probes the port config.json names', probePort(null, '8086') === '8086',
+            probePort(null, '8086'));
+        check('the health check trims a padded port like the gateway does', probePort(null, ' 8086 ') === '8086',
+            JSON.stringify(probePort(null, ' 8086 ')));
+        check('the health check falls back to 8083 for an unusable port', probePort(null, 'not-a-port') === '8083',
+            probePort(null, 'not-a-port'));
+        check('the health check falls back to 8083 without a stored config', probePort(null, null) === '8083',
+            probePort(null, null));
+        fs.rmSync(probeDir, { recursive: true, force: true });
+    }
+
     const readmeSource = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
     const undocumented = configKeys.filter((key) => !readmeSource.includes(`| \`${key}\` |`));
     check('every configurable key has a row in the README configuration table',
@@ -396,6 +428,17 @@ async function run() {
         maskUrlQuery('/v1/models?password=hunter2&model=x') === '/v1/models?password=***&model=x' &&
         maskUrlQuery('/v1/models?db_password=hunter2') === '/v1/models?db_password=***',
         maskUrlQuery('/v1/models?password=hunter2&model=x'));
+    // A URL reaches this helper straight from a request target, which any caller can make as long as the header block
+    // allows. The pair pattern started at the `=` of a pair whose name ran into a second `?` and rescanned from there:
+    // 14 011 characters of `?` cost 96 ms of the serving thread, unauthenticated, on every logged line.
+    const pathologicalQuery = `/v1/models?${'?'.repeat(14000)}&api_key=secret`;
+    const maskingStartedAt = Date.now();
+    const pathologicalMasked = maskUrlQuery(pathologicalQuery);
+    const maskingMs = Date.now() - maskingStartedAt;
+    check('masking a pathological query string stays linear',
+        maskingMs < 25 && pathologicalMasked.endsWith('&api_key=***') &&
+        !pathologicalMasked.includes('secret'),
+        `${maskingMs}ms ${pathologicalMasked.slice(-24)}`);
 
     // A URL is not the only credential an upstream can quote. The gateway sends the credential it lifted out of
     // OPENCODE_SERVER_URL as a Basic header, and a proxy in front of the backend can echo the header it refused in its
@@ -707,6 +750,16 @@ async function run() {
         fs.writeFileSync(flagKeyPath, JSON.stringify({ DISABLE_TOOLS: 'yes', USE_ISOLATED_HOME: false }));
         check('readConfigFile accepts the documented flag values',
             readConfigFile(flagKeyPath).error === null, String(readConfigFile(flagKeyPath).error));
+        // An empty value in `config.json` must fall through to the default, not become the value: the container's
+        // entrypoint writes `OPENCODE_PATH: ""` when the image sets no path, and the empty string used to end the
+        // chain (`??` catches only nullish), so a container that had always started refused to run
+        check('an empty config.json value does not shadow the default', envOrFile({}, 'OPENCODE_PATH', '') === undefined,
+            String(envOrFile({}, 'OPENCODE_PATH', '')));
+        check('a whitespace-only config.json value does not shadow the default',
+            envOrFile({}, 'BIND_HOST', '   ') === undefined, JSON.stringify(envOrFile({}, 'BIND_HOST', '   ')));
+        check('a blank environment value falls back to config.json',
+            envOrFile({ API_KEY: '  ' }, 'API_KEY', 'sk-from-file') === 'sk-from-file',
+            String(envOrFile({ API_KEY: '  ' }, 'API_KEY', 'sk-from-file')));
         const unknownKeyPath = path.join(configDir, 'unknown-key.json');
         fs.writeFileSync(unknownKeyPath, JSON.stringify({ FUTURE_KEY: { nested: true } }));
         check('readConfigFile keeps keys it does not know',
@@ -1822,6 +1875,56 @@ async function run() {
     check('a streaming provider error is never delivered as model text',
         !/Proxy Error/.test(streamedFailure.text), streamedFailure.text.slice(0, 160));
 
+    // --- the newest assistant message, not an earlier finished step ---------------------------------------
+    // A tool-using completion produces more than one assistant message: the step that asked for the tool is finished
+    // (`finish: "tool-calls"`) while the step that answers is still being written. Walking back to the first message
+    // that looked finished answered the earlier step, under `finish_reason: "stop"`.
+    const twoStep = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'TWOSTEP please' }], stream: false }
+    });
+    check('a completion answers its newest assistant message, not an earlier finished step',
+        twoStep.json?.choices?.[0]?.message?.content === 'THE FINAL ANSWER',
+        JSON.stringify(twoStep.json?.choices?.[0]?.message?.content || '').slice(0, 160));
+
+    // --- a provider failure that arrives after the text ---------------------------------------------------
+    // The event that ends the message carries the error next to `time.completed`. Dropping it served the truncated text
+    // as `finish_reason: "stop"`: a failed completion reported to every client as a complete answer.
+    const failedMid = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'FAILMID please' }], stream: false }
+    });
+    check('a provider error that follows the text is a 502 in non-streaming mode',
+        failedMid.response.status === 502 && failedMid.json?.error?.code === 'ProviderError',
+        `status ${failedMid.response.status} ${failedMid.text.slice(0, 160)}`);
+    const failedMidStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'FAILMID please' }], stream: true },
+        stream: true
+    });
+    const failedMidFrames = failedMidStream.text.split('\n\n').filter((frame) => frame.startsWith('data: '));
+    check('a provider error that follows the text ends the stream with an error frame',
+        failedMidStream.response.status === 200 &&
+        failedMidStream.text.includes('"error"') &&
+        !/"finish_reason":"stop"/.test(failedMidStream.text) &&
+        failedMidFrames[failedMidFrames.length - 1] === 'data: [DONE]',
+        JSON.stringify(failedMidStream.text.slice(-200)));
+    const failedMidText = failedMidFrames
+        .filter((frame) => !frame.includes('"error"') && !frame.includes('[DONE]'))
+        .map((frame) => {
+            try {
+                return JSON.parse(frame.slice(6))?.choices?.[0]?.delta?.content || '';
+            } catch {
+                return '';
+            }
+        })
+        .join('');
+    check('the text written before a provider error still reaches the client',
+        failedMidText === 'partial answer', JSON.stringify(failedMidText));
+    const afterMidFailure = await sessionsAfterCleanup(STUB_URL);
+    check('a completion that fails after its text still deletes its session',
+        afterMidFailure && afterMidFailure.live === 0, JSON.stringify(afterMidFailure));
+
     // --- request ids --------------------------------------------------------------------------------------
     // A client-supplied trace id is kept so its logs and the gateway's can be joined; the response header is
     // exposed to browsers, and a value that could break the log line or the header is ignored rather than echoed
@@ -2647,6 +2750,33 @@ async function run() {
             .join('');
         check(`a stream cut inside a tool block is recovered whole (${marker})`,
             cutToolText === cutToolAnswer, JSON.stringify(cutToolText));
+    }
+
+    // A closing tag with no block at all, and an opening tag that never closes: the streaming filter and the
+    // non-streaming scan have to drop exactly the same characters, because the same answer served either way must read
+    // the same. The streaming filter used to forward a stray closing tag and to swallow everything after an unclosed
+    // opening one, while `removeToolMarkup()` dropped only the tag.
+    for (const [marker, expected] of [['STRAYTAG', 'aaaabbbb'], ['OPENTAIL', 'visible text tail words here']]) {
+        const strayResponse = await fetch(`${toolUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ messages: [{ role: 'user', content: `${marker} please` }], stream: true })
+        }).then((response) => response.text());
+        const strayText = strayResponse
+            .split('\n\n')
+            .filter((frame) => frame.startsWith('data: ') && !frame.includes('[DONE]'))
+            .map((frame) => {
+                try {
+                    return JSON.parse(frame.slice(6));
+                } catch {
+                    return null;
+                }
+            })
+            .filter(Boolean)
+            .map((frame) => frame.choices?.[0]?.delta?.content || '')
+            .join('');
+        check(`tool-call markup is filtered the same way in streaming mode (${marker})`,
+            strayText === expected, `${JSON.stringify(strayText)} expected ${JSON.stringify(expected)}`);
     }
 
     // The tag sweep runs over the whole answer, which is not bounded by MAX_BODY_MB (that limits the request). A lazy
@@ -3968,8 +4098,9 @@ async function run() {
         }
     });
     children.push(deadlineGateway);
-    deadlineGateway.stdout.on('data', () => {});
-    deadlineGateway.stderr.on('data', () => {});
+    let deadlineOut = '';
+    deadlineGateway.stdout.on('data', (chunk) => { deadlineOut += chunk.toString(); });
+    deadlineGateway.stderr.on('data', (chunk) => { deadlineOut += chunk.toString(); });
     await waitForOk(`http://127.0.0.1:${deadlinePort}/health`);
     const stalledBody = (headers) => new Promise((resolve) => {
         const startedAt = Date.now();
@@ -4043,6 +4174,13 @@ async function run() {
     check('a body that keeps arriving is served instead of being cut off with the stall deadline',
         /^HTTP\/1\.1 200 /.test(paced.raw) && paced.ms > 1200,
         `${paced.ms}ms ${JSON.stringify(paced.raw.slice(0, 200))}`);
+    // The deadline closes the request's own socket after it has written its 408, and Node reports the resulting
+    // HPE_INVALID_EOF_STATE to `clientErrorHandler`: the gateway logged "Rejected malformed request" about a request it
+    // had just answered, and wrote a second, 400 response into a socket that was already done.
+    await sleep(200);
+    check('the deadline does not report its own close as a malformed request',
+        deadlineOut !== '' && !deadlineOut.includes('Rejected malformed request'),
+        deadlineOut.split('\n').filter((line) => line.includes('Rejected')).join(' | ').slice(0, 200));
     stopGateway(deadlineGateway);
     await waitForExit(deadlineGateway);
 
@@ -4210,7 +4348,17 @@ async function run() {
             `${blankEnvConfig.slice(0, -1)},"__proto__":{"polluted":true}}`);
         const blankEnvGateway = spawn(process.execPath, ['index.js'], {
             cwd: blankEnvDir,
-            env: { ...process.env, PORT: '', API_KEY: '', LOG_LEVEL: 'warn' }
+            // The three values below are present and cannot be used: a unit file's `Environment=BIND_HOST= `, a
+            // template that rendered an empty string with a space left in it. They used to be read verbatim, so the
+            // gateway bound to `' '` (ENOTFOUND) and pointed at a backend URL of one space instead of the file's.
+            env: {
+                ...process.env,
+                PORT: '',
+                API_KEY: '',
+                BIND_HOST: ' ',
+                OPENCODE_SERVER_URL: ' ',
+                LOG_LEVEL: 'warn'
+            }
         });
         children.push(blankEnvGateway);
         let blankEnvOut = '';
@@ -4228,6 +4376,12 @@ async function run() {
         check('a blank environment variable does not hide the port and key from config.json',
             blankEnvUp && fileKeyStatus === 200 && builtinKeyStatus === 401,
             `listening=${blankEnvUp} fileKey=${fileKeyStatus} builtinKey=${builtinKeyStatus}`);
+        const blankEnvHealth = blankEnvUp
+            ? await fetch(`http://127.0.0.1:${blankEnvPort}/health`).then((response) => response.json()).catch(() => null)
+            : null;
+        check('a whitespace-only environment value does not shadow config.json',
+            blankEnvUp && blankEnvHealth?.backend === STUB_URL && blankEnvHealth?.status === 'ok',
+            `listening=${blankEnvUp} backend=${blankEnvHealth?.backend}`);
         check('an unknown config.json key is reported with the key it probably meant',
             blankEnvOut.includes("unknown key 'APIKEY' (did you mean 'API_KEY'?)") &&
             blankEnvOut.includes("unknown key '__proto__'"),
@@ -4421,7 +4575,11 @@ async function run() {
             `fs.writeFileSync(${JSON.stringify(childDumpFile)}, JSON.stringify({` +
                 ' apiKey: process.env.API_KEY ?? null,' +
                 ' mode: (fs.statSync(process.cwd()).mode & 0o777).toString(8),' +
-                ' cwd: process.cwd() }));',
+                ' cwd: process.cwd(),' +
+                ' home: process.env.HOME ?? null,' +
+                ' xdgData: process.env.XDG_DATA_HOME ?? null,' +
+                ' tmp: process.env.TMPDIR ?? null,' +
+                ' serverUrl: process.env.OPENCODE_SERVER_URL ?? null }));',
             'setInterval(() => {}, 1000);',
             ''
         ].join('\n'));
@@ -4434,7 +4592,7 @@ async function run() {
             "import { startProxy } from './src/proxy.js';",
             `const proxy = startProxy({ PORT: ${childEnvDriverPort}, API_KEY: 'sk-inherited-only',` +
                 ` OPENCODE_SERVER_URL: 'http://127.0.0.1:${GATEWAY_PORT + 28}',` +
-                ` OPENCODE_PATH: ${JSON.stringify(childCli)}, LOG_LEVEL: 'error' });`,
+                ` OPENCODE_PATH: ${JSON.stringify(childCli)}, USE_ISOLATED_HOME: true, LOG_LEVEL: 'error' });`,
             'const fs = await import(\'node:fs\');',
             // The CLI writes its dump as soon as it is spawned, which happens after the health probe gives up (2 s):
             // poll for it instead of guessing a delay
@@ -4451,7 +4609,18 @@ async function run() {
         ].join('\n')], {
             cwd: ROOT,
             stdio: ['ignore', 'pipe', 'pipe'],
-            env: { ...process.env, API_KEY: 'sk-inherited-only' }
+            // XDG_*/TMPDIR and the backend URL are in the environment on purpose: the child must not inherit any of
+            // them (the first three are exactly what sent an isolated run back to the real user's store, config and
+            // cache; the URL is the gateway's own configuration)
+            env: {
+                ...process.env,
+                API_KEY: 'sk-inherited-only',
+                OPENCODE_SERVER_URL: 'http://127.0.0.1:1/from-env',
+                XDG_DATA_HOME: '/nonexistent-real-user-data',
+                XDG_CACHE_HOME: '/nonexistent-real-user-cache',
+                // ...and a real directory, because the gateway resolves its own jail under os.tmpdir()
+                TMPDIR: childEnvDir
+            }
         });
         children.push(childEnvDriver);
         let childEnvOut = '';
@@ -4483,6 +4652,20 @@ async function run() {
             `${dumpLine.slice(0, 160)} | exit ${childEnvExit} | ${childEnvErr.slice(0, 200)}`);
         check('the backend jail directory is not readable by other users',
             dump !== null && dump.mode === '700', `${dump ? dump.mode : 'no dump'} (${dump ? dump.cwd : ''})`);
+        // `XDG_*` and `TMPDIR` are resolved before `HOME`: a desktop session, a systemd unit or an image that sets them
+        // sent the isolated run to the real user's store, config and cache, outside the 0700 jail this exists to be.
+        // The child reports its cwd as the resolved path (`/private/var/...` on macOS) while the environment it was
+        // handed carries the path as configured (`/var/...`), so both sides lose that prefix before they are compared
+        const unResolved = (value) => (value || '').replace(/^\/private(?=\/)/, '');
+        const jailRoot = dump ? path.dirname(unResolved(dump.cwd)) : '';
+        check('the isolated home points its store, config and temp directory inside the jail',
+            dump !== null &&
+            unResolved(dump.home) === path.join(jailRoot, 'fake-home') &&
+            unResolved(dump.xdgData) === path.join(jailRoot, 'fake-home', '.local', 'share') &&
+            unResolved(dump.tmp) === path.join(jailRoot, 'tmp'),
+            dump ? `home=${dump.home} xdgData=${dump.xdgData} tmp=${dump.tmp}` : 'no dump');
+        check('the spawned backend does not inherit the gateway backend URL',
+            dump !== null && dump.serverUrl === null, dump ? String(dump.serverUrl) : 'no dump');
         fs.rmSync(childEnvDir, { recursive: true, force: true });
     }
 }
@@ -4538,6 +4721,136 @@ if (process.platform !== 'win32') {
         `spawned pid ${spawnedPid}`);
     await new Promise((resolve) => silent.close(resolve));
     fs.rmSync(shutdownDir, { recursive: true, force: true });
+
+    // --- a backend that ignores SIGTERM does not outlive the gateway ---------------------------------------
+    // killBackend() bounds its whole teardown and spends what is left of that budget on the escalation, so SIGKILL is
+    // always scheduled before the entry point gives up. Each step used to spend its own budget (a pending start, the
+    // session drain, the 3 s grace, the reap), and their sum outlasted the hard exit that is only meant to be a
+    // backstop: measured, the gateway exited 0 at 5 008 ms with the child still holding the backend port.
+    const stubbornDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-stubborn-'));
+    const stubbornPidFile = path.join(stubbornDir, 'child.pid');
+    const stubbornCli = path.join(stubbornDir, 'opencode');
+    fs.writeFileSync(stubbornCli, [
+        '#!/usr/bin/env node',
+        "if (process.argv.includes('--version')) { process.stdout.write('1.19.5\\n'); process.exit(0); }",
+        `require('node:fs').writeFileSync(${JSON.stringify(stubbornPidFile)}, String(process.pid));`,
+        // Exactly what a supervisor-wrapped or buggy backend does: it hears SIGTERM and keeps running
+        "process.on('SIGTERM', () => { });",
+        "process.on('SIGINT', () => { });",
+        'setInterval(() => {}, 1000);',
+        ''
+    ].join('\n'));
+    fs.chmodSync(stubbornCli, 0o755);
+    const stubbornPort = GATEWAY_PORT + 42;
+    const stubbornBackendPort = GATEWAY_PORT + 43;
+    await assertPortFree(stubbornPort, 'stubborn-signal gateway');
+    const stubbornGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(stubbornPort),
+            BIND_HOST: '127.0.0.1',
+            // Nothing listens here, so the health probe fails at once and the gateway spawns the CLI (and then waits for
+            // a readiness that never comes - the shutdown lands inside that wait, which is the checkpoint it must honour)
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${stubbornBackendPort}`,
+            OPENCODE_PATH: stubbornCli,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(stubbornGateway);
+    stubbornGateway.stdout.on('data', () => {});
+    stubbornGateway.stderr.on('data', () => {});
+    let stubbornPid = null;
+    for (let i = 0; i < 200 && stubbornPid === null; i += 1) {
+        if (fs.existsSync(stubbornPidFile)) stubbornPid = Number(fs.readFileSync(stubbornPidFile, 'utf8'));
+        else await sleep(50);
+    }
+    const stubbornStartedAt = Date.now();
+    stubbornGateway.kill('SIGTERM');
+    const stubbornExit = await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            stubbornGateway.kill('SIGKILL');
+            resolve('timeout');
+        }, 20000);
+        stubbornGateway.once('exit', (code) => {
+            clearTimeout(timer);
+            resolve(code);
+        });
+    });
+    const stubbornShutdownMs = Date.now() - stubbornStartedAt;
+    const stubbornAlive = (() => {
+        if (!stubbornPid) return true;
+        try {
+            process.kill(stubbornPid, 0);
+            return true;
+        } catch {
+            return false;
+        }
+    })();
+    if (stubbornPid && stubbornAlive) {
+        try { process.kill(stubbornPid, 'SIGKILL'); } catch { /* best effort */ }
+    }
+    check('a backend that ignores SIGTERM is killed before the gateway exits',
+        stubbornPid !== null && stubbornExit === 0 && !stubbornAlive,
+        `pid=${stubbornPid} alive=${stubbornAlive} exit=${stubbornExit} after ${stubbornShutdownMs}ms`);
+    check('the teardown finishes inside its budget instead of the hard exit',
+        stubbornShutdownMs < 12000, `${stubbornShutdownMs}ms`);
+
+    // --- a session created while the gateway is shutting down is still deleted -----------------------------
+    // The drain used to take one snapshot of `liveSessions`: a `session.create` that answered after it was read added an
+    // id nobody looked at again, and with an external backend that session stayed for good. Measured before this:
+    // `{"live":1,"created":1,"deleted":0}` after a single delayed creation.
+    const slowCreateStubPort = GATEWAY_PORT + 44;
+    const slowCreateStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(slowCreateStubPort), STUB_CREATE_DELAY_MS: '900' }
+    });
+    children.push(slowCreateStub);
+    slowCreateStub.stdout.on('data', () => {});
+    slowCreateStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${slowCreateStubPort}/health`);
+    const slowCreatePort = GATEWAY_PORT + 45;
+    await assertPortFree(slowCreatePort, 'slow-create gateway');
+    const slowCreateGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(slowCreatePort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${slowCreateStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(slowCreateGateway);
+    slowCreateGateway.stdout.on('data', () => {});
+    slowCreateGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${slowCreatePort}/health`);
+    const slowCreateAnswer = fetch(`http://127.0.0.1:${slowCreatePort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'slow create' }] })
+    }).then((response) => response.status).catch(() => 0);
+    // Long enough for the request to be inside `session.create`, short enough that it has not been answered
+    await sleep(300);
+    slowCreateGateway.kill('SIGINT');
+    const slowCreateExit = await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            slowCreateGateway.kill('SIGKILL');
+            resolve('timeout');
+        }, 20000);
+        slowCreateGateway.once('exit', (code) => {
+            clearTimeout(timer);
+            resolve(code);
+        });
+    });
+    const slowCreateStatus = await slowCreateAnswer;
+    const afterSlowCreate = await sessionsAfterCleanup(`http://127.0.0.1:${slowCreateStubPort}`);
+    check('a session created while the gateway shuts down is deleted, not orphaned',
+        slowCreateExit === 0 && afterSlowCreate && afterSlowCreate.live === 0,
+        `exit=${slowCreateExit} status=${slowCreateStatus} ${JSON.stringify(afterSlowCreate)}`);
+    stop(slowCreateStub);
+    await waitForExit(slowCreateStub);
+    fs.rmSync(stubbornDir, { recursive: true, force: true });
 
 // --- a closed log reader does not take the gateway down ---------------------------------------------------
 // `node index.js | head -3`, a log shipper that restarts, `docker logs` closing mid-write: the next write emits EPIPE

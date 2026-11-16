@@ -198,11 +198,16 @@ const isSensitiveHeader = (lowerName) => SENSITIVE_HEADER_NAMES.has(lowerName) |
  * put one in the request target (`GET /v1/models#access_token=…`), Node hands that URL over as it arrived, and the
  * gateway logged the credential at the default level. A fragment is not part of an HTTP request, so masking one costs
  * nothing, and an unmasked one is a secret in `docker logs`.
+ * The name run is bounded by the separators that start a pair, `?` included: a `?` inside `[^=&#]` started a fresh
+ * scan at every character of a `?` run (the name class accepted the next `?`), so a client could spend the serving
+ * thread's CPU with one request target - 14 000 `?` after `/v1/models` measured 96 ms per request, unauthenticated,
+ * because the summary line is built for every `/v1/*` response. A real credential name never contains a `?` (it is
+ * `%3F` when encoded), so excluding it changes no real URL.
  * @param {string} url raw request URL
  * @returns {string} the URL with credential query values masked
  */
 export function maskUrlQuery(url) {
-    return String(url).replace(/([?&#])([^=&#]+)=([^&#]*)/g, (match, separator, name, value) => {
+    return String(url).replace(/([?&#])([^=&#?]+)=([^&#]*)/g, (match, separator, name, value) => {
         let decoded = name;
         try {
             decoded = decodeURIComponent(name);

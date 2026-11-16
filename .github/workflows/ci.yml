@@ -61,15 +61,22 @@ jobs:
       - name: Workflow actions are pinned to commit SHAs
         run: |
           status=0
-          for file in .github/workflows/*.yml .github/workflows/*.yaml; do
+          # The reference is read wherever `uses:` sits on the line, not only at the start: a flow-style step
+          # (`- { name: Checkout, uses: actions/checkout@v4 }`) begins with `{` and used to pass unseen.
+          files=$(ls .github/workflows/*.yml .github/workflows/*.yaml .github/workflows/*/*.yml 2>/dev/null || true)
+          for file in $files; do
             [ -f "$file" ] || continue
-            hits=$(grep -nE '^[[:space:]]*(-[[:space:]]+)?us[e]s:[[:space:]]*[^[:space:]#]+@[^[:space:]#]+' "$file" || true)
+            # A comment that explains the rule must not be read as a use of an action (`:[[:space:]]*#` is a line
+            # whose content starts with `#`, which no step does)
+            hits=$(grep -nE 'us[e]s:[[:space:]]*[^[:space:]#},]+' "$file" | grep -vE ':[[:space:]]*#' || true)
             [ -n "$hits" ] || continue
-            # A bare SHA is not enough: the release it belongs to has to be written next to it, or a reviewer cannot
-            # tell a frozen v4.4.0 from a commit that was never released
-            unpinned=$(printf '%s\n' "$hits" | grep -vE '@[0-9a-f]{40}[[:space:]]+#[[:space:]]*v[0-9]' || true)
+            # A reference with no `@` is not pinned either: `docker://alpine:3` moves on every pull, and a local action
+            # (`./.github/actions/x`) is only as frozen as the checkout it comes from. A bare SHA is not enough on its
+            # own: the release has to be written next to it, or a reviewer cannot tell a frozen v4.4.0 from a commit
+            # that was never released.
+            unpinned=$(printf '%s\n' "$hits" | grep -vE 'us[e]s:[[:space:]]*[^[:space:]#}@]+@[0-9a-f]{40}([[:space:]]+|[[:space:]]*[,}])+#[[:space:]]*v[0-9]' || true)
             if [ -n "$unpinned" ]; then
-              echo "::error file=$file::an action is referenced by a movable ref, or its commit SHA has no '# vX.Y.Z' release comment"
+              echo "::error file=$file::an action is referenced by a movable ref (no 40-character commit SHA), or its SHA has no '# vX.Y.Z' release comment"
               printf '%s\n' "$unpinned"
               status=1
             fi

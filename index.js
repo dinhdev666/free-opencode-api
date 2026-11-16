@@ -96,13 +96,15 @@ const finalConfig = {
     // environment value counts as unset, so `-e API_KEY=` cannot replace a key written in config.json with the public
     // default one
     API_KEY: resolveApiKey(envOrFile(process.env, 'API_KEY', fileConfig.API_KEY) ?? defaultConfig.API_KEY),
-    OPENCODE_SERVER_URL: process.env.OPENCODE_SERVER_URL || fileConfig.OPENCODE_SERVER_URL || defaultConfig.OPENCODE_SERVER_URL,
-    OPENCODE_BIND_HOST: process.env.OPENCODE_BIND_HOST || fileConfig.OPENCODE_BIND_HOST || defaultConfig.OPENCODE_BIND_HOST,
-    OPENCODE_PATH: process.env.OPENCODE_PATH || fileConfig.OPENCODE_PATH || defaultConfig.OPENCODE_PATH,
+    OPENCODE_SERVER_URL: envOrFile(process.env, 'OPENCODE_SERVER_URL', fileConfig.OPENCODE_SERVER_URL) ?? defaultConfig.OPENCODE_SERVER_URL,
+    OPENCODE_BIND_HOST: envOrFile(process.env, 'OPENCODE_BIND_HOST', fileConfig.OPENCODE_BIND_HOST) ?? defaultConfig.OPENCODE_BIND_HOST,
+    OPENCODE_PATH: envOrFile(process.env, 'OPENCODE_PATH', fileConfig.OPENCODE_PATH) ?? defaultConfig.OPENCODE_PATH,
     // `OPENCODE_PROXY_BIND_HOST` is documented as an alias, and it is the only one that used to be dead: startProxy()
     // reads it only when no BIND_HOST is passed, and this line always passed one, so setting it changed nothing while
     // the README advertised it.
-    BIND_HOST: process.env.BIND_HOST || fileConfig.BIND_HOST || process.env.OPENCODE_PROXY_BIND_HOST || defaultConfig.BIND_HOST,
+    BIND_HOST: envOrFile(process.env, 'BIND_HOST', fileConfig.BIND_HOST)
+        ?? envOrFile(process.env, 'OPENCODE_PROXY_BIND_HOST', undefined)
+        ?? defaultConfig.BIND_HOST,
     // The legacy OPENCODE_-prefixed name keeps working; the bare name matches every other key and the container's
     // `-e DISABLE_TOOLS=...` flag
     DISABLE_TOOLS: readFlag(disableToolsSource.label, disableToolsSource.value, defaultConfig.DISABLE_TOOLS),
@@ -111,7 +113,7 @@ const finalConfig = {
     USE_ISOLATED_HOME: readFlag(isolatedHomeSource.label, isolatedHomeSource.value, defaultConfig.USE_ISOLATED_HOME),
     // LOG_LEVEL: env takes precedence over config.json; when neither is explicitly set, undefined is passed
     // through and startProxy falls back to the default info while keeping the legacy DEBUG -> debug level interlock
-    LOG_LEVEL: process.env.LOG_LEVEL || fileConfig.LOG_LEVEL || undefined,
+    LOG_LEVEL: envOrFile(process.env, 'LOG_LEVEL', fileConfig.LOG_LEVEL) ?? undefined,
     // Legacy switch, still honoured (also read by startProxy); a service manager may set it on a version that predates
     // LOG_LEVEL
     DEBUG: readFlag(debugSource.label, debugSource.value, false),
@@ -274,7 +276,11 @@ try {
             // The backend is awaited before exiting: SIGTERM used to be followed by process.exit() on the next line, so
             // the SIGKILL escalation inside killBackend() never ran and a backend that ignores SIGTERM outlived the
             // gateway that owns it. A second watchdog bounds the teardown itself.
-            const hardExit = setTimeout(() => process.exit(exitCode), 5000);
+            // This is a backstop for the teardown, not its budget: `killBackend()` bounds itself to 8 s
+            // (`SHUTDOWN_TEARDOWN_BUDGET_MS`) so the SIGTERM/SIGKILL escalation always runs, and a hard exit shorter
+            // than that preempted it - the gateway left while a child that ignores SIGTERM still held the backend port.
+            // The watchdog above adds its own 6 s before this timer starts.
+            const hardExit = setTimeout(() => process.exit(exitCode), 10000);
             hardExit.unref();
             stopBackend().then(() => process.exit(exitCode));
         };

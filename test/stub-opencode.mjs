@@ -93,6 +93,17 @@ const MULTIPART_SECOND = 'ALPHA BETA GAMMA';
 const TOOL_ANSWER = 'hello <function_calls>secret</function_calls> world';
 const TOOL_OPEN_CUT = 'hello <function_ca';
 const TOOL_CLOSE_CUT = 'hello <function_calls>secret</function_cal';
+// The two-step answer (prompt marker TWOSTEP): the step that asked for a tool, already finished with
+// `finish: "tool-calls"`, and the real answer, which is still being written when the gateway starts polling
+const TWO_STEP_EARLIER = 'STEP ONE TEXT';
+const TWO_STEP_FINAL = 'THE FINAL ANSWER';
+// Answers carrying tool-call markup the streaming filter used to get wrong (prompt markers STRAYTAG and OPENTAIL): a
+// stray closing tag with no block at all, and an opening tag that never closes, whose text must survive
+const STRAY_TAG_ANSWER = 'aaaa</function_calls>bbbb';
+const OPEN_TAIL_ANSWER = 'visible text <function_calls>tail words here';
+// A provider that fails after it has written text (prompt marker FAILMID): the finishing event carries `error` next to
+// `time.completed`, so the answer has to end as a failure, not as `finish_reason: "stop"`
+const FAIL_MID_ANSWER = 'partial answer';
 // The MIXED answer: two increments, each also carrying the part's cumulative text, then a closing update with no delta
 const MIXED_ANSWER = 'Hello world';
 // A text part whose `text` is not a string (a changed backend shape): it is not text and must not be stringified into
@@ -104,6 +115,10 @@ export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub
 export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// How long `POST /session` takes to answer (STUB_CREATE_DELAY_MS): a shutdown that lands inside this window used to
+// leave the created session in a set nobody read again
+const CREATE_DELAY_MS = Number(process.env.STUB_CREATE_DELAY_MS || 0) || 0;
 
 const sessions = new Map();
 const eventClients = new Set();
@@ -211,6 +226,30 @@ async function cutStreamMidAnswer(sessionID, snapshots) {
         client.end();
         eventClients.delete(client);
     }
+}
+
+// Deltas followed by a finishing event that reports a provider error: a provider that fails after it has written text.
+// `error` sits next to `time.completed` on the same `message.updated`, which is how opencode reports it.
+async function failMidStream(sessionID, pieces) {
+    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
+    let text = '';
+    for (const piece of pieces) {
+        text += piece;
+        sendEvent({ type: 'message.part.updated', properties: { part: { id: 'prt_failmid', sessionID, type: 'text', text } } });
+        await sleep(5);
+    }
+    sendEvent({
+        type: 'message.updated',
+        properties: {
+            info: {
+                id: `msg_${sessionID}`,
+                sessionID,
+                role: 'assistant',
+                error: { name: 'ProviderError', data: { message: 'provider failed mid-answer' } },
+                time: { created: Date.now(), completed: Date.now() }
+            }
+        }
+    });
 }
 
 // One text part whose snapshots are exactly what a backend that rewrote its part sends: the second snapshot is
@@ -392,6 +431,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === '/session' && req.method === 'POST') {
+        // A backend that is slow to answer the creation: the gateway is still waiting for it when its shutdown begins,
+        // which is the window in which a session used to be created after the teardown had already counted the set
+        if (CREATE_DELAY_MS) await sleep(CREATE_DELAY_MS);
         if (BIG_ERROR_BODY) {
             return sendJson(res, 502, { error: { message: 'x'.repeat(1000000), detail: { nested: ['y'.repeat(200000)] } } });
         }
@@ -477,6 +519,65 @@ const server = http.createServer(async (req, res) => {
                 // 64 000 unclosed tags: the strip has to walk the answer once, so this answers in milliseconds and used
                 // to spend seconds inside the regular expression before the client saw anything
                 return sendJson(res, 200, buildAssistantMessage(id, TOOL_SPAM_ANSWER, ''));
+            }
+            if (session.promptText.includes('TWOSTEP')) {
+                // A tool-using completion: the step that asked for the tool is already finished, and the answer that
+                // follows it is still being written. `finish: "tool-calls"` is what opencode reports for such a step.
+                session.messages.push({
+                    info: {
+                        id: `msg_${id}_step`,
+                        sessionID: id,
+                        role: 'assistant',
+                        finish: 'tool-calls',
+                        time: { created: Date.now(), completed: Date.now() }
+                    },
+                    parts: [{ type: 'text', text: TWO_STEP_EARLIER }]
+                });
+                const finalMessage = {
+                    info: { id: `msg_${id}_final`, sessionID: id, role: 'assistant' },
+                    parts: [{ type: 'text', text: TWO_STEP_FINAL.slice(0, 5) }]
+                };
+                session.messages.push(finalMessage);
+                sendJson(res, 200, { info: finalMessage.info, parts: [] });
+                setTimeout(() => {
+                    finalMessage.parts[0].text = TWO_STEP_FINAL;
+                    finalMessage.info.finish = 'stop';
+                    finalMessage.info.time = { created: Date.now(), completed: Date.now() };
+                }, 400);
+                return;
+            }
+            if (session.promptText.includes('FAILMID')) {
+                // A provider failure that arrives after the text: the event that ends the message carries the error, so
+                // the truncated answer must not be reported as a completed one
+                session.messages.push({
+                    info: {
+                        id: `msg_${id}`,
+                        sessionID: id,
+                        role: 'assistant',
+                        error: { name: 'ProviderError', data: { message: 'provider failed mid-answer' } },
+                        time: { created: Date.now(), completed: Date.now() }
+                    },
+                    parts: [{ type: 'text', text: FAIL_MID_ANSWER }]
+                });
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                failMidStream(id, ['partial ', 'answer']).catch(() => {});
+                return;
+            }
+            if (session.promptText.includes('STRAYTAG') || session.promptText.includes('OPENTAIL')) {
+                // Tool-call markup the streaming filter has to answer exactly like the non-streaming scan: a stray
+                // closing tag (dropped, text around it kept) and an opening tag that never closes (dropped, the text
+                // after it kept)
+                const stray = session.promptText.includes('STRAYTAG');
+                const text = stray ? STRAY_TAG_ANSWER : OPEN_TAIL_ANSWER;
+                session.messages.push(buildAssistantMessage(id, text, REASONING));
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                streamAssistantReply(id, text, REASONING, {
+                    chunks: stray
+                        ? ['aaaa', '</function_calls>', 'bbbb']
+                        : ['visible text ', '<function_calls>', 'tail words here'],
+                    delayMs: 1
+                }).catch(() => {});
+                return;
             }
             if (session.promptText.includes('LEAKYFAIL')) {
                 // The provider error carries a credential-bearing URL and 2 KB of text. Checked before FAIL, whose

@@ -1604,7 +1604,11 @@ function createApp(config) {
             const overrides = {};
             ids.forEach((id) => {
                 /* With opencode>=1.19 + a free zen model, disabling either read or glob makes the prompt request hang forever, so these two read-only tools stay enabled while all other tools remain disabled */
-                overrides[id] = ["read","glob"].includes(String(id).toLowerCase()) ? true : false;
+                // `setOwnProperty()` for the same reason the masking helpers use it: the id is backend-supplied (an MCP
+                // server names its own tools), and `overrides['__proto__'] = false` runs the prototype setter as a
+                // silent no-op - that tool stayed enabled while DISABLE_TOOLS was on, the failure this switch exists to
+                // prevent.
+                setOwnProperty(overrides, id, ["read","glob"].includes(String(id).toLowerCase()));
             });
             cachedToolOverrides = overrides;
             cachedToolAt = Date.now();

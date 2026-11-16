@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 372 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 387 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -94,7 +94,8 @@ prompt), `PAUSE` (silence longer than the idle timeout), `HOLD` (finishes after 
 flight while the backend is killed or the gateway shuts down), `SLOWFINISH` (finishes after 3 s), `TAILTAG` (a last
 delta ending in a tag prefix that never becomes a tag), `REJECTPROMPT` (a 500 for `POST /session/:id/message`),
 `PROMPTDONE` (the prompt response already carries the finished message), `CUTSTREAM` (two cumulative snapshots then
-a dropped event connection), `MULTIPART` (one message whose two text parts send their own cumulative snapshots,
+a dropped event connection), `LAGSTORE` (the stream delivers the whole answer while the stored message keeps only its
+first characters, then the stream is cut), `MULTIPART` (one message whose two text parts send their own cumulative snapshots,
 interleaved), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `MIXED` (part updates
 carrying both a `delta` and the part's cumulative text, then one closing update with neither),
 `CUTTOOL`/`OPENTOOL` (a tool-call answer whose stream is cut inside the closing/opening tag), `TOOLSPAM` (a tool-call
@@ -212,9 +213,13 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
 - **An announced request body has a deadline.** Fastify sets `requestTimeout: 0`, so nothing bounded the wait: a client
   that sent `Content-Length: 4096` and four bytes held the socket as long as it liked without a credential, because
   the `401` is written from the headers while Node keeps the connection alive to drain a body it will never read. `armBodyDeadline()` in the `onRequest` hook (armed before auth, only when
-  the request announces a body, cleared on `end`/`close`/`error`) closes it after `min(30 s, REQUEST_TIMEOUT_MS)`,
-  answering the `408` envelope when nothing has been sent, in the gateway's voice and with the deadline in force
-  (`request body was not received within …ms; send the declared body or close the connection`). It closes the
+  the request announces a body, cleared on `end`/`close`/`error`) closes it after `min(30 s, REQUEST_TIMEOUT_MS)` of
+  **no progress**, answering the `408` envelope when nothing has been sent, in the gateway's voice and with the deadline
+  in force (`request body was not received within …ms; send the declared body or close the connection`). The window
+  re-arms while the socket is reading more bytes (`req.socket.bytesRead` moved since the last arming) and the upload is
+  given a total budget of that window plus `REQUEST_TIMEOUT_MS`: a deadline that never renewed cut off a slow client
+  mid-body and told it to send the body it was sending, while the stall it exists for is a body that *stops*. When the
+  budget runs out on an upload that was still progressing, the message says so instead of blaming a stall. It closes the
   **request's** socket, not `reply.raw`: a keep-alive response is detached from the connection once it ends, so destroying it
   closed nothing.
 - A `model` id whose provider or model half is empty (`"opencode/"`, `"/big-pickle"`) is a `400` in the
@@ -250,7 +255,11 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error, with a
   `code`: `ProviderError`, `backend_unreachable` or `upstream_error`), `503`
   (`type: "queue_full"`, the wait queue is full, with `Retry-After: 1` so an OpenAI SDK backs off instead of failing
-  the request), `504` (timeout), `500` (anything else). Every error body carries a
+  the request) or `type: "server_error"` with `code: "gateway_shutting_down"` (also with `Retry-After: 1`, when
+  `SIGINT`/`SIGTERM` arrived and the request is not one of the responses being finished), `504` (timeout), `500`
+  (anything else). A backend the gateway cannot start (a missing CLI, a 2.x release, a taken port, a start cooldown) is
+  the same `502 backend_unreachable` as a backend that died mid-request: the tagged `backendUnavailable()` error is
+  what tells the two paths apart, and the message names the start failure. Every error body carries a
   `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name, and its message is
   masked and bounded (`clientFacingText()`): a 5xx sentence comes from whatever threw, and a thrown `fetch`/SDK error can
   quote its URL. The route handler's own catch writes its `500` body itself, so it reads the sentence through
@@ -300,7 +309,11 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   socket open) breaks or hangs the client.
 - Every completion deletes the OpenCode session it created — on the success path, the error path and after a client
   abort. The backend must never accumulate one session per served request; `test/stub-opencode.mjs` exposes
-  `GET /__sessions` so the smoke suite can assert `live === 0`.
+  `GET /__sessions` so the smoke suite can assert `live === 0`. A completion that the **shutdown** interrupts never
+  reaches that cleanup, so every created session id is also tracked in the module-level `liveSessions` set (removed in
+  `cleanupSession()`'s `finally`) and `killBackend()` drains what is left before the child is stopped
+  (`SHUTDOWN_SESSION_TIMEOUT_MS`, 3 s, best effort): with an external backend those orphans outlive the gateway, one
+  per restart.
 - Every response carries `X-Content-Type-Options: nosniff` (`NO_SNIFF`, `createApp()`) on the same three paths as the
   CORS set (`onRequest` hijacked streams included, `clientErrorHandler`, `badUrlHandler`): it writes only JSON
   and SSE, which a browser must not re-read as something else.
@@ -332,15 +345,20 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   the userinfo and any credential query value and leaves scheme/host/path readable, which is what they are read for. The entrypoint repeats the masking for its own log line (it cannot import the module: it writes the file the
   module reads); the stored `config.json` keeps the real value.
   The same applies to **text**: `resolveBackendAuth()` (`src/proxy.js`) splits the userinfo out of the value the SDK is
-  given and `maskUrlCredentials()` masks a `scheme://user:pass@` inside any sentence. Both exist because the documented
+  given and `maskUrlCredentials()` masks a `scheme://user:pass@` inside any sentence. Its scheme run is bounded
+  (`\w[\w+.-]{0,31}`): an unbounded one rescanned every position of a whitespace-free token containing `://` and no
+  `@`, which is O(n²) — 8 ms at 2 000 characters, 1.85 s at 32 000 — on the serving thread, reachable through a debug
+  dump or an upstream sentence. A quoted credential is masked **by value** as well when it is the gateway's own backend
+  credential: `maskQuotedCredentials()` needs 16 characters to tell a token from prose, and `base64("u:pw")` is 8. Both exist because the documented
   shape could not work - Node's `fetch` refuses a URL with credentials, so every completion answered `502`. The
   userinfo now travels as a Basic `Authorization` header (and on `checkHealth()`, which read its `401` as "backend missing"), and every upstream reason that reaches a client or a log line
   goes through `clientFacingText()` (URLs and a quoted `Authorization` value masked, cut at 512 characters): a backend or a proxy
   can quote a URL, or echo the Basic header it refused (`maskQuotedCredentials()`), in its own error payload.
 - Request log format: `METHOD url -> status Xms [reqId] model=… stream=…` (info for `/v1/*`, debug otherwise).
   The `model` value and the URL are client-controlled, so both are normalised before they are logged
-  (`loggableModelId()`: control characters replaced, 128 characters max; a URL over 512 characters is cut with a
-  `…[truncated N chars]` marker): one log line is one record, and a newline in a model id used to start a second,
+  (`loggableModelId()`: control characters replaced, 128 characters max; a URL goes through `maskUrlQuery()` *and*
+  `maskUrlCredentials()`, so a `user:pass@` in a request target is masked the way `maskBackendUrl()` masks it, and one
+  over 512 characters is cut with a `…[truncated N chars]` marker): one log line is one record, and a newline in a model id used to start a second,
   attacker-written line while a 2 MB id produced a 2 MB line. The backend still receives the id
   verbatim - the contract does not restrict model ids, only what is logged is normalised, and an **operator** value
   quoted in a startup line goes through `loggableConfigValue()` for the same reason: `config.json` and the environment
@@ -363,7 +381,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   characters — because `docker logs` is collected (`maskHeaders`/`maskSecret`). Header **names** are matched against
   `SENSITIVE_HEADER_PATTERN`, built from the exported `SENSITIVE_NAME_ALTERNATIVES` (`auth`, `authorization`,
   `authentication`, `api-key`/`apikey`, `token`, `secret`, `cookie`, `session`, `passw`, `key`, `code`, `sig`,
-  `signature`, `credential`, `bearer` as whole name segments) rather than a fixed denylist: `x-goog-api-key`,
+  `signature`, `credential`, `bearer`, `password`/`passwd`/`pwd` as whole name segments — a bare `passw` was a
+  prefix and matched nothing else) rather than a fixed denylist: `x-goog-api-key`,
   `x-auth-token` or `openai-api-key` is a credential too, and the client decides that name. **URLs are masked too**
   (`maskUrlQuery()` before `loggableUrl()` truncates): `?api_key=…`, `?token=…` and `?Authorization=…` are a
   documented OpenAI-compatible client convention, and so are Google's `?key=…`, an OAuth `?code=…` and an Azure SAS
@@ -399,7 +418,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   held tag prefix, or dropped everything after it (a cut inside a block answered `hello ` with
   `finish_reason: "stop"`). An answer the backend rewrote is written around the filter (`sendReleasedDelta`) instead.
   `DISABLE_TOOLS` is read
-  from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`.
+  from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`. The per-tool override map is
+  built with `setOwnProperty()` for the same reason the masking helpers are: a backend tool id of `__proto__` assigned
+  through `overrides[id] = …` changed the map's prototype instead of adding the switch, so the prompt silently omitted
+  it.
 - **Boolean options go through `parseBoolean()`** (exported from `src/proxy.js`), the single parser used by
   `index.js` and `startProxy()`. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off"
   in the container); do not add a third. A value that is present but cannot be read is **named with the
@@ -407,8 +429,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `USE_ISOLATED_HOME` and `DEBUG`): `[Config] DISABLE_TOOLS='maybe' is not a boolean (use true/false, yes/no, on/off
   or 1/0), using false`. A silent fallback is the failure the numeric tuning keys were fixed for, and
   a `DISABLE_TOOLS` typo leaves `<function_calls>` markup in the answer while the operator believes it
-  is filtered out. `parseBoolean()`
-  stays the only parser (it is also used on request bodies, where a warning would be wrong: an unreadable `stream` or
+  is filtered out. `parseBoolean()` rejects a value longer than 64 characters before it trims and lowercases it (the longest accepted
+  spelling is five characters; a client-sized `stream` value cost 10 ms per call and the handler reads each boolean
+  twice) and stays the only parser (it is also used on request bodies, where a warning would be wrong: an unreadable `stream` or
   `stream_options.include_usage` there is a `400` naming the field, because a typo answered JSON to a client parsing
   SSE, and `stream_options` must be an object); `readFlag()` only reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable); the value goes
   through `loggableConfigValue()` too, because it lands in a log line.
@@ -466,7 +489,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   copy: a streaming request whose event stream timed out spent a second full budget polling, so the client waited
   about twice the advertised timeout (measured 60 s for a 40 s budget) and the queue timer named a budget already
   exceeded. `remainingBudget()` never goes below 1 ms, so an exhausted budget surfaces as its
-  timeout rather than a spinning loop. `client.session.create` takes it too: with a fresh budget there, a
+  timeout rather than a spinning loop. When the whole-collector budget expires it clears the first-delta and idle
+  timers before aborting, so a `data` event cannot fire a handler into a settled collector.
+  `client.session.create` takes it too: with a fresh budget there, a
   completion that had queued 3 s answered at 5.7 s with a 4 s budget.
 - **A failed poll does not end the completion.** `pollForAssistantResponse` retries a poll that answers with an error
   (a 5xx while the backend is busy) or throws (a reset while it restarts): one bad poll used to lose an
@@ -497,7 +522,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   plus a 32-character head and tail window against the part's *previous* snapshot, `SNAPSHOT_EDGE_CHARS`), where
   `startsWith` against the whole answer forced a rope flatten and a full compare per event — measured 299 ms of
   gateway CPU for a 200 KB answer, 823 ms for 400 KB, growing quadratically.
-  A snapshot that is not an extension of the previous one is forwarded whole; the 32-character window is the
+  The recovery poll describes a copy that can be *behind* the stream it already delivered (a store written behind the
+  broadcast): when the polled text is a prefix of what the client has, it carries nothing new and is not written — both
+  extension checks were false for a shorter copy, so it was appended and the head of the answer arrived twice under
+  `finish_reason: "stop"` (`LAGSTORE`). A snapshot that is not an extension of the previous one is forwarded whole; the 32-character window is the
   deliberate limit, so a rewrite *inside* it reads as a continuation. The snapshot is recorded on **every** event that
   carries one, including events that also carry a `delta` (the SDK's event type allows both): recording it only on the
   delta-less branch left a mixed backend's closing update diffed against `''` and delivered the whole part twice
@@ -527,7 +555,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   block shutdown. The backend is stopped *after* that grace period, not before it: killing it first turned a
   completion the gateway was already serving into an upstream error, which is the opposite of a graceful shutdown.
   Every exit path stops the backend exactly once. Do not register signal handlers that call `process.exit()` from a
-  module — they win the race and skip backend teardown.
+  module — they win the race and skip backend teardown. The status the process leaves with is part of the contract: a
+  signal is `0`, an `uncaughtException` is `1` (`shutdown(signal, exitCode)`), because a crashed gateway reported as a
+  clean stop is never restarted by `Restart=on-failure` or a Kubernetes restart policy and never alerts anyone.
 - **The wait queue is bounded** (`OPENCODE_PROXY_MAX_QUEUE`, default 64) because every waiting request pins its parsed
   body; overflow answers `503 queue_full` instead of growing memory. The other half is `OPENCODE_PROXY_MAX_BODY_MB`
   (default 50, the Fastify `bodyLimit`): together they allow 3.2 GiB of pinned bodies, so both are documented
@@ -577,7 +607,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   sleeps between attempts, so a request arriving
   during a start is served as soon as the backend answers.
 - **`killBackend()` returns a promise that settles when the child is gone** (SIGTERM, then SIGKILL after 3 s), and
-  `index.js` awaits it before `process.exit(0)`; the jail directory is removed only after the child is gone, because it
+  `index.js` awaits it before `process.exit(exitCode)`; the jail directory is removed only after the child is gone, because it
   is the child's cwd. Exiting right after SIGTERM skipped the escalation, so a backend that ignores SIGTERM outlived
   the gateway that owns it. It also sets `state.shuttingDown`, which every `ensureBackend()` path checks before it
   spawns: an attempt still inside its health probe (or waiting for the previous child) used to spawn `opencode serve`

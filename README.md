@@ -57,7 +57,7 @@
 OpenAI client  ──HTTP──▶  Free OpenCode API (default :8083)  ──▶  opencode serve (default :4097)  ──▶  model providers
 ```
 
-The gateway accepts OpenAI-shaped requests, translates them into OpenCode sessions and prompts, streams the results back as standard SSE chunks or a single JSON body, and hides the lifecycle of the backend process (startup, health checks, teardown). Each completion gets its own session, which is deleted as soon as the answer has been delivered, so the backend does not accumulate history.
+The gateway accepts OpenAI-shaped requests, translates them into OpenCode sessions and prompts, streams the results back as standard SSE chunks or a single JSON body, and hides the lifecycle of the backend process (startup, health checks, teardown). Each completion gets its own session, which is deleted as soon as the answer has been delivered, so the backend does not accumulate history (a completion that `SIGINT`/`SIGTERM` interrupts is deleted by the shutdown sequence before the gateway exits, which matters when the backend is an external one it does not own).
 
 ---
 
@@ -394,14 +394,17 @@ enforced, since sending less or raising the knob is the fix), `415` for a conten
 gateway cannot read, `502` for an upstream/provider failure (streaming requests included: a
 provider failure that arrives before the first token is an HTTP error, not an empty answer, and a backend that dies
 mid-request is an upstream failure rather than a `500` — the next request starts it again, a backend that refuses
-to create a session reports its status and reason in the message instead of a bare `500`, and a backend that keeps
-failing while the answer is polled gives up after 5 consecutive failures instead of waiting out the whole request
-budget), `503` when the completion
-queue is full (`type: "queue_full"`, with a `Retry-After: 1` header so SDKs retry instead of failing), `504` on timeout — including a backend that accepts the connection and then
+to create a session reports its status and reason in the message instead of a bare `500`, a backend the gateway cannot
+start at all (a missing CLI, a 2.x release, a port already taken, a restart cooldown after a failed attempt) is the
+same upstream failure, and a backend that keeps failing while the answer is polled gives up after 5 consecutive
+failures instead of waiting out the whole request budget), `503` in two cases — the completion queue is full
+(`type: "queue_full"`) or the gateway is shutting down (`code: "gateway_shutting_down"`), both with a `Retry-After: 1`
+header so SDKs retry instead of failing — and `504` on timeout — including a backend that accepts the connection and then
 never answers the request (it is reported as a gateway timeout with the budget that was exceeded instead of leaving the
 client without a response). Everything the gateway or the backend failed at carries
 `type: "server_error"` and the upstream message (`502` carries a `code` too: `ProviderError` when the provider
-reported the failure, `backend_unreachable` when the backend could not be reached, `upstream_error` otherwise); an
+reported the failure, `backend_unreachable` when the backend could not be reached or started, `upstream_error`
+otherwise); an
 internal exception's class name is never exposed. Once a stream has started, errors are delivered in-band
 (`data: {"error": …}` then `data: [DONE]`) — never as assistant text.
 
@@ -446,8 +449,11 @@ characters replaced, so a non-string name cannot reach the model as `[object Obj
 cannot forge a second conversation line.
 
 **A body must arrive.** A request that announces a body (`Content-Length`, `Transfer-Encoding: chunked`) has to
-deliver it within 30 s or the shared request budget, whichever is shorter. On expiry the client receives the `408`
-envelope (`request body was not received within …ms; send the declared body or close the connection`) and the
+deliver it within 30 s or the shared request budget, whichever is shorter — and that window is about *silence*, not
+about the size of the upload: it renews while the socket is making progress, so a slow client that is genuinely sending
+is served, up to a total of that window plus one request budget. On expiry the client receives the `408`
+envelope (`request body was not received within …ms; send the declared body or close the connection`, or, when the
+upload was still progressing, the window and the upload budget it exceeded) and the
 connection is closed; a request that was already refused (an unauthenticated one, for example) is simply
 disconnected, because the client is not waiting for another answer.
 Without that deadline a client could send `Content-Length: 4096`, write four bytes and hold the socket open for as long
@@ -509,7 +515,9 @@ invalid, because a body with one of those keys parses fine and the fix is to rem
 likewise names what it refused: `unsupported content type "application/xml"; send Content-Type: application/json`, and
 `the request has a body but no Content-Type header; send Content-Type: application/json` when the header is missing.
 
-Sensitive headers such as `authorization`, `x-api-key`, and `cookie` are masked before they are logged, and so are
+Sensitive headers such as `authorization`, `x-api-key`, `cookie` and any name carrying a credential segment —
+`token`, `secret`, `session`, `password`/`passwd`/`pwd`, `key`, `code`, `sig`/`signature`, `credential`, `bearer` — are
+masked before they are logged, and so are
 credential values sent in a query string (`?api_key=…`, and the spellings other clients use for the same secret:
 Google's `?key=…`, an OAuth `?code=…`, an Azure SAS `?sig=`/`?signature=…` — in a fragment too, since a raw client can
 send `GET /v1/models#access_token=…`, which `curl` and browsers strip but a socket does not) and a credential carried
@@ -517,7 +525,8 @@ by the configured backend URL
 (`http://user:secret@host:4097`, a proxy in front of the backend): the startup summary, the `[Config]` notes and
 `/health` show `http://***@host:4097` instead. An upstream reason that quotes the same credential back — a proxy in
 front of the backend reporting the `Authorization: Basic …` header it refused — is masked as `Basic ***` before it
-reaches a `502` body or a log line. The same sentence is masked in a **stack trace** and in a debug dump of a request
+reaches a `502` body or a log line, the configured backend credential is masked even when the upstream quotes it
+base64-encoded and shorter than 16 characters, and a `user:pass@` inside the URL of a request log line is masked too. The same sentence is masked in a **stack trace** and in a debug dump of a request
 body: a stack's first line is the message it repeats, so a record that masked `message` and printed `stack` verbatim
 published the credential the masking had just removed. A string in that dump is cut at 32 KB *before* it is masked,
 the length the finished line is cut to: a body at the 50 MiB limit cost 688 ms of event loop per debug line while
@@ -612,6 +621,9 @@ git push origin v3.0.0
 | `400 model "…" must be a "provider/model" id` | The `model` value had an empty half (`opencode/` or `/big-pickle`). Send a full id from `/v1/models`, or omit `model` to use `opencode/big-pickle`. |
 | `502 OpenCode backend rejected …` | The backend answered a non-2xx to a gateway call (session creation, prompt, message poll, event stream). The message carries the upstream status and reason; check `opencode --version` and the backend log. |
 | `502 … rejected session creation (status 405)` | The `opencode` on `PATH` is a 2.x release, whose `serve` exposes the web UI instead of the 1.x session API. Install a 1.x version (`npm install -g opencode-ai@1`) or set `OPENCODE_PATH` to one; the gateway logs a warning naming this cause. |
+| `502 … Failed to start OpenCode backend …` (`code: "backend_unreachable"`) | The gateway could not start its backend: `OPENCODE_PATH` is wrong, the CLI is not on `PATH`, the backend port (`OPENCODE_BIND_HOST`:`4097`) is taken, or a previous start failed and its cooldown is still running. The message names the cause; `/health` keeps answering `200` throughout, and the next request retries the start. |
+| `503` with `code: "gateway_shutting_down"` | The gateway received `SIGINT`/`SIGTERM` and is finishing the responses it already accepted. Retry after the advertised `Retry-After` (1 s) against a gateway that is up — a load balancer should stop sending new work on the first signal. |
+| Requests fail while a body uploads | The gateway answers `408` when a declared body stops arriving (no bytes for 30 s or the request budget, whichever is shorter). A slow but steady upload is served; a stalled one is closed so it cannot hold a socket without a credential. |
 | Port already in use | Change `PORT` in `config.json` or the environment. |
 | The gateway exits immediately, `config.json is not valid JSON …` | Fix the syntax or delete `config.json`; the process refuses to start rather than ignore a key you configured. |
 

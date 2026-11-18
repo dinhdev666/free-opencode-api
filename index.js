@@ -227,10 +227,12 @@ logger.info(`  - Wait queue: ${queueLimits.queue} waiting completion(s) before 5
 function probeOpencodeVersion(binPath) {
     return new Promise((resolve) => {
         // The version probe is still a child of this gateway: it gets the same scrubbed environment the backend
-        // spawn uses, so the gateway's own key is not inherited by a CLI that has no use for it.
+        // spawn uses, so the gateway's own key is not inherited by a CLI that has no use for it - and neither is
+        // `OPENCODE_SERVER_URL`, which can carry `user:pass@` for a proxy in front of the backend.
         const env = { ...process.env };
         delete env.API_KEY;
         delete env.OPENCODE_PROXY_DEBUG;
+        delete env.OPENCODE_SERVER_URL;
         execFile(binPath, ['--version'], { timeout: 5000, encoding: 'utf8', env }, (error, stdout) => {
             if (error) {
                 resolve({ error });

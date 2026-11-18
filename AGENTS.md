@@ -49,7 +49,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 
 | Path | Responsibility |
 | --- | --- |
-| `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved queue limits, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
+| `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved queue limits, via `getQueueLimits()`), calls `startProxy()` and awaits its `ready` promise (a listen failure is reported and exits there, not inside the proxy), wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. A BOM is tolerated. |
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses) for debug logging. |
@@ -74,7 +74,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 449 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 456 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -90,14 +90,15 @@ Releases come from tags, not from a laptop: bump `version` in `package.json`, th
 
 `pnpm test` covers the HTTP contract against the stub in `test/stub-opencode.mjs` (health, providers, sessions,
 messages and SSE events, plus a test-only `GET /__sessions` reporting created/deleted/live counts, `lastSystemPrompt`,
-`lastPromptText` and `messagePolls`). Behaviour is selected by markers in the prompt text - `SLOW`
+`lastPromptText`, `messagePolls` and `toolIdCalls`). Behaviour is selected by markers in the prompt text - `SLOW`
 (an answer slow enough to abort mid-stream), `STALL` (silence after two deltas), `TOOLTAG` (a tool-call block cut inside
 both of its tags), `FAIL` (a provider error with no content), `ENDONLY` (a finish event carrying only `time.completed`),
 `GROW` (an answer still being written when the prompt returns), `SUICIDE` (the stub SIGKILLs itself after accepting the
 prompt), `PAUSE` (silence longer than the idle timeout), `HOLD` (finishes after 400 ms, so a completion stays in
 flight while the backend is killed or the gateway shuts down), `SLOWFINISH` (finishes after 3 s), `TAILTAG` (a last
 delta ending in a tag prefix that never becomes a tag), `REJECTPROMPT` (a 500 for `POST /session/:id/message`),
-`PROMPTDONE` (the prompt response already carries the finished message), `CUTSTREAM` (two cumulative snapshots then
+`PROMPTDONE` (the prompt response already carries the finished message), `PROMPTTOOLCALLS` (the prompt response carries a
+finished `finish: "tool-calls"` step while the real answer is only stored), `CUTSTREAM` (two cumulative snapshots then
 a dropped event connection), `LAGSTORE` (the stream delivers the whole answer while the stored message keeps only its
 first characters, then the stream is cut), `MULTIPART` (one message whose two text parts send their own cumulative snapshots,
 interleaved), `MULTIPARTNOID` (the same without part ids, so both parts are of type `text`), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `MIXED` (part updates
@@ -111,7 +112,8 @@ idle timer that is re-armed on every one) - and by the variables `STUB_FAIL_SESS
 credential-bearing URL), `STUB_ECHO_AUTH=1` (a 401 quoting the header it refused), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every creation after the n-th goes
 unanswered), `STUB_DROP_CREATE=1` (the session is created and the connection dropped before the answer),
-`STUB_REJECT_DELETES=1` (a `500` for `DELETE /session/:id`, so the session stays), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
+`STUB_REJECT_DELETES=1` (a `500` for `DELETE /session/:id`, so the session stays), `STUB_HANG_DELETES=1` (a delete that is
+never answered), `STUB_FAIL_TOOL_IDS=1` (a `500` for `GET /experimental/tool/ids`), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
 body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. Session-cleanup
 assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the session (its own
@@ -320,7 +322,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   A refused `event.subscribe` carries no stream, so the streaming path falls back to polling and still answers.
   Reading any of these as "the backend returned nothing" turned a refusal into a missing answer (`tool.ids` was worst:
   an error tuple cached an empty override map, so `DISABLE_TOOLS` sent no tool switches for the whole
-  cache window).
+  cache window). The tool list is read once after the warmup probe (`warmToolOverrides()`, so the first completion does not
+  pay for it) and then served stale-while-revalidate for `TOOL_IDS_CACHE_MS` (5 min) behind one in-flight refresh; a
+  failed refresh **keeps the last known map** and is retried at most once per `TOOL_IDS_FAILURE_TTL_MS` (60 s), because
+  an absent `tools` field means "the backend defaults", i.e. every tool enabled.
 - A provider failure is an upstream error in both modes. Non-streaming answers `502`; a streaming request whose
   provider failed before the first frame answers the same `502` envelope (the stream never started), and one that
   fails after frames are on the wire ends with the in-band error frame. It must never be streamed as assistant text:
@@ -350,10 +355,16 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   per restart. The drain **loops** while the set is non-empty inside that budget (one snapshot missed a creation that
   answered after it was read: `/__sessions` reported `{"live":1,"created":1,"deleted":0}`), and a completion that has
   not created its session yet when shutdown began answers `503 gateway_shutting_down` instead of adding one the teardown
-  has already counted. Each delete result is inspected the way `cleanupSession()` inspects it: a refused delete arrives
+  has already counted. A request still **waiting for a slot** is answered the same way by `beginShutdown()`, which drains
+  the queue: `server.close()` would have waited for a request that can no longer be served, and `closeAllConnections()`
+  answered it with a reset 1.5 s later (measured 1 507 ms after the signal) - a `fetch failed` a client cannot tell from a
+  crash. Each delete result is inspected the way `cleanupSession()` inspects it: a refused delete arrives
   as an `{ error, response }` tuple, and counting that as a deletion dropped the id and logged a success for a session
   that stayed on the backend. A round that deletes nothing ends the loop (a refusing backend cannot be retried into
-  success inside 3 s) and one `warn` names the sessions that are left (`remaining`).
+  success inside 3 s) and one `warn` names the sessions that are left (`remaining`). `cleanupSession()` classifies a
+  delete that answers 404/410 as already gone (debug, no warning) and any other failure as transient: the id stays in
+  `liveSessions` so the shutdown drain retries it, and the warning is rate-limited to one per minute
+  (`noteCleanupFailure()`), because a backend that refuses every delete used to log one line per request.
 - Every response carries `X-Content-Type-Options: nosniff` (`NO_SNIFF`, `createApp()`) on the same three paths as the
   CORS set (`onRequest` hijacked streams included, `clientErrorHandler`, `badUrlHandler`): it writes only JSON
   and SSE, which a browser must not re-read as something else.
@@ -385,8 +396,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   (`http://user:secret@host:4097` for a proxy in front of the backend); it reached the startup summary, the `[Config]`
   notes, the container's first-boot config dump and `/health` verbatim — and `/health` needs no key, so that published
   the secret to every caller and to `docker logs`. `maskBackendUrl()` in `src/logger.js` masks
-  the userinfo and any credential query value and leaves scheme/host/path readable, which is what they are read for. The entrypoint repeats the masking for its own log line (it cannot import the module: it writes the file the
-  module reads); the stored `config.json` keeps the real value.
+  the userinfo and any credential query value and leaves scheme/host/path readable, which is what they are read for. The entrypoint **imports** the helper for its own first-boot dump and log line (`node --input-type=module -e … /app/src/logger.js`), so the container cannot drift from the module - its earlier hand-written copy matched neither `#`-separated pairs nor the length rule - and masks everything as `***` if that import fails; the stored `config.json` keeps the real value.
   The same applies to **text**: `resolveBackendAuth()` (`src/proxy.js`) splits the userinfo out of the value the SDK is
   given and `maskUrlCredentials()` masks a `scheme://user:pass@` inside any sentence. Its scheme run is bounded
   (`\w[\w+.-]{0,31}`): an unbounded one rescanned every position of a whitespace-free token containing `://` and no
@@ -407,7 +417,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   quoted in a startup line goes through `loggableConfigValue()` for the same reason: `config.json` and the environment
   are text a script can write. It covers every `[Config]` note naming a value it could not use, the ignored-file
   paths and the `[Security]` warning that names the bind address; `docker/docker-entrypoint.sh` repeats the rule for
-  its log-level line (`tr '[:cntrl:]' '?'`, cut at 128), because it cannot import the module.
+  its log-level line (`tr '[:cntrl:]' '?'`, cut at 128), because the shell writes that line before Node starts.
   An **OS sentence** is the other shape of the same problem: `spawn()` repeats the command back inside its error
   message, so `[Proxy] Failed to spawn OpenCode: ${err.message}` quoted `OPENCODE_PATH` verbatim and a newline in it
   started a second record. `loggableUpstreamText()` bounds the text first (`MAX_LOGGED_UPSTREAM_LENGTH`, 256) and then
@@ -445,9 +455,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   documented OpenAI-compatible client convention, and so are Google's `?key=…`, an OAuth `?code=…` and an Azure SAS
   `?sig=`/`?signature=…`; `#` separates a pair too, because a raw client can put a fragment in the request target
   (`GET /v1/models#access_token=…`) even though `curl` and browsers strip it, and Node logs the URL as it arrived. The
-  list is one exported string because
-  `docker/docker-entrypoint.sh` cannot import this module and repeats it for its own first-boot dump; the smoke suite
-  asserts the two copies are identical.
+  list is one exported string because `docker/docker-entrypoint.sh` masks its own first-boot dump with the same helpers
+  (it imports `src/logger.js` through `node --input-type=module -e` instead of carrying a copy, whose regex missed
+  `#`-separated pairs); the smoke suite asserts the entrypoint calls the helper rather than re-implementing it.
   A request body reaches the debug dump through `maskDetail()` (the same name list on a bounded copy, each string cut
   at `MAX_SERIALIZED_LENGTH` before it is masked: the line is cut to that length too, so a body at the 50 MiB limit no
   longer costs 688 ms per debug line), and the model-fetch error line uses the same helpers. A detail object handed to a
@@ -497,7 +507,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   spelling is five characters; a client-sized `stream` value cost 10 ms per call and the handler reads each boolean
   twice) and stays the only parser (it is also used on request bodies, where a warning would be wrong: an unreadable `stream` or
   `stream_options.include_usage` there is a `400` naming the field, because a typo answered JSON to a client parsing
-  SSE, and `stream_options` must be an object); `readFlag()` only reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable); the value goes
+  SSE, and `stream_options` must be an object). A **number** counts only as `1`/`0`: every other number used to read as
+  "on", so `{"stream": 0}` answered SSE to a client waiting for a JSON body, and `{"stream": 2}` did the same; `readFlag()` only reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable); the value goes
   through `loggableConfigValue()` too, because it lands in a log line.
   `startProxy()` applies the same rule to its own fallbacks (`flagOption()`), for an embedder with no
   entry point to resolve it first: an option the caller passed is taken as given — `index.js` already
@@ -531,6 +542,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   startup". The entry point normalises the value **before** printing the summary and emits the notes there (the
   function is exported for that), because the summary is where an operator copies the value from. `startProxy()`
   normalises what it is handed once more: a no-op for an already-normalised value, still correct for an embedder.
+  `BIND_HOST` and `OPENCODE_BIND_HOST` are trimmed the same way (`normalizeBindHost()`, with a `[Config]` note): a
+  trailing space reached `listen()` as part of the address. A bind address that is **not loopback** is warned about
+  where it matters: `OPENCODE_SERVER_URL` over plain `http://` says its credential travels in clear text, and a
+  non-loopback backend URL with a spawned child says the child cannot satisfy it (the child listens on `OPENCODE_BIND_HOST`).
 - **Every tuning key follows the same precedence.** `OPENCODE_PROXY_MAX_CONCURRENCY`, `OPENCODE_PROXY_MAX_QUEUE`,
   `OPENCODE_PROXY_MAX_BODY_MB`, `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_HEALTH_CACHE_MS` and
   `OPENCODE_PROXY_START_RETRY_MS` are read through `readLimit()` / `readMilliseconds()`, which take the `config.json`
@@ -547,6 +562,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   embedder and the smoke suite cannot disagree. A blank environment value falls through to `config.json` like every
   other key (`??` ended the chain at `''`, so `Environment=OPENCODE_PROXY_REQUEST_TIMEOUT_MS=` in a unit file silently
   replaced the file's value with the 300000 ms default, and the "unusable value" note was skipped for a blank one).
+  A timeout above `MAX_TIMER_MS` (`2 ** 31 - 1`, the largest delay `setTimeout` accepts) is clamped to it with a note: a
+  larger value is stored as `1` and fires immediately, so a mistyped budget turned every completion into an instant `504`.
 - **Polling watches the newest assistant message.** A tool-using completion has more than one: the step that asked for
   the tool is finished (`finish: "tool-calls"`) while the step that answers is still being written. The poll reads the
   last assistant message in the list and evaluates only that one; walking back to the first message that looked

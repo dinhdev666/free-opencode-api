@@ -57,7 +57,9 @@ The service is then reachable at `http://<your-ip>:8083`.
 > **Pass `-e API_KEY=…`.** Without it the gateway runs with the built-in key `sk-dummy-123`, which is public: anyone who
 > can reach the port can then drive your OpenCode installation. `--privileged` is **not** needed and is never used
 > here: the image needs no extra capability, and the backend runs model-directed tools, so keep those tools inside the
-> container's default isolation (with `DISABLE_TOOLS=true`, the image default, they are off entirely).
+> container's default isolation. `DISABLE_TOOLS=true` (the image default) switches every tool that can execute
+> something or write a file off (bash, edit, write, task, webfetch…); the two read-only tools `read` and `glob` stay
+> enabled, because disabling either of them makes the backend hang on opencode ≥ 1.19 (see **Fix 1** below).
 
 ---
 
@@ -315,6 +317,10 @@ git push origin v1.0.1
 The publish job itself is guarded by `if: startsWith(github.ref, 'refs/tags/v')`, so a run started from a branch (a
 manual dispatch) stops before it logs in to the registry: only a tag can move `latest`.
 
+Every published image carries a **provenance attestation** and an **SBOM** (`provenance: true`, `sbom: true` on
+`docker/build-push-action`): `docker buildx imagetools inspect <image>` shows the build's inputs, and a scanner can read
+the package list without unpacking the layers.
+
 The workflow needs two repository secrets (Settings → Secrets and variables → Actions):
 `DOCKERHUB_USERNAME` (the Docker Hub account) and `DOCKERHUB_TOKEN` (an access token with Read & Write scope, not the
 account password). Builds run on GitHub-hosted runners, so no local Docker installation is required.
@@ -341,7 +347,11 @@ publishing workflow leaves a Docker Hub token with write scope on the runner: a 
 nobody reviewed running at a version nobody froze. `ci.yml` enforces this — the step "Workflow actions are pinned to
 commit SHAs" fails when any action reference is not a 40-character SHA.
 
-To update a pin, resolve the commit the tag currently points at (an annotated tag needs one more hop to the commit)
+`.github/dependabot.yml` opens weekly pull requests for the three things that go stale on their own: the npm
+dependencies, the GitHub Actions pins below (it rewrites the SHA and its comment), and the `node` base image used by
+`docker/Dockerfile`. Commit subjects follow CONTRIBUTING.md (`deps: …`, `ci: …`, `docker: …`).
+
+To update a pin by hand, resolve the commit the tag currently points at (an annotated tag needs one more hop to the commit)
 and replace the SHA plus its comment:
 
 ```bash

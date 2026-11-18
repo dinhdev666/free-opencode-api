@@ -24,6 +24,5 @@ test
 # nothing in the container reads it. LICENSE stays, because it has to travel with the code.
 AGENTS.md
 CONTRIBUTING.md
-IMPROVEMENT_PROPOSALS.md
 README.md
 docker/README.md

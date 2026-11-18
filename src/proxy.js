@@ -290,8 +290,8 @@ export const resolveApiKey = (value) => {
 
 /**
  * Boolean option parsing shared by the entry point and startProxy, so the two cannot disagree about what
- * `DISABLE_TOOLS=yes` means. Numbers follow JavaScript truthiness (`1` is on, `0` off); an unrecognised value
- * returns the fallback instead of being coerced.
+ * `DISABLE_TOOLS=yes` means. A number is read as a switch only when it is exactly `1` or `0` (`2` is not "on", it is
+ * unreadable); an unrecognised value returns the fallback instead of being coerced.
  */
 // The accepted spellings, module scope so a call does not rebuild them: `parseBoolean()` runs several times per
 // completion (a request body's `stream`, `stream_options.include_usage`, and the read that validates each one).
@@ -302,11 +302,11 @@ export function parseBoolean(value, fallback = undefined) {
     if (typeof value === 'boolean') return value;
     if (typeof value === 'number') return value === 1;
     if (typeof value === 'string') {
-        // The longest accepted spelling is five characters, so anything longer is rejected without being normalised: a
-        // request body is bounded by `OPENCODE_PROXY_MAX_BODY_MB`, and `{"stream": "aaaa…"}` (50 MiB) was copied and
-        // lowercased twice per completion - 10 ms per call on the single serving thread, ~100 MB of garbage - to answer
-        // a question the length already answers. `readableFlag()` in the handler calls this once to validate and once to
-        // read, so the cost was paid twice per field.
+        // The longest accepted spelling is five characters, so a value over 64 characters is rejected before it is
+        // trimmed or lowercased: a request body is bounded by `OPENCODE_PROXY_MAX_BODY_MB`, and `{"stream": "aaaa…"}`
+        // (50 MiB) was copied and lowercased twice per completion - 10 ms per call on the single serving thread, ~100 MB
+        // of garbage - to answer a question the length already answers. `readableFlag()` in the handler calls this once
+        // to validate and once to read, so the cost was paid twice per field.
         const trimmed = value.length > 64 ? '' : value.trim();
         if (!trimmed) return fallback;
         const normalized = trimmed.toLowerCase();

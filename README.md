@@ -575,7 +575,7 @@ Two GitHub Actions workflows live in `.github/workflows/`; the CI checks need no
 
 | Workflow | Trigger | What it does |
 | --- | --- | --- |
-| `ci.yml` | every push to `main`, every pull request, manual dispatch | Runs `pnpm run check`, `sh -n docker/docker-entrypoint.sh` and `pnpm test` (the smoke suite in `test/`, which needs no OpenCode CLI or network) on Node 20, 22 and 24; a fourth job builds the Docker image, starts the container and waits for `/health` to answer. |
+| `ci.yml` | every push to `main`, every pull request, manual dispatch | Runs `pnpm run check`, `sh -n docker/docker-entrypoint.sh` and `pnpm test` (the smoke suite in `test/`, which needs no OpenCode CLI or network) on Node 20, 22 and 24, plus two gate steps — every action pinned to a commit SHA, and every added commit subject checked against the commit convention; a fourth job builds the Docker image, starts the container and waits for `/health` to answer. |
 | `docker-publish.yml` | pushing a `v*.*.*` tag, or a manual dispatch from a tag | Fails if the tag does not match `version` in `package.json`, then builds `linux/amd64` + `linux/arm64` and pushes `<version>` and `latest` to Docker Hub. Needs the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. |
 
 The four required status checks on `main` are `Test on Node 20`, `Test on Node 22`, `Test on Node 24` and
@@ -597,6 +597,7 @@ git push origin v3.0.0
 ├── index.js                  # Entry point: merges config and starts the gateway
 ├── src/
 │   ├── proxy.js              # Fastify app, OpenAI routes, OpenCode backend management
+│   ├── config.js             # Reads config.json (a missing file is fine, an unusable one stops the gateway)
 │   └── logger.js             # Zero-dependency leveled logger with secret masking
 ├── config.json.example       # Sample configuration
 ├── package.json              # Scripts, dependencies, packageManager pin (pnpm)
@@ -604,7 +605,9 @@ git push origin v3.0.0
 ├── docker/                   # Dockerfile, entrypoint, container documentation
 ├── test/
 │   ├── stub-opencode.mjs     # Minimal opencode serve stand-in used by the smoke suite
-│   └── smoke.mjs             # Contract checks: boot stub + gateway, assert OpenAI behaviour
+│   ├── smoke.mjs             # Contract checks: boot stub + gateway, assert OpenAI behaviour
+│   ├── check-syntax.mjs      # `node --check` over every JavaScript file in the repository
+│   └── check-commit-messages.mjs  # Applies the CONTRIBUTING.md rules to a commit range
 ├── .github/workflows/
 │   ├── ci.yml                # CI: syntax check, smoke suite (Node 20/22/24), Docker build
 │   └── docker-publish.yml    # Release: multi-arch image to Docker Hub on a v*.*.* tag

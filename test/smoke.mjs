@@ -3540,11 +3540,18 @@ async function run() {
     const debugUrl = `http://127.0.0.1:${debugPort}`;
     await waitForOk(`${debugUrl}/health`);
     const DEBUG_SECRET = 'sk-must-not-appear-in-the-log';
+    // A credential the client puts in the *prompt* rather than in a credential-named field: a wrapper forwarding its
+    // own config writes it there, and the "Upstream payload" dump of the final backend body used to print it verbatim
+    // while the earlier dump of the same body masked it.
+    const DEBUG_PROMPT_SECRET = 's3cr3t-inside-the-prompt-text';
     const debugAnswer = await fetch(`${debugUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
         body: JSON.stringify({
-            messages: [{ role: 'user', content: 'hi' }],
+            messages: [{
+                role: 'user',
+                content: `call http://alice:${DEBUG_PROMPT_SECRET}@127.0.0.1:4097/session?token=${DEBUG_PROMPT_SECRET} and store it`
+            }],
             api_key: DEBUG_SECRET,
             metadata: { authorization: `Bearer ${DEBUG_SECRET}`, note: 'kept' }
         }),
@@ -3559,8 +3566,17 @@ async function run() {
         `${debugAnswer.status} ${debugDump.slice(0, 200)}`);
     check('the debug body dump keeps the field and the rest of the body',
         /"api_key":"sk-[^"]*\*\*\*\(\d+ chars\)"/.test(debugDump) &&
-        /"note":"kept"/.test(debugDump) && /"content":"hi"/.test(debugDump),
+        /"note":"kept"/.test(debugDump) &&
+        /"content":"call http:\/\/\*\*\*@/.test(debugDump),
         debugDump.slice(0, 300));
+    // The last dump before the backend call is the one that carries the built prompt, and it is read for exactly this
+    const upstreamDump = debugOutput.split('\n').find((line) => line.includes('Upstream payload')) || '';
+    check('the upstream payload dump masks a credential quoted in the prompt',
+        upstreamDump.includes('Upstream payload') && !debugOutput.includes(DEBUG_PROMPT_SECRET) &&
+        /http:\/\/\*\*\*@127\.0\.0\.1:4097\/session\?token=\*\*\*/.test(upstreamDump) &&
+        upstreamDump.includes('and store it'),
+        upstreamDump.slice(-400));
+
     stopGateway(debugGateway);
     await waitForExit(debugGateway);
 

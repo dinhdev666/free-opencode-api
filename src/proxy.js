@@ -1491,11 +1491,39 @@ function createApp(config) {
 
     // Shared by /v1/models and /v1/models/:modelId so both answer from the same cache
     let modelsInFlight = null;
+    // An expired cache is still an answer: the provider list changes rarely, and awaiting the refresh put one full
+    // backend round trip (RTT, DNS and connect included) in front of the request that crossed the TTL - measured at
+    // 5.0-5.3 ms against 0.6 ms warm against a loopback stub, and one network RTT against a real backend. A five
+    // millisecond old list is not wrong for a client choosing a model, so the stale one is served while the refresh
+    // runs behind it. The bound is what keeps "serve stale" from meaning "never notice a backend that stopped
+    // answering".
+    const MODELS_STALE_MS = 60000;
+    // When the last background refresh started. Serving stale would otherwise start one attempt per request: a
+    // provider that keeps failing never refreshes the cache, so every listing would ask it again - the per-request
+    // round trip `FALLBACK_HOLD_MS` prevents on the response path, reintroduced on the backend one. One attempt per
+    // TTL is exactly what the blocking path cost before.
+    let modelsRefreshAt = 0;
+    const refreshModelsInBackground = () => {
+        if (modelsInFlight) return;
+        const now = Date.now();
+        if (now - modelsRefreshAt < MODELS_CACHE_TTL_MS) return;
+        modelsRefreshAt = now;
+        modelsInFlight = fetchModels();
+        // `fetchModels()` answers its own failures (fallback plus a log line), so this only frees the dedupe slot
+        modelsInFlight.then(() => { modelsInFlight = null; }, () => { modelsInFlight = null; });
+    };
+    // "Usable now, and does it need a refresh?" lives in one place because the listing route and the by-id route have
+    // to agree on the bound, and a second copy of these two comparisons is how they stop agreeing.
+    const warmModelsCache = () => {
+        if (!modelsCache) return false;
+        const age = Date.now() - modelsCacheAt;
+        if (age >= MODELS_STALE_MS) return false;
+        if (age >= MODELS_CACHE_TTL_MS) refreshModelsInBackground();
+        return true;
+    };
     const loadModels = async () => {
         const now = Date.now();
-        if (modelsCache && now - modelsCacheAt < MODELS_CACHE_TTL_MS) {
-            return modelsCache.data;
-        }
+        if (warmModelsCache()) return modelsCache.data;
         // A cold cache under a burst (an autoscaler probe, a client retrying a startup listing) would otherwise put
         // one provider round trip behind every request in that burst; the first caller does the work and the rest
         // await the same promise
@@ -1578,9 +1606,11 @@ function createApp(config) {
     };
 
     app.get('/v1/models', { schema: { response: { 200: MODELS_SCHEMA } } }, async (request, reply) => {
-        // A fresh cache answers with the body built when it was filled (Fastify sends a string payload as it is, the
-        // way `/health` and `/` do); a cold cache takes the object path, which is also what the fallback uses
-        if (modelsCache && Date.now() - modelsCacheAt < MODELS_CACHE_TTL_MS) {
+        // A warm cache answers with the body built when it was filled (Fastify sends a string payload as it is, the
+        // way `/health` and `/` do); a cold or too-old cache takes the object path, which is also what the fallback
+        // uses. `warmModelsCache()` includes the expired-but-bounded entry, so the 5 s cliff is a background refresh
+        // rather than a provider round trip on this request.
+        if (warmModelsCache() && modelsCacheBody) {
             return reply.type('application/json; charset=utf-8').send(modelsCacheBody);
         }
         return { object: 'list', data: await loadModels() };
@@ -1589,10 +1619,12 @@ function createApp(config) {
     // OpenAI clients (and several SDKs) look a model up by id. The gateway does not restrict the model a chat
     // request may use, so an id that is not in the provider list is described here instead of being a 404.
     const describeModel = async (requestedId) => {
-        // The map is only as fresh as the cache it was built with, so a by-id request that finds the cache expired
-        // reloads the listing (one backend round trip, like the listing route) instead of answering from a stale map
-        const known = modelsCache && modelsById && Date.now() - modelsCacheAt < MODELS_CACHE_TTL_MS
-            ? modelsById.get(requestedId)
+        // A warm cache answers from the map built with it - both are filled together, so the map can be no fresher
+        // than the entry - and an expired-but-bounded one answers from the same map instead of paying a provider round
+        // trip per by-id lookup (clients resolve the model before every completion). A cold or too-old cache reloads
+        // the listing, one backend round trip like the listing route.
+        const known = warmModelsCache()
+            ? (modelsById ? modelsById.get(requestedId) : null)
             : (await loadModels()).find((m) => m.id === requestedId);
         if (known) return known;
         // The default model answers with its own name even when a healthy backend lists other models: it is the id a

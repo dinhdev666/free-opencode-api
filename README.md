@@ -76,8 +76,10 @@ summary, CORS headers, bearer auth) and no plugin-level middleware chain. Additi
   route (100.1k → 102.8k req/s).
 - **Short model-list cache** — `/v1/models` results are cached for 5 s, so client startup probes do not hit the
   backend every time, and a burst that arrives with a cold cache shares a single provider round trip instead of one
-  per request. A failure is not cached either, but it is held for 1 s, so a provider that answers 500 is not asked
-  once per listing (measured 72.4k → 101.2k req/s on the route, +40 %).
+  per request. An **expired** entry is still served (for up to 60 s) while the refresh runs in the background, so the
+  request that crosses the 5 s boundary no longer waits for a provider round trip: a listing measured 5.0 ms with the
+  blocking refresh and 0.6 ms from a warm cache. A failure is not cached either, but it is held for 1 s, so a provider
+  that answers 500 is not asked once per listing (measured 72.4k → 101.2k req/s on the route, +40 %).
 - **No hidden allocations on the hot path** — header masking for debug logs is only built when `LOG_LEVEL=debug`,
   the bearer token string is precomputed once, and request paths are parsed once per request.
 - **SSE written straight to the socket** — streaming replies hijack the response and write `data:` frames directly

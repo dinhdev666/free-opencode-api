@@ -104,6 +104,21 @@ const closeSocketAfterFlush = (socket) => {
     }
 };
 
+// The client's own trace id, when it sent one that can be copied into a header and a log line: a short printable token
+// only, because the value reaches both. Module scope because the two handlers that answer a request the router or the
+// parser rejected - they run before any Fastify hook, and one of them is handed the raw request - echo it too: a client
+// that sets its own trace id must find the same id in the response and in the gateway's log line, on every path.
+const CLIENT_REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+const requestId = (request) => {
+    const raw = request?.headers?.['x-request-id'];
+    if (typeof raw !== 'string') return null;
+    const trimmed = raw.trim();
+    return CLIENT_REQUEST_ID_RE.test(trimmed) ? trimmed : null;
+};
+// A generated id for the refusals that answer before routing (a parse error, a URL that cannot be decoded): those
+// paths log a `warn` line a client cannot otherwise connect to its response.
+const generatedRequestId = () => `gw-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+
 // One log line is one record. A client-controlled value carrying a newline would be read as a *second* record (a
 // forged request summary, a fake `[Security]` or `[Shutdown]` line), an ANSI escape would reach the operator's
 // terminal and the log shipper, and an unbounded value would turn one request body into an arbitrarily large log
@@ -254,6 +269,11 @@ export const resolveApiKey = (value) => {
  * `DISABLE_TOOLS=yes` means. Numbers follow JavaScript truthiness (`1` is on, `0` off); an unrecognised value
  * returns the fallback instead of being coerced.
  */
+// The accepted spellings, module scope so a call does not rebuild them: `parseBoolean()` runs several times per
+// completion (a request body's `stream`, `stream_options.include_usage`, and the read that validates each one).
+const TRUE_SPELLINGS = ['1', 'true', 'yes', 'y', 'on'];
+const FALSE_SPELLINGS = ['0', 'false', 'no', 'n', 'off'];
+
 export function parseBoolean(value, fallback = undefined) {
     if (typeof value === 'boolean') return value;
     if (typeof value === 'number') return value === 1;
@@ -266,8 +286,8 @@ export function parseBoolean(value, fallback = undefined) {
         const trimmed = value.length > 64 ? '' : value.trim();
         if (!trimmed) return fallback;
         const normalized = trimmed.toLowerCase();
-        if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) return true;
-        if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) return false;
+        if (TRUE_SPELLINGS.includes(normalized)) return true;
+        if (FALSE_SPELLINGS.includes(normalized)) return false;
     }
     return fallback;
 }
@@ -496,6 +516,12 @@ let MAX_BODY_MB = readLimit('OPENCODE_PROXY_MAX_BODY_MB', { min: 1, max: 200, fa
 
 let activeTasks = 0;
 
+// How long after a completion's own budget the slot watchdog waits before freeing the slot of a task that never
+// settled. It only has to cover the handler's finishing path after a timeout (aborting the collector, the in-band
+// error frame, the session-delete call), whose own budget is SESSION_CLEANUP_TIMEOUT_MS: five seconds leaves room for
+// that plus the response write without leaving the gateway refusing work for long.
+const SLOT_WATCHDOG_GRACE_MS = 5000;
+
 function runQueuedTask() {
     const entry = queue.shift();
     const { task, timeout, resolve, reject } = entry;
@@ -520,6 +546,20 @@ function runQueuedTask() {
         if (settled) return;
         settled = true;
         reject(new Error(timeoutMessage(timeoutMs)));
+        // The client has been answered 504, but `.finally(release)` below only runs once the task settles - and a task
+        // parked in an await that never resolves (a backend call without a deadline, a stuck socket) is exactly the
+        // case this timer exists for: at the default concurrency of 1 that single task pinned the only slot, so every
+        // later completion queued, the queue filled, and a gateway that still answered /health 200 refused all traffic
+        // with 503. The grace gives the handler's own finishing path (which releases on response completion) time to
+        // run first; `release()` is idempotent, so the two cannot double-count.
+        const watchdog = setTimeout(() => {
+            if (released) return;
+            logger.warn(
+                `[Proxy] A completion outlived its ${timeoutMs}ms budget by ${SLOT_WATCHDOG_GRACE_MS}ms; releasing its slot`
+            );
+            release();
+        }, SLOT_WATCHDOG_GRACE_MS);
+        if (watchdog.unref) watchdog.unref();
     }, timeoutMs);
 
     Promise.resolve()
@@ -649,6 +689,15 @@ export function resolveBackendAuth(serverUrl) {
     return { url: withoutUserInfo, authorization: `Basic ${Buffer.from(`${user}:${password}`, 'utf8').toString('base64')}` };
 }
 
+// How long one health probe may take, start to finish. The deadline has to cover the phases `req.setTimeout()` does not:
+// that timer only starts once a socket is *assigned and connected*, so `dns.lookup()` and the TCP handshake were
+// unbounded. `ensureBackend()` runs this probe on the completion path (with the completion slot already taken) and in
+// the "another request is starting the backend" wait loop, so a backend host that drops SYNs - a firewall, an
+// unresolvable name, a wrong port on a black-holed address - suspended the request for the OS connect timeout (~2 min
+// on Linux) while every other backend call in this file carries a deadline. The probe is not a completion: a couple of
+// seconds is the whole budget it gets.
+const HEALTH_PROBE_TIMEOUT_MS = 2000;
+
 /**
  * Robust Health Check Helper
  */
@@ -656,19 +705,36 @@ function checkHealth(serverUrl, authorization = BACKEND_AUTHORIZATION) {
     const secure = String(serverUrl).startsWith('https://');
     const transport = secure ? https : http;
     return new Promise((resolve, reject) => {
+        let settled = false;
+        let guard = null;
+        const finish = (error) => {
+            if (settled) return;
+            settled = true;
+            if (guard) clearTimeout(guard);
+            if (error) reject(error);
+            else resolve(true);
+        };
+        const abandon = (reason) => {
+            if (settled) return;
+            finish(reason);
+            try {
+                req.destroy();
+            } catch (e) { }
+        };
         const options = { agent: secure ? healthAgentSecure : healthAgent };
         if (authorization) options.headers = { authorization };
         const req = transport.get(`${serverUrl}/health`, options, (res) => {
             // Drain the body so the socket goes back to the keep-alive pool
             res.resume();
-            if (res.statusCode === 200) resolve(true);
-            else reject(new Error(`Status ${res.statusCode}`));
+            if (res.statusCode === 200) finish(null);
+            else finish(new Error(`Status ${res.statusCode}`));
         });
-        req.on('error', (e) => reject(e));
-        req.setTimeout(2000, () => {
-            req.destroy();
-            reject(new Error('Timeout'));
-        });
+        // Armed before the socket exists, so it covers DNS and connect as well as the response; unref'd so a probe in
+        // flight never keeps the process alive on its own
+        guard = setTimeout(() => abandon(new Error('Timeout')), HEALTH_PROBE_TIMEOUT_MS);
+        if (guard.unref) guard.unref();
+        req.on('error', (e) => finish(e));
+        req.setTimeout(HEALTH_PROBE_TIMEOUT_MS, () => abandon(new Error('Timeout')));
     });
 }
 
@@ -717,6 +783,18 @@ const isConnectionError = (error) => {
         message.includes('ECONNREFUSED') ||
         message.includes('socket hang up') ||
         error?.cause?.code === 'ECONNREFUSED';
+};
+
+// A connection that was *refused* proves nothing reached the backend; `fetch failed` / `socket hang up` do not - the
+// request may have been accepted and only the answer lost. The distinction matters for the one call the gateway retries
+// (`session.create`): retrying a request that may have created a session leaves that first session on the backend with
+// no id in this process, so neither `cleanupSession()` nor the shutdown drain can ever delete it.
+const isConnectionRefused = (error) => {
+    if (String(error?.message || '').includes('ECONNREFUSED')) return true;
+    const cause = error?.cause;
+    if (cause?.code === 'ECONNREFUSED') return true;
+    // Node's `fetch` wraps the per-address failures (`127.0.0.1:4097`, `::1:4097`) in an AggregateError
+    return Array.isArray(cause?.errors) && cause.errors.some((inner) => inner?.code === 'ECONNREFUSED');
 };
 
 // A backend that could not be reached, or could not be started, is an upstream failure and not a bug in the gateway:
@@ -928,8 +1006,11 @@ function createApp(config) {
         // The error code is the useful part for support; the message can carry raw bytes from the request, so it is
         // not logged (a log line is one record and must not be forgeable by a malformed client)
         const code = typeof error?.code === 'string' && /^[A-Z_]{1,64}$/.test(error.code) ? error.code : undefined;
-        const reqId = `gw-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-        logger.warn(`[Proxy] Rejected malformed request: ${error?.code || 'parse error'}`);
+        const reqId = generatedRequestId();
+        // The id goes into the response header, so it belongs in the log line that reports the same request: a client
+        // report quotes the id, and without it here there was nothing to search for it by (`AGENTS.md`: the response id
+        // is the one the request log line ends with)
+        logger.warn(`[Proxy] Rejected malformed request: ${error?.code || 'parse error'} [${reqId}]`);
         const body = JSON.stringify({ error: { message: reason, type: 'invalid_request_error', ...(code ? { code } : {}) } });
         if (socket.writable) {
             socket.write(
@@ -958,9 +1039,12 @@ function createApp(config) {
     // `type` and every response an `X-Request-Id`. `find-my-way` hands this handler the raw request and response, so
     // the envelope, the CORS headers and the id are written here, the same way `clientErrorHandler` does it.
     const badUrlHandler = (path, rawRequest, rawResponse) => {
-        const reqId = `gw-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        // The client's own trace id when it sent a usable one, like every other response path; that request never
+        // reached the hook that normally echoes it, so without this a client setting `X-Request-Id` got a different id
+        // back for the one class of failure where the cause is least obvious.
+        const reqId = requestId(rawRequest) || generatedRequestId();
         // The path is the client's own bytes: truncated and stripped of anything that could forge a log line
-        logger.warn(`[Proxy] Rejected a URL that cannot be decoded: ${loggableUrl(urlPath(String(path ?? '')))}`);
+        logger.warn(`[Proxy] Rejected a URL that cannot be decoded: ${loggableUrl(urlPath(String(path ?? '')))} [${reqId}]`);
         const body = JSON.stringify({
             error: {
                 message: 'The request URL could not be decoded',
@@ -1024,15 +1108,6 @@ function createApp(config) {
 
     // Precomputed once: comparing against a ready-made buffer avoids rebuilding the token on every request.
     // resolveApiKey() guarantees a non-empty key, so authentication can never be switched off.
-    const CLIENT_REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
-    // The incoming X-Request-Id, if it is usable as-is (see the note where it is used)
-    const requestId = (request) => {
-        const raw = request.headers['x-request-id'];
-        if (typeof raw !== 'string') return null;
-        const trimmed = raw.trim();
-        return CLIENT_REQUEST_ID_RE.test(trimmed) ? trimmed : null;
-    };
-
     const apiKeyToken = resolveApiKey(API_KEY);
     const apiKeyTokenBuffer = Buffer.from(apiKeyToken);
     const AUTH_SCHEME_RE = /^Bearer[ \t]+/i;
@@ -1408,7 +1483,11 @@ function createApp(config) {
         if (requestedId === DEFAULT_MODEL_ID) return DEFAULT_MODEL;
         const slash = requestedId.indexOf('/');
         const provider = slash > 0 ? requestedId.slice(0, slash) : 'opencode';
-        const name = slash > 0 ? requestedId.slice(slash + 1) : requestedId;
+        // `>= 0`, not `> 0`: an id whose first segment is empty (`/big-pickle`) has its separator at index 0, and
+        // `> 0` answered `name: "/big-pickle"` - the separator as part of a model name - while the documented
+        // derivation (`provider` = text before `/`, default `opencode`) yields `big-pickle`. `/big-pickle` is refused
+        // `400` by `/v1/chat/completions`, so the two routes named the same non-model differently.
+        const name = slash >= 0 ? requestedId.slice(slash + 1) : requestedId;
         return { id: requestedId, name, object: 'model', owned_by: provider };
     };
     const modelByIdSchema = { schema: { response: { 200: MODEL_SCHEMA } } };
@@ -1660,7 +1739,9 @@ function createApp(config) {
             cachedToolOverrides = null;
             cachedToolAt = Date.now();
             cachedToolError = true;
-            logDebug('Tool override fetch failed', { error: e.message });
+            // Masked and bounded like every other upstream sentence: a thrown `fetch`/SDK error quotes the URL it
+            // failed on, and a log line is collected (`docker logs`) as often as not
+            logDebug('Tool override fetch failed', { error: clientFacingText(e.message) });
             return null;
         }
     };
@@ -1980,8 +2061,40 @@ function createApp(config) {
         let reasoning = '';
         let receivedDelta = false;
         let deltaChars = 0;
-        // Last snapshot seen per part, so an incremental event is diffed against its own part (see snapshotDelta)
+        // Snapshots seen per part key, so an incremental event is diffed against its own part (see snapshotDelta). The
+        // key is the backend's part id when it sends one; an id-less part is keyed by its type, and one answer can
+        // carry several id-less parts of the same type, so a key holds the snapshots of every part it stands for and the
+        // increment is taken against the one the new text continues.
         const partTexts = new Map();
+        // A bounded list: a part whose text is rewritten (SHRINK) starts a new entry, and a backend that rewrites on
+        // every event must not grow this per completion.
+        const MAX_PART_SNAPSHOTS = 4;
+        // The increment for a part snapshot, and the bookkeeping that keeps its base current. `snapshotDelta()` returns
+        // the whole text when the new snapshot is not an extension of the base - the rewrite case, and also the first
+        // update of a *different* id-less part of the same type - so that answer is what selects the base: an existing
+        // snapshot it continues is updated in place, anything else becomes its own base.
+        const recordPartSnapshot = (key, text) => {
+            const snapshots = partTexts.get(key);
+            if (!snapshots) {
+                if (text) partTexts.set(key, [text]);
+                return text;
+            }
+            for (let i = snapshots.length - 1; i >= 0; i -= 1) {
+                const increment = snapshotDelta(snapshots[i], text);
+                if (increment !== text) {
+                    // The part continues this snapshot: same base, new snapshot (an empty text drops a base that can
+                    // no longer be continued, so `''` stays a fresh start rather than a prefix of everything)
+                    if (text) snapshots[i] = text;
+                    else snapshots.splice(i, 1);
+                    return increment;
+                }
+            }
+            if (text) {
+                snapshots.push(text);
+                if (snapshots.length > MAX_PART_SNAPSHOTS) snapshots.shift();
+            }
+            return text;
+        };
         let firstDeltaAt = null;
         let firstDeltaTimer = null;
         let idleTimer = null;
@@ -2074,9 +2187,11 @@ function createApp(config) {
                             // events left this map unset, so the next delta-less event diffed against '' and duplicated
                             // the answer the client already had.
                             if ((part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
-                                const partKey = part.id || part.type;
-                                if (!delta) delta = snapshotDelta(partTexts.get(partKey) || '', part.text);
-                                partTexts.set(partKey, part.text);
+                                // The snapshot is recorded on every event that carries one, whether or not the event also
+                                // carries a delta, so the increment of a delta-less event is never taken against a stale
+                                // base; the returned increment is only needed when the event brought no delta of its own.
+                                const increment = recordPartSnapshot(part.id || part.type, part.text);
+                                if (!delta) delta = increment;
                             }
                             if (delta) {
                                 receivedDelta = true;
@@ -2605,9 +2720,16 @@ function createApp(config) {
                         // client had to retry to get the recovery the gateway could do itself. Drop the cached trust,
                         // start the backend again and retry the call once; a deadline or a backend that is really gone
                         // is not retried (a timeout keeps its own 504, and the retry would spend the budget twice).
-                        if (!isConnectionError(createError)) throw createError;
-                        logDebug('Session creation failed on a connection error, restarting the backend', {
-                            error: createError.message
+                        //
+                        // Only a *refused* connection is retried: that one proves the request never reached the
+                        // backend. `fetch failed` and `socket hang up` are what a backend that accepted the POST and
+                        // then died looks like, and retrying those created a second session while the first one kept
+                        // existing with no id in this process - nothing could delete it (an external backend keeps it,
+                        // and its message history, for good). Those requests answer `502 backend_unreachable`, which is
+                        // the documented answer for "the backend disappeared mid-request"; the next request recovers.
+                        if (!isConnectionRefused(createError)) throw createError;
+                        logDebug('Session creation failed on a refused connection, restarting the backend', {
+                            error: clientFacingText(createError.message)
                         });
                         const backend = backendState.get(OPENCODE_SERVER_URL);
                         if (backend) backend.healthyAt = 0;
@@ -2665,7 +2787,10 @@ function createApp(config) {
                                 logDebug('Session deleted', { sessionId });
                             }
                         } catch (e) {
-                            logger.debug('[Proxy] Failed to delete session:', { sessionId, error: e.message });
+                            logger.debug('[Proxy] Failed to delete session:', {
+                                sessionId,
+                                error: clientFacingText(e.message)
+                            });
                         } finally {
                             // Bookkeeping for the shutdown drain, not the cleanup itself: a delete that failed (an
                             // already-gone session, a rejected call) must not be retried at exit, and the set must not
@@ -3108,7 +3233,9 @@ function createApp(config) {
                     logger.error('[Proxy] API Error (upstream call failed)', {
                         reqId,
                         sessionId,
-                        message: clientFacingText(error.message),
+                        // The same helper the response body below uses: whatever threw may not be an `Error` at all, and
+                        // reading `.message` off it logged an empty cause for a failure that had one
+                        message: handlerFailureMessage(error),
                         status: upstream.status,
                         // The body is backend-controlled text: it can quote a URL and a log line is collected as often as not
                         bodySummary: clientFacingText(upstream.bodySummary) || null
@@ -3124,7 +3251,7 @@ function createApp(config) {
 
                     // The reason can quote a URL (a proxy in front of the backend does), so it is masked before it
                     // reaches the response body and, below, the log line
-                    let errorMessage = clientFacingText(error.message);
+                    let errorMessage = handlerFailureMessage(error);
                     let statusCode = 500;
                     if (error.message && error.message.includes('Request timeout')) {
                         statusCode = 504;
@@ -3946,18 +4073,39 @@ export function startProxy(options) {
     const drainLiveSessions = async (budgetMs = SHUTDOWN_SESSION_TIMEOUT_MS) => {
         const deadline = Date.now() + budgetMs;
         let deleted = 0;
+        let failed = 0;
         // One snapshot missed a session whose `session.create` answered after it was taken (a slow or busy backend, a
         // proxy in front of one): the completion added its id to a set nobody read again, and its own cleanup never
         // ran, so an external backend kept that session for good. The set is re-read while it is non-empty.
         while (liveSessions.size && Date.now() < deadline) {
             const ids = [...liveSessions];
-            await Promise.all(ids.map((id) => client.session.delete({
-                path: { id },
-                ...backendDeadline(Math.max(1, Math.min(SHUTDOWN_SESSION_TIMEOUT_MS, deadline - Date.now())))
-            }).then(() => {
-                liveSessions.delete(id);
-                deleted += 1;
-            }).catch(() => { })));
+            let deletedThisRound = 0;
+            await Promise.all(ids.map(async (id) => {
+                // The SDK resolves a non-2xx answer with `{ error, response }` instead of rejecting (the rule every
+                // other call in this file follows, and what `cleanupSession()` checks for this same call): testing only
+                // the rejection path counted a refused delete as a deletion, dropped the id from the set and reported
+                // success while the session - with its whole message history - stayed on the backend for good.
+                const result = await client.session.delete({
+                    path: { id },
+                    ...backendDeadline(Math.max(1, Math.min(SHUTDOWN_SESSION_TIMEOUT_MS, deadline - Date.now())))
+                }).catch(() => null);
+                if (result && !result.error) {
+                    liveSessions.delete(id);
+                    deletedThisRound += 1;
+                }
+            }));
+            deleted += deletedThisRound;
+            if (deletedThisRound === 0) {
+                // Nothing was deleted: the backend refuses (or is gone). Retrying the same calls until the budget runs
+                // out cannot turn a refusal into a success, so the remaining ids are reported once instead.
+                failed = ids.length;
+                break;
+            }
+        }
+        if (failed) {
+            logger.warn('[Shutdown] Could not delete every session left by interrupted completions', {
+                remaining: failed
+            });
         }
         if (deleted && logger.isEnabled('debug')) {
             logger.debug('[Shutdown] Deleted the sessions left by interrupted completions', { count: deleted });

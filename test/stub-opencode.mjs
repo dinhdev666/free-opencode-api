@@ -25,6 +25,13 @@ const FAIL_PROVIDERS = process.env.STUB_FAIL_PROVIDERS === '1';
 // Reject POST /session (an incompatible backend, a proxy in front of it) so a test can prove the gateway reports the
 // upstream status and reason instead of a bare 500
 const FAIL_SESSION = process.env.STUB_FAIL_SESSION === '1';
+// Accept POST /session (the session is created on the backend) and then drop the connection without answering: what a
+// backend that dies between accepting the call and writing the answer looks like. A gateway that retries it creates a
+// second session and loses the id of the first, so the test reads `/__sessions` to prove only one was created
+const DROP_CREATE = process.env.STUB_DROP_CREATE === '1';
+// Refuse DELETE /session/:id with a 500 and keep the session: the SDK resolves that with an error tuple instead of
+// throwing, so a test can prove the gateway inspects it instead of counting a refused delete as a deletion
+const REJECT_DELETES = process.env.STUB_REJECT_DELETES === '1';
 // Hang on this session creation (1-based) and never answer: a backend that wedges on POST /session, which is
 // what a queued completion used to be granted a second, fresh request budget for
 const HANG_CREATE_AFTER = Number(process.env.STUB_HANG_CREATE_AFTER || 0);
@@ -276,16 +283,24 @@ async function streamSnapshots(sessionID, snapshots, delayMs) {
 
 // Two text parts in one message, each sending its own cumulative snapshots, interleaved: what a backend does when the
 // model writes, calls a tool and keeps writing. Each part's text is the part's own full text, never the whole answer.
-async function streamTwoParts(sessionID, pieces, delayMs) {
+// `withIds: false` sends the same two parts without `id`, the shape a backend that does not identify its parts uses:
+// both parts are then of type `text`, so a diff keyed by the type alone mixes them up
+async function streamTwoParts(sessionID, pieces, delayMs, withIds = true) {
     for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
     let first = '';
     let second = '';
     for (const piece of pieces) {
         first += piece;
-        sendEvent({ type: 'message.part.updated', properties: { part: { id: 'prt_first', sessionID, type: 'text', text: first } } });
+        sendEvent({
+            type: 'message.part.updated',
+            properties: { part: { ...(withIds ? { id: 'prt_first' } : {}), sessionID, type: 'text', text: first } }
+        });
         await sleep(delayMs);
         second += piece.toUpperCase();
-        sendEvent({ type: 'message.part.updated', properties: { part: { id: 'prt_second', sessionID, type: 'text', text: second } } });
+        sendEvent({
+            type: 'message.part.updated',
+            properties: { part: { ...(withIds ? { id: 'prt_second' } : {}), sessionID, type: 'text', text: second } }
+        });
         await sleep(delayMs);
     }
     sendEvent({
@@ -454,6 +469,11 @@ const server = http.createServer(async (req, res) => {
             return;
         }
         sessions.set(id, { messages: [] });
+        if (DROP_CREATE) {
+            // Accepted, then the connection is dropped: the session exists and the caller never learns its id
+            req.destroy();
+            return;
+        }
         return sendJson(res, 200, { id });
     }
 
@@ -464,6 +484,7 @@ const server = http.createServer(async (req, res) => {
         const session = sessions.get(id);
 
         if (!isMessage && req.method === 'DELETE') {
+            if (REJECT_DELETES) return sendJson(res, 500, { error: { message: 'the session store is busy' } });
             if (sessions.delete(id)) deletedSessions += 1;
             return sendJson(res, 200, {});
         }
@@ -712,6 +733,17 @@ const server = http.createServer(async (req, res) => {
                     LAGSTORE_ANSWER.slice(0, Math.ceil(LAGSTORE_ANSWER.length / 2)),
                     LAGSTORE_ANSWER
                 ]).catch(() => {});
+                return;
+            }
+            if (session.promptText.includes('MULTIPARTNOID')) {
+                // The same interleaved cumulative parts, sent without ids: two parts of the same type must still be
+                // delivered once each instead of being diffed against one another
+                session.messages.push({
+                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } },
+                    parts: [{ type: 'text', text: MULTIPART_FIRST }, { type: 'text', text: MULTIPART_SECOND }]
+                });
+                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
+                streamTwoParts(id, ['alpha ', 'beta ', 'gamma '], 1, false).catch(() => {});
                 return;
             }
             if (session.promptText.includes('MULTIPART')) {

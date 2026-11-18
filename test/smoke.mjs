@@ -980,6 +980,16 @@ async function run() {
         defaultModel.json?.name === 'Big Pickle' && defaultModel.json?.owned_by === 'opencode',
         defaultModel.text.slice(0, 160));
 
+    // An id whose *first* segment is empty is a non-model too (`/v1/chat/completions` refuses it with a 400 naming the
+    // value), and its name is derived by the documented rule - text after the last `/` - rather than keeping the
+    // separator: `slash > 0` read the separator at index 0 as "no separator", so the name was `/big-pickle`.
+    const leadingSlash = await fetch(`${BASE}/v1/models/%2Fbig-pickle`, { headers: { authorization: `Bearer ${API_KEY}` } })
+        .then(async (r) => ({ status: r.status, json: await r.json() }));
+    check('a model id with an empty leading segment is described without its separator',
+        leadingSlash.status === 200 && leadingSlash.json?.id === '/big-pickle' &&
+        leadingSlash.json?.name === 'big-pickle' && leadingSlash.json?.owned_by === 'opencode',
+        `status ${leadingSlash.status} ${JSON.stringify(leadingSlash.json)?.slice(0, 160)}`);
+
     // A doubled slash is read as a trailing slash, so `/v1/models//` reaches the by-id route with an empty id.
     // Describing "" answered 200 with {"id":"","name":""} - not a model at all - so it is a missing route instead.
     const blankList = await fetch(`${BASE}/v1/models//`, { headers: { authorization: `Bearer ${API_KEY}` } })
@@ -1021,6 +1031,24 @@ async function run() {
         badUrl.headers.get('access-control-allow-origin') === '*' &&
         /^gw-[a-z0-9]+$/.test(badUrl.headers.get('x-request-id') || ''),
         `${badUrl.headers.get('access-control-allow-origin')} ${badUrl.headers.get('x-request-id')}`);
+    // ...and that id is in the log line for the same request: a client report quotes the id, so an id no log entry
+    // carries is the one thing the header cannot do. The client's own trace id is echoed on this path too - it is the
+    // path that answers before any hook, so it is where the echo was missing.
+    let badUrlLine = '';
+    for (let i = 0; i < 40 && !badUrlLine; i += 1) {
+        badUrlLine = gatewayOutput.split('\n').find((line) => line.includes('Rejected a URL that cannot be decoded')) || '';
+        if (!badUrlLine) await sleep(50);
+    }
+    check('the id in an undecodable-URL response is in its log line',
+        Boolean(badUrlLine) && badUrlLine.includes(badUrl.headers.get('x-request-id') || 'no-id'),
+        (badUrlLine || 'no log line').slice(0, 200));
+    const badUrlTraced = await fetch(`${BASE}/v1/models/%E0%A4%A`, {
+        headers: { authorization: `Bearer ${API_KEY}`, 'x-request-id': 'trace-cli-42' }
+    }).then(async (r) => ({ headers: r.headers, json: await r.json().catch(() => null) }));
+    check('an undecodable URL echoes a usable X-Request-Id like every other response',
+        badUrlTraced.headers.get('x-request-id') === 'trace-cli-42' &&
+        badUrlTraced.json?.error?.type === 'invalid_request_error',
+        `${badUrlTraced.headers.get('x-request-id')} ${JSON.stringify(badUrlTraced.json)?.slice(0, 120)}`);
 
     // --- validation -------------------------------------------------------------------------------------
     const invalid = await request('/v1/chat/completions', { method: 'POST', body: {} });
@@ -1597,6 +1625,31 @@ async function run() {
     check('a message with two interleaved text parts delivers each part exactly once',
         multiPartContent.trim() === multiPartExpected,
         JSON.stringify(multiPartContent));
+
+    // The same answer from a backend that sends no part ids: both parts are of type `text`, so a snapshot map keyed by
+    // the type alone diffs one part against the other and the client receives a part twice and the other's prefix not
+    // at all. The key holds the snapshots of every part it stands for; the increment is taken against the one the new
+    // text actually continues.
+    const multiPartNoId = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'MULTIPARTNOID' }], stream: true },
+        stream: true
+    });
+    const multiPartNoIdContent = parseSseFrames(multiPartNoId.text)
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        })
+        .filter((chunk) => chunk?.choices?.[0]?.delta?.content)
+        .map((chunk) => chunk.choices[0].delta.content)
+        .join('');
+    check('two id-less parts of the same type are delivered once each, not diffed against each other',
+        multiPartNoIdContent.trim() === multiPartExpected,
+        JSON.stringify(multiPartNoIdContent));
 
     // A part the backend rewrote (a snapshot shorter than the previous one) is not an extension of it: the whole text
     // has to be forwarded, so the client sees it instead of the collector swallowing the correction.
@@ -3057,6 +3110,54 @@ async function run() {
     stop(rejectStub);
     await waitForExit(rejectStub);
 
+    // --- a backend that accepts the creation and then drops the connection -----------------------------
+    // `fetch failed` and `socket hang up` are what a backend that *accepted* POST /session and died before answering
+    // looks like. Retrying that created a second session, and the first one - whose id this process never saw - stayed
+    // on the backend for good, since neither the completion's cleanup nor the shutdown drain can address it. Only a
+    // refused connection is retried now; this one answers 502 and the backend reports a single creation.
+    const dropStubPort = GATEWAY_PORT + 71;
+    const dropStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(dropStubPort), STUB_DROP_CREATE: '1' }
+    });
+    children.push(dropStub);
+    dropStub.stdout.on('data', () => {});
+    dropStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${dropStubPort}/health`);
+    const dropGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(dropStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${dropStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(dropGateway);
+    dropGateway.stdout.on('data', () => {});
+    dropGateway.stderr.on('data', () => {});
+    const dropUrl = `http://127.0.0.1:${dropStubPort + 1}`;
+    await waitForOk(`${dropUrl}/health`);
+    const droppedCreation = await fetch(`${dropUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(20000)
+    }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => null) }))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    check('a creation whose answer is lost is an upstream error',
+        droppedCreation.status === 502 && droppedCreation.json?.error?.type === 'server_error',
+        `status ${droppedCreation.status} ${JSON.stringify(droppedCreation.json)?.slice(0, 160)}`);
+    const dropSessions = await fetch(`http://127.0.0.1:${dropStubPort}/__sessions`).then((r) => r.json()).catch(() => null);
+    check('a lost session-creation answer is not retried into a second session',
+        dropSessions?.created === 1,
+        JSON.stringify(dropSessions)?.slice(0, 160));
+    stopGateway(dropGateway);
+    await waitForExit(dropGateway);
+    stop(dropStub);
+    await waitForExit(dropStub);
+
     // --- a backend error body larger than the summary --------------------------------------------------
     // The 500 characters the gateway keeps as a log summary used to come from `JSON.stringify(body).slice(0, 500)`:
     // the whole backend payload was serialised first, so a proxy answering with a megabyte of JSON paid a megabyte
@@ -4079,6 +4180,18 @@ async function run() {
     check('a parser-level rejection delivers its whole body instead of a reset',
         Number.isFinite(declaredLength) && Buffer.byteLength(rawBody, 'latin1') === declaredLength,
         `declared ${declaredLength}, received ${Buffer.byteLength(rawBody, 'latin1')}`);
+    // The id in that header has to be found in the log line about the same request: "my client got a 400 with id gw-…"
+    // is only traceable if the id is printed with the cause.
+    const parserId = (/x-request-id: (\S+)/i.exec(rawHeaderBlock) || [])[1] || '';
+    let parserLine = '';
+    for (let i = 0; i < 40 && !parserLine; i += 1) {
+        parserLine = gatewayOutput.split('\n')
+            .find((line) => line.includes('Rejected malformed request') && parserId && line.includes(parserId)) || '';
+        if (!parserLine) await sleep(50);
+    }
+    check('the id in a parser-level rejection is in its log line', Boolean(parserLine),
+        `${parserId} :: ${(parserLine || gatewayOutput.split('\n').filter((l) => l.includes('Rejected'))
+            .join(' | ')).slice(0, 200)}`);
 
     // --- a body that never arrives must not hold a connection --------------------------------------------
     // Fastify sets `requestTimeout: 0`, so nothing bounded the wait for an announced body: a client that sent a
@@ -4250,6 +4363,59 @@ async function run() {
         sessionsAfterShutdown?.live === 0,
         `live ${sessionsDuringShutdown?.live} -> ${sessionsAfterShutdown?.live}, exit ${drainExitCode}, ` +
         `${Date.now() - drainStoppedAt}ms`);
+
+    // --- a session the backend refuses to delete --------------------------------------------------------
+    // The SDK resolves a refused DELETE with `{ error, response }` instead of throwing, so a drain that only caught
+    // rejections counted the refusal as a deletion, dropped the id and reported success while the session stayed on the
+    // backend. The truth is reported instead: the id stays in the set and one warning names how many are left.
+    const refuseStubPort = GATEWAY_PORT + 73;
+    const refuseStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(refuseStubPort), STUB_REJECT_DELETES: '1' }
+    });
+    children.push(refuseStub);
+    refuseStub.stdout.on('data', () => {});
+    refuseStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${refuseStubPort}/health`);
+    const refusePort = refuseStubPort + 1;
+    const refuseGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(refusePort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${refuseStubPort}`,
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(refuseGateway);
+    let refuseOut = '';
+    refuseGateway.stdout.on('data', (chunk) => { refuseOut += chunk; });
+    refuseGateway.stderr.on('data', (chunk) => { refuseOut += chunk; });
+    await waitForOk(`http://127.0.0.1:${refusePort}/health`);
+    const refusedCompletion = fetch(`http://127.0.0.1:${refusePort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'STALL while shutting down' }] })
+    }).then(() => null).catch(() => null);
+    await sleep(400);
+    const refuseExit = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 12000);
+        refuseGateway.once('exit', (code) => {
+            clearTimeout(timer);
+            resolve(code);
+        });
+        stopGateway(refuseGateway);
+    });
+    await refusedCompletion;
+    const refuseSessions = await fetch(`http://127.0.0.1:${refuseStubPort}/__sessions`).then((r) => r.json()).catch(() => null);
+    check('a delete the backend refuses is not counted as a deletion',
+        refuseExit === 0 && refuseSessions?.live === 1 && refuseSessions?.deleted === 0 &&
+        /Could not delete every session/.test(refuseOut) && /remaining/.test(refuseOut),
+        `exit ${refuseExit}, ${JSON.stringify(refuseSessions)}, ` +
+        `${refuseOut.split('\n').filter((line) => line.includes('delete')).join(' | ').slice(0, 200)}`);
+    stop(refuseStub);
+    await waitForExit(refuseStub);
 
     // --- a tuning value that cannot be used is named, not silently replaced -------------------------------
     // These three keys fell back to their default without a word, so an operator who typo'd the request budget ran a

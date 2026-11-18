@@ -70,7 +70,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 411 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 419 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -96,7 +96,7 @@ delta ending in a tag prefix that never becomes a tag), `REJECTPROMPT` (a 500 fo
 `PROMPTDONE` (the prompt response already carries the finished message), `CUTSTREAM` (two cumulative snapshots then
 a dropped event connection), `LAGSTORE` (the stream delivers the whole answer while the stored message keeps only its
 first characters, then the stream is cut), `MULTIPART` (one message whose two text parts send their own cumulative snapshots,
-interleaved), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `MIXED` (part updates
+interleaved), `MULTIPARTNOID` (the same without part ids, so both parts are of type `text`), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `MIXED` (part updates
 carrying both a `delta` and the part's cumulative text, then one closing update with neither),
 `CUTTOOL`/`OPENTOOL` (a tool-call answer whose stream is cut inside the closing/opening tag), `TOOLSPAM` (a tool-call
 block repeated by the answer), `BADPART` (a text part whose `text` is a number, next to a normal part), `REASONONLY`
@@ -105,7 +105,8 @@ credential-bearing URL behind a long message) - and by the variables `STUB_FAIL_
 `POST /session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 502 whose message quotes a
 credential-bearing URL), `STUB_ECHO_AUTH=1` (a 401 quoting the header it refused), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every creation after the n-th goes
-unanswered), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
+unanswered), `STUB_DROP_CREATE=1` (the session is created and the connection dropped before the answer),
+`STUB_REJECT_DELETES=1` (a `500` for `DELETE /session/:id`, so the session stays), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
 body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. Session-cleanup
 assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the session (its own
@@ -150,7 +151,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either — the one
   exception is `opencode/big-pickle`, answered from `DEFAULT_MODEL` so it keeps its `Big Pickle` name instead of the
   id-derived `big-pickle`. The wildcard route exists because clients send `opencode/big-pickle` unencoded as often as
-  `%2F`-escaped. A **blank** id (`/v1/models//`, `/v1/models/%20`) is a `404` in the usual `not_found` envelope, not a
+  `%2F`-escaped. The id-derived `name` is the text after the **first** `/` (`/v1/models/%2Fbig-pickle` answers
+  `name: "big-pickle"`, `owned_by: "opencode"`): treating the separator at index 0 as "no separator" put the `/` in the
+  name of a non-model that `/v1/chat/completions` refuses with a `400`. A **blank** id (`/v1/models//`, `/v1/models/%20`) is a `404` in the usual `not_found` envelope, not a
   `200` whose body is `{"id":"","name":""}`: a doubled slash reads as a trailing slash. An id whose **last segment** is empty (`/v1/models/%2F`, `/v1/models/opencode%2F`)
   is the same class of non-model and answers `404` too; `/v1/models/` itself still answers the listing.
 - `POST /v1/chat/completions` non-streaming → `chat.completion` with
@@ -264,7 +267,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   masked and bounded (`clientFacingText()`): a 5xx sentence comes from whatever threw, and a thrown `fetch`/SDK error can
   quote its URL. The route handler's own catch writes its `500` body itself, so it reads the sentence through
   `handlerFailureMessage()` - masked, and built *before* the log line that prints it, because a `const` read ahead of
-  its declaration is a `ReferenceError` that replaces the cause of the `500` with a bug in the catch itself.
+  its declaration is a `ReferenceError` that replaces the cause of the `500` with a bug in the catch itself. The inner
+  catch around a failed upstream call reads its `[Proxy] API Error` sentence from the same helper, for the same reason:
+  `error.message` is `undefined` for a throw that is not an `Error`, so the line logged nothing and the client was told
+  `undefined`.
   A log record prints the sentence *and* the stack behind that error, whose first line is the message: both go
   through `loggableError()` - masked, stack bounded (`MAX_LOGGED_STACK_CHARS`).
   A backend that disappears mid-request is an upstream failure (`502`), not a bug (`500`): the client is told the upstream is gone and the next request
@@ -285,6 +291,13 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   produced; when it already carries `finish` or `time.completed`, the non-streaming path serves it instead of spending
   a `GET …/message` round trip (plus a poll interval) on data it holds. A message still being written has no `finish`
   and keeps the poll loop, so a partial answer is never served.
+- **Only a refused connection is retried.** `session.create` is retried once, after dropping the cached health and
+  restarting the backend - but only when the connection was *refused* (`isConnectionRefused()`: `ECONNREFUSED`, also
+  through the `AggregateError` Node's `fetch` builds per address), because that proves the request never reached the
+  backend. `fetch failed` and `socket hang up` are what a backend that accepted `POST /session` and then died looks
+  like: retrying those created a second session while the first one kept existing with no id in this process, so
+  neither `cleanupSession()` nor the shutdown drain could ever delete it. Those answer `502 backend_unreachable`, the
+  documented answer for "the backend disappeared mid-request", and the next request recovers.
 - Every SDK call hands back an error tuple instead of throwing, and every tuple is inspected: `session.create`,
   `session.prompt`, `session.messages`, `session.delete`, `config.providers`, `tool.ids` and `event.subscribe`.
   A refused `event.subscribe` carries no stream, so the streaming path falls back to polling and still answers.
@@ -320,7 +333,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   per restart. The drain **loops** while the set is non-empty inside that budget (one snapshot missed a creation that
   answered after it was read: `/__sessions` reported `{"live":1,"created":1,"deleted":0}`), and a completion that has
   not created its session yet when shutdown began answers `503 gateway_shutting_down` instead of adding one the teardown
-  has already counted.
+  has already counted. Each delete result is inspected the way `cleanupSession()` inspects it: a refused delete arrives
+  as an `{ error, response }` tuple, and counting that as a deletion dropped the id and logged a success for a session
+  that stayed on the backend. A round that deletes nothing ends the loop (a refusing backend cannot be retried into
+  success inside 3 s) and one `warn` names the sessions that are left (`remaining`).
 - Every response carries `X-Content-Type-Options: nosniff` (`NO_SNIFF`, `createApp()`) on the same three paths as the
   CORS set (`onRequest` hijacked streams included, `clientErrorHandler`, `badUrlHandler`): it writes only JSON
   and SSE, which a browser must not re-read as something else.
@@ -334,13 +350,16 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   timeout) never reaches a hook, so the `clientErrorHandler` Fastify option answers it: `400` for a parse error,
   `431` for `HPE_HEADER_OVERFLOW`, `408` for `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope
   (`type: "invalid_request_error"`, the parser's code in `code` when it is a plain `[A-Z_]+` token) with CORS headers,
-  an `X-Request-Id` and a `warn` log line. It writes the envelope,
+  an `X-Request-Id` and a `warn` log line that **carries that same id** (`[gw-…]`): the id a client quotes in a report
+  has to be searchable in the log. It writes the envelope,
   then closes with `socket.end()` (`closeSocketAfterFlush()`), never `socket.destroy()`: `destroy()` discards buffered
   writes, so under backpressure the client got a reset instead of its error.
 - A URL the **router** cannot decode (a percent escape that is not valid UTF-8, `GET /v1/models/%E0%A4%A`) never reaches
-  a hook, so Fastify answered its own body (no `type`, CORS, `X-Request-Id` or log line). `routerOptions.onBadUrl` (`badUrlHandler`) writes the usual envelope, with a generated
-  request id and one `warn` line carrying the path truncated by `loggableUrl`. It is handed the raw request/response
-  (`find-my-way` builds no Fastify request), like `clientErrorHandler`.
+  a hook, so Fastify answered its own body (no `type`, CORS, `X-Request-Id` or log line). `routerOptions.onBadUrl` (`badUrlHandler`) writes the usual envelope, with the client's own `X-Request-Id` when it sent a usable one (a
+  generated `gw-…` otherwise - this path answers before the hook that normally echoes it) and one `warn` line carrying
+  that id and the path truncated by `loggableUrl`. It is handed the raw request/response
+  (`find-my-way` builds no Fastify request), like `clientErrorHandler`; both take the id from the module-level
+  `requestId()` / `generatedRequestId()` helpers, which is also what puts it in their log lines.
 - Every response carries `X-Request-Id`, the same id the request log line ends with, so a client report can be traced
   to a log entry. An incoming `X-Request-Id` is echoed when it is a short printable token
   (`[A-Za-z0-9._:-]{1,64}`) and replaced by a generated `gw-…` id otherwise — the value reaches the log line and a
@@ -553,14 +572,22 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   deliberate limit, so a rewrite *inside* it reads as a continuation. The snapshot is recorded on **every** event that
   carries one, including events that also carry a `delta` (the SDK's event type allows both): recording it only on the
   delta-less branch left a mixed backend's closing update diffed against `''` and delivered the whole part twice
-  (`Hello worldHello world`). A `delta` that is not a string is ignored, so the event takes the snapshot path.
+  (`Hello worldHello world`). A `delta` that is not a string is ignored, so the event takes the snapshot path. A part
+  the backend sends **without an id** is keyed by its type, and one answer can carry several parts of the same type: a
+  key therefore holds a bounded list of snapshots (`MAX_PART_SNAPSHOTS`, 4) and the increment is taken against the
+  snapshot the new text actually continues, so two id-less `text` parts are delivered once each instead of being
+  diffed against one another (`MULTIPARTNOID`).
 - **A finished message ends the stream, whatever the finish reason.** The collector settles on any non-empty
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.
 - **Every backend call carries a deadline.** `client.session.create`, `client.session.messages`,
   `client.session.delete`, `client.session.prompt`, `client.config.providers` and `client.tool.ids` are all called
   with an `AbortSignal` (`backendDeadline()`), and an expired one answers `504` ("did not answer within …ms") instead
-  of `500`. Node's `fetch` has no default timeout: a backend that answers `/health` but never `/session` left the
+  of `500`. The health probe is bounded too, and by a deadline armed **before** the request exists
+  (`HEALTH_PROBE_TIMEOUT_MS`, 2 s, `checkHealth()`): `request.setTimeout()` starts its clock only once a socket is
+  assigned, so DNS and the TCP handshake were unbounded - and this probe runs on the completion path with the slot
+  already taken, so a backend host that drops SYNs (a firewall, a wrong port on a black-holed address) suspended the
+  request for the OS connect timeout (~2 min on Linux) without any of the SDK calls above being involved. Node's `fetch` has no default timeout: a backend that answers `/health` but never `/session` left the
   handler waiting forever, so the client got nothing and the slot was never released - at concurrency 1 that stops the
   gateway. Session cleanup uses its own shorter budget
   (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client already has its answer, so it must not hold the slot for
@@ -589,7 +616,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   means "never queue", not "refuse every completion" (a lone request with a free slot is served). A slot is released
   when its response is complete (`release()` in `runQueuedTask`), not when the task promise settles: the session
   deletion after the answer is a backend round trip, and holding the slot through it made a follow-up request look like
-  a full gateway. `.finally(release)` stays the safety net, so `release()` is idempotent. A request whose client
+  a full gateway. `.finally(release)` stays the safety net, so `release()` is idempotent. That safety net only runs
+  when the task settles, though, so a task parked in an await that never resolves pinned the slot for good: the
+  execution timer rejects the caller (the `504`) and, `SLOT_WATCHDOG_GRACE_MS` (5 s) later, releases the slot itself
+  with one `warn` line. A request whose client
   disconnects while queued is dropped when its turn comes (`reply.raw` 'close'), so it never spends backend time. The
   disconnect signal is not `request.raw.destroyed`: that stream is destroyed once its body is read.
   A body over `OPENCODE_PROXY_MAX_BODY_MB` is still refused with `413`, but only after it has been read to its end (`refuseOversizedBody()`, bounded by `BODY_DRAIN_TIMEOUT_MS`): Node ends the socket when a response finishes with

@@ -98,6 +98,13 @@ jobs:
           PUSH_BEFORE: ${{ github.event.before }}
         run: |
           case "$PUSH_BEFORE" in ''|0000000000000000000000000000000000000000) PUSH_BEFORE='' ;; esac
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            # A dispatch checks out a branch tip that has already shipped. The fallback below would judge the default
+            # `HEAD~1..HEAD` range, which is not one commit on `main` - it spans the merge and everything it brought in -
+            # so a manual run re-opened history nobody can reword and could go red on commits that already passed.
+            echo "manual dispatch: the checked-out history has already shipped, nothing to check"
+            exit 0
+          fi
           range=''
           if [ "$EVENT_NAME" = "pull_request" ]; then
             # refs/pull/<n>/head lives in the base repository, so it reaches a fork's commits - fetching the head SHA

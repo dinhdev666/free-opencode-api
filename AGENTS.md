@@ -142,7 +142,13 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   shares one provider round trip (`modelsInFlight`) instead of one per request; failures — including a provider call
   that runs into its deadline, because a silent backend would never answer the listing — fall back to
   a single static model and are not cached, but a served fallback is held for 1 s (`FALLBACK_HOLD_MS`) so a failing
-  provider is not asked once per listing. A fresh cache answers with the body built when it was filled
+  provider is not asked once per listing. An **expired** entry is not a miss: the listing and the by-id answers are
+  served from the cache for up to `MODELS_STALE_MS` (60 s) while the refresh runs in the background behind
+  `modelsInFlight`, rate-limited to one attempt per `MODELS_CACHE_TTL_MS` so a failing provider is not asked once per
+  request — awaiting the refresh put a full provider round trip in front of the 1-in-N request that crossed the TTL
+  (measured 5.0–5.3 ms against 0.6 ms warm on a loopback stub, and one network RTT against a real backend). Past that
+  bound the cache is a miss again, so a backend that stopped answering is still noticed. A warm cache answers with the
+  body built when it was filled
   (`modelsCacheBody`; by-id answers read `modelsById`). That model is `opencode/big-pickle` (`DEFAULT_MODEL` in `src/proxy.js`), also the model a chat request
   without `model` is sent to (one constant, so the two cannot name different ids). `big-pickle` is an **alias**: OpenCode
   routes it to whichever model it serves and never publishes which, so it is the only id worth hardcoding and its entry

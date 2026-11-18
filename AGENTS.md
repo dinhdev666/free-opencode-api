@@ -30,7 +30,11 @@ These are product decisions, not implementation details. Do not "improve" them w
    no key sent, a wrong `Authorization` (a proxy-injected `Basic …` included) or `X-Api-Key` header - and
    never the value; `Unauthorized` alone named none of them.
 2. **The default key stays visible and warned about.** `index.js` logs a `[Security]` warning when the built-in key is
-   in use; the startup summary states that authentication is enforced.
+   in use; the startup summary states that authentication is enforced. A **custom** key with tools enabled gets its
+   own `[Security]` warning, naming where a model-directed tool can still read it (the file `config.json` was read from,
+   or this process's environment) and `DISABLE_TOOLS=true` as the fix: `spawnBackend()` deletes `API_KEY` from the
+   child's environment, which is hygiene rather than a boundary, because the child runs as the same uid. It never prints
+   the key.
 3. **OpenAI wire format is the contract.** Success and error bodies, SSE frames, status codes and header names must
    stay compatible with standard OpenAI clients. See "API contract" below. `stream` in particular is read through
    `parseBoolean()` (see "Boolean options" below).
@@ -48,7 +52,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved queue limits, via `getQueueLimits()`), calls `startProxy()`, wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. A BOM is tolerated. |
-| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify) for debug logging. |
+| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses) for debug logging. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
@@ -70,7 +74,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 419 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 447 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -100,8 +104,9 @@ interleaved), `MULTIPARTNOID` (the same without part ids, so both parts are of t
 carrying both a `delta` and the part's cumulative text, then one closing update with neither),
 `CUTTOOL`/`OPENTOOL` (a tool-call answer whose stream is cut inside the closing/opening tag), `TOOLSPAM` (a tool-call
 block repeated by the answer), `BADPART` (a text part whose `text` is a number, next to a normal part), `REASONONLY`
-(a message carrying reasoning and no text that is never marked finished) and `LEAKYFAIL` (a provider error quoting a
-credential-bearing URL behind a long message) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
+(a message carrying reasoning and no text that is never marked finished), `LEAKYFAIL` (a provider error quoting a
+credential-bearing URL behind a long message) and `MANYDELTAS` (a 470-character answer split into ~180 deltas, for the
+idle timer that is re-armed on every one) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
 `POST /session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 502 whose message quotes a
 credential-bearing URL), `STUB_ECHO_AUTH=1` (a 401 quoting the header it refused), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every creation after the n-th goes
@@ -253,6 +258,12 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   missing comma. The envelope keeps Fastify's `code` and names both causes (`request body is not valid JSON, or it
   carries a forbidden property name (__proto__, constructor); send Content-Type: application/json`). The refusal stays:
   an OpenAI client does not send those names, and `onProtoPoisoning: 'remove'` would silently drop a field it did send.
+  The guard is unconditional, so the **text path** applies it too: a `text/plain` or
+  `application/x-www-form-urlencoded` body is parsed by the handler with its own `JSON.parse`, and the same bytes were
+  refused under `application/json` and served under `text/plain` (measured). The parse uses a reviver that stops at the
+  first forbidden key at any depth (`FORBIDDEN_BODY_KEYS`), the escaped spelling (`"\u005f\u005fproto__"`) included,
+  and answers the same `code` and sentence as Fastify's own refusal (`FORBIDDEN_BODY_MESSAGE`, one copy for both
+  paths): the content type must not decide whether a client's body is safe.
 - Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request, `type: "invalid_request_error"`, plus
   Fastify's `code` when it rejected the body), `401` (auth, `type: "invalid_request_error"`,
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error, with a
@@ -391,6 +402,20 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   are text a script can write. It covers every `[Config]` note naming a value it could not use, the ignored-file
   paths and the `[Security]` warning that names the bind address; `docker/docker-entrypoint.sh` repeats the rule for
   its log-level line (`tr '[:cntrl:]' '?'`, cut at 128), because it cannot import the module.
+  An **OS sentence** is the other shape of the same problem: `spawn()` repeats the command back inside its error
+  message, so `[Proxy] Failed to spawn OpenCode: ${err.message}` quoted `OPENCODE_PATH` verbatim and a newline in it
+  started a second record. `loggableUpstreamText()` bounds the text first (`MAX_LOGGED_UPSTREAM_LENGTH`, 256) and then
+  replaces control characters, so the path stays readable on one line. Single quotes in that sentence are not a problem
+  either way: a detail object escapes its newlines through `JSON.stringify`, so only a *message* needs this.
+  A **query name** is decoded by `maskUrlQuery()` before it is matched, because `?%61pi_key=` is the same credential:
+  the decoder is `decodeQueryName()`, a form-decode of `%XX` runs only (no `decodeURIComponent`), so a malformed escape
+  (`?%zz=1`) is compared as written instead of throwing one `URIError` - and a captured stack - per pair (1 600
+  malformed pairs measured 1.8 ms of the serving thread per request, on a line built before the auth check). The
+  decision is unchanged: 300 000 random names answered the same with both decoders.
+  A debug detail that already came from `maskDetail()` is passed as `logger.debugBounded(message, detail)`
+  (`serializeDetail(value, true)`): the copy is bounded and acyclic by construction, so the second tree walk
+  `safeClone()` performs is skipped (36 ms of a 91 ms line for a body with about a million nodes). The text is
+  byte-identical, and a value that still defeats `JSON.stringify` falls back to the cloned path.
 
 ## Working rules for code changes
 
@@ -433,7 +458,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   listener is an uncaught exception: `node index.js | head -3` killed a live gateway. Only `EPIPE`/`ERR_STREAM_DESTROYED` are swallowed: that line is lost, the process keeps answering (asserted).
 - **Tool-call filtering** removes `<function_calls>…</function_calls>` blocks only when `DISABLE_TOOLS` is on. The
   streaming variant holds back a trailing fragment that could still become one of the two tags, because a delta
-  boundary can fall inside either of them; the held fragment is flushed at end of stream. The filter is one
+  boundary can fall inside either of them; the held fragment is flushed at end of stream. That tail is found with one
+  `lastIndexOf('<')` (`splitAtPossibleTag()`, bounded to the window a tag prefix can occupy), never by testing up to
+  16 candidate suffixes per delta. The filter is one
   left-to-right scan (`removeToolMarkup`), never a lazy `[\s\S]*?` regex: that one backtracked quadratically from every
   open tag (64 000 tags in a 1 MB answer took 8.5 s, wedging the only completion slot) and the scan answers the same 15
   shapes byte-identically. The flush must write
@@ -509,6 +536,11 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS='0' is not a positive number, using 300000`, `… HEALTH_CACHE_MS='abc' is not a
   number, using 2000`): a silent fallback left the operator convinced a value was in force while the gateway ran the
   default.
+  The completion budget has one resolution point, `resolveRequestTimeoutMs(options, env)` (exported from
+  `src/proxy.js`): it applies the same precedence and returns the value **and** the note to print, so an entry point, an
+  embedder and the smoke suite cannot disagree. A blank environment value falls through to `config.json` like every
+  other key (`??` ended the chain at `''`, so `Environment=OPENCODE_PROXY_REQUEST_TIMEOUT_MS=` in a unit file silently
+  replaced the file's value with the 300000 ms default, and the "unusable value" note was skipped for a blank one).
 - **Polling watches the newest assistant message.** A tool-using completion has more than one: the step that asked for
   the tool is finished (`finish: "tool-calls"`) while the step that answers is still being written. The poll reads the
   last assistant message in the list and evaluates only that one; walking back to the first message that looked
@@ -547,7 +579,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   (status 200)` - not by the status, which reads like a gateway bug; the payload's type and top-level keys go to the
   debug line next to it, which tells an envelope change from an error body.
 - **An idle stream is recovered, not ended.** When the event stream goes silent for `DEFAULT_EVENT_IDLE_TIMEOUT_MS`
-  the gateway polls for the rest of the answer and appends only what the client does not have yet. That recovery poll
+  the gateway polls for the rest of the answer and appends only what the client does not have yet. The timer that
+  measures that silence is **re-armed in place** (`idleTimer.refresh()`, one call per delta) instead of being cleared
+  and re-created for every frame — and it is only armed while the stream is unfinished and a timeout is configured. The
+  behaviour is the same either way, which is why the many-delta case is asserted end to end (`MANYDELTAS`). That recovery poll
   tolerates a full idle window of further silence (`IDLE_RECOVERY_STALL_POLLS`) before accepting a message the backend
   never marks finished: the default three intervals of no growth (~1.5 s, time not polls) is right after
   a normal prompt, but applied to a stream already silent for 8 s it ended the response with `finish_reason: "stop"`
@@ -693,7 +728,13 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   Provider credentials the CLI needs live in its own auth store or under their own names, so they stay. The jail
   directory (`<tmp>/opencode-proxy-jail/<salt>`, the child's cwd and its whole `HOME` under `USE_ISOLATED_HOME`) is
   created `0700`: on a shared `/tmp` the default `0755` let every other local user list and traverse it, and it is
-  removed on every platform (a Windows skip left the directory behind for good). Under `USE_ISOLATED_HOME` the child's
+  removed on every platform (a Windows skip left the directory behind for good).
+  The **parent** of that jail is checked before it is used (`resolveJailParent()`): `/tmp` is world-writable and the
+  name is predictable, so another unprivileged account can pre-create `opencode-proxy-jail` - or a symlink of that name
+  - and `mkdirSync(recursive)` succeeds on it, which would leave that account owning the parent of the backend's
+  working directory (and of its `HOME`). The parent is trusted only when it is a directory this process owns (uid match;
+  no comparison on Windows), a symlink or a foreign directory is warned about and replaced by a private
+  `opencode-proxy-jail-XXXXXX` (`mkdtempSync`, `0700`), and only the directories this process created are removed. Under `USE_ISOLATED_HOME` the child's
   `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`, `TMPDIR`, `TMP` and `TEMP` all point inside
   that jail: the CLI resolves them before `HOME`, so an inherited value (a desktop session, a systemd unit, an image)
   sent the "isolated" run straight back to the real user's store, config and cache.

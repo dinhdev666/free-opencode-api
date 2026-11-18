@@ -2982,11 +2982,15 @@ function createApp(config) {
                         promptParams.body.tools = toolOverrides;
                     }
                     if (logger.isEnabled('debug')) {
-                        logger.debug('Upstream payload (final request body to opencode serve)', {
+                        // Masked like the earlier dump of the same body: `parts[].text` and `system` are client text, and
+                        // a prompt that quotes a credential-bearing URL (a wrapper forwarding its own config) was written
+                        // to `docker logs` verbatim here while the `Incoming OpenAI request` record masked it.
+                        // `debugBounded()` because `maskDetail()`'s copy is bounded and acyclic by construction.
+                        logger.debugBounded('Upstream payload (final request body to opencode serve)', {
                             reqId,
                             sessionId,
                             model: `${pID}/${mID}`,
-                            payload: promptParams
+                            payload: maskDetail(promptParams)
                         });
                     }
 
@@ -3410,7 +3414,14 @@ function createApp(config) {
                         // The body is backend-controlled text: it can quote a URL and a log line is collected as often as not
                         bodySummary: clientFacingText(upstream.bodySummary) || null
                     });
-                    logger.debug('[Proxy] Error details', { reqId, sessionId, error });
+                    // A rejection that is not an `Error` is not masked by `safeClone()` on its way to the line, so the
+                    // value goes through the masking helper here: this is the same handler that needs
+                    // `handlerFailureMessage()` to read a sentence out of whatever threw.
+                    logger.debug('[Proxy] Error details', {
+                        reqId,
+                        sessionId,
+                        error: error instanceof Error ? loggableError(error) : maskDetail(error)
+                    });
 
                     // A dead/unreachable backend must not stay cached as healthy: drop the timestamp so the next
                     // request performs a real probe (and restarts the backend if needed)

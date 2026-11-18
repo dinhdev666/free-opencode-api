@@ -125,6 +125,13 @@ const generatedRequestId = () => `gw-${Date.now().toString(36)}${Math.random().t
 // record - a 2 MB model id produced a 2 MB info line. The values are normalised for logging only; the backend still
 // receives the id verbatim, because the contract does not restrict model ids.
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
+// Fastify refuses a JSON body carrying `__proto__` or `constructor` before any handler runs, and the refusal reaches the
+// client as `FST_ERR_CTP_INVALID_JSON_BODY` - the code a syntax error produces too, so the sentence has to name both
+// causes. One copy: the mapping in the route handler's catch and the text-body guard below answer identically, because a
+// client must not be able to tell which content type it sent.
+const FORBIDDEN_BODY_MESSAGE = 'request body is not valid JSON, or it carries a forbidden property name '
+    + '(__proto__, constructor); send Content-Type: application/json';
+const FORBIDDEN_BODY_KEYS = new Set(['__proto__', 'constructor']);
 const MAX_LOGGED_MODEL_LENGTH = 128;
 const MAX_LOGGED_URL_LENGTH = 512;
 const loggableModelId = (id) => {
@@ -2376,7 +2383,30 @@ function createApp(config) {
                             });
                         }
                         try {
-                            const parsed = JSON.parse(text);
+                            // Fastify refuses a body carrying `__proto__` or `constructor` before any handler runs
+                            // (`onProtoPoisoning: 'error'` is its default), and AGENTS.md documents that refusal as
+                            // unconditional. A body handed over as text is parsed *here*, with plain `JSON.parse`, which
+                            // has no such guard: the same bytes were served under `text/plain` and refused with `400
+                            // FST_ERR_CTP_INVALID_JSON_BODY` under `application/json` (measured), so a client could pick
+                            // the content type to skip the check. Nothing in this gateway spreads a parsed body today,
+                            // which is exactly why the guard must not depend on that: one future copy would turn it into
+                            // prototype pollution. The reviver sees every key at every level, including one escaped as
+                            // `"\u005f_proto__"` that a scan of the raw text would miss, so both content types answer
+                            // the same refusal.
+                            let forbiddenKey = null;
+                            const parsed = JSON.parse(text, (key, value) => {
+                                if (forbiddenKey === null && FORBIDDEN_BODY_KEYS.has(key)) forbiddenKey = key;
+                                return value;
+                            });
+                            if (forbiddenKey !== null) {
+                                return reply.code(400).send({
+                                    error: {
+                                        message: FORBIDDEN_BODY_MESSAGE,
+                                        type: 'invalid_request_error',
+                                        code: 'FST_ERR_CTP_INVALID_JSON_BODY'
+                                    }
+                                });
+                            }
                             if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
                                 return refuseNonObjectBody(parsed);
                             }
@@ -3465,8 +3495,7 @@ function createApp(config) {
                     + 'OPENCODE_PROXY_MAX_BODY_MB';
             }
             if (err.code === 'FST_ERR_CTP_INVALID_JSON_BODY') {
-                return 'request body is not valid JSON, or it carries a forbidden property name (__proto__, constructor); '
-                    + 'send Content-Type: application/json';
+                return FORBIDDEN_BODY_MESSAGE;
             }
             // An empty body is what a retry whose payload went missing sends, and Fastify answered it with a sentence
             // about the content type the client had just set correctly. The same request without that header reaches

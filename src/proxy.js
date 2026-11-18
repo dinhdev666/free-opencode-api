@@ -850,6 +850,60 @@ const backendUnavailable = (message) => Object.assign(new Error(message), { back
 // may be using the same parent directory, so the exit hook must never delete a directory it does not own.
 const ownedJailRoots = new Set();
 
+// The parent directories holding those jails, and only the ones this process may remove: the shared
+// `<tmp>/opencode-proxy-jail` (which disappears with the last instance, since `rmdir` refuses a non-empty one) and a
+// private one when the shared directory turned out to belong to somebody else (see `resolveJailParent()`).
+const ownedJailParents = new Set();
+
+/**
+ * The directory the per-spawn jail lives in, or a private one when the shared directory cannot be trusted.
+ *
+ * `/tmp` is world-writable and this name is predictable, and `mkdirSync(…, { recursive: true })` succeeds silently on a
+ * directory somebody else already created. Another unprivileged account that pre-creates the path would then own the
+ * **parent** of the backend's working directory - and, with `USE_ISOLATED_HOME`, of its `HOME`, which holds the provider
+ * credential store. The leaf is mode 0700, but its owner can rename that leaf and put their own directory, or a symlink
+ * to one, in its place, which the next respawn would use as `cwd`/`HOME` for a model-driven agent; and `0700` owned by
+ * someone else makes the leaf's `mkdir` fail with an `EACCES` that the spawn error names as nothing in particular.
+ *
+ * So the shared parent is used only when it is a real directory (not a symlink, hence `lstat`) owned by this uid. When
+ * the platform has no uid to compare (Windows), the check is the directory test alone. Otherwise the backend gets a
+ * private parent from `mkdtempSync()`: atomic, unpredictable, mode 0700, and removed with the jails it contains.
+ * @param {boolean} isWindows true on `win32`, where the isolation check has no uid to compare
+ * @param {string} tmpDir the temporary directory to build in (`os.tmpdir()` unless a test says otherwise)
+ * @returns {string} an absolute directory this process may write into
+ */
+export function resolveJailParent(isWindows, tmpDir = os.tmpdir()) {
+    const shared = path.join(tmpDir, 'opencode-proxy-jail');
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+    try {
+        fs.mkdirSync(shared, { recursive: true, mode: 0o700 });
+        // lstat, not stat: a symlink here is exactly the shape an attacker would use to redirect the tree
+        const stats = fs.lstatSync(shared);
+        const trusted = stats.isDirectory() && (currentUid === null || stats.uid === currentUid);
+        if (trusted) {
+            if (!isWindows) {
+                // mkdirSync does not change the mode of a directory that already exists, so a parent created by an older
+                // build (0755) kept its permissions for the lifetime of the machine; re-assert them on every start.
+                try {
+                    fs.chmodSync(shared, 0o700);
+                } catch (error) {
+                    logger.warn('[Proxy] Could not restrict the backend jail directory:', { path: shared, error: error.message });
+                }
+            }
+            ownedJailParents.add(shared);
+            return shared;
+        }
+        logger.warn('[Proxy] The shared backend jail directory is not a directory this process owns; using a private one',
+            { path: shared, uid: stats.uid, expectedUid: currentUid, symlink: stats.isSymbolicLink() });
+    } catch (error) {
+        logger.warn('[Proxy] Could not prepare the shared backend jail directory; using a private one',
+            { path: shared, error: error.message });
+    }
+    const privateParent = fs.mkdtempSync(path.join(tmpDir, 'opencode-proxy-jail-'));
+    ownedJailParents.add(privateParent);
+    return privateParent;
+}
+
 // Sessions this process created and has not deleted yet. Every completion deletes its own (success, error, client
 // abort), but a SIGTERM in the middle bypasses all three: the HTTP server closes, `stopBackend()` runs and the process
 // exits while the task is still parked in the collector or the poll. A managed child takes its sessions with it, but an
@@ -873,12 +927,16 @@ function cleanupTempDirs() {
         }
     }
     ownedJailRoots.clear();
-    // The parent only disappears once the last instance is gone; a leftover one is harmless
-    try {
-        fs.rmdirSync(path.join(os.tmpdir(), 'opencode-proxy-jail'));
-    } catch (e) {
-        // not empty or already gone: expected when another instance is still running
+    // A parent this process owns disappears with its last jail; the shared one stays while another instance uses it
+    // (`rmdir` refuses a non-empty directory), and the private one is this process's alone
+    for (const jailParent of ownedJailParents) {
+        try {
+            fs.rmdirSync(jailParent);
+        } catch (e) {
+            // not empty or already gone: expected when another instance is still running
+        }
     }
+    ownedJailParents.clear();
 }
 
 // Register cleanup on exit
@@ -3819,17 +3877,8 @@ async function ensureBackend(config, options = {}) {
             // default mode (0755) let any other local user on a shared /tmp traverse and list it, which defeats the
             // isolation the option exists for. mkdir's mode is masked by the umask, so 0700 is the strictest that
             // survives.
-            const jailParent = path.join(os.tmpdir(), 'opencode-proxy-jail');
-            // mkdirSync does not change the mode of a directory that already exists, so a parent created by an older
-            // build (0755) kept its permissions for the lifetime of the machine; re-assert them on every start.
-            fs.mkdirSync(jailParent, { recursive: true, mode: 0o700 });
-            if (!isWindows) {
-                try {
-                    fs.chmodSync(jailParent, 0o700);
-                } catch (error) {
-                    logger.warn('[Proxy] Could not restrict the backend jail directory:', { path: jailParent, error: error.message });
-                }
-            }
+            // Ownership-checked, with a private fallback: see `resolveJailParent()`
+            const jailParent = resolveJailParent(isWindows);
             const jailRoot = path.join(jailParent, salt);
             state.jailRoot = jailRoot;
             ownedJailRoots.add(jailRoot);

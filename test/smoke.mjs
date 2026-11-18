@@ -11,7 +11,10 @@ import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
-import { clientFacingText, handlerFailureMessage, parseBoolean, resolveBackendAuth, timeoutMessage } from '../src/proxy.js';
+import {
+    clientFacingText, handlerFailureMessage, parseBoolean, resolveBackendAuth, resolveJailParent, resolveRequestTimeoutMs,
+    timeoutMessage
+} from '../src/proxy.js';
 import { readConfigFile, findUnknownKeys, envOrFile, CONFIG_FILE_KEYS } from '../src/config.js';
 import {
     createLogger, loggableError, maskBackendUrl, maskDetail, maskHeaders, maskQuotedCredentials, maskSecret,
@@ -34,6 +37,8 @@ const ANSWER = 'Hello from the smoke test stub.';
 // own copy of every marker answer)
 const LAGSTORE_ANSWER = 'The frames carry the whole answer, but the stored message lags behind them by a wide margin.';
 const REASONING = 'Thinking about the request.';
+// Kept in step with MANY_DELTAS_ANSWER in test/stub-opencode.mjs (separate process, so the suite carries its own copy)
+const MANY_DELTAS_ANSWER = Array.from({ length: 60 }, (_, index) => `part${index}`).join(' ');
 
 const results = [];
 const children = [];
@@ -439,6 +444,20 @@ async function run() {
         maskingMs < 25 && pathologicalMasked.endsWith('&api_key=***') &&
         !pathologicalMasked.includes('secret'),
         `${maskingMs}ms ${pathologicalMasked.slice(-24)}`);
+    // The name is decoded only to answer "does this spell a credential?", and the decode must not throw: a malformed
+    // escape (`?%zz=1`) is ordinary client noise, and one thrown `URIError` costs an object plus a captured stack per
+    // pair - 1600 malformed pairs measured 1.8 ms of the serving thread per request, on a summary line built before the
+    // auth check, so an unauthenticated caller chose the price. Escaped spellings of the credential names have to keep
+    // being recognised, which is the only thing the decode is for.
+    const encodedNameCases = ['%61pi_key', 'api%5Fkey', 'x%2Dapi%2Dkey', 'tok%65n', '%61%75%74%68'];
+    const encodedNameResults = encodedNameCases.map((name) => maskUrlQuery(`/v1/models?${name}=secret`));
+    check('an escaped credential name is still masked',
+        encodedNameResults.every((masked, index) => masked === `/v1/models?${encodedNameCases[index]}=***`),
+        JSON.stringify(encodedNameResults));
+    check('a malformed query name is compared as written instead of thrown',
+        maskUrlQuery('/v1/models?%zz=1&token=secret') === '/v1/models?%zz=1&token=***' &&
+        maskUrlQuery(`/v1/models?${'%zz=1&'.repeat(2000)}model=x`) === `/v1/models?${'%zz=1&'.repeat(2000)}model=x`,
+        maskUrlQuery('/v1/models?%zz=1&token=secret'));
 
     // A URL is not the only credential an upstream can quote. The gateway sends the credential it lifted out of
     // OPENCODE_SERVER_URL as a Basic header, and a proxy in front of the backend can echo the header it refused in its
@@ -666,6 +685,27 @@ async function run() {
         Object.keys(protoMasked).includes('__proto__') && protoMasked.authorization === 'Bear***(26 chars)' &&
         ({}).injected === undefined,
         Object.keys(protoMasked).join(','));
+    // `maskDetail()` already returns an acyclic, bounded copy, so `serializeDetail(value, true)` - what
+    // `logger.debugBounded()` uses - skips the second tree walk `safeClone()` would do. On a body with about a million
+    // nodes that walk was 36 ms of a 91 ms debug line. The text must be byte-identical to the cloned path.
+    const boundedDetail = maskDetail({
+        messages: [{ role: 'user', content: 'hi' }],
+        metadata: { authorization: 'Bearer sk-bounded-1234567890' },
+        count: 2
+    });
+    const boundedSerialized = serializeDetail(boundedDetail, true);
+    check('a masked detail serialises identically without the second walk',
+        boundedSerialized === serializeDetail(boundedDetail) && boundedSerialized.includes('***') &&
+        !boundedSerialized.includes('sk-bounded-1234567890'),
+        boundedSerialized.slice(0, 200));
+    // The skip is a fast path, not a promise about the value: one that still defeats `JSON.stringify` (a cycle) falls
+    // back to the cloned path, so a caller that passes the flag wrongly gets the same bound line instead of an exception
+    const cyclicDetail = { name: 'cyclic' };
+    cyclicDetail.self = cyclicDetail;
+    check('a pre-bounded detail that cannot be stringified falls back to the cloned path',
+        serializeDetail(cyclicDetail, true) === serializeDetail(cyclicDetail) &&
+        serializeDetail(cyclicDetail, true).includes('cyclic'),
+        serializeDetail(cyclicDetail, true).slice(0, 160));
 
     // The logger writes to the process's own streams, so the level filter, the prefix and the stamp are observed
     // through a child process. A detail that cannot be serialised (a cycle, a BigInt, a function) and a non-string
@@ -760,6 +800,35 @@ async function run() {
         check('a blank environment value falls back to config.json',
             envOrFile({ API_KEY: '  ' }, 'API_KEY', 'sk-from-file') === 'sk-from-file',
             String(envOrFile({ API_KEY: '  ' }, 'API_KEY', 'sk-from-file')));
+
+        // The completion budget follows the same rule: `??` treated `''` as a value, so
+        // `Environment=OPENCODE_PROXY_REQUEST_TIMEOUT_MS=` (a unit file, a Helm value rendered empty) ended the chain at
+        // the empty string and the value written in config.json was never read - silently, because the "unusable value"
+        // warning is skipped for a blank one too. The resolution is one exported helper so the entry point, an embedder
+        // and this suite cannot disagree about it.
+        const blankBudget = resolveRequestTimeoutMs(
+            { OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '5000' },
+            { OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '   ' }
+        );
+        check('a blank environment budget falls back to the config.json value',
+            blankBudget.value === 5000 && blankBudget.note === null, JSON.stringify(blankBudget));
+        check('a blank config.json budget is the default, not a warning',
+            resolveRequestTimeoutMs({ OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '' }, {}).note === null,
+            JSON.stringify(resolveRequestTimeoutMs({ OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '' }, {})));
+        check('the environment budget still wins over the file',
+            resolveRequestTimeoutMs({ OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '5000' },
+                { OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '9000' }).value === 9000);
+        check('an explicit budget wins over the environment and the file',
+            resolveRequestTimeoutMs({ REQUEST_TIMEOUT_MS: 1234, OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '5000' },
+                { OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '9000' }).value === 1234);
+        const unusableBudget = resolveRequestTimeoutMs({ OPENCODE_PROXY_REQUEST_TIMEOUT_MS: 'abc' }, {});
+        check('a budget that is not a positive number is named with the value used',
+            unusableBudget.value === 300000 &&
+            /OPENCODE_PROXY_REQUEST_TIMEOUT_MS='abc' is not a positive number, using 300000/.test(String(unusableBudget.note)),
+            JSON.stringify(unusableBudget));
+        const zeroBudget = resolveRequestTimeoutMs({ OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '0' }, {});
+        check('zero is not a budget', zeroBudget.value === 300000 && Boolean(zeroBudget.note),
+            JSON.stringify(zeroBudget));
         const unknownKeyPath = path.join(configDir, 'unknown-key.json');
         fs.writeFileSync(unknownKeyPath, JSON.stringify({ FUTURE_KEY: { nested: true } }));
         check('readConfigFile keeps keys it does not know',
@@ -1219,6 +1288,61 @@ async function run() {
     check('a JSON body sent as text/plain is still served',
         textPlain.status === 200 && textPlainJson?.choices?.[0]?.message?.content === ANSWER,
         `status ${textPlain.status} ${JSON.stringify(textPlainJson).slice(0, 120)}`);
+    // Fastify refuses a body carrying `__proto__`/`constructor` before any handler runs, and that refusal is documented
+    // as unconditional - but the text path parses the string itself with plain `JSON.parse`, so the same bytes were
+    // served under `text/plain` after being refused under `application/json` (measured). The reviver sees every key at
+    // every level, so an escaped spelling (`"\u005f\u005fproto..."`) is caught too, and both content types answer the
+    // same envelope, `code` and sentence.
+    const forbiddenBodies = [
+        '{"__proto__":{"polluted":true},"messages":[{"role":"user","content":"hi"}]}',
+        '{"messages":[{"role":"user","content":"hi"}],"metadata":{"__proto__":{"polluted":true}}}',
+        '{"\\u005f\\u005fproto\\u005f\\u005f":{"polluted":true},"messages":[{"role":"user","content":"hi"}]}',
+        '{"constr\\u0075ctor":{"prototype":{"polluted":true}},"messages":[{"role":"user","content":"hi"}]}'
+    ];
+    for (const [index, body] of forbiddenBodies.entries()) {
+        const res = await fetch(`${BASE}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'text/plain' },
+            body
+        });
+        const json = await res.json().catch(() => null);
+        check(`a forbidden property name is refused on the text path (body ${index + 1})`,
+            res.status === 400 && json?.error?.code === 'FST_ERR_CTP_INVALID_JSON_BODY' &&
+            /forbidden property name/.test(String(json?.error?.message)),
+            `status ${res.status} ${String(json?.error?.message).slice(0, 120)}`);
+    }
+    // `curl -d` labels the body `application/x-www-form-urlencoded`, which is handed over as the same string: the
+    // content type cannot be picked to skip the check
+    const formPoisoned = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/x-www-form-urlencoded' },
+        body: forbiddenBodies[0]
+    });
+    const formPoisonedJson = await formPoisoned.json().catch(() => null);
+    check('a forbidden property name is refused on the form-urlencoded path',
+        formPoisoned.status === 400 && formPoisonedJson?.error?.code === 'FST_ERR_CTP_INVALID_JSON_BODY',
+        `status ${formPoisoned.status} ${String(formPoisonedJson?.error?.message).slice(0, 120)}`);
+    // The two content types must answer the same thing, or the refusal tells a client which path it took
+    const sameBodyAsJson = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: forbiddenBodies[0]
+    });
+    const sameBodyAsJsonJson = await sameBodyAsJson.json().catch(() => null);
+    const sameBodyAsText = await fetch(`${BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'text/plain' },
+        body: forbiddenBodies[0]
+    });
+    const sameBodyAsTextJson = await sameBodyAsText.json().catch(() => null);
+    check('the prototype-poisoning refusal is identical on both content types',
+        sameBodyAsJson.status === 400 && sameBodyAsText.status === 400 &&
+        sameBodyAsJsonJson?.error?.message === sameBodyAsTextJson?.error?.message &&
+        sameBodyAsJsonJson?.error?.code === sameBodyAsTextJson?.error?.code,
+        `${String(sameBodyAsJsonJson?.error?.message).slice(0, 80)} | ${String(sameBodyAsTextJson?.error?.message).slice(0, 80)}`);
+    check('a refused body does not reach Object.prototype',
+        ({}).polluted === undefined && Object.getPrototypeOf({}).polluted === undefined);
+
     const textPlainBad = await fetch(`${BASE}/v1/chat/completions`, {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'text/plain' },
@@ -1436,6 +1560,49 @@ async function run() {
     const contentFrameCount = chunks.filter((chunk) => chunk?.choices?.[0]?.delta?.content).length;
     check('property-less backend events do not break the stream', contentFrameCount >= 2,
         `${contentFrameCount} content frame(s)`);
+
+    // A long answer arrives as ~180 deltas, and the collector re-arms its idle timer for every one of them. Re-arming it
+    // in place (`refresh()`) measured 0.28 ms against 2.10 ms of clear-and-create churn over 4000 deltas, so the timer
+    // that is refreshed has to behave exactly like the one that was rebuilt: the whole answer still arrives, in many
+    // frames, and the stream still ends with the finish frame and `[DONE]`.
+    const manyDeltas = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'MANYDELTAS' }], stream: true },
+        stream: true
+    });
+    const manyDeltaFrames = parseSseFrames(manyDeltas.text);
+    const manyDeltaChunks = manyDeltaFrames
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        });
+    const manyDeltaContent = manyDeltaChunks
+        .filter((chunk) => chunk?.choices?.[0]?.delta?.content)
+        .map((chunk) => chunk.choices[0].delta.content)
+        .join('');
+    const manyDeltaFrameCount = manyDeltaChunks.filter((chunk) => chunk?.choices?.[0]?.delta?.content).length;
+    check('a stream of many deltas arrives whole',
+        manyDeltas.response.status === 200 && manyDeltaContent === MANY_DELTAS_ANSWER,
+        `${manyDeltaContent.length} of ${MANY_DELTAS_ANSWER.length} chars`);
+    check('a stream of many deltas really is many frames', manyDeltaFrameCount >= 50,
+        `${manyDeltaFrameCount} content frame(s)`);
+    check('a stream of many deltas still ends with the finish frame and [DONE]',
+        manyDeltaFrames[manyDeltaFrames.length - 1] === '[DONE]' &&
+        manyDeltaChunks.some((chunk) => chunk?.choices?.[0]?.finish_reason === 'stop') &&
+        manyDeltaChunks.some((chunk) => chunk?.choices?.[0]?.delta?.role === 'assistant'),
+        `${manyDeltaFrames.length} frames`);
+    const manyDeltasPlain = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'MANYDELTAS' }] }
+    });
+    check('a many-delta answer is served whole without streaming',
+        manyDeltasPlain.json?.choices?.[0]?.message?.content === MANY_DELTAS_ANSWER &&
+        manyDeltasPlain.json?.choices?.[0]?.finish_reason === 'stop',
+        `${String(manyDeltasPlain.json?.choices?.[0]?.message?.content).length} chars`);
 
     const reasoningDeltas = chunks
         .filter((chunk) => chunk?.choices?.[0]?.delta?.reasoning_content)
@@ -2139,6 +2306,50 @@ async function run() {
         forgedConfigLines.length > 0 &&
             forgedConfigLines.every((line) => line.includes('/nonexistent/forged?[Shutdown]')),
         JSON.stringify(forgedConfigLines));
+    // The spawn error is the one place where text from outside the gateway lands in a log **message** rather than in a
+    // detail object (whose newline `JSON.stringify` escapes): `spawn` repeats the command it was handed back inside an
+    // OS sentence. A configured path that exists is used as-is (no shell, so the quoting guard above does not run), and
+    // a non-executable file of that name answers EACCES - so the path under test can carry a newline into that message.
+    const spawnDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-spawn-'));
+    const spawnBinary = path.join(spawnDir, 'opencode\n[Shutdown] Not really spawning');
+    fs.writeFileSync(spawnBinary, 'not a program');
+    fs.chmodSync(spawnBinary, 0o644);
+    const spawnFailPort = GATEWAY_PORT + 72;
+    const spawnFailUrl = `http://127.0.0.1:${spawnFailPort}`;
+    const spawnFailGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(spawnFailPort),
+            BIND_HOST: '127.0.0.1',
+            // Nothing answers on this backend address, so a completion reaches spawnBackend()
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${GATEWAY_PORT + 73}`,
+            OPENCODE_PATH: spawnBinary,
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(spawnFailGateway);
+    let spawnFailOutput = '';
+    spawnFailGateway.stdout.on('data', (chunk) => { spawnFailOutput += chunk; });
+    spawnFailGateway.stderr.on('data', (chunk) => { spawnFailOutput += chunk; });
+    await waitForOk(`${spawnFailUrl}/health`);
+    await fetch(`${spawnFailUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+    }).then((res) => res.text()).catch(() => '');
+    for (let i = 0; i < 120 && !spawnFailOutput.includes('Failed to spawn OpenCode'); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const spawnFailLine = spawnFailOutput.split('\n').find((line) => line.includes('Failed to spawn OpenCode')) || '';
+    // The other two lines that quote the path are detail objects, where `JSON.stringify` escapes the newline by itself
+    const forgedSpawnRecord = spawnFailOutput.split('\n').some((line) => line.startsWith('[Shutdown] Not really spawning'));
+    check('a newline in a spawn error cannot forge a second log record',
+        spawnFailLine.includes('?[Shutdown] Not really spawning EACCES') && !forgedSpawnRecord,
+        JSON.stringify(spawnFailLine).slice(0, 240));
+    stopGateway(spawnFailGateway);
+    await waitForExit(spawnFailGateway);
+    fs.rmSync(spawnDir, { recursive: true, force: true });
 
     // The same rule reaches the values `[Config]` names: `readLimit()` builds its note out of the operator's text, and
     // the port and the three timing knobs interpolated the raw value, so a newline in any of them forged a record too.
@@ -2233,6 +2444,103 @@ async function run() {
     stopGateway(forgedCwdGateway);
     await waitForExit(forgedCwdGateway);
     fs.rmSync(forgedCwdDir, { recursive: true, force: true });
+
+    // --- the key a tool-using backend can still read --------------------------------------------------------
+    // `spawnBackend()` deletes `API_KEY` from the child's environment, which is hygiene and not a boundary: the backend
+    // runs as the same uid with model-directed tools, so it can open the file the key came from (or this process's
+    // environment). Nothing inside one uid prevents that, so the gateway says so at startup, next to the built-in-key
+    // warning - and says nothing when tools are switched off, where the warning would be noise.
+    const keyWarnPort = GATEWAY_PORT + 74;
+    const keyWarnUrl = `http://127.0.0.1:${keyWarnPort}`;
+    const keyWarnGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(keyWarnPort),
+            BIND_HOST: '127.0.0.1',
+            API_KEY: 'sk-real-key-from-env',
+            OPENCODE_SERVER_URL: STUB_URL,
+            DISABLE_TOOLS: '',
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(keyWarnGateway);
+    let keyWarnOutput = '';
+    keyWarnGateway.stdout.on('data', (chunk) => { keyWarnOutput += chunk; });
+    keyWarnGateway.stderr.on('data', (chunk) => { keyWarnOutput += chunk; });
+    await waitForOk(`${keyWarnUrl}/health`);
+    const keyWarnLine = keyWarnOutput.split('\n').find((line) => line.includes('[Security] API_KEY is set')) || '';
+    check('a custom key with tools enabled warns that the backend can read it',
+        /\[Security\] API_KEY is set, but tools are enabled/.test(keyWarnLine) &&
+            /DISABLE_TOOLS=true/.test(keyWarnLine),
+        JSON.stringify(keyWarnLine).slice(0, 260));
+    check('the warning never prints the key it is about',
+        !keyWarnOutput.includes('sk-real-key-from-env'), JSON.stringify(keyWarnOutput.slice(0, 200)));
+    stopGateway(keyWarnGateway);
+    await waitForExit(keyWarnGateway);
+
+    const keyQuietPort = GATEWAY_PORT + 75;
+    const keyQuietUrl = `http://127.0.0.1:${keyQuietPort}`;
+    const keyQuietGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(keyQuietPort),
+            BIND_HOST: '127.0.0.1',
+            API_KEY: 'sk-real-key-from-env',
+            OPENCODE_SERVER_URL: STUB_URL,
+            DISABLE_TOOLS: 'true',
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(keyQuietGateway);
+    let keyQuietOutput = '';
+    keyQuietGateway.stdout.on('data', (chunk) => { keyQuietOutput += chunk; });
+    keyQuietGateway.stderr.on('data', (chunk) => { keyQuietOutput += chunk; });
+    await waitForOk(`${keyQuietUrl}/health`);
+    check('tools disabled: the key warning is not emitted',
+        !keyQuietOutput.includes('[Security] API_KEY is set'), JSON.stringify(keyQuietOutput.slice(0, 200)));
+    stopGateway(keyQuietGateway);
+    await waitForExit(keyQuietGateway);
+
+    // --- the jail parent directory belongs to this process --------------------------------------------------
+    // `/tmp` is world-writable and the jail parent name is predictable, and `mkdirSync(recursive)` succeeds on a
+    // directory somebody else already created: that account would own the parent of the backend's working directory
+    // (and, with USE_ISOLATED_HOME, of its HOME with the provider auth store) and could swap the leaf for its own
+    // directory or a symlink before the next respawn. The check is a filesystem decision, so the helper is asserted
+    // directly rather than through a spawned backend.
+    if (process.platform !== 'win32') {
+        const plantedParent = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-jail-'));
+        const symlinkTarget = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-jail-target-'));
+        try {
+            fs.symlinkSync(symlinkTarget, path.join(plantedParent, 'opencode-proxy-jail'), 'dir');
+            const chosen = resolveJailParent(false, plantedParent);
+            check('a planted jail parent is not followed',
+                chosen !== path.join(plantedParent, 'opencode-proxy-jail') &&
+                    fs.statSync(chosen).isDirectory() && fs.readdirSync(symlinkTarget).length === 0,
+                `${chosen} | ${JSON.stringify(fs.readdirSync(symlinkTarget))}`);
+            check('the replacement jail parent is private and unpredictable',
+                path.basename(chosen).startsWith('opencode-proxy-jail-') &&
+                    (fs.statSync(chosen).mode & 0o777) === 0o700,
+                `${path.basename(chosen)} mode ${(fs.statSync(chosen).mode & 0o777).toString(8)}`);
+            fs.rmSync(chosen, { recursive: true, force: true });
+        } finally {
+            fs.rmSync(plantedParent, { recursive: true, force: true });
+            fs.rmSync(symlinkTarget, { recursive: true, force: true });
+        }
+        // A parent this process owns is reused instead of replaced, which is what keeps one tree per running gateway
+        const ownedParent = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-jail-'));
+        try {
+            const first = resolveJailParent(false, ownedParent);
+            const second = resolveJailParent(false, ownedParent);
+            check('a jail parent this process owns is reused',
+                first === path.join(ownedParent, 'opencode-proxy-jail') && second === first &&
+                    (fs.statSync(first).mode & 0o777) === 0o700,
+                `${first} mode ${(fs.statSync(first).mode & 0o777).toString(8)}`);
+        } finally {
+            fs.rmSync(ownedParent, { recursive: true, force: true });
+        }
+    }
 
     // The legacy debug switch loses to an explicit LOG_LEVEL. That used to happen in complete silence: an operator who
     // raised the detail with the documented switch got a warn-only log and a summary line that looked as if the switch

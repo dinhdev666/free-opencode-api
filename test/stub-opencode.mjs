@@ -119,6 +119,9 @@ const BAD_PART_TEXT = 'Alpha';
 // The reasoning-only answer: a provider that writes reasoning and no text, and never marks the message finished
 const REASON_ONLY_TEXT = 'thinking only';
 export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub.';
+// An answer long enough to be delivered as ~180 deltas (prompt marker MANYDELTAS): the gateway re-arms its idle timer on
+// every delta, and the whole answer still has to arrive in order
+export const MANY_DELTAS_ANSWER = Array.from({ length: 60 }, (_, index) => `part${index}`).join(' ');
 export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -801,7 +804,14 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
                 return;
             }
-            const answerText = toolTag ? TOOL_TAG_ANSWER : tailTag ? TAIL_TAG_ANSWER : ANSWER;
+            const manyDeltas = session.promptText.includes('MANYDELTAS');
+            const answerText = toolTag
+                ? TOOL_TAG_ANSWER
+                : tailTag
+                    ? TAIL_TAG_ANSWER
+                    : manyDeltas
+                        ? MANY_DELTAS_ANSWER
+                        : ANSWER;
             session.messages.push(buildAssistantMessage(id, answerText, REASONING));
             sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
             // Fire and forget: the gateway collects the answer from /event (or polling). A prompt containing SLOW
@@ -821,6 +831,11 @@ const server = http.createServer(async (req, res) => {
                 options.delayMs = 1;
             }
             if (completedOnly) options.finish = 'completed-only';
+            if (manyDeltas) {
+                // 200 pieces over a 470-character answer: one SSE delta per ~3 characters, no artificial delay
+                options.pieces = 200;
+                options.delayMs = 0;
+            }
             streamAssistantReply(id, answerText, REASONING, options).catch(() => {});
             return;
         }

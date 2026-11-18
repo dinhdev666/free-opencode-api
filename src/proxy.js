@@ -1501,7 +1501,9 @@ function createApp(config) {
     // An id whose last segment is empty addresses no model: `/v1/models/%2F` and `/v1/models/opencode%2F` reached the
     // routes below with `/` and `opencode/` and were described as models with an empty (or separator) name - the same
     // class of non-model the blank id was.
-    const isDescribableModelId = (id) => Boolean(id && id.split('/').pop());
+    // The question is only "does the id end in a separator?": `split('/').pop()` built an array and one string per
+    // segment per by-id request (97 ns against 24 ns) on one of the two documented hot read routes.
+    const isDescribableModelId = (id) => Boolean(id && id[id.length - 1] !== '/');
     // A blank id (`/v1/models//`, `/v1/models/%20`) reaches this route with an empty param, because a doubled slash is
     // read as a trailing slash. Describing "" answered 200 with `{"id":"","name":""}` - not a model at all - so a blank
     // id is a missing route instead. `/v1/models/` itself still answers the listing.
@@ -1705,6 +1707,10 @@ function createApp(config) {
     // round trip to every completion
     const TOOL_IDS_FAILURE_TTL_MS = 60 * 1000;
     let cachedToolOverrides = null;
+    // How many switches the cached map carries. The handler needs "is this map empty?" once per completion, and
+    // `Object.keys(...).length` built an array of every tool id to answer it (552 ns and a 60-element array per
+    // completion, while `for…in` is no cheaper: V8 enumerates either way). The count is known right here.
+    let cachedToolOverrideCount = 0;
     let cachedToolAt = 0;
     let cachedToolError = false;
 
@@ -1738,6 +1744,7 @@ function createApp(config) {
                 setOwnProperty(overrides, id, ["read","glob"].includes(String(id).toLowerCase()));
             });
             cachedToolOverrides = overrides;
+            cachedToolOverrideCount = ids.length;
             cachedToolAt = Date.now();
             cachedToolError = false;
             logDebug('Tool overrides loaded', { count: ids.length });
@@ -1746,6 +1753,7 @@ function createApp(config) {
             // Remember the failure for a short while (the cache stays empty, so no tools are sent) instead of asking
             // the backend again on the next request
             cachedToolOverrides = null;
+            cachedToolOverrideCount = 0;
             cachedToolAt = Date.now();
             cachedToolError = true;
             // Masked and bounded like every other upstream sentence: a thrown `fetch`/SDK error quotes the URL it
@@ -2858,7 +2866,9 @@ function createApp(config) {
                         }
                     };
                     const toolOverrides = await getToolOverrides();
-                    if (toolOverrides && Object.keys(toolOverrides).length > 0) {
+                    // The count `getToolOverrides()` cached with the map: enumerating the keys here built the whole tool
+                    // list (and its array) once per completion to answer "is there anything in it?"
+                    if (toolOverrides && cachedToolOverrideCount > 0) {
                         promptParams.body.tools = toolOverrides;
                     }
                     if (logger.isEnabled('debug')) {

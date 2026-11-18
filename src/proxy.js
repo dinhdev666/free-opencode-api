@@ -759,6 +759,41 @@ const readMilliseconds = (name, fallback, fileValue) => {
     return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
 };
 
+/**
+ * The completion budget (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`), resolved through the documented precedence:
+ * an explicit embedder option, then the environment, then `config.json`, then the default.
+ *
+ * A blank environment value counts as **unset**, the rule every other key follows (`envOrFile()` in `src/config.js`,
+ * `readLimit()` and `readMilliseconds()` here): `??` treats `''` as a value, so a unit file's
+ * `Environment=OPENCODE_PROXY_REQUEST_TIMEOUT_MS=`, a Helm value rendered empty or a shell that exports unconditionally
+ * ended the chain at the empty string and the gateway ran the default while the value in `config.json` was never read -
+ * silently, because the "unusable value" warning is skipped for a blank one too. A value that is present and unusable
+ * is still named in `note`, so the operator sees what was used.
+ * @param {object} options options handed to `startProxy()` (an explicit `REQUEST_TIMEOUT_MS` wins)
+ * @param {object} env environment to read, injectable so the precedence can be tested without mutating `process.env`
+ * @returns {{ value: number, note: string | null }} the budget in milliseconds and a `[Config]` note, if any
+ */
+export function resolveRequestTimeoutMs(options = {}, env = process.env) {
+    const fromEnv = env?.OPENCODE_PROXY_REQUEST_TIMEOUT_MS;
+    const fromFile = options.OPENCODE_PROXY_REQUEST_TIMEOUT_MS;
+    const fileIsUsable = fromFile !== undefined && fromFile !== null && String(fromFile).trim() !== '';
+    // Environment first, but only when it actually carries a value
+    const requested = (fromEnv === undefined || String(fromEnv).trim() === '')
+        ? (fileIsUsable ? fromFile : undefined)
+        : fromEnv;
+    const embedder = options.REQUEST_TIMEOUT_MS;
+    const embedderIsUsable = embedder !== undefined && embedder !== null && String(embedder).trim() !== '';
+    const chosen = embedderIsUsable ? embedder : requested;
+    const parsed = Number(chosen);
+    if (Number.isFinite(parsed) && parsed > 0) return { value: Math.floor(parsed), note: null };
+    const blank = chosen === undefined || chosen === null || String(chosen).trim() === '';
+    if (blank) return { value: DEFAULT_REQUEST_TIMEOUT_MS, note: null };
+    return {
+        value: DEFAULT_REQUEST_TIMEOUT_MS,
+        note: `OPENCODE_PROXY_REQUEST_TIMEOUT_MS='${loggableConfigValue(String(chosen).trim())}' is not a positive number, using ${DEFAULT_REQUEST_TIMEOUT_MS}`
+    };
+}
+
 // True when a configured millisecond value is present but unusable (so startProxy can name it and the value it used)
 const isUnusableMilliseconds = (value) => {
     if (value === undefined || value === null || String(value).trim() === '') return false;
@@ -4006,6 +4041,7 @@ export function startProxy(options) {
     // Normalised once: a trailing slash in OPENCODE_SERVER_URL turns every SDK path into `//session` (404)
     const backendUrl = normalizeBackendUrl(options.OPENCODE_SERVER_URL || 'http://127.0.0.1:4097');
 
+    const requestTimeout = resolveRequestTimeoutMs(options);
     const config = {
         PORT: options.PORT || 8083,
         // Empty/blank values fall back to DEFAULT_API_KEY: authentication is always on
@@ -4022,22 +4058,12 @@ export function startProxy(options) {
             ['OPENCODE_USE_ISOLATED_HOME', 'USE_ISOLATED_HOME'],
             false
         ),
-        REQUEST_TIMEOUT_MS: (() => {
-            // A malformed value must fall back to the default: Number('abc') is NaN and setTimeout(NaN) fires
-            // immediately, which would turn every completion into a 504. The fallback is named, like the queue and
-            // body knobs: a typo used to be invisible, so the gateway ran with 300000 ms while the operator believed
-            // a shorter budget was in force.
-            const requested = options.REQUEST_TIMEOUT_MS ??
-                process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS ??
-                options.OPENCODE_PROXY_REQUEST_TIMEOUT_MS;
-            const raw = Number(requested);
-            if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
-            const blank = requested === undefined || requested === null || String(requested).trim() === '';
-            if (!blank) {
-                logger.warn(`[Config] OPENCODE_PROXY_REQUEST_TIMEOUT_MS='${loggableConfigValue(String(requested).trim())}' is not a positive number, using ${DEFAULT_REQUEST_TIMEOUT_MS}`);
-            }
-            return DEFAULT_REQUEST_TIMEOUT_MS;
-        })(),
+        // A malformed value must fall back to the default: Number('abc') is NaN and setTimeout(NaN) fires immediately,
+        // which would turn every completion into a 504. The fallback is named, like the queue and body knobs: a typo
+        // used to be invisible, so the gateway ran with 300000 ms while the operator believed a shorter budget was in
+        // force. Resolution lives in one exported helper so the precedence (a blank environment value is "not set")
+        // is the same everywhere and can be tested without mutating `process.env`.
+        REQUEST_TIMEOUT_MS: requestTimeout.value,
         DISABLE_TOOLS: disableTools,
         DEBUG: flagOption(options.DEBUG, ['OPENCODE_PROXY_DEBUG'], false)
     };
@@ -4045,6 +4071,7 @@ export function startProxy(options) {
     // The queue limits follow the same precedence as every other key (environment, then config.json, then default).
     // They used to be resolved from the environment alone, so the same keys in config.json were silently ignored and
     // the gateway kept the documented default while the operator believed a different value was in force.
+    if (requestTimeout.note) logger.warn(`[Config] ${requestTimeout.note}`);
     const resolvedLimits = getQueueLimits(options);
     MAX_CONCURRENCY = resolvedLimits.concurrency;
     MAX_QUEUE_LENGTH = resolvedLimits.queue;

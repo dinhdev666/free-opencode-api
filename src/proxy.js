@@ -246,6 +246,23 @@ export const loggableConfigValue = (value) => {
         : clean;
 };
 
+// Text from the OS or from upstream on its way into a log *message*, rather than into a detail object.
+//
+// A detail is serialised with `JSON.stringify()`, so a newline inside it is escaped and stays on one line. A value
+// interpolated into the message is not: `Failed to spawn OpenCode: ${err.message}` puts an OS message there, and that
+// message quotes `OPENCODE_PATH`, which `config.json`/the environment can spell with a line break - so one spawn error
+// could write a record the gateway never wrote (`[gateway] … [ERROR] …` of the attacker's choosing) into `docker logs`.
+// Same rule as `loggableConfigValue()`, applied to text this process did not compose.
+const MAX_LOGGED_UPSTREAM_LENGTH = 256;
+const loggableUpstreamText = (value) => {
+    const raw = typeof value === 'string' ? value : String(value);
+    const clean = (raw.length > MAX_LOGGED_UPSTREAM_LENGTH ? raw.slice(0, MAX_LOGGED_UPSTREAM_LENGTH) : raw)
+        .replace(CONTROL_CHARS_RE, '?');
+    return raw.length > MAX_LOGGED_UPSTREAM_LENGTH
+        ? `${clean}…[truncated ${raw.length - MAX_LOGGED_UPSTREAM_LENGTH} chars]`
+        : clean;
+};
+
 /**
  * The type of a value from a request body as a word, for an error message that names what arrived. `Array.isArray`
  * comes first because `typeof []` is 'object': the reader of "found an object" would be told the field they sent is
@@ -4003,7 +4020,8 @@ async function ensureBackend(config, options = {}) {
             let spawnError = null;
             state.process.on('error', (err) => {
                 spawnError = err;
-                logger.error(`[Proxy] Failed to spawn OpenCode: ${err.message}`);
+                // Masked and flattened: the message is quoted from the OS and repeats `OPENCODE_PATH`
+                logger.error(`[Proxy] Failed to spawn OpenCode: ${loggableUpstreamText(err.message)}`);
                 if (err.code === 'ENOENT') {
                     logger.error(`[Proxy] Command '${loggableConfigValue(OPENCODE_PATH)}' not found. Please ensure OpenCode is installed and in your PATH.`);
                     logger.error(`[Proxy] You can specify the full path in config.json using 'OPENCODE_PATH'`);

@@ -1,0 +1,45 @@
+# Dependency updates in one place: the three ecosystems this project actually pins something in.
+#
+# Nothing here runs code from a dependency at start-up, so an outdated entry is not automatically an incident - but the
+# image packages `opencode-ai` and the runtime carries `fastify` and `@opencode-ai/sdk`, and a security fix in any of
+# them should arrive as a reviewable pull request rather than as a CVE nobody looked at. Dependabot opens one pull
+# request per ecosystem on the schedule below; every one of them goes through the same CI (the smoke suite and the
+# commit-message check), so a bump that breaks the contract is caught before it can be merged.
+version: 2
+updates:
+  # Runtime dependencies (package.json + pnpm-lock.yaml). Dependabot reads the lockfile, so the update it proposes is
+  # the one `pnpm install --frozen-lockfile` will accept.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      # The repository's convention (CONTRIBUTING.md): `deps` is the scope for a dependency bump
+      prefix: deps
+      include: scope
+
+  # The workflow actions are pinned to full commit SHAs on purpose (ci.yml enforces it), so an update is a new SHA plus
+  # its release comment - exactly the review Dependabot can prepare.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+      include: scope
+
+  # The base image and the `opencode-ai` CLI version (docker/Dockerfile): a digest or a CLI release that is no longer
+  # fetched is a supply-chain question an operator should see, not one buried in a rebuild.
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: docker
+      include: scope

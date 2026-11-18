@@ -171,6 +171,20 @@ async function run() {
         booleanResults.every(([, actual, expected]) => actual === expected), JSON.stringify(booleanResults));
     check('parseBoolean returns the fallback for an unknown value',
         parseBoolean('maybe', 'fallback') === 'fallback' && parseBoolean(undefined, 'fallback') === 'fallback');
+    // A number is what `JSON.parse` gives for a numeric `stream` field, and every other number used to be "on":
+    // `{"stream": 0}` was read as `stream: true` and answered SSE to a client waiting for a JSON body.
+    check('parseBoolean reads the numbers 1 and 0, and nothing else as a number',
+        parseBoolean(1, null) === true && parseBoolean(0, null) === false &&
+            parseBoolean(2, 'fallback') === 'fallback' && parseBoolean(-1, 'fallback') === 'fallback',
+        JSON.stringify([parseBoolean(1, null), parseBoolean(0, null), parseBoolean(2, 'fallback')]));
+
+    // A timeout above `setTimeout`'s 32-bit ceiling fires immediately in Node, so a `…_REQUEST_TIMEOUT_MS=9999999999`
+    // (typo, or milliseconds where seconds were meant) turned every completion into an instant 504 while the summary
+    // reported the value. Clamped, with a note.
+    const clampedTimeout = resolveRequestTimeoutMs({}, { OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '9999999999' });
+    check('a request timeout above the largest timer is clamped',
+        clampedTimeout.value === 2147483647 && /above the maximum 2147483647/.test(clampedTimeout.note || ''),
+        JSON.stringify(clampedTimeout));
     // The longest accepted spelling is five characters, so a client-sized value is rejected on its length alone instead
     // of being trimmed and lowercased first (a 50 MiB `stream` value cost 10 ms per call on the serving thread, and the
     // handler reads each boolean field twice)
@@ -220,13 +234,16 @@ async function run() {
     check('credential query values are masked in a logged URL',
         urlMaskingResults.every(([, actual, expected]) => actual === expected), JSON.stringify(urlMaskingResults));
 
-    // docker/docker-entrypoint.sh prints the first-boot config from `docker logs` and cannot import this module, so it
-    // repeats the name list. A name added to one copy only leaves the secret in one of the two dumps, which is exactly
-    // how three hand-copied CORS lists drifted once already.
+    // docker/docker-entrypoint.sh prints the first-boot config from `docker logs`. It imports `maskSecret()` and
+    // `maskBackendUrl()` from src/logger.js instead of repeating them: the hand-copied alternation had drifted (it had
+    // no `#` separator and no `%XX` decoding), and a name added to one copy only leaves a secret in one of the two
+    // dumps. The check asserts the import and that no copy was pasted back in.
     const entrypointSource = fs.readFileSync(path.join(ROOT, 'docker', 'docker-entrypoint.sh'), 'utf8');
-    check('the entrypoint masks the same credential names as the logger',
-        entrypointSource.includes(`(${SENSITIVE_NAME_ALTERNATIVES})`),
-        JSON.stringify(SENSITIVE_NAME_ALTERNATIVES));
+    check('the entrypoint masks with the logger helpers instead of a copy',
+        entrypointSource.includes('maskBackendUrl(cfg.OPENCODE_SERVER_URL)') &&
+        entrypointSource.includes('maskSecret(cfg.API_KEY)') &&
+        !entrypointSource.includes(`(${SENSITIVE_NAME_ALTERNATIVES})`),
+        'docker/docker-entrypoint.sh');
 
     // A configuration key lives in four places: the keys the entry point reads (`CONFIG_FILE_KEYS`), the template
     // operators copy (`config.json.example`), the README table they read, and the generated file the container
@@ -599,12 +616,14 @@ async function run() {
         !hugeContent.includes('secret'),
         `${hugeContent.length} chars`);
 
-    // The wiring, on the source: every fatal line logs the masked pair, and none of them prints a raw stack.
+    // The wiring, on the source: every fatal line logs the masked pair, and none of them prints a raw stack. Four of
+    // them: the failed start, the unhandled rejection, the uncaught exception, and the listen failure `startProxy()`
+    // now reports through `ready` instead of calling `process.exit()` itself.
     const indexSource = fs.readFileSync(path.join(ROOT, 'index.js'), 'utf8');
     check('no fatal handler prints a raw error sentence or stack',
         !/stack:\s*(err|error|reason)\??\.stack/.test(indexSource) &&
         !/stack:\s*(err|error|reason)\??\.stack/.test(proxySource) &&
-        (indexSource.match(/loggableError\(/g) || []).length === 3 &&
+        (indexSource.match(/loggableError\(/g) || []).length === 4 &&
         !proxySource.includes('stack: error.stack'),
         JSON.stringify({
             indexRaw: /stack:\s*(err|error|reason)\??\.stack/.test(indexSource),
@@ -1964,6 +1983,20 @@ async function run() {
         pollsAfterFastPath === pollsBeforeFastPath,
         `message polls ${pollsBeforeFastPath} -> ${pollsAfterFastPath}`);
 
+    // The fast path is for a *finished answer*, and opencode marks the step that asked for a tool `finish: "tool-calls"`
+    // while the step that answers it is still being written. Serving that step here handed the client the model's
+    // preamble for a request that went on to run a tool and answer (measured: the step text in 30 ms).
+    const promptToolCalls = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'PROMPTTOOLCALLS' }], stream: false }
+    });
+    const promptToolCallsContent = String(promptToolCalls.json?.choices?.[0]?.message?.content ?? '');
+    check('a finished tool-calls step in the prompt response is not served as the answer',
+        promptToolCalls.response.status === 200 &&
+            promptToolCallsContent === ANSWER &&
+            !promptToolCallsContent.includes('TWO_STEP'),
+        JSON.stringify(promptToolCallsContent).slice(0, 200));
+
     // --- the newer `developer` role is an instruction, not a chat turn -----------------------------------
     // OpenAI renamed the system role to `developer`; a client that sends it means the instructions. Prefixing it with
     // "DEVELOPER: …" and pushing it into the conversation changed how a model reads it.
@@ -2247,9 +2280,12 @@ async function run() {
         JSON.stringify(flagOutput.slice(0, 240)));
     // index.js resolves the flag and startProxy() takes that resolved value as given, so the same typo must not be
     // reported twice: two lines for one value read like two different settings.
+    // index.js resolves the flag and startProxy() takes that resolved value as given, so the same typo must not be
+    // reported twice: two lines for one value read like two different settings. Matched on the falsy-value note itself:
+    // the `[Security]` tools line below also names `DISABLE_TOOLS=true` and is not a second report of this value.
+    const flagNoteLines = flagOutput.split('\n').filter((line) => /DISABLE_TOOLS='.*' is not a boolean/.test(line));
     check('the flag warning is written once, not by both layers',
-        flagOutput.split('\n').filter((line) => line.includes('DISABLE_TOOLS=')).length === 1,
-        JSON.stringify(flagOutput.split('\n').filter((line) => line.includes('DISABLE_TOOLS='))));
+        flagNoteLines.length === 1, JSON.stringify(flagNoteLines));
     // A module embedder calls startProxy() directly, with no entry point to resolve the option first: the environment
     // fallback has to report the value too, or the tool guard is off with nothing in the log about it.
     const embedDriver = [
@@ -3155,6 +3191,121 @@ async function run() {
         spamText === 'done', JSON.stringify(spamText.slice(0, 80)));
     check('stripping a 1 MB answer of tool-call tags does not stall the gateway',
         spamMs < 4000, `${spamMs} ms`);
+
+    // --- the tool list the switch map is built from ---------------------------------------------------------
+    // With tools disabled the gateway asks the backend for its tool ids and sends one switch per tool. Reading that list
+    // is what makes the map complete: it used to be requested lazily on the first completion, and a failed request was
+    // cached as "the backend has no tools" - so no switches were sent at all and every tool stayed enabled for the
+    // whole cache window while DISABLE_TOOLS was on.
+    // The stub counts the requests, so the "it was read" half is asserted against the gateway that has tools off.
+    const toolStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    check('tools disabled: the backend tool list is read for the switch map',
+        Number(toolStats?.toolIdCalls) > 0, `toolIdCalls=${toolStats?.toolIdCalls}`);
+
+    // The failure half needs a backend that refuses the list. The completion must still answer (the backend defaults
+    // apply), and the reason has to be said once rather than per request - a refusal retried on every completion was one
+    // extra failed round trip each time.
+    const failToolStubPort = GATEWAY_PORT + 76;
+    const failToolStubUrl = `http://127.0.0.1:${failToolStubPort}`;
+    await assertPortFree(failToolStubPort, 'tool-list stub');
+    const failToolStub = spawn(process.execPath, [path.join(ROOT, 'test', 'stub-opencode.mjs')], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(failToolStubPort), STUB_FAIL_TOOL_IDS: '1' }
+    });
+    children.push(failToolStub);
+    failToolStub.stdout.on('data', () => {});
+    failToolStub.stderr.on('data', () => {});
+    await waitForOk(`${failToolStubUrl}/health`);
+
+    const failToolPort = GATEWAY_PORT + 77;
+    const failToolUrl = `http://127.0.0.1:${failToolPort}`;
+    await assertPortFree(failToolPort, 'tool-list gateway');
+    const failToolGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(failToolPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: failToolStubUrl,
+            LOG_LEVEL: 'warn',
+            DISABLE_TOOLS: 'true'
+        }
+    });
+    children.push(failToolGateway);
+    let failToolOutput = '';
+    failToolGateway.stdout.on('data', (chunk) => { failToolOutput += chunk; });
+    failToolGateway.stderr.on('data', (chunk) => { failToolOutput += chunk; });
+    await waitForOk(`${failToolUrl}/health`);
+
+    const failToolResponses = [];
+    for (let i = 0; i < 2; i++) {
+        failToolResponses.push(await fetch(`${failToolUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+        }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) })));
+    }
+    check('a tool list the backend refuses still answers every completion',
+        failToolResponses.every((r) => r.status === 200 && r.json?.choices?.[0]?.message?.content === ANSWER),
+        JSON.stringify(failToolResponses.map((r) => r.status)));
+    const failToolLines = failToolOutput.split('\n').filter((line) => line.includes('tool list'));
+    check('a refused tool list is named once, not once per completion',
+        /DISABLE_TOOLS is on but the backend tool list could not be read/.test(failToolOutput) && failToolLines.length === 1,
+        JSON.stringify(failToolLines).slice(0, 240));
+    stopGateway(failToolGateway);
+    await waitForExit(failToolGateway);
+
+    // --- a request still waiting for a slot when shutdown begins ------------------------------------------
+    // The documented answer for a request the gateway refuses because it is going away is `503` with
+    // `code: "gateway_shutting_down"` and `Retry-After: 1`. A completion already being served got it through
+    // `killBackend()`; one still *waiting for a slot* did not - `server.close()` waited for it, `closeAllConnections()`
+    // destroyed the socket 1.5 s later, and the client saw `fetch failed` (measured 1 507 ms after the signal), a
+    // connection reset it cannot tell from a crash.
+    const queueShutdownPort = GATEWAY_PORT + 78;
+    const queueShutdownUrl = `http://127.0.0.1:${queueShutdownPort}`;
+    await assertPortFree(queueShutdownPort, 'queued-shutdown gateway');
+    const queueShutdownGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(queueShutdownPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: STUB_URL,
+            LOG_LEVEL: 'error',
+            OPENCODE_PROXY_MAX_CONCURRENCY: '1'
+        }
+    });
+    children.push(queueShutdownGateway);
+    queueShutdownGateway.stdout.on('data', () => {});
+    queueShutdownGateway.stderr.on('data', () => {});
+    await waitForOk(`${queueShutdownUrl}/health`);
+
+    // Fills the only slot for 3 s, so the request below is still queued when the signal arrives
+    const holdsOnlySlot = fetch(`${queueShutdownUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'SLOWFINISH while queueing' }] })
+    }).catch(() => null);
+    await sleep(150);
+    const queuedDuringShutdown = fetch(`${queueShutdownUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+    }).then(async (response) => ({
+        status: response.status,
+        retryAfter: response.headers.get('retry-after'),
+        json: await response.json().catch(() => null)
+    })).catch((error) => ({ status: 0, retryAfter: null, json: null, error: String(error?.message) }));
+    await sleep(150);
+    stopGateway(queueShutdownGateway);
+    const queuedAnswer = await queuedDuringShutdown;
+    await holdsOnlySlot;
+    check('a request still queued when shutdown begins is answered 503 gateway_shutting_down',
+        queuedAnswer.status === 503 &&
+            queuedAnswer.json?.error?.code === 'gateway_shutting_down' &&
+            queuedAnswer.retryAfter === '1',
+        `status ${queuedAnswer.status} retry-after ${queuedAnswer.retryAfter} ${JSON.stringify(queuedAnswer.json)?.slice(0, 160)}`);
+    await waitForExit(queueShutdownGateway);
 
     // --- a non-ASCII key ----------------------------------------------------------------
     // The bearer check compares bytes: a key with accented characters matching in string length but not in byte

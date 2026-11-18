@@ -82,5 +82,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # A published image is something operators run; attest it. Provenance records how the image was built (the
+          # commit, the workflow, the base image digest) and the SBOM lists what is inside it, so a CVE report can name
+          # the packages this image actually contains instead of the ones the repository happens to declare. Both are
+          # attached to the manifest list, which is also what makes the image inspectable by scanners.
+          provenance: true
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max

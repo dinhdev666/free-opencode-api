@@ -47,6 +47,15 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Advisory, never a gate: the audit needs the registry, so a network hiccup or a finding nobody has fixed yet
+      # would fail a pull request that changed nothing about dependencies. `continue-on-error` keeps the report in the
+      # log while the required checks stay about the code, and Dependabot (.github/dependabot.yml) prepares the bump.
+      # One matrix entry runs it: three identical reports per push cost runner time and tell nobody anything new.
+      - name: Dependency audit (advisory)
+        if: matrix.node == '22'
+        continue-on-error: true
+        run: pnpm audit --audit-level high
+
       - name: Syntax check
         run: pnpm run check
 

@@ -29,8 +29,25 @@ if [ -d "$CONFIG" ]; then
 fi
 
 if [ ! -f "$CONFIG" ]; then
-    node -e '
-        const fs = require("fs");
+    # The masking helpers live in src/logger.js and are imported instead of copied: the hand-copied copy of the
+    # credential-name list here had already drifted (it missed the `#` separator a raw request target can carry and the
+    # `%XX`-encoded parameter names), and a name added to one copy only leaves a secret in one of the two dumps. The
+    # module is ESM, so the snippet runs as one (`--input-type=module`) and awaits the import; the path is passed in
+    # rather than hardcoded.
+    node --input-type=module -e '
+        const fs = await import("node:fs");
+        const { pathToFileURL } = await import("node:url");
+        // A logger that cannot be imported (an image whose /app was rearranged) must not leave the key unmasked: both
+        // values are then shown as `***`, which is a coarser rule than maskSecret()/maskBackendUrl() and never a leak.
+        let maskSecret = () => "***";
+        let maskBackendUrl = () => "***";
+        try {
+            const helpers = await import(pathToFileURL(process.argv[1]).href);
+            maskSecret = helpers.maskSecret;
+            maskBackendUrl = helpers.maskBackendUrl;
+        } catch (e) {
+            console.error("[entrypoint] could not import the logger helpers, masking the whole values instead:", String(e && e.message));
+        }
         const env = (k, d) => { const v = process.env[k]; return (v === undefined || v === "") ? d : v; };
         // The OPENCODE_-prefixed name wins, exactly like `process.env.OPENCODE_X ?? process.env.X` in index.js
         const either = (keys, d) => { for (const k of keys) { const v = process.env[k]; if (v !== undefined && v !== "") return v; } return d; };
@@ -61,26 +78,18 @@ if [ ! -f "$CONFIG" ]; then
         fs.renameSync(tmp, "/app/config.json");
         // The generated config holds the API key, and this line ends up in `docker logs` (collected and shipped as
         // often as not): print where the key came from, never the key itself. Same rule as maskSecret() in
-        // src/logger.js - nothing is revealed up to 16 characters, and only the 4-character prefix above that.
-        const key = String(cfg.API_KEY);
-        const masked = (key.length <= 16 ? "***" : key.slice(0, 4) + "***") + ` (${key.length} chars)`;
+        // src/logger.js, which is the same function used here now.
         // The backend URL can carry credentials too (`http://user:secret@host:4097`, a proxy in front of the backend),
-        // and this line is collected from `docker logs`: userinfo and credential query values are masked the same way
-        // maskBackendUrl()/maskUrlQuery() in src/logger.js do it, and for the same reason. This script cannot import
-        // that module, so the alternation is repeated verbatim from SENSITIVE_NAME_ALTERNATIVES there - the smoke suite
-        // compares the two, and a name added in one place only would leave a secret in one of the two dumps.
-        const maskUrl = (value) => String(value)
-            .replace(/([?&])([^=&#]+)=([^&#]*)/gi,
-                (match, sep, name, v) => /(^|[-_])(auth|token|secret|cookie|session|passw|password|passwd|pwd|key|code|sig|signature|credential|bearer)([-_]|$)|authorization|authentication|api[-_]?key/i.test(name)
-                    ? `${sep}${name}=***`
-                    : match)
-            .replace(/^(\w[\w+.-]*:\/\/)[^/?#]*@/, "$1***@");
-        const shown = Object.assign({}, cfg, { API_KEY: masked, OPENCODE_SERVER_URL: maskUrl(cfg.OPENCODE_SERVER_URL) });
+        // so it goes through maskBackendUrl() for the same reason.
+        const shown = Object.assign({}, cfg, {
+            API_KEY: maskSecret(cfg.API_KEY),
+            OPENCODE_SERVER_URL: maskBackendUrl(cfg.OPENCODE_SERVER_URL)
+        });
         console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(shown));
         // Normalised like the shell branch below, and like loggableConfigValue() in src/proxy.js: one log record.
         const levelShown = String(env("LOG_LEVEL", "info")).replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 128);
         console.log("[entrypoint] log level (LOG_LEVEL env, higher priority than config.json):", levelShown);
-    '
+    ' /app/src/logger.js
 else
     echo "[entrypoint] /app/config.json exists, keeping it (environment variables still win over the file)"
     echo "[entrypoint] log level (LOG_LEVEL env, higher priority than config.json): $LOG_LEVEL_DISPLAY"

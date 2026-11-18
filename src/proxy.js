@@ -18,9 +18,17 @@ const queue = [];
 
 const STARTUP_WAIT_ITERATIONS = 60;
 const STARTUP_WAIT_INTERVAL_MS = 2000;
+// The delays between the readiness probes of a child that is still binding: short at first (a backend that answers in
+// 100 ms must not wait a full interval), then the documented interval. The iteration budget is unchanged.
+const STARTUP_BACKOFF_MS = [100, 250, 500, 1000, 2000];
 const STARTING_WAIT_ITERATIONS = 120;
 const STARTING_WAIT_INTERVAL_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
+// The largest delay `setTimeout` (and `AbortSignal.timeout`, which arms one internally) accepts. A millisecond value
+// above it does not wait longer: Node warns `TimeoutOverflowWarning` and fires the timer after 1 ms, so every completion
+// answered `504` in ~13 ms with a budget the operator believed was in force. Values are clamped rather than dropped, so
+// "as long as possible" stays expressible.
+const MAX_TIMER_MS = 2 ** 31 - 1;
 /**
  * The message for a phase that ran into its deadline.
  * `remainingBudget()` floors what is left at 1 ms so a timer never gets 0 or a negative value, and interpolating that
@@ -221,6 +229,9 @@ export const handlerFailureMessage = (error) => {
 // methods answered that case with the path it had just declared missing.
 const SERVED_ROUTES = 'POST /v1/chat/completions, GET /v1/models and GET /health';
 const MAX_ECHOED_VALUE_LENGTH = 64;
+// A message role becomes the `USER:`/`ASSISTANT:` label a model reads, so it is bounded like every other client value
+// that reaches the prompt: the known roles are short, and anything longer is a label nobody wrote.
+const MAX_ROLE_LABEL_LENGTH = 32;
 const echoedValue = (value) => {
     // Bound first, transform second (see `loggableModelId()`): the replace runs on at most 64 characters of a value a
     // client can send 50 MiB of, and the output is unchanged because the regex is per character.
@@ -300,7 +311,15 @@ const FALSE_SPELLINGS = ['0', 'false', 'no', 'n', 'off'];
 
 export function parseBoolean(value, fallback = undefined) {
     if (typeof value === 'boolean') return value;
-    if (typeof value === 'number') return value === 1;
+    // A number is a switch only when it is exactly 1 or 0. Returning `value === 1` for every number made `2`, `-1` and
+    // `1.5` mean `false` instead of "unreadable", so the rule the string branch follows (report it, or refuse the field)
+    // depended on the JSON type a client or a config file happened to use: `{"stream": 2}` was served as JSON for a
+    // client parsing SSE, and a numeric `DISABLE_TOOLS: 2` in config.json left the tool filter off with no warning.
+    if (typeof value === 'number') {
+        if (value === 1) return true;
+        if (value === 0) return false;
+        return fallback;
+    }
     if (typeof value === 'string') {
         // The longest accepted spelling is five characters, so a value over 64 characters is rejected before it is
         // trimmed or lowercased: a request body is bounded by `OPENCODE_PROXY_MAX_BODY_MB`, and `{"stream": "aaaa…"}`
@@ -398,7 +417,14 @@ function findExecutableInDirs(dirs, names) {
     return null;
 }
 
-function resolveOpencodePath(requestedPath) {
+/**
+ * Resolves `OPENCODE_PATH` to the binary `spawnBackend()` will run (PATH, PATHEXT candidates, npm prefixes).
+ *
+ * Exported so the entry point's version probe asks the same question: probing the configured value answered "cannot
+ * verify the installation" for a backend that had resolved perfectly well elsewhere, and the 2.x warning that names a
+ * wrong major version never ran.
+ */
+export function resolveOpencodePath(requestedPath) {
     const input = (requestedPath || '').trim();
     const names = getOpencodeCandidateNames();
 
@@ -491,6 +517,35 @@ function resolveOpencodePath(requestedPath) {
 // value once at startup is cheaper than wondering why nothing works. Exported so the entry point can normalise before
 // it prints the startup summary: the summary is where an operator copies the value from, and it used to show the raw
 // form - a trailing slash or a trailing space the gateway never used - right beside a note saying it was corrected.
+/**
+ * A bind address is handed to `net` verbatim, and surrounding whitespace is not a host: a unit file, a Compose value or
+ * a rendered template that leaves a trailing space answered `getaddrinfo ENOTFOUND " 127.0.0.1"` and the gateway refused
+ * to start - with the padded value in the summary as the only clue. Trimmed, with a `[Config]` note naming the value
+ * that changed, the same rule `normalizeBackendUrl()` follows. `OPENCODE_PATH` is deliberately not trimmed: a path can
+ * contain a space.
+ * @param {string} label the name the operator used, for the note (`BIND_HOST`, `config.json BIND_HOST`, …)
+ * @param {string} value the configured value
+ * @returns {string} the trimmed value (empty when the value was blank, so the caller's default applies)
+ */
+export function normalizeBindHost(label, value) {
+    const raw = value === undefined || value === null ? '' : String(value);
+    const trimmed = raw.trim();
+    if (trimmed && trimmed !== raw) {
+        logger.warn(`[Config] ${label}='${loggableConfigValue(raw)}' has surrounding whitespace; using '${loggableConfigValue(trimmed)}'`);
+    }
+    return trimmed;
+}
+
+// True for the addresses whose traffic never leaves the host: `localhost`, the IPv4 loopback block, `::1` and the IPv6
+// forms a URL parser produces for them (`[::1]` arrives without brackets from `new URL().hostname`).
+const isLoopbackHost = (host) => {
+    const value = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
+    if (!value) return false;
+    if (value === 'localhost' || value === '::1' || value === '0:0:0:0:0:0:0:1') return true;
+    if (value === '::ffff:127.0.0.1') return true;
+    return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(value);
+};
+
 export function normalizeBackendUrl(raw) {
     let url = String(raw || '').trim();
     const notes = [];
@@ -569,7 +624,7 @@ function runQueuedTask() {
     const timeoutId = setTimeout(() => {
         if (settled) return;
         settled = true;
-        reject(new Error(timeoutMessage(timeoutMs)));
+        reject(Object.assign(new Error(timeoutMessage(timeoutMs)), { deadlineMs: timeoutMs }));
         // The client has been answered 504, but `.finally(release)` below only runs once the task settles - and a task
         // parked in an await that never resolves (a backend call without a deadline, a stuck socket) is exactly the
         // case this timer exists for: at the default concurrency of 1 that single task pinned the only slot, so every
@@ -645,6 +700,12 @@ class QueueFullError extends Error {
 
 function lock(task, timeout = 120000) {
     return new Promise((resolve, reject) => {
+        // A gateway that is going away must not park the request in a queue whose slots are being torn down: the
+        // documented 503 is an answer the client can retry, a closed socket is not.
+        if (gatewayShuttingDown) {
+            reject(Object.assign(new Error('The gateway is shutting down; retry shortly'), { gatewayShuttingDown: true }));
+            return;
+        }
         // The cap bounds the requests *waiting* for a slot, so it is only reached when every slot is busy: a queue of
         // 0 then means "never queue" (reject instead of waiting) rather than "refuse every completion", which would
         // let one configuration value switch the whole gateway off while it sits there looking healthy.
@@ -660,12 +721,43 @@ function lock(task, timeout = 120000) {
             const index = queue.indexOf(entry);
             if (index === -1) return;
             queue.splice(index, 1);
-            reject(new Error(`Request timeout after ${timeout}ms waiting for a free completion slot`));
+            // The deadline travels with the error so the client-facing sentence names the budget that was actually in
+            // force (the queue backstop is `REQUEST_TIMEOUT_MS` plus a grace) instead of a smaller one it never had
+            reject(Object.assign(
+                new Error(`Request timeout after ${timeout}ms waiting for a free completion slot`),
+                { deadlineMs: timeout }
+            ));
         }, timeout);
         queue.push(entry);
         processQueue();
     });
 }
+
+/**
+ * Marks the gateway as going away (`SIGINT`/`SIGTERM`), so a request that has not started yet is answered instead of
+ * being dropped.
+ *
+ * The documented contract is a `503 gateway_shutting_down` with `Retry-After: 1` for a request that is not one of the
+ * responses being finished. In-flight completions got that through `killBackend()`; a request still *waiting for a
+ * slot* did not - `server.close()` waits for it and `closeAllConnections()` destroys the socket 1.5 s later, so the
+ * client saw `fetch failed` (measured: 1 507 ms after the signal, no envelope). An OpenAI SDK treats a reset
+ * differently from a 503, and the whole point of the retry hint is that this refusal is temporary.
+ *
+ * The queue is drained here rather than polled: every waiting entry is rejected with a tagged error, which the
+ * handler's outer catch already maps to the 503 envelope.
+ */
+export function beginShutdown() {
+    gatewayShuttingDown = true;
+    while (queue.length) {
+        const entry = queue.shift();
+        if (entry.waitTimer) clearTimeout(entry.waitTimer);
+        entry.reject(Object.assign(new Error('The gateway is shutting down; retry shortly'), { gatewayShuttingDown: true }));
+    }
+}
+
+// Set by beginShutdown(); read by lock() so a request that arrives after the signal does not queue for a slot that will
+// never be free, and by ensureBackend() so a process that is going away does not start a new backend.
+let gatewayShuttingDown = false;
 
 // Keep-alive socket for backend health probes: a fresh connection per chat request is measurable overhead.
 // A remote (https) OPENCODE_SERVER_URL needs its own agent, otherwise the probe cannot even be sent.
@@ -676,6 +768,8 @@ const healthAgentSecure = new https.Agent({ keepAlive: true, maxSockets: 4 });
 // does, otherwise a backend behind a credential-requiring proxy answers the probe with 401 and the gateway concludes
 // its backend is gone (and tries to start a local one).
 let BACKEND_AUTHORIZATION = null;
+// Reads the backend tool list once, set by createApp() (it closes over the SDK client) and called after the warmup
+let warmToolOverrides = null;
 
 /**
  * Split a configured backend URL into the URL the SDK is given and the header that carries its credentials.
@@ -773,7 +867,8 @@ const readMilliseconds = (name, fallback, fileValue) => {
     const raw = (fromEnv === undefined || String(fromEnv).trim() === '') ? fileValue : fromEnv;
     if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
     const parsed = Number(raw);
-    return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+    if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+    return Math.min(Math.floor(parsed), MAX_TIMER_MS);
 };
 
 /**
@@ -802,7 +897,15 @@ export function resolveRequestTimeoutMs(options = {}, env = process.env) {
     const embedderIsUsable = embedder !== undefined && embedder !== null && String(embedder).trim() !== '';
     const chosen = embedderIsUsable ? embedder : requested;
     const parsed = Number(chosen);
-    if (Number.isFinite(parsed) && parsed > 0) return { value: Math.floor(parsed), note: null };
+    if (Number.isFinite(parsed) && parsed > 0) {
+        const floored = Math.floor(parsed);
+        if (floored <= MAX_TIMER_MS) return { value: floored, note: null };
+        // Longer than a timer can wait: clamp instead of arming a timer that fires after 1 ms
+        return {
+            value: MAX_TIMER_MS,
+            note: `OPENCODE_PROXY_REQUEST_TIMEOUT_MS=${floored} is above the maximum ${MAX_TIMER_MS} (the largest timer), using ${MAX_TIMER_MS}`
+        };
+    }
     const blank = chosen === undefined || chosen === null || String(chosen).trim() === '';
     if (blank) return { value: DEFAULT_REQUEST_TIMEOUT_MS, note: null };
     return {
@@ -927,6 +1030,21 @@ export function resolveJailParent(isWindows, tmpDir = os.tmpdir()) {
 // external backend (`OPENCODE_SERVER_URL`) keeps them in its store forever - one per restart. `killBackend()` drains
 // this set, so shutdown leaves the backend as it found it.
 const liveSessions = new Set();
+
+// A session delete that fails is the only signal that a backend is accumulating sessions, so it must not be silent -
+// but a backend that refuses every delete would otherwise write one warning per completion. One line per minute names
+// the cause; the rest stay at debug, where an operator debugging the backend can still see each one.
+const CLEANUP_FAILURE_WARN_INTERVAL_MS = 60 * 1000;
+let cleanupFailureWarnedAt = 0;
+const noteCleanupFailure = (sessionId, error) => {
+    const now = Date.now();
+    if (now - cleanupFailureWarnedAt < CLEANUP_FAILURE_WARN_INTERVAL_MS) {
+        logger.debug('[Proxy] Failed to delete session:', { sessionId, error });
+        return;
+    }
+    cleanupFailureWarnedAt = now;
+    logger.warn('[Proxy] Failed to delete session:', { sessionId, error });
+};
 
 /**
  * Removes the jail directories this process created. This runs on process exit, so it cannot rely on
@@ -1218,6 +1336,24 @@ function createApp(config) {
     // health probe, which the backend (or the proxy) would otherwise refuse with 401 and look like a missing backend.
     const backendAuth = resolveBackendAuth(OPENCODE_SERVER_URL);
     BACKEND_AUTHORIZATION = backendAuth.authorization;
+    // A credential sent over plain `http://` to a host that is not this machine travels in cleartext: readable by every
+    // hop between here and there, which is the one thing the masking elsewhere cannot help with. Loopback is fine (the
+    // bytes never leave the host), a remote host is worth a line.
+    if (backendAuth.authorization) {
+        let backendHost = null;
+        try {
+            backendHost = new URL(backendAuth.url).hostname;
+        } catch {
+            // Not a URL the gateway could parse: `resolveBackendAuth()` already left it as configured
+        }
+        if (backendHost && !isLoopbackHost(backendHost) && String(backendAuth.url).startsWith('http://')) {
+            logger.warn(
+                `[Security] OPENCODE_SERVER_URL sends its credential over plain http to ${loggableConfigValue(backendHost)}: ` +
+                'the Basic Authorization header is not encrypted on the wire. Use https:// or a loopback/tunnelled address ' +
+                'for a remote backend.'
+            );
+        }
+    }
     const client = createOpencodeClient({
         baseUrl: backendAuth.url,
         ...(backendAuth.authorization ? { headers: { authorization: backendAuth.authorization } } : {})
@@ -1853,60 +1989,108 @@ function createApp(config) {
     // `Object.keys(...).length` built an array of every tool id to answer it (552 ns and a 60-element array per
     // completion, while `for…in` is no cheaper: V8 enumerates either way). The count is known right here.
     let cachedToolOverrideCount = 0;
+    // When the map was last loaded successfully (its age), and when the list was last asked for (the failure backoff)
     let cachedToolAt = 0;
+    let cachedToolAttemptAt = 0;
     let cachedToolError = false;
+    // The refresh in flight, so a cold cache shares one round trip instead of one per waiting completion
+    let toolIdsInFlight = null;
 
-    const getToolOverrides = async () => {
-        if (!DISABLE_TOOLS) return null;
-        const cachedTtl = cachedToolError ? TOOL_IDS_FAILURE_TTL_MS : TOOL_IDS_CACHE_MS;
-        if (Date.now() - cachedToolAt < cachedTtl) {
-            return cachedToolOverrides;
+    // Reads the map and stores it. Throws on failure; the callers decide what that means.
+    const loadToolOverrides = async () => {
+        const idsRes = await client.tool.ids(backendDeadline(TOOL_IDS_TIMEOUT_MS));
+        // The SDK resolves on a non-2xx answer instead of throwing: an error tuple carries no data, so it used to
+        // be read as "the backend has no tools" and cached as a *success* - DISABLE_TOOLS then sent no tool
+        // switches at all for the whole cache window, leaving every tool enabled.
+        if (idsRes && idsRes.error) {
+            const { status } = upstreamFailureReason(idsRes);
+            throw new Error(`tool list rejected${status ? ` (status ${status})` : ''}`);
         }
-        try {
-            const idsRes = await client.tool.ids(backendDeadline(TOOL_IDS_TIMEOUT_MS));
-            // The SDK resolves on a non-2xx answer instead of throwing: an error tuple carries no data, so it used to
-            // be read as "the backend has no tools" and cached as a *success* - DISABLE_TOOLS then sent no tool
-            // switches at all for the whole cache window, leaving every tool enabled.
-            if (idsRes && idsRes.error) {
-                const { status } = upstreamFailureReason(idsRes);
-                throw new Error(`tool list rejected${status ? ` (status ${status})` : ''}`);
-            }
-            const ids = Array.isArray(idsRes?.data)
-                ? idsRes.data
-                : Array.isArray(idsRes)
-                    ? idsRes
-                    : [];
-            const overrides = {};
-            ids.forEach((id) => {
-                /* With opencode>=1.19 + a free zen model, disabling either read or glob makes the prompt request hang forever, so these two read-only tools stay enabled while all other tools remain disabled */
-                // `setOwnProperty()` for the same reason the masking helpers use it: the id is backend-supplied (an MCP
-                // server names its own tools), and `overrides['__proto__'] = false` runs the prototype setter as a
-                // silent no-op - that tool stayed enabled while DISABLE_TOOLS was on, the failure this switch exists to
-                // prevent.
-                setOwnProperty(overrides, id, ["read","glob"].includes(String(id).toLowerCase()));
+        const ids = Array.isArray(idsRes?.data)
+            ? idsRes.data
+            : Array.isArray(idsRes)
+                ? idsRes
+                : [];
+        const overrides = {};
+        ids.forEach((id) => {
+            /* With opencode>=1.19 + a free zen model, disabling either read or glob makes the prompt request hang forever, so these two read-only tools stay enabled while all other tools remain disabled */
+            // `setOwnProperty()` for the same reason the masking helpers use it: the id is backend-supplied (an MCP
+            // server names its own tools), and `overrides['__proto__'] = false` runs the prototype setter as a
+            // silent no-op - that tool stayed enabled while DISABLE_TOOLS was on, the failure this switch exists to
+            // prevent.
+            setOwnProperty(overrides, id, ["read","glob"].includes(String(id).toLowerCase()));
+        });
+        cachedToolOverrides = overrides;
+        cachedToolOverrideCount = ids.length;
+        cachedToolAt = Date.now();
+        cachedToolAttemptAt = cachedToolAt;
+        cachedToolError = false;
+        logDebug('Tool overrides loaded', { count: ids.length });
+        return overrides;
+    };
+
+    // Records a failed refresh. The last known-good map is kept, because an absent `tools` field is not "no tools":
+    // the gateway sends an override map, and omitting it leaves the backend's own defaults, i.e. every tool enabled.
+    // Discarding the map on a transient failure therefore turned one bad round trip into an open switch.
+    const noteToolOverrideFailure = (error) => {
+        const firstOfWindow = !cachedToolError;
+        cachedToolAttemptAt = Date.now();
+        cachedToolError = true;
+        if (!firstOfWindow) return;
+        // Masked and bounded like every other upstream sentence: a thrown `fetch`/SDK error quotes the URL it
+        // failed on, and a log line is collected (`docker logs`) as often as not
+        const sentence = clientFacingText(error?.message);
+        if (cachedToolOverrides) {
+            logger.warn('[Proxy] Could not refresh the backend tool list; the last known map is still in force', {
+                error: sentence
             });
-            cachedToolOverrides = overrides;
-            cachedToolOverrideCount = ids.length;
-            cachedToolAt = Date.now();
-            cachedToolError = false;
-            logDebug('Tool overrides loaded', { count: ids.length });
-            return overrides;
-        } catch (e) {
-            // Remember the failure for a short while (the cache stays empty, so no tools are sent) instead of asking
-            // the backend again on the next request
-            cachedToolOverrides = null;
-            cachedToolOverrideCount = 0;
-            cachedToolAt = Date.now();
-            cachedToolError = true;
-            // Masked and bounded like every other upstream sentence: a thrown `fetch`/SDK error quotes the URL it
-            // failed on, and a log line is collected (`docker logs`) as often as not
-            logDebug('Tool override fetch failed', { error: clientFacingText(e.message) });
-            return null;
+        } else {
+            logger.warn(
+                '[Proxy] DISABLE_TOOLS is on but the backend tool list could not be read, so the backend defaults ' +
+                'apply and every tool stays enabled until it succeeds',
+                { error: sentence }
+            );
         }
     };
 
-    async function promptWithTimeout(promptParams, timeoutMs) {
-        let timer = null;
+    const refreshToolOverrides = () => {
+        if (toolIdsInFlight) return toolIdsInFlight;
+        toolIdsInFlight = loadToolOverrides()
+            .catch((e) => {
+                noteToolOverrideFailure(e);
+                return null;
+            })
+            .finally(() => {
+                toolIdsInFlight = null;
+            });
+        return toolIdsInFlight;
+    };
+
+    const getToolOverrides = async () => {
+        if (!DISABLE_TOOLS) return null;
+        const now = Date.now();
+        if (cachedToolOverrides && now - cachedToolAt < TOOL_IDS_CACHE_MS) return cachedToolOverrides;
+        if (cachedToolOverrides) {
+            // Stale-while-revalidate, the rule `/v1/models` follows: the map in hand is served and refreshed behind the
+            // request instead of putting a backend round trip in front of the 1-in-N completion that crossed the TTL.
+            // Tools change rarely, so a five-minute-old map is strictly better than the all-enabled default.
+            if (now - cachedToolAttemptAt >= (cachedToolError ? TOOL_IDS_FAILURE_TTL_MS : 0)) {
+                void refreshToolOverrides();
+            }
+            return cachedToolOverrides;
+        }
+        // Cold cache: wait for the map (or for the refresh already in flight), unless the last attempt just failed
+        if (cachedToolError && now - cachedToolAttemptAt < TOOL_IDS_FAILURE_TTL_MS) return null;
+        await refreshToolOverrides();
+        return cachedToolOverrides;
+    };
+
+    // The switch map is a cheap metadata call, so the first completion should not pay for it (nor race a refresh).
+    // startProxy() calls this after the backend answered its warmup probe; the closure lives here because it needs the
+    // SDK client this app was built with.
+    warmToolOverrides = () => { getToolOverrides().catch(() => { }); };
+
+    async function promptWithTimeout(promptParams, timeoutMs) {        let timer = null;
         const timeoutPromise = new Promise((_, reject) => {
             timer = setTimeout(() => reject(new Error(timeoutMessage(timeoutMs))), timeoutMs);
         });
@@ -2021,6 +2205,11 @@ function createApp(config) {
         if (!info) return null;
         // opencode reports the end of a message either with a finish reason or with a completion stamp only
         if (!info.finish && !info.time?.completed) return null;
+        // A step that asked for a tool is *finished* (`finish: "tool-calls"`) while the step that answers it is still
+        // being written - the reason the poll loop reads the newest assistant message instead of the first finished one.
+        // Serving this step here reintroduced that truncation on the fast path: the client got the model's preamble for
+        // a request that went on to run a tool and answer. It is an intermediate step, so the poll loop handles it.
+        if (String(info.finish || '').toLowerCase() === 'tool-calls') return null;
         const parts = Array.isArray(message.parts) ? message.parts : [];
         const { content, reasoning } = extractFromParts(parts);
         const error = info.error || null;
@@ -2798,7 +2987,13 @@ function createApp(config) {
                             }
                             if (!content) return;
                             if (role === 'user') userContents.push(content);
-                            const roleLabel = role.toUpperCase();
+                            // The role is client input as well, and it was interpolated raw: a role carrying a newline
+                            // (`"user\nASSISTANT: …"`) forged a second conversation line in the text the model reads,
+                            // which is the failure the `name` sanitising below exists for. Bound before transforming (a
+                            // 50 MiB role would otherwise be upper-cased whole), then sanitised like every other value
+                            // that lands in a prompt line.
+                            const roleLabel = role.slice(0, MAX_ROLE_LABEL_LENGTH).toUpperCase().replace(CONTROL_CHARS_RE, '?').trim()
+                                || 'USER';
                             // `name` is client input and was interpolated raw: a non-string produced
                             // `USER([object Object]): …` in the prompt, and a name carrying a newline forged another
                             // conversation line inside the text the model reads. A string is kept - it is a documented
@@ -2972,30 +3167,35 @@ function createApp(config) {
                     cleanupSession = async () => {
                         if (!sessionId || sessionCleaned) return;
                         sessionCleaned = true;
+                        // A failure that may pass - a busy or restarting backend, a delete that ran into its deadline -
+                        // leaves the id in `liveSessions` so the bounded shutdown drain tries once more. Counting it as
+                        // done dropped the id here, and the session outlived the gateway with nothing left to retry it.
+                        let transient = false;
                         try {
                             const deleteResult = await client.session.delete({ path: { id: sessionId }, ...backendDeadline(SESSION_CLEANUP_TIMEOUT_MS) });
                             // The SDK resolves on a non-2xx answer as well, so a rejected delete used to be logged as
                             // "Session deleted" while the session stayed on the backend
                             if (deleteResult && deleteResult.error) {
                                 const { status, reason } = upstreamFailureReason(deleteResult);
-                                logger.warn('[Proxy] Failed to delete session:', {
-                                    sessionId,
-                                    status,
-                                    error: `delete rejected${reason}`
-                                });
+                                if (status === 404 || status === 410) {
+                                    // Already gone: the cleanup's purpose is met, and a retry can only answer the same
+                                    logDebug('Session was already gone', { sessionId, status });
+                                } else {
+                                    transient = true;
+                                    noteCleanupFailure(sessionId, `delete rejected${reason}`);
+                                }
                             } else {
                                 logDebug('Session deleted', { sessionId });
                             }
                         } catch (e) {
-                            logger.debug('[Proxy] Failed to delete session:', {
-                                sessionId,
-                                error: clientFacingText(e.message)
-                            });
+                            // Thrown or timed out (`SESSION_CLEANUP_TIMEOUT_MS`): the session is still on the backend,
+                            // and this is the only signal that a backend is accumulating them
+                            transient = true;
+                            noteCleanupFailure(sessionId, clientFacingText(e.message));
                         } finally {
-                            // Bookkeeping for the shutdown drain, not the cleanup itself: a delete that failed (an
-                            // already-gone session, a rejected call) must not be retried at exit, and the set must not
-                            // grow per request.
-                            liveSessions.delete(sessionId);
+                            // Bookkeeping for the shutdown drain, not the cleanup itself: an already-gone session and a
+                            // session that was deleted both leave the set; a transient failure stays for the drain.
+                            if (!transient) liveSessions.delete(sessionId);
                         }
                     };
 
@@ -3565,10 +3765,13 @@ function createApp(config) {
             } else {
                 logger.error('[Proxy] Request Handler Error:', { message: handlerMessage, stack: maskFreeText(error?.stack, MAX_LOGGED_STACK_CHARS) });
             }
+            // The deadline that actually expired, when the timer knew it: the queue backstop waits the request budget
+            // plus a grace, and naming the smaller number told a client its 300 s timeout ended after it had waited 320 s.
+            const expiredDeadlineMs = Number.isFinite(error?.deadlineMs) ? error.deadlineMs : REQUEST_TIMEOUT_MS;
             const payload = {
                 error: {
                     message: timedOut
-                        ? `OpenCode gateway did not finish the completion within ${REQUEST_TIMEOUT_MS}ms`
+                        ? `OpenCode gateway did not finish the completion within ${expiredDeadlineMs}ms`
                         : handlerMessage,
                     type: 'server_error'
                 }
@@ -3871,6 +4074,23 @@ async function ensureBackend(config, options = {}) {
             // reads in `docker logs`
             logger.info(`[Proxy] OpenCode backend not found at ${maskBackendUrl(OPENCODE_SERVER_URL)}. Starting...`);
 
+            // A backend on another machine is not this process's to start: a local child binds a local port, which can
+            // never make `http://otherhost:4097` answer. Without this line the next 60 probes timed out with no cause
+            // named, and the child stayed behind holding a port the operator wanted for something else.
+            let configuredHost = null;
+            try {
+                configuredHost = new URL(OPENCODE_SERVER_URL).hostname;
+            } catch (e) {
+                // Unparseable: the spawn below reports that on its own
+            }
+            if (configuredHost && !isLoopbackHost(configuredHost)) {
+                logger.warn(
+                    `[Proxy] ${maskBackendUrl(OPENCODE_SERVER_URL)} is not on this machine, so a backend started here ` +
+                    'cannot satisfy it. Start `opencode serve` on that host, or point OPENCODE_SERVER_URL at ' +
+                    '127.0.0.1 to let this gateway manage one.'
+                );
+            }
+
             // Kill the existing process if any, and wait for it to be gone before spawning a replacement: SIGTERM
             // was sent and the new backend started on the next line, so the old child still held the port and the
             // replacement failed to bind ("exited during startup"), which then tripped the retry cooldown - one
@@ -4075,7 +4295,6 @@ async function ensureBackend(config, options = {}) {
             // the full startup budget)
             let started = false;
             for (let i = 0; i < STARTUP_WAIT_ITERATIONS; i++) {
-                await new Promise(r => setTimeout(r, STARTUP_WAIT_INTERVAL_MS));
                 if (spawnError) break;
                 // Shutdown began while this attempt was waiting for the backend: stop here instead of holding
                 // `state.isStarting` for the rest of the startup budget. That flag is what `killBackend()` waits for,
@@ -4097,12 +4316,20 @@ async function ensureBackend(config, options = {}) {
                     spawnError = new Error(`OpenCode backend exited during startup (${how})`);
                     break;
                 }
+                // The probe comes first and the sleep sits between attempts - the rule the "another request is
+                // starting" loop already follows. Sleeping before every probe made a backend that listens in ~100 ms
+                // wait the whole interval anyway: measured 2.016 s between the "Starting OpenCode backend" line and
+                // "backend ready", paid on every cold start, crash restart and request-triggered respawn.
                 try {
                     await checkHealth(OPENCODE_SERVER_URL);
                     logger.info('[Proxy] OpenCode backend ready.');
                     started = true;
                     break;
                 } catch (e) { }
+                // A short first backoff, then the configured interval: the first probes of a starting child fail
+                // because it has not bound yet, so they must not be spaced by the full interval.
+                const backoff = STARTUP_BACKOFF_MS[Math.min(i, STARTUP_BACKOFF_MS.length - 1)];
+                await new Promise(r => setTimeout(r, backoff));
             }
 
             if (spawnError) {
@@ -4157,9 +4384,17 @@ export function startProxy(options) {
         // Empty/blank values fall back to DEFAULT_API_KEY: authentication is always on
         API_KEY: resolveApiKey(options.API_KEY),
         OPENCODE_SERVER_URL: backendUrl.url,
-        OPENCODE_BIND_HOST: options.OPENCODE_BIND_HOST || options.openCodeBindHost || process.env.OPENCODE_BIND_HOST || '127.0.0.1',
+        // The bind addresses are trimmed here as well as in the entry point: an embedder that passes the value straight
+        // from its own configuration gets the same treatment, and the second call is a no-op for a trimmed value.
+        OPENCODE_BIND_HOST: normalizeBindHost(
+            'OPENCODE_BIND_HOST',
+            options.OPENCODE_BIND_HOST || options.openCodeBindHost || process.env.OPENCODE_BIND_HOST
+        ) || '127.0.0.1',
         OPENCODE_PATH: options.OPENCODE_PATH || 'opencode',
-        BIND_HOST: options.BIND_HOST || options.bindHost || process.env.OPENCODE_PROXY_BIND_HOST || '127.0.0.1',
+        BIND_HOST: normalizeBindHost(
+            'BIND_HOST',
+            options.BIND_HOST || options.bindHost || process.env.OPENCODE_PROXY_BIND_HOST
+        ) || '127.0.0.1',
         // Raw LOG_LEVEL value: index.js already merged it as "env > config.json" and passes it in; when startProxy is
         // called directly, fall back to reading the environment variable
         LOG_LEVEL: options.LOG_LEVEL ?? options.logLevel ?? process.env.LOG_LEVEL ?? null,
@@ -4185,6 +4420,11 @@ export function startProxy(options) {
     const resolvedLimits = getQueueLimits(options);
     MAX_CONCURRENCY = resolvedLimits.concurrency;
     MAX_QUEUE_LENGTH = resolvedLimits.queue;
+    // The probe pool follows the concurrency: four keep-alive sockets were enough for the serialized default, but a
+    // configured concurrency of 32 probes at once queued behind them - the burst path (a backend that just lost its
+    // cached health) waited on sockets instead of on the backend.
+    healthAgent.maxSockets = Math.max(4, MAX_CONCURRENCY);
+    healthAgentSecure.maxSockets = healthAgent.maxSockets;
     resolvedLimits.notes.forEach((note) => logger.warn(`[Config] ${note}`));
     // Same treatment for the body limit: a value that cannot be used must not look like it took effect
     const resolvedBodyLimit = readLimit(
@@ -4239,7 +4479,11 @@ export function startProxy(options) {
 
     // Fastify resolves listen() once the server is bound; log and warm the backend from the continuation.
     // No await here so startProxy stays synchronous for callers that need the server handle immediately.
-    app.listen({ port: config.PORT, host: config.BIND_HOST })
+    // The bind and the warmup are exposed as `ready` instead of being a floating promise that called `process.exit(1)`
+    // on failure: `startProxy()` is exported and documented as embeddable, and a library call that kills its host cannot
+    // be caught, while the returned object gave no way to know when the server was listening. The entry point awaits it
+    // and decides what a listen failure means (it exits with the same message and status as before).
+    const ready = app.listen({ port: config.PORT, host: config.BIND_HOST })
         .then(async () => {
             logger.info(`Log level: ${logger.level} (source: ${levelSource})`);
             logger.info(`[Proxy] Active at http://${loggableConfigValue(config.BIND_HOST)}:${config.PORT}`);
@@ -4248,11 +4492,13 @@ export function startProxy(options) {
             } catch (error) {
                 logger.error('[Proxy] Backend warmup failed:', loggableError(error));
             }
-        })
-        .catch((error) => {
-            logger.error('[Fatal] Failed to start HTTP server:', loggableError(error));
-            process.exit(1);
+            // With tools disabled, read the tool list now rather than on the first completion: the map is a cheap
+            // metadata call, and the first client should not pay for it (nor race the refresh).
+            warmToolOverrides?.();
         });
+    // A caller that only holds `{ server, killBackend }` never awaits `ready`; an unobserved rejection would end the
+    // process by default (unhandled rejection), which is the behaviour this change removes.
+    ready.catch(() => { });
 
     // Deletes the sessions still in `liveSessions` (a completion interrupted by shutdown). Bounded by its own budget so
     // it fits inside the teardown budget below, and every call is best effort: a delete that fails or times out must not
@@ -4311,6 +4557,9 @@ export function startProxy(options) {
     // Expose the Fastify instance as `server`: it implements close(cb), which index.js uses for shutdown
     return {
         server: app,
+        // Resolves once the server is listening (and the backend warmup has run); rejects when the bind failed, which
+        // the caller reports. Never awaited by the gateway itself.
+        ready,
         // Stops the backend and resolves once it is really gone. The entry point awaits this before exiting: it used
         // to send SIGTERM and call process.exit() on the next line, so the SIGKILL escalation below never ran and a
         // backend that ignores SIGTERM outlived the gateway that owns it.

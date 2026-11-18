@@ -207,7 +207,12 @@ const isSensitiveHeader = (lowerName) => SENSITIVE_HEADER_NAMES.has(lowerName) |
  * @returns {string} the URL with credential query values masked
  */
 export function maskUrlQuery(url) {
-    return String(url).replace(/([?&#])([^=&#?]+)=([^&#]*)/g, (match, separator, name, value) => {
+    const text = String(url);
+    // A masked credential is always a `name=value` pair, so a text carrying no `=` cannot change: this is the warm path
+    // of the request summary line (`loggableUrl()` runs it on every `/v1/*` request at the default level), and most
+    // request targets carry no query string at all.
+    if (!text.includes('=')) return text;
+    return text.replace(/([?&#])([^=&#?]+)=([^&#]*)/g, (match, separator, name, value) => {
         let decoded = name;
         try {
             decoded = decodeURIComponent(name);
@@ -246,6 +251,10 @@ export function maskBackendUrl(url) {
  * @returns {string} the text with every `scheme://user:pass@` reduced to `scheme://***@`
  */
 export function maskUrlCredentials(text) {
+    const value = String(text);
+    // Masking needs userinfo, which needs an `@`: this runs on every request log line and on every upstream sentence,
+    // and the vast majority of both carry none.
+    if (!value.includes('@')) return value;
     // Not anchored: the URL can sit anywhere in the sentence, and a `@` in a path or query is not userinfo (the
     // authority is everything up to the first `/`, `?` or `#`, which the character class excludes).
     //
@@ -255,7 +264,7 @@ export function maskUrlCredentials(text) {
     // reachable through the debug dump of a request body (each string up to 32 KiB) and through an upstream error
     // sentence quoted into a 502. With the bound, a start position can only be a candidate when `://` follows within
     // 32 characters, so the scan is linear (1 MiB measured ~70 ms).
-    return String(text).replace(/(\w[\w+.-]{0,31}:\/\/)[^\s/?#@]*@/g, '$1***@');
+    return value.replace(/(\w[\w+.-]{0,31}:\/\/)[^\s/?#@]*@/g, '$1***@');
 }
 
 /**

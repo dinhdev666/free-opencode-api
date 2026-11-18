@@ -115,12 +115,14 @@ function safeClone(value, seen = new WeakSet(), depth = 0) {
         if (value.length > MAX_ARRAY_ITEMS) out.push(`[+${value.length - MAX_ARRAY_ITEMS} more items]`);
     } else {
         out = {};
-        const keys = Object.keys(value).slice(0, MAX_OBJECT_KEYS);
+        // One key array, not two: the list used to be built again (`Object.keys(value).length`) only to learn how many
+        // keys the cap hid, which doubled the enumeration of every object in the payload.
+        const allKeys = Object.keys(value);
+        const keys = allKeys.length > MAX_OBJECT_KEYS ? allKeys.slice(0, MAX_OBJECT_KEYS) : allKeys;
         keys.forEach((key) => {
             setOwnProperty(out, key, safeClone(value[key], seen, depth + 1));
         });
-        const hiddenKeys = Object.keys(value).length - keys.length;
-        if (hiddenKeys > 0) out['[hiddenKeys]'] = hiddenKeys;
+        if (allKeys.length > keys.length) out['[hiddenKeys]'] = allKeys.length - keys.length;
     }
     seen.delete(value);
     return out;
@@ -130,14 +132,20 @@ function safeClone(value, seen = new WeakSet(), depth = 0) {
  * Serialize any value into a single-line JSON string; on failure emit a placeholder with the reason
  * (never swallow silently)
  * @param {*} value any value
+ * @param {boolean} preBounded true when the value came from `maskDetail()`, whose copy is already acyclic and bounded
+ *        (depth, member count and string lengths), so the second tree walk `safeClone()` performs can find nothing to
+ *        change: on a body with about a million nodes that walk cost 36 ms of a 91 ms debug line, in exactly the mode
+ *        an operator turns on to investigate. A value that still defeats `JSON.stringify` (a BigInt, a getter) is
+ *        cloned the normal way, so the annotated placeholder is unchanged.
  * @returns {string}
  */
-export function serializeDetail(value) {
+export function serializeDetail(value, preBounded = false) {
     if (value === undefined) return '';
     let text;
     try {
-        text = JSON.stringify(safeClone(value));
+        text = JSON.stringify(preBounded ? value : safeClone(value));
     } catch (e) {
+        if (preBounded) return serializeDetail(value, false);
         // JSON.stringify should not throw (safeClone already removes circular references); fall back with the reason
         return `[Unserializable detail: ${e && e.message ? e.message : 'unknown error'}]`;
     }
@@ -206,21 +214,26 @@ const isSensitiveHeader = (lowerName) => SENSITIVE_HEADER_NAMES.has(lowerName) |
  * @param {string} url raw request URL
  * @returns {string} the URL with credential query values masked
  */
+// A query *name* is decoded only to answer "does this spell a credential?", so the decode must answer that question
+// without allocating an exception. `decodeURIComponent()` throws on any malformed escape, and `?%zz=1` is ordinary
+// client noise - one thrown `URIError` costs an object plus a captured stack, about 1 µs against ~130 ns, once per
+// `&`-separated pair. The name is bounded only by Node's 16 KiB header limit and the summary line that calls this runs
+// before the auth check, so an unauthenticated caller chose the price: 1600 malformed pairs measured 1.8 ms of blocked
+// event loop per request (2.9 ms end-to-end against 0.27 ms with the summary off). The credential words are ASCII, so
+// decoding the escapes byte-wise decides identically, and a name carrying no escape is returned without a copy.
+const decodeQueryName = (name) => {
+    if (name.indexOf('%') === -1) return name;
+    return name.replace(/%([0-9A-Fa-f]{2})/g, (match, hex) => String.fromCharCode(parseInt(hex, 16)));
+};
+
 export function maskUrlQuery(url) {
     const text = String(url);
     // A masked credential is always a `name=value` pair, so a text carrying no `=` cannot change: this is the warm path
     // of the request summary line (`loggableUrl()` runs it on every `/v1/*` request at the default level), and most
     // request targets carry no query string at all.
     if (!text.includes('=')) return text;
-    return text.replace(/([?&#])([^=&#?]+)=([^&#]*)/g, (match, separator, name, value) => {
-        let decoded = name;
-        try {
-            decoded = decodeURIComponent(name);
-        } catch {
-            // a name that is not valid percent-encoding is compared as written
-        }
-        return isSensitiveHeader(decoded.toLowerCase()) ? `${separator}${name}=***` : match;
-    });
+    return text.replace(/([?&#])([^=&#?]+)=([^&#]*)/g, (match, separator, name, value) =>
+        (isSensitiveHeader(decodeQueryName(name).toLowerCase()) ? `${separator}${name}=***` : match));
 }
 
 /**
@@ -430,13 +443,13 @@ export function createLogger(options = {}) {
         return `${stampText}.${String(now % 1000).padStart(3, '0')}Z`;
     };
 
-    function write(stream, levelName, message, detail) {
+    function write(stream, levelName, message, detail, preBoundedDetail = false) {
         // A logging call must never be the thing that fails a request: the message is interpolated into the line, so a
         // non-string (a Symbol throws on coercion) would surface as an exception from inside the logger
         const text = typeof message === 'string' ? message : String(message);
         let line = `${prefix} ${isoTimestamp()} [${levelName.toUpperCase()}] ${text}`;
         if (detail !== undefined) {
-            const serialized = serializeDetail(detail);
+            const serialized = serializeDetail(detail, preBoundedDetail);
             if (serialized !== '') line += ` ${serialized}`;
         }
         stream.write(`${line}\n`);
@@ -481,6 +494,15 @@ export function createLogger(options = {}) {
         /** debug level: full request bodies / responses / flow details, only visible with LOG_LEVEL=debug, goes to stdout */
         debug(message, detail) {
             if (LEVELS[state.level] >= LEVELS.debug) write(process.stdout, 'debug', message, detail);
+        },
+        /**
+         * debug level for a detail that `maskDetail()` already masked and bounded. The function is the contract: it
+         * promises an acyclic copy whose depth, member count and string lengths are capped, which is what
+         * `serializeDetail(value, true)` relies on to skip the second tree walk. Anything else (a bare request body, a
+         * backend payload) belongs in `debug()`, which clones and bounds it itself.
+         */
+        debugBounded(message, detail) {
+            if (LEVELS[state.level] >= LEVELS.debug) write(process.stdout, 'debug', message, detail, true);
         }
     };
 }

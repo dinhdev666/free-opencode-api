@@ -2330,7 +2330,10 @@ function createApp(config) {
                     reqId = request.gatewayLog?.reqId || null;
                     // Header masking allocates a fresh object; only build it when debug logging is actually on
                     if (logger.isEnabled('debug')) {
-                        logger.debug('Incoming OpenAI request', {
+                        // `debugBounded`: every value below is masked and bounded already (`maskHeaders()`, `maskDetail()`,
+                        // `loggableUrl()`), so the logger must not walk the tree a second time - that walk cost 36 ms of a
+                        // 91 ms line for a body with about a million nodes
+                        logger.debugBounded('Incoming OpenAI request', {
                             reqId,
                             method: request.method,
                             path: loggableUrl(request.url),

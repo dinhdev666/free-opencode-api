@@ -43,7 +43,11 @@
 - **Tool guard** — `DISABLE_TOOLS=true` keeps models from running commands or touching files on the host.
 - **The backend never sees the gateway key** — the `opencode serve` child is spawned without `API_KEY` in its
   environment (it authenticates nothing with it), and its throwaway working directory is created with mode `0700`, so
-  neither the credential nor the backend's sandbox is exposed to other local users.
+  neither the credential nor the backend's sandbox is exposed to other local users. That is hygiene, not a boundary:
+  the child runs as the same user, so a model-directed tool can still read a custom `API_KEY` from `config.json` or
+  this process's environment. When that combination is in force (a key that is not the built-in default, with tools
+  enabled) startup logs a `[Security]` warning naming the file to protect and `DISABLE_TOOLS=true` as the fix — it never
+  prints the key.
 - **Structured logging** — `error` / `warn` / `info` / `debug` levels, one-line request summaries, secrets masked.
 - **Production friendly** — configurable bind host, request timeouts (a body that never arrives is cut off, not held open),
   graceful shutdown, Docker image available.
@@ -259,7 +263,7 @@ while the gateway ran the default you thought you had replaced:
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway; a trailing slash is stripped and a missing scheme is read as `http://` (both are reported in the startup log, *before* the summary, so the `Backend:` line always shows the value the gateway actually uses). Surrounding whitespace is trimmed silently. A credential in the URL (`http://user:secret@host:4097`, a proxy in front of the backend) is sent to the backend as a Basic `Authorization` header — the SDK calls every endpoint through `fetch`, which refuses a URL that carries credentials, so such a URL could not work at all — and it is masked wherever the value is logged or returned (`/health`), including inside an upstream error message |
 | `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend. Keep it on loopback: the backend has no authentication of its own, so publishing it bypasses the gateway's key |
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
-| `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files. Booleans accept `true`/`false` (JSON) or `1`/`0`, `yes`/`no`, `y`/`n`, `on`/`off` (environment or string); a value none of those match is reported in a `[Config]` warning together with the value actually used (`DISABLE_TOOLS='maybe' is not a boolean …, using false`), for `DISABLE_TOOLS`, `USE_ISOLATED_HOME` and `DEBUG` alike |
+| `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files. With a custom `API_KEY` and tools enabled, a model-directed tool can read that key from the same host, so startup warns (`[Security]`) and names this switch; `true` is the recommended setting whenever the gateway is exposed. Booleans accept `true`/`false` (JSON) or `1`/`0`, `yes`/`no`, `y`/`n`, `on`/`off` (environment or string); a value none of those match is reported in a `[Config]` warning together with the value actually used (`DISABLE_TOOLS='maybe' is not a boolean …, using false`), for `DISABLE_TOOLS`, `USE_ISOLATED_HOME` and `DEBUG` alike |
 | `USE_ISOLATED_HOME` | `false` | Run the backend with a throwaway `HOME` instead of the real one, so it cannot pick up your machine's OpenCode state. `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`, `TMPDIR`, `TMP` and `TEMP` point inside the same throwaway directory, because the CLI resolves them before `HOME` and an inherited value would otherwise send it back to your real store, config and cache |
 | `DEBUG` | `false` | Switch logging to `debug` **when no explicit `LOG_LEVEL` is set** (an explicit level wins and the switch is ignored with a `[Config]` warning; the environment name for the same switch is `OPENCODE_PROXY_DEBUG`, and `LOG_LEVEL=debug` is the preferred way) |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (case-insensitive) |

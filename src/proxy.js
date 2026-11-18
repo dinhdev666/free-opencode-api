@@ -125,6 +125,13 @@ const generatedRequestId = () => `gw-${Date.now().toString(36)}${Math.random().t
 // record - a 2 MB model id produced a 2 MB info line. The values are normalised for logging only; the backend still
 // receives the id verbatim, because the contract does not restrict model ids.
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
+// Fastify refuses a JSON body carrying `__proto__` or `constructor` before any handler runs, and the refusal reaches the
+// client as `FST_ERR_CTP_INVALID_JSON_BODY` - the code a syntax error produces too, so the sentence has to name both
+// causes. One copy: the mapping in the route handler's catch and the text-body guard below answer identically, because a
+// client must not be able to tell which content type it sent.
+const FORBIDDEN_BODY_MESSAGE = 'request body is not valid JSON, or it carries a forbidden property name '
+    + '(__proto__, constructor); send Content-Type: application/json';
+const FORBIDDEN_BODY_KEYS = new Set(['__proto__', 'constructor']);
 const MAX_LOGGED_MODEL_LENGTH = 128;
 const MAX_LOGGED_URL_LENGTH = 512;
 const loggableModelId = (id) => {
@@ -236,6 +243,23 @@ export const loggableConfigValue = (value) => {
     const clean = String(value).replace(CONTROL_CHARS_RE, '?');
     return clean.length > MAX_LOGGED_CONFIG_LENGTH
         ? `${clean.slice(0, MAX_LOGGED_CONFIG_LENGTH)}…[truncated ${clean.length - MAX_LOGGED_CONFIG_LENGTH} chars]`
+        : clean;
+};
+
+// Text from the OS or from upstream on its way into a log *message*, rather than into a detail object.
+//
+// A detail is serialised with `JSON.stringify()`, so a newline inside it is escaped and stays on one line. A value
+// interpolated into the message is not: `Failed to spawn OpenCode: ${err.message}` puts an OS message there, and that
+// message quotes `OPENCODE_PATH`, which `config.json`/the environment can spell with a line break - so one spawn error
+// could write a record the gateway never wrote (`[gateway] … [ERROR] …` of the attacker's choosing) into `docker logs`.
+// Same rule as `loggableConfigValue()`, applied to text this process did not compose.
+const MAX_LOGGED_UPSTREAM_LENGTH = 256;
+const loggableUpstreamText = (value) => {
+    const raw = typeof value === 'string' ? value : String(value);
+    const clean = (raw.length > MAX_LOGGED_UPSTREAM_LENGTH ? raw.slice(0, MAX_LOGGED_UPSTREAM_LENGTH) : raw)
+        .replace(CONTROL_CHARS_RE, '?');
+    return raw.length > MAX_LOGGED_UPSTREAM_LENGTH
+        ? `${clean}…[truncated ${raw.length - MAX_LOGGED_UPSTREAM_LENGTH} chars]`
         : clean;
 };
 
@@ -752,6 +776,41 @@ const readMilliseconds = (name, fallback, fileValue) => {
     return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
 };
 
+/**
+ * The completion budget (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`), resolved through the documented precedence:
+ * an explicit embedder option, then the environment, then `config.json`, then the default.
+ *
+ * A blank environment value counts as **unset**, the rule every other key follows (`envOrFile()` in `src/config.js`,
+ * `readLimit()` and `readMilliseconds()` here): `??` treats `''` as a value, so a unit file's
+ * `Environment=OPENCODE_PROXY_REQUEST_TIMEOUT_MS=`, a Helm value rendered empty or a shell that exports unconditionally
+ * ended the chain at the empty string and the gateway ran the default while the value in `config.json` was never read -
+ * silently, because the "unusable value" warning is skipped for a blank one too. A value that is present and unusable
+ * is still named in `note`, so the operator sees what was used.
+ * @param {object} options options handed to `startProxy()` (an explicit `REQUEST_TIMEOUT_MS` wins)
+ * @param {object} env environment to read, injectable so the precedence can be tested without mutating `process.env`
+ * @returns {{ value: number, note: string | null }} the budget in milliseconds and a `[Config]` note, if any
+ */
+export function resolveRequestTimeoutMs(options = {}, env = process.env) {
+    const fromEnv = env?.OPENCODE_PROXY_REQUEST_TIMEOUT_MS;
+    const fromFile = options.OPENCODE_PROXY_REQUEST_TIMEOUT_MS;
+    const fileIsUsable = fromFile !== undefined && fromFile !== null && String(fromFile).trim() !== '';
+    // Environment first, but only when it actually carries a value
+    const requested = (fromEnv === undefined || String(fromEnv).trim() === '')
+        ? (fileIsUsable ? fromFile : undefined)
+        : fromEnv;
+    const embedder = options.REQUEST_TIMEOUT_MS;
+    const embedderIsUsable = embedder !== undefined && embedder !== null && String(embedder).trim() !== '';
+    const chosen = embedderIsUsable ? embedder : requested;
+    const parsed = Number(chosen);
+    if (Number.isFinite(parsed) && parsed > 0) return { value: Math.floor(parsed), note: null };
+    const blank = chosen === undefined || chosen === null || String(chosen).trim() === '';
+    if (blank) return { value: DEFAULT_REQUEST_TIMEOUT_MS, note: null };
+    return {
+        value: DEFAULT_REQUEST_TIMEOUT_MS,
+        note: `OPENCODE_PROXY_REQUEST_TIMEOUT_MS='${loggableConfigValue(String(chosen).trim())}' is not a positive number, using ${DEFAULT_REQUEST_TIMEOUT_MS}`
+    };
+}
+
 // True when a configured millisecond value is present but unusable (so startProxy can name it and the value it used)
 const isUnusableMilliseconds = (value) => {
     if (value === undefined || value === null || String(value).trim() === '') return false;
@@ -808,6 +867,60 @@ const backendUnavailable = (message) => Object.assign(new Error(message), { back
 // may be using the same parent directory, so the exit hook must never delete a directory it does not own.
 const ownedJailRoots = new Set();
 
+// The parent directories holding those jails, and only the ones this process may remove: the shared
+// `<tmp>/opencode-proxy-jail` (which disappears with the last instance, since `rmdir` refuses a non-empty one) and a
+// private one when the shared directory turned out to belong to somebody else (see `resolveJailParent()`).
+const ownedJailParents = new Set();
+
+/**
+ * The directory the per-spawn jail lives in, or a private one when the shared directory cannot be trusted.
+ *
+ * `/tmp` is world-writable and this name is predictable, and `mkdirSync(…, { recursive: true })` succeeds silently on a
+ * directory somebody else already created. Another unprivileged account that pre-creates the path would then own the
+ * **parent** of the backend's working directory - and, with `USE_ISOLATED_HOME`, of its `HOME`, which holds the provider
+ * credential store. The leaf is mode 0700, but its owner can rename that leaf and put their own directory, or a symlink
+ * to one, in its place, which the next respawn would use as `cwd`/`HOME` for a model-driven agent; and `0700` owned by
+ * someone else makes the leaf's `mkdir` fail with an `EACCES` that the spawn error names as nothing in particular.
+ *
+ * So the shared parent is used only when it is a real directory (not a symlink, hence `lstat`) owned by this uid. When
+ * the platform has no uid to compare (Windows), the check is the directory test alone. Otherwise the backend gets a
+ * private parent from `mkdtempSync()`: atomic, unpredictable, mode 0700, and removed with the jails it contains.
+ * @param {boolean} isWindows true on `win32`, where the isolation check has no uid to compare
+ * @param {string} tmpDir the temporary directory to build in (`os.tmpdir()` unless a test says otherwise)
+ * @returns {string} an absolute directory this process may write into
+ */
+export function resolveJailParent(isWindows, tmpDir = os.tmpdir()) {
+    const shared = path.join(tmpDir, 'opencode-proxy-jail');
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+    try {
+        fs.mkdirSync(shared, { recursive: true, mode: 0o700 });
+        // lstat, not stat: a symlink here is exactly the shape an attacker would use to redirect the tree
+        const stats = fs.lstatSync(shared);
+        const trusted = stats.isDirectory() && (currentUid === null || stats.uid === currentUid);
+        if (trusted) {
+            if (!isWindows) {
+                // mkdirSync does not change the mode of a directory that already exists, so a parent created by an older
+                // build (0755) kept its permissions for the lifetime of the machine; re-assert them on every start.
+                try {
+                    fs.chmodSync(shared, 0o700);
+                } catch (error) {
+                    logger.warn('[Proxy] Could not restrict the backend jail directory:', { path: shared, error: error.message });
+                }
+            }
+            ownedJailParents.add(shared);
+            return shared;
+        }
+        logger.warn('[Proxy] The shared backend jail directory is not a directory this process owns; using a private one',
+            { path: shared, uid: stats.uid, expectedUid: currentUid, symlink: stats.isSymbolicLink() });
+    } catch (error) {
+        logger.warn('[Proxy] Could not prepare the shared backend jail directory; using a private one',
+            { path: shared, error: error.message });
+    }
+    const privateParent = fs.mkdtempSync(path.join(tmpDir, 'opencode-proxy-jail-'));
+    ownedJailParents.add(privateParent);
+    return privateParent;
+}
+
 // Sessions this process created and has not deleted yet. Every completion deletes its own (success, error, client
 // abort), but a SIGTERM in the middle bypasses all three: the HTTP server closes, `stopBackend()` runs and the process
 // exits while the task is still parked in the collector or the poll. A managed child takes its sessions with it, but an
@@ -831,12 +944,16 @@ function cleanupTempDirs() {
         }
     }
     ownedJailRoots.clear();
-    // The parent only disappears once the last instance is gone; a leftover one is harmless
-    try {
-        fs.rmdirSync(path.join(os.tmpdir(), 'opencode-proxy-jail'));
-    } catch (e) {
-        // not empty or already gone: expected when another instance is still running
+    // A parent this process owns disappears with its last jail; the shared one stays while another instance uses it
+    // (`rmdir` refuses a non-empty directory), and the private one is this process's alone
+    for (const jailParent of ownedJailParents) {
+        try {
+            fs.rmdirSync(jailParent);
+        } catch (e) {
+            // not empty or already gone: expected when another instance is still running
+        }
     }
+    ownedJailParents.clear();
 }
 
 // Register cleanup on exit
@@ -1494,7 +1611,9 @@ function createApp(config) {
     // An id whose last segment is empty addresses no model: `/v1/models/%2F` and `/v1/models/opencode%2F` reached the
     // routes below with `/` and `opencode/` and were described as models with an empty (or separator) name - the same
     // class of non-model the blank id was.
-    const isDescribableModelId = (id) => Boolean(id && id.split('/').pop());
+    // The question is only "does the id end in a separator?": `split('/').pop()` built an array and one string per
+    // segment per by-id request (97 ns against 24 ns) on one of the two documented hot read routes.
+    const isDescribableModelId = (id) => Boolean(id && id[id.length - 1] !== '/');
     // A blank id (`/v1/models//`, `/v1/models/%20`) reaches this route with an empty param, because a doubled slash is
     // read as a trailing slash. Describing "" answered 200 with `{"id":"","name":""}` - not a model at all - so a blank
     // id is a missing route instead. `/v1/models/` itself still answers the listing.
@@ -1621,15 +1740,17 @@ function createApp(config) {
         // read by `flush()`: `removeToolMarkup()` drops an *unclosed* opening tag and keeps the text after it, and the
         // streaming filter used to return `''` there, losing the rest of the answer.
         let pending = '';
-        // Splits text into the part that can be written out and the suffix that could still become a tag
+        // Splits text into the part that can be written out and the suffix that could still become a tag.
+        // Both tags start with '<', so at most one suffix can be a tag prefix: the text after the **last** '<' inside
+        // the hold-back window. That one backward search replaces a loop that sliced up to MAX_HELD suffixes per delta
+        // (112 ns against 26 ns, and 16 fewer allocations for every delta of every stream).
         const splitAtPossibleTag = (text) => {
-            for (let length = Math.min(text.length, MAX_HELD); length > 0; length -= 1) {
-                const tail = text.slice(text.length - length);
-                if (OPEN_TAG.startsWith(tail) || CLOSE_TAG.startsWith(tail)) {
-                    return [text.slice(0, text.length - length), tail];
-                }
-            }
-            return [text, ''];
+            const windowStart = text.length > MAX_HELD ? text.length - MAX_HELD : 0;
+            const at = text.lastIndexOf('<');
+            if (at === -1 || at < windowStart) return [text, ''];
+            const tail = text.slice(at);
+            if (!OPEN_TAG.startsWith(tail) && !CLOSE_TAG.startsWith(tail)) return [text, ''];
+            return [text.slice(0, at), tail];
         };
         const filter = (chunk) => {
             if (!chunk && !held) return chunk;
@@ -1696,6 +1817,10 @@ function createApp(config) {
     // round trip to every completion
     const TOOL_IDS_FAILURE_TTL_MS = 60 * 1000;
     let cachedToolOverrides = null;
+    // How many switches the cached map carries. The handler needs "is this map empty?" once per completion, and
+    // `Object.keys(...).length` built an array of every tool id to answer it (552 ns and a 60-element array per
+    // completion, while `for…in` is no cheaper: V8 enumerates either way). The count is known right here.
+    let cachedToolOverrideCount = 0;
     let cachedToolAt = 0;
     let cachedToolError = false;
 
@@ -1729,6 +1854,7 @@ function createApp(config) {
                 setOwnProperty(overrides, id, ["read","glob"].includes(String(id).toLowerCase()));
             });
             cachedToolOverrides = overrides;
+            cachedToolOverrideCount = ids.length;
             cachedToolAt = Date.now();
             cachedToolError = false;
             logDebug('Tool overrides loaded', { count: ids.length });
@@ -1737,6 +1863,7 @@ function createApp(config) {
             // Remember the failure for a short while (the cache stays empty, so no tools are sent) instead of asking
             // the backend again on the next request
             cachedToolOverrides = null;
+            cachedToolOverrideCount = 0;
             cachedToolAt = Date.now();
             cachedToolError = true;
             // Masked and bounded like every other upstream sentence: a thrown `fetch`/SDK error quotes the URL it
@@ -2122,10 +2249,20 @@ function createApp(config) {
             }, ms);
         };
 
+        // The idle timer is re-armed **in place**: `refresh()` restarts the same `Timeout` instead of building a new one,
+        // and the callback reads `content` / `reasoning` / `deltaChars` from this closure, so a refreshed timer settles on
+        // exactly what a rebuilt one would. Clear-and-create per delta allocated a `Timeout` for every delta of every
+        // stream (4000 deltas measured 2.10 ms, against 0.28 ms with a refresh) - GC time a CPU profile of the gateway
+        // attributed to streaming. `finished` returns early because `settle()` clears the timer: a collector that has
+        // already settled must not re-arm anything.
         const scheduleIdleTimer = () => {
-            if (!idleTimeoutMs) return;
-            if (idleTimer) clearTimeout(idleTimer);
+            if (!idleTimeoutMs || finished) return;
+            if (idleTimer) {
+                idleTimer.refresh();
+                return;
+            }
             idleTimer = setTimeout(() => {
+                idleTimer = null;
                 if (finished) return;
                 if (logger.isEnabled('debug')) {
                     logger.debug('Event idle timeout', {
@@ -2195,7 +2332,12 @@ function createApp(config) {
                             }
                             if (delta) {
                                 receivedDelta = true;
-                                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+                                // Nulled here as well as on the budget path: the timer has fired by the time a delta
+                                // arrives (it is cleared here), so every later delta cleared an already-dead handle
+                                if (firstDeltaTimer) {
+                                    clearTimeout(firstDeltaTimer);
+                                    firstDeltaTimer = null;
+                                }
                                 scheduleIdleTimer();
                                 if (!firstDeltaAt) {
                                     firstDeltaAt = Date.now();
@@ -2330,7 +2472,10 @@ function createApp(config) {
                     reqId = request.gatewayLog?.reqId || null;
                     // Header masking allocates a fresh object; only build it when debug logging is actually on
                     if (logger.isEnabled('debug')) {
-                        logger.debug('Incoming OpenAI request', {
+                        // `debugBounded`: every value below is masked and bounded already (`maskHeaders()`, `maskDetail()`,
+                        // `loggableUrl()`), so the logger must not walk the tree a second time - that walk cost 36 ms of a
+                        // 91 ms line for a body with about a million nodes
+                        logger.debugBounded('Incoming OpenAI request', {
                             reqId,
                             method: request.method,
                             path: loggableUrl(request.url),
@@ -2373,7 +2518,30 @@ function createApp(config) {
                             });
                         }
                         try {
-                            const parsed = JSON.parse(text);
+                            // Fastify refuses a body carrying `__proto__` or `constructor` before any handler runs
+                            // (`onProtoPoisoning: 'error'` is its default), and AGENTS.md documents that refusal as
+                            // unconditional. A body handed over as text is parsed *here*, with plain `JSON.parse`, which
+                            // has no such guard: the same bytes were served under `text/plain` and refused with `400
+                            // FST_ERR_CTP_INVALID_JSON_BODY` under `application/json` (measured), so a client could pick
+                            // the content type to skip the check. Nothing in this gateway spreads a parsed body today,
+                            // which is exactly why the guard must not depend on that: one future copy would turn it into
+                            // prototype pollution. The reviver sees every key at every level, including one escaped as
+                            // `"\u005f_proto__"` that a scan of the raw text would miss, so both content types answer
+                            // the same refusal.
+                            let forbiddenKey = null;
+                            const parsed = JSON.parse(text, (key, value) => {
+                                if (forbiddenKey === null && FORBIDDEN_BODY_KEYS.has(key)) forbiddenKey = key;
+                                return value;
+                            });
+                            if (forbiddenKey !== null) {
+                                return reply.code(400).send({
+                                    error: {
+                                        message: FORBIDDEN_BODY_MESSAGE,
+                                        type: 'invalid_request_error',
+                                        code: 'FST_ERR_CTP_INVALID_JSON_BODY'
+                                    }
+                                });
+                            }
                             if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
                                 return refuseNonObjectBody(parsed);
                             }
@@ -2808,7 +2976,9 @@ function createApp(config) {
                         }
                     };
                     const toolOverrides = await getToolOverrides();
-                    if (toolOverrides && Object.keys(toolOverrides).length > 0) {
+                    // The count `getToolOverrides()` cached with the map: enumerating the keys here built the whole tool
+                    // list (and its array) once per completion to answer "is there anything in it?"
+                    if (toolOverrides && cachedToolOverrideCount > 0) {
                         promptParams.body.tools = toolOverrides;
                     }
                     if (logger.isEnabled('debug')) {
@@ -3462,8 +3632,7 @@ function createApp(config) {
                     + 'OPENCODE_PROXY_MAX_BODY_MB';
             }
             if (err.code === 'FST_ERR_CTP_INVALID_JSON_BODY') {
-                return 'request body is not valid JSON, or it carries a forbidden property name (__proto__, constructor); '
-                    + 'send Content-Type: application/json';
+                return FORBIDDEN_BODY_MESSAGE;
             }
             // An empty body is what a retry whose payload went missing sends, and Fastify answered it with a sentence
             // about the content type the client had just set correctly. The same request without that header reaches
@@ -3725,17 +3894,8 @@ async function ensureBackend(config, options = {}) {
             // default mode (0755) let any other local user on a shared /tmp traverse and list it, which defeats the
             // isolation the option exists for. mkdir's mode is masked by the umask, so 0700 is the strictest that
             // survives.
-            const jailParent = path.join(os.tmpdir(), 'opencode-proxy-jail');
-            // mkdirSync does not change the mode of a directory that already exists, so a parent created by an older
-            // build (0755) kept its permissions for the lifetime of the machine; re-assert them on every start.
-            fs.mkdirSync(jailParent, { recursive: true, mode: 0o700 });
-            if (!isWindows) {
-                try {
-                    fs.chmodSync(jailParent, 0o700);
-                } catch (error) {
-                    logger.warn('[Proxy] Could not restrict the backend jail directory:', { path: jailParent, error: error.message });
-                }
-            }
+            // Ownership-checked, with a private fallback: see `resolveJailParent()`
+            const jailParent = resolveJailParent(isWindows);
             const jailRoot = path.join(jailParent, salt);
             state.jailRoot = jailRoot;
             ownedJailRoots.add(jailRoot);
@@ -3860,7 +4020,8 @@ async function ensureBackend(config, options = {}) {
             let spawnError = null;
             state.process.on('error', (err) => {
                 spawnError = err;
-                logger.error(`[Proxy] Failed to spawn OpenCode: ${err.message}`);
+                // Masked and flattened: the message is quoted from the OS and repeats `OPENCODE_PATH`
+                logger.error(`[Proxy] Failed to spawn OpenCode: ${loggableUpstreamText(err.message)}`);
                 if (err.code === 'ENOENT') {
                     logger.error(`[Proxy] Command '${loggableConfigValue(OPENCODE_PATH)}' not found. Please ensure OpenCode is installed and in your PATH.`);
                     logger.error(`[Proxy] You can specify the full path in config.json using 'OPENCODE_PATH'`);
@@ -3947,6 +4108,7 @@ export function startProxy(options) {
     // Normalised once: a trailing slash in OPENCODE_SERVER_URL turns every SDK path into `//session` (404)
     const backendUrl = normalizeBackendUrl(options.OPENCODE_SERVER_URL || 'http://127.0.0.1:4097');
 
+    const requestTimeout = resolveRequestTimeoutMs(options);
     const config = {
         PORT: options.PORT || 8083,
         // Empty/blank values fall back to DEFAULT_API_KEY: authentication is always on
@@ -3963,22 +4125,12 @@ export function startProxy(options) {
             ['OPENCODE_USE_ISOLATED_HOME', 'USE_ISOLATED_HOME'],
             false
         ),
-        REQUEST_TIMEOUT_MS: (() => {
-            // A malformed value must fall back to the default: Number('abc') is NaN and setTimeout(NaN) fires
-            // immediately, which would turn every completion into a 504. The fallback is named, like the queue and
-            // body knobs: a typo used to be invisible, so the gateway ran with 300000 ms while the operator believed
-            // a shorter budget was in force.
-            const requested = options.REQUEST_TIMEOUT_MS ??
-                process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS ??
-                options.OPENCODE_PROXY_REQUEST_TIMEOUT_MS;
-            const raw = Number(requested);
-            if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
-            const blank = requested === undefined || requested === null || String(requested).trim() === '';
-            if (!blank) {
-                logger.warn(`[Config] OPENCODE_PROXY_REQUEST_TIMEOUT_MS='${loggableConfigValue(String(requested).trim())}' is not a positive number, using ${DEFAULT_REQUEST_TIMEOUT_MS}`);
-            }
-            return DEFAULT_REQUEST_TIMEOUT_MS;
-        })(),
+        // A malformed value must fall back to the default: Number('abc') is NaN and setTimeout(NaN) fires immediately,
+        // which would turn every completion into a 504. The fallback is named, like the queue and body knobs: a typo
+        // used to be invisible, so the gateway ran with 300000 ms while the operator believed a shorter budget was in
+        // force. Resolution lives in one exported helper so the precedence (a blank environment value is "not set")
+        // is the same everywhere and can be tested without mutating `process.env`.
+        REQUEST_TIMEOUT_MS: requestTimeout.value,
         DISABLE_TOOLS: disableTools,
         DEBUG: flagOption(options.DEBUG, ['OPENCODE_PROXY_DEBUG'], false)
     };
@@ -3986,6 +4138,7 @@ export function startProxy(options) {
     // The queue limits follow the same precedence as every other key (environment, then config.json, then default).
     // They used to be resolved from the environment alone, so the same keys in config.json were silently ignored and
     // the gateway kept the documented default while the operator believed a different value was in force.
+    if (requestTimeout.note) logger.warn(`[Config] ${requestTimeout.note}`);
     const resolvedLimits = getQueueLimits(options);
     MAX_CONCURRENCY = resolvedLimits.concurrency;
     MAX_QUEUE_LENGTH = resolvedLimits.queue;

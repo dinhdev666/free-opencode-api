@@ -159,6 +159,28 @@ if (finalConfig.API_KEY === DEFAULT_API_KEY) {
     );
 }
 
+// Where the key came from decides what the line below can name: `config.json` is a file the backend can open, while an
+// environment value is readable through `/proc/<pid>/environ` on Linux. A blank environment value counts as unset, which
+// is the same rule the merge above follows.
+const apiKeyFromFile = String(process.env.API_KEY ?? '').trim() === '' &&
+    String(fileConfig.API_KEY ?? '').trim() !== '';
+
+// The `API_KEY` scrub in `spawnBackend()` (it deletes the variable from the child's environment) is **hygiene, not a
+// boundary**: the backend runs as this same user, with model-directed tools, so it can read the key from the file or
+// from this process's environment. Nothing in the gateway can prevent that from inside the same uid - what it can do is
+// say so, next to the built-in-key warning, because "tools enabled + key in a readable file" is a combination an
+// operator should know about before pointing a model at an untrusted prompt.
+if (finalConfig.API_KEY !== DEFAULT_API_KEY && !finalConfig.DISABLE_TOOLS) {
+    logger.warn(
+        `[Security] API_KEY is set, but tools are enabled: the OpenCode backend runs model-directed tools as the same user, ` +
+        `so it can read the key from ${apiKeyFromFile
+            ? `the file ${loggableConfigValue(configPath)}`
+            : 'this process environment (/proc/<pid>/environ on Linux)'}, and a prompt that asks the model to read it ` +
+            'gets the key (and any credential inside OPENCODE_SERVER_URL). The child environment is scrubbed, which is ' +
+            'hygiene and not a boundary; set DISABLE_TOOLS=true if the backend must not be able to reach it.'
+    );
+}
+
 // Validate required configuration
 if (!finalConfig.OPENCODE_PATH) {
     logger.error('[Error] OPENCODE_PATH is not set. Please configure it in config.json or environment variable.');

@@ -4517,6 +4517,41 @@ async function run() {
         `${parserId} :: ${(parserLine || gatewayOutput.split('\n').filter((l) => l.includes('Rejected'))
             .join(' | ')).slice(0, 200)}`);
 
+    // A header block over Node's --max-http-header-size is rejected by the parser with HPE_HEADER_OVERFLOW, which the
+    // gateway maps to 431; only the generic 400 of HPE_INVALID_HEADER_TOKEN was asserted, so a change to that map
+    // (or to the envelope around it) could not be caught.
+    const overflowReply = await new Promise((resolve) => {
+        let data = '';
+        let settled = false;
+        const done = () => {
+            if (settled) return;
+            settled = true;
+            resolve(data);
+        };
+        const socket = net.connect(GATEWAY_PORT, '127.0.0.1', () => {
+            socket.write(`GET /v1/models HTTP/1.1\r\nHost: localhost\r\nX-Pad: ${'a'.repeat(20000)}\r\n\r\n`);
+        });
+        socket.on('data', (chunk) => { data += chunk.toString('latin1'); });
+        socket.on('close', done);
+        socket.on('error', done);
+        setTimeout(() => {
+            socket.destroy();
+            done();
+        }, 4000);
+    });
+    const overflowHead = overflowReply.split('\r\n\r\n')[0] || '';
+    let overflowJson = null;
+    try {
+        overflowJson = JSON.parse(overflowReply.slice(overflowHead.length + 4));
+    } catch {
+        overflowJson = null;
+    }
+    check('an oversized header block answers 431 in the documented envelope',
+        /^HTTP\/1\.1 431 /.test(overflowReply) && overflowJson?.error?.type === 'invalid_request_error' &&
+        overflowJson?.error?.code === 'HPE_HEADER_OVERFLOW' &&
+        /access-control-allow-origin: \*/i.test(overflowHead) && /x-request-id: gw-/i.test(overflowHead),
+        JSON.stringify(overflowReply.slice(0, 240)));
+
     // --- a body that never arrives must not hold a connection --------------------------------------------
     // Fastify sets `requestTimeout: 0`, so nothing bounded the wait for an announced body: a client that sent a
     // Content-Length and then stopped held the socket for as long as it liked - measured 20 s with no answer - and it

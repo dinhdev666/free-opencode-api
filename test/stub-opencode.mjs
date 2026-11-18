@@ -137,6 +137,16 @@ let deletedSessions = 0;
 let promptedSessions = 0;
 // Counts /config/providers calls, so a test can prove the gateway collapses a cold-cache burst into one round trip
 let providerCalls = 0;
+// Counts /experimental/tool/ids calls: with tools disabled the gateway builds its per-tool switch map from that list, so
+// a test can prove it asked the backend instead of sending no switches at all
+let toolIdCalls = 0;
+// Refuse the tool list with a 500 (a backend whose registry moved, a proxy in front of it). The SDK resolves that with an
+// error tuple, and caching that as "no tools" left every tool enabled for the whole cache window while DISABLE_TOOLS was
+// on; a test proves the completion still answers and the gateway keeps its last known map.
+const FAIL_TOOL_IDS = process.env.STUB_FAIL_TOOL_IDS === '1';
+// Hang on DELETE /session/:id and never answer (a backend that wedges): the gateway's own deadline turns it into a
+// classified cleanup failure instead of a stuck slot
+const HANG_DELETES = process.env.STUB_HANG_DELETES === '1';
 // The system prompt of the most recent prompt body: the gateway folds `system`/`developer` messages into it, so a
 // test can prove they never reach the conversation parts
 let lastSystemPrompt = '';
@@ -418,10 +428,19 @@ const server = http.createServer(async (req, res) => {
             deleted: deletedSessions,
             prompts: promptedSessions,
             providerCalls,
+            toolIdCalls,
             messagePolls,
             lastSystemPrompt,
             lastPromptText
         });
+    }
+
+    // The tool list the gateway builds its per-tool switches from when DISABLE_TOOLS is on. An unknown path here would
+    // answer 404 (an error tuple), which is the failure the gateway has to survive rather than cache as "no tools".
+    if (path === '/experimental/tool/ids') {
+        toolIdCalls += 1;
+        if (FAIL_TOOL_IDS) return sendJson(res, 500, { error: { message: 'tool registry unavailable' } });
+        return sendJson(res, 200, ['bash', 'edit', 'write', 'read', 'glob', 'list']);
     }
 
     if (path === '/config/providers') {
@@ -488,6 +507,9 @@ const server = http.createServer(async (req, res) => {
 
         if (!isMessage && req.method === 'DELETE') {
             if (REJECT_DELETES) return sendJson(res, 500, { error: { message: 'the session store is busy' } });
+            // Accepted and never answered: the gateway's own deadline (not this process) is what ends the cleanup, so a
+            // test can prove a wedged delete is classified as a transient failure instead of holding the slot
+            if (HANG_DELETES) return;
             if (sessions.delete(id)) deletedSessions += 1;
             return sendJson(res, 200, {});
         }
@@ -510,6 +532,25 @@ const server = http.createServer(async (req, res) => {
                 // The SDK resolves with { error, response } on a non-2xx answer instead of throwing: a gateway that
                 // ignores that tuple waits for an assistant message that will never exist and answers 504
                 return sendJson(res, 500, { error: { message: 'provider refused the prompt' } });
+            }
+            if (session.promptText.includes('PROMPTTOOLCALLS')) {
+                // The prompt response carries a *finished* step that only asked for a tool (`finish: "tool-calls"`), and
+                // the step that answers it is stored but still being written. Serving the prompt response because it
+                // looked finished handed the client the model's preamble for a request that went on to run a tool and
+                // answer (the poll loop reads the newest message instead).
+                session.messages.push({
+                    info: {
+                        id: `msg_${id}_step`,
+                        sessionID: id,
+                        role: 'assistant',
+                        finish: 'tool-calls',
+                        time: { created: Date.now(), completed: Date.now() }
+                    },
+                    parts: [{ type: 'text', text: TWO_STEP_EARLIER }]
+                });
+                session.messages.push(buildAssistantMessage(id, ANSWER, REASONING));
+                const stepMessage = session.messages[session.messages.length - 2];
+                return sendJson(res, 200, stepMessage);
             }
             if (session.promptText.includes('PROMPTDONE')) {
                 // The prompt response already carries the finished message and nothing is stored for polling: an answer

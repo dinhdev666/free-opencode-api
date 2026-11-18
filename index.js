@@ -1,9 +1,12 @@
 import {
     startProxy,
+    beginShutdown,
     DEFAULT_API_KEY,
     resolveApiKey,
     getQueueLimits,
     normalizeBackendUrl,
+    normalizeBindHost,
+    resolveOpencodePath,
     loggableConfigValue,
     readFlag
 } from './src/proxy.js';
@@ -97,14 +100,19 @@ const finalConfig = {
     // default one
     API_KEY: resolveApiKey(envOrFile(process.env, 'API_KEY', fileConfig.API_KEY) ?? defaultConfig.API_KEY),
     OPENCODE_SERVER_URL: envOrFile(process.env, 'OPENCODE_SERVER_URL', fileConfig.OPENCODE_SERVER_URL) ?? defaultConfig.OPENCODE_SERVER_URL,
-    OPENCODE_BIND_HOST: envOrFile(process.env, 'OPENCODE_BIND_HOST', fileConfig.OPENCODE_BIND_HOST) ?? defaultConfig.OPENCODE_BIND_HOST,
+    OPENCODE_BIND_HOST: normalizeBindHost('OPENCODE_BIND_HOST', envOrFile(process.env, 'OPENCODE_BIND_HOST', fileConfig.OPENCODE_BIND_HOST))
+        || defaultConfig.OPENCODE_BIND_HOST,
     OPENCODE_PATH: envOrFile(process.env, 'OPENCODE_PATH', fileConfig.OPENCODE_PATH) ?? defaultConfig.OPENCODE_PATH,
     // `OPENCODE_PROXY_BIND_HOST` is documented as an alias, and it is the only one that used to be dead: startProxy()
     // reads it only when no BIND_HOST is passed, and this line always passed one, so setting it changed nothing while
     // the README advertised it.
-    BIND_HOST: envOrFile(process.env, 'BIND_HOST', fileConfig.BIND_HOST)
-        ?? envOrFile(process.env, 'OPENCODE_PROXY_BIND_HOST', undefined)
-        ?? defaultConfig.BIND_HOST,
+    // Both bind addresses are trimmed (with a `[Config]` note when a value changed): a trailing space from a unit file or
+    // a rendered template is not a host, and `app.listen()` answered `getaddrinfo ENOTFOUND " 127.0.0.1"`.
+    BIND_HOST: normalizeBindHost(
+        'BIND_HOST',
+        envOrFile(process.env, 'BIND_HOST', fileConfig.BIND_HOST)
+            ?? envOrFile(process.env, 'OPENCODE_PROXY_BIND_HOST', undefined)
+    ) || defaultConfig.BIND_HOST,
     // The legacy OPENCODE_-prefixed name keeps working; the bare name matches every other key and the container's
     // `-e DISABLE_TOOLS=...` flag
     DISABLE_TOOLS: readFlag(disableToolsSource.label, disableToolsSource.value, defaultConfig.DISABLE_TOOLS),
@@ -170,15 +178,28 @@ const apiKeyFromFile = String(process.env.API_KEY ?? '').trim() === '' &&
 // from this process's environment. Nothing in the gateway can prevent that from inside the same uid - what it can do is
 // say so, next to the built-in-key warning, because "tools enabled + key in a readable file" is a combination an
 // operator should know about before pointing a model at an untrusted prompt.
-if (finalConfig.API_KEY !== DEFAULT_API_KEY && !finalConfig.DISABLE_TOOLS) {
-    logger.warn(
-        `[Security] API_KEY is set, but tools are enabled: the OpenCode backend runs model-directed tools as the same user, ` +
-        `so it can read the key from ${apiKeyFromFile
-            ? `the file ${loggableConfigValue(configPath)}`
-            : 'this process environment (/proc/<pid>/environ on Linux)'}, and a prompt that asks the model to read it ` +
+//
+// Which tools are on is the other half, and it used to be named only for a *custom* key: the built-in key is public and
+// reachable from any origin, and it handed out the same shell and file-write capability in silence. `DISABLE_TOOLS=true`
+// turns the execution tools off; the read-only ones (`read`, `glob`, `list`) stay on, so the line says "tools" and
+// points at the README rather than promising a backend that cannot read anything.
+if (!finalConfig.DISABLE_TOOLS) {
+    const capability = 'the OpenCode backend runs model-directed tools (shell commands, file writes) as the same user as ' +
+        'the gateway, so a prompt can change this host';
+    if (finalConfig.API_KEY === DEFAULT_API_KEY) {
+        logger.warn(
+            `[Security] Tools are enabled with the built-in default key: ${capability} - and any web page can reach them. ` +
+            'Set DISABLE_TOOLS=true to turn the execution tools off (read-only tools stay enabled; see README).'
+        );
+    } else {
+        logger.warn(
+            `[Security] API_KEY is set, but tools are enabled: ${capability}, and it can read the key from ${apiKeyFromFile
+                ? `the file ${loggableConfigValue(configPath)}`
+                : 'this process environment (/proc/<pid>/environ on Linux)'}, so a prompt that asks the model to read it ` +
             'gets the key (and any credential inside OPENCODE_SERVER_URL). The child environment is scrubbed, which is ' +
             'hygiene and not a boundary; set DISABLE_TOOLS=true if the backend must not be able to reach it.'
-    );
+        );
+    }
 }
 
 // Validate required configuration
@@ -233,7 +254,17 @@ function probeOpencodeVersion(binPath) {
         delete env.API_KEY;
         delete env.OPENCODE_PROXY_DEBUG;
         delete env.OPENCODE_SERVER_URL;
-        execFile(binPath, ['--version'], { timeout: 5000, encoding: 'utf8', env }, (error, stdout) => {
+        // Windows installs the CLI as `opencode.cmd`, and Node refuses to spawn a `.cmd`/`.bat` without a shell since the
+        // CVE-2024-27980 fix: the probe never ran there, so every start warned that the installation could not be
+        // verified and a 2.x release - the one case this check exists for - was never named. Quoted for the same reason
+        // `spawnBackend()` quotes it: a shell splits `C:\Program Files\...` on the space.
+        const needsShell = process.platform === 'win32' || /\.(cmd|bat)$/i.test(binPath);
+        execFile(needsShell ? `"${binPath}"` : binPath, ['--version'], {
+            timeout: 5000,
+            encoding: 'utf8',
+            env,
+            shell: needsShell
+        }, (error, stdout) => {
             if (error) {
                 resolve({ error });
                 return;
@@ -268,8 +299,18 @@ function reportOpencodeVersion(result) {
 // Start the proxy
 try {
     const proxy = startProxy(finalConfig);
-    // Deliberately not awaited: the gateway is already serving, and the answer only adds a line (or a warning)
-    probeOpencodeVersion(finalConfig.OPENCODE_PATH).then(reportOpencodeVersion).catch(() => {});
+    // The bind (and the backend warmup) are a promise now: `startProxy()` used to call `process.exit(1)` from inside
+    // its own listen catch, which an embedder cannot catch either. The message and the status are unchanged.
+    proxy.ready.catch((error) => {
+        logger.error('[Fatal] Failed to start HTTP server:', loggableError(error));
+        process.exit(1);
+    });
+    // Deliberately not awaited: the gateway is already serving, and the answer only adds a line (or a warning).
+    // The *resolved* binary is probed, not the configured value: probing the latter reported "cannot verify the
+    // installation" for a CLI that had resolved perfectly well elsewhere (a PATH entry, an npm prefix).
+    probeOpencodeVersion(resolveOpencodePath(finalConfig.OPENCODE_PATH).path || finalConfig.OPENCODE_PATH)
+        .then(reportOpencodeVersion)
+        .catch(() => { });
 
     // Graceful shutdown: stop accepting connections, let the responses in flight finish, then stop the backend and
     // exit. Long-lived SSE streams can keep server.close() pending, so in-flight sockets get a short grace period
@@ -283,6 +324,11 @@ try {
         if (shuttingDown) return;
         shuttingDown = true;
         logger.info(`[Shutdown] Received ${signal}, shutting down gracefully...`);
+        // Answer the requests that are still waiting for a slot before the socket is torn down. `server.close()` waits
+        // for them, and `closeAllConnections()` destroyed the socket 1.5 s later, so a client that had not started yet
+        // saw `fetch failed` instead of the documented `503 gateway_shutting_down` with `Retry-After: 1`. A completion
+        // already in flight keeps its slot (this only drains the queue and refuses new arrivals).
+        beginShutdown();
 
         // The backend answers the requests that are still in flight, so it is stopped only once they are gone: it
         // used to be killed first, which turned a completion the gateway was already serving into an upstream error.

@@ -5,18 +5,25 @@ import fs from 'fs';
 // to be a regular file.
 const MAX_CONFIG_BYTES = 1024 * 1024;
 
-// Keys the entry point reads. A value of the wrong type is refused instead of coerced: `resolveApiKey()` on a boolean
-// `true` turns the gateway's credential into the literal string "true" (guessable by every client, while the startup
-// summary still reports "custom - authentication always enforced"), and a nested object becomes "[object Object]".
-// So a mis-typed key has to stop the start, exactly like a file that is not valid JSON.
-const STRING_OR_NUMBER_KEYS = [
+// Keys the entry point reads as **text**. A value of the wrong type is refused instead of coerced: `resolveApiKey()` on
+// a boolean `true` turns the gateway's credential into the literal string "true" (guessable by every client, while the
+// startup summary still reports "custom - authentication always enforced"), and a nested object becomes
+// "[object Object]". So a mis-typed key has to stop the start, exactly like a file that is not valid JSON.
+//
+// A number is not text here. Accepting one let `{"OPENCODE_PATH": 5}` through validation and then threw
+// `(requestedPath || "").trim is not a function` out of `resolveOpencodePath()` - after the port had been bound, as a
+// fatal start error naming an internal expression instead of the key the operator wrote. `PORT` and the tuning keys are
+// the ones a number legitimately spells, and they are listed separately below.
+const STRING_KEYS = [
     'API_KEY',
-    'PORT',
     'BIND_HOST',
     'OPENCODE_BIND_HOST',
     'OPENCODE_SERVER_URL',
     'OPENCODE_PATH',
-    'LOG_LEVEL',
+    'LOG_LEVEL'
+];
+const NUMBER_KEYS = [
+    'PORT',
     'OPENCODE_PROXY_MAX_CONCURRENCY',
     'OPENCODE_PROXY_MAX_QUEUE',
     'OPENCODE_PROXY_MAX_BODY_MB',
@@ -24,6 +31,7 @@ const STRING_OR_NUMBER_KEYS = [
     'OPENCODE_PROXY_HEALTH_CACHE_MS',
     'OPENCODE_PROXY_START_RETRY_MS'
 ];
+const STRING_OR_NUMBER_KEYS = [...STRING_KEYS, ...NUMBER_KEYS];
 // Flags are parsed by parseBoolean(), which accepts booleans as well as their string/number spellings.
 // `OPENCODE_PROXY_DEBUG` is deliberately absent: it is an environment name (the file key is `DEBUG`) and nothing reads
 // it from the file, so listing it here made a file entry a known key that did nothing at all - exactly the silent
@@ -116,7 +124,13 @@ export function readConfigFile(configPath) {
         return { config: {}, error: `must contain a JSON object, found ${describeType(parsed)}` };
     }
 
-    for (const key of STRING_OR_NUMBER_KEYS) {
+    for (const key of STRING_KEYS) {
+        if (!Object.prototype.hasOwnProperty.call(parsed, key)) continue;
+        const value = parsed[key];
+        if (typeof value === 'string') continue;
+        return { config: {}, error: `${key} must be a string, found ${describeType(value)}` };
+    }
+    for (const key of NUMBER_KEYS) {
         if (!Object.prototype.hasOwnProperty.call(parsed, key)) continue;
         const value = parsed[key];
         if (typeof value === 'string' || typeof value === 'number') continue;

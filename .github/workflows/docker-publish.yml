@@ -4,6 +4,8 @@ name: Publish image
 # tag, so the released image always matches a reviewable commit. A `workflow_dispatch` run is only published when it is
 # started from a tag ref too (Actions -> Publish image -> Run workflow -> "Use workflow from" = the tag): the publish
 # job itself carries `if: startsWith(github.ref, 'refs/tags/v')`, so a run from a branch stops before it logs in.
+# Before anything is logged in or built, the tagged commit must be on `main` and carry only successful check runs, so a
+# tag cannot publish a commit that never went through CI.
 #
 # Required repository secrets (Settings -> Secrets and variables -> Actions):
 #   DOCKERHUB_USERNAME  Docker Hub account, for example dinhdev666
@@ -19,6 +21,8 @@ on:
 
 permissions:
   contents: read
+  # Reading the check runs of the tagged commit, so a tag cannot publish a commit whose CI never ran or never passed
+  checks: read
 
 concurrency:
   group: publish-${{ github.ref }}
@@ -39,6 +43,31 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The ancestry test below walks real history: with the default depth of 1 both sides are shallow grafts and
+          # `merge-base --is-ancestor` cannot answer
+          fetch-depth: 0
+
+      # A published image is what operators run, and the tag is the only thing that decides it: any `v*.*.*` tag on any
+      # commit used to publish, including `latest`, whether or not that commit was on `main` or had ever passed CI.
+      - name: The tag is on main and its CI passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          result=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | length')
+          total=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --jq '.total_count')
+          if [ "$total" = "0" ]; then
+            echo "commit $SHA has no check runs: let CI run on main before tagging it"
+            exit 1
+          fi
+          if [ "$result" != "0" ]; then
+            echo "$result check run(s) on commit $SHA did not succeed; fix main and tag a green commit"
+            exit 1
+          fi
+          echo "commit $SHA has $total check run(s), all green"
 
       - name: Verify the tag matches package.json
         run: |
@@ -49,6 +78,15 @@ jobs:
             exit 1
           fi
           echo "publishing version $package_version"
+
+      - name: The tagged commit is on main
+        run: |
+          git fetch --no-tags --quiet origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "commit $GITHUB_SHA is not on main; tag a commit that shipped"
+            exit 1
+          fi
+          echo "commit $GITHUB_SHA is on main"
 
       # arm64 is built on an amd64 runner, so the QEMU binfmt handlers have to be registered first
       - name: Set up QEMU

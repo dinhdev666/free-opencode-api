@@ -178,9 +178,9 @@ const SENSITIVE_HEADER_NAMES = new Set([
     'cookie',
     'set-cookie'
 ]);
-// Name segments that carry a credential in a header **or** in a query string. Shared as a string rather than written
-// into the pattern directly because `docker/docker-entrypoint.sh` cannot import this module and repeats it verbatim for
-// its own first-boot config dump: the smoke suite compares the two copies, so they cannot drift apart. `key`, `code`,
+// Name segments that carry a credential in a header **or** in a query string. Exported because the same list answers
+// for the container entrypoint's first-boot dump and for the smoke suite's own table; the entrypoint imports this
+// module (`node --input-type=module -e`) rather than repeating the list, so there is one copy to change. `key`, `code`,
 // `sig`, `signature`, `credential` and `bearer` were missing, and those are exactly the spellings other clients use for
 // the same secret: Google's `?key=AIza…`, an OAuth `?code=…`, an Azure SAS `?sig=…`, `?access_token=`'s relatives
 // (`?bearer=…`, `?credential=…`). A request URL is logged at the default level, so each of them reached `docker logs`.
@@ -194,7 +194,18 @@ const SENSITIVE_HEADER_PATTERN = new RegExp(
     'i'
 );
 
-const isSensitiveHeader = (lowerName) => SENSITIVE_HEADER_NAMES.has(lowerName) || SENSITIVE_HEADER_PATTERN.test(lowerName);
+// A name is matched in its separated form, so `accessToken` and `x-authToken` are read as `access-token` / `x-auth-token`:
+// the pattern's segment anchors require a `_` or `-` around a word, and a camelCase compound has neither, so every
+// camelCase spelling (`accessToken`, `authToken`, `refreshToken`, `clientSecret`, `sessionId` - the shape a JavaScript
+// client uses for its own metadata) collapsed into one word that matched no alternative and was written to
+// `docker logs` in clear by the request summary line and the masked header dump. The split runs before the lower-case
+// so the case boundary survives; it allocates one short string per name that is checked, and headers are dumped only
+// at debug while a query name is checked only when the URL carries a `=` (the existing fast path).
+const credentialNameKey = (name) => String(name).replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+const isSensitiveHeader = (name) => {
+    const key = credentialNameKey(name);
+    return SENSITIVE_HEADER_NAMES.has(key) || SENSITIVE_HEADER_PATTERN.test(key);
+};
 
 /**
  * Mask a value carried in the query string. A client that sends its key as `?api_key=…` (an OpenAI-compatible
@@ -211,6 +222,11 @@ const isSensitiveHeader = (lowerName) => SENSITIVE_HEADER_NAMES.has(lowerName) |
  * thread's CPU with one request target - 14 000 `?` after `/v1/models` measured 96 ms per request, unauthenticated,
  * because the summary line is built for every `/v1/*` response. A real credential name never contains a `?` (it is
  * `%3F` when encoded), so excluding it changes no real URL.
+ * `;` separates pairs as well (a legacy CGI-style query, `?x=1;api_key=…`): the value after it was logged in clear, and
+ * a `;` is never part of a credential *name*, so treating it as a separator changes no real URL either.
+ * Not covered: a credential nested inside another pair's **value** (`?redirect=http://h/?token=…`), because the first
+ * pair consumes the rest as its value. Masking that needs a recursive walk of client text on the serving thread, and a
+ * client that puts its own credential in a redirect target is already publishing it to the peer it names.
  * @param {string} url raw request URL
  * @returns {string} the URL with credential query values masked
  */
@@ -232,8 +248,8 @@ export function maskUrlQuery(url) {
     // of the request summary line (`loggableUrl()` runs it on every `/v1/*` request at the default level), and most
     // request targets carry no query string at all.
     if (!text.includes('=')) return text;
-    return text.replace(/([?&#])([^=&#?]+)=([^&#]*)/g, (match, separator, name, value) =>
-        (isSensitiveHeader(decodeQueryName(name).toLowerCase()) ? `${separator}${name}=***` : match));
+    return text.replace(/([?&#;])([^=&#?;]+)=([^&#;]*)/g, (match, separator, name, value) =>
+        (isSensitiveHeader(decodeQueryName(name)) ? `${separator}${name}=***` : match));
 }
 
 /**
@@ -247,8 +263,13 @@ export function maskUrlQuery(url) {
  */
 export function maskBackendUrl(url) {
     const text = maskUrlQuery(String(url));
-    // Everything between `//` and the last `@` before the path is userinfo (`user:pass`); a host cannot contain `@`
-    return text.replace(/^(\w[\w+.-]*:\/\/)[^/?#]*@/, '$1***@');
+    // Everything between the scheme and the last `@` before the path is userinfo (`user:pass`); a host cannot contain `@`
+    //
+    // The scheme is optional, because the value `normalizeBackendUrl()` is about to *correct* is the one it also quotes:
+    // `OPENCODE_SERVER_URL='alice:s3cr3t@host:4398' has no scheme, assuming http://` was built from the raw value before
+    // the scheme was added, and a pattern anchored on `scheme://` left that credential in the startup log - the one line
+    // that publishes a secret to `docker logs`, in a configuration the gateway supports and repairs.
+    return text.replace(/^(\w[\w+.-]{0,31}:\/\/)?[^/?#]*@/, (match, scheme = '') => `${scheme}***@`);
 }
 
 /**
@@ -263,6 +284,12 @@ export function maskBackendUrl(url) {
  * @param {*} text any text (non-strings are stringified the way `maskUrlQuery` does it)
  * @returns {string} the text with every `scheme://user:pass@` reduced to `scheme://***@`
  */
+// URI schemes whose `name:value@text` shapes are addresses, not credentials - `mailto:` first: an e-mail address is the
+// one `user:pass@host` lookalike a log line carries in bulk. Fixed vocabulary, so a set is the whole rule.
+const NON_CREDENTIAL_SCHEMES = new Set([
+    'mailto', 'tel', 'sms', 'data', 'file', 'urn', 'news', 'xmpp', 'javascript', 'about', 'magnet', 'geo'
+]);
+
 export function maskUrlCredentials(text) {
     const value = String(text);
     // Masking needs userinfo, which needs an `@`: this runs on every request log line and on every upstream sentence,
@@ -277,7 +304,28 @@ export function maskUrlCredentials(text) {
     // reachable through the debug dump of a request body (each string up to 32 KiB) and through an upstream error
     // sentence quoted into a 502. With the bound, a start position can only be a candidate when `://` follows within
     // 32 characters, so the scan is linear (1 MiB measured ~70 ms).
-    return value.replace(/(\w[\w+.-]{0,31}:\/\/)[^\s/?#@]*@/g, '$1***@');
+    const withScheme = value.replace(/(\w[\w+.-]{0,31}:\/\/)[^\s/?#@]*@/g, '$1***@');
+    // A URL written **without** a scheme is the form `normalizeBackendUrl()` repairs and then quotes back, and it is the
+    // form a hand-written sentence uses (`connect alice:s3cr3t@proxy failed`): requiring `scheme://` left both in clear.
+    // The `:` before the `@` is what separates userinfo from an e-mail address, so `alice@example.com` - the shape a
+    // log line carries in bulk - is still left alone, and the name class cannot cross a separator or `:`.
+    //
+    // `mailto:someone@example.com` is the shape that breaks that rule: read literally, `mailto` is the user name, the
+    // `:` is the separator and the address is the credential, so the text was rewritten to `***@example.com` - not an
+    // address any more, and never a secret. The two are told apart by what follows the `@`: an authority (`host:port`,
+    // or a host followed by a path/query/fragment) proves a credential whatever the leading word is, and a bare host
+    // does too unless the leading word is a URI scheme the login and address forms use.
+    // The name class cannot cross a separator, `:`, `=` or a quote: `KEY=user:pass@host` is a note naming the value, and
+    // starting at the `=` keeps the key readable while the credential goes.
+    return withScheme.replace(
+        /(^|[\s="'(<])([^\s/?#@"'()<>=:]+):([^\s/?#@]*)@(?=[^\s/?#@]+)/g,
+        (match, boundary, user, secret, offset, whole) => {
+            const afterAt = whole.slice(offset + match.length);
+            const looksLikeAuthority = /^[^\s/?#@]+(?::\d+|[/?#])/.test(afterAt);
+            return looksLikeAuthority || !NON_CREDENTIAL_SCHEMES.has(user.toLowerCase())
+                ? `${boundary}***@`
+                : match;
+        });
 }
 
 /**
@@ -299,6 +347,37 @@ export function maskQuotedCredentials(text) {
     return String(text).replace(/(\bbasic\s+|\bbearer\s+)([A-Za-z0-9+/=_.~-]{16,})/gi, '$1***');
 }
 
+// The credentials this process actually holds, removed **by value** from any text that leaves it.
+//
+// `maskQuotedCredentials()` needs 16 characters of token to tell a credential from prose ("basic setup", "Bearer of good
+// news"), and `base64("u:pw")` is 8: the gateway's own backend credential, echoed back by a proxy that refused it, is
+// the one credential a reader can pair with the host it opens. `clientFacingText()` removes it by value, but that is
+// the client-facing copy only - the log-side chain (`maskFreeText()`, `loggableError()`, `maskDetail()`, every stack)
+// did not know the value, so a backend that quoted the header inside a JSON body or an error message published it at
+// debug. Registered once from `resolveBackendAuth()`, which is the single place that lifts the credential out of
+// `OPENCODE_SERVER_URL`, so one `includes()` per registered value stands between the secret and every sentence here.
+const sensitiveValues = [];
+const MIN_REGISTERED_VALUE_LENGTH = 8;
+/**
+ * Register a value that must never be printed, whatever text it turns up in.
+ * @param {string|null|undefined} value the credential (a token, an encoded header value)
+ */
+export function registerSensitiveValue(value) {
+    const text = typeof value === 'string' ? value.trim() : '';
+    // A short value is not a credential: a one-character password would mask every occurrence of that character.
+    if (text.length < MIN_REGISTERED_VALUE_LENGTH || sensitiveValues.includes(text)) return;
+    sensitiveValues.push(text);
+    // Bounded: the list is written by this process, not by a client, and a longer one only slows down every log line.
+    if (sensitiveValues.length > 8) sensitiveValues.shift();
+}
+const redactRegisteredValues = (text) => {
+    let out = text;
+    for (let i = 0; i < sensitiveValues.length; i += 1) {
+        if (out.includes(sensitiveValues[i])) out = out.split(sensitiveValues[i]).join('***');
+    }
+    return out;
+};
+
 // Upstream text on its way to a client or a log line is masked and bounded. A backend (or a proxy in front of it) can
 // quote a URL inside an error payload, and a configured backend URL may carry a credential, so every sentence that
 // leaves the process goes through the same chain - the `500` body, the `502` body, the request log and the stack a
@@ -317,12 +396,20 @@ const MASK_TEXT_WINDOW_FACTOR = 16;
 // The words are found by splitting on whitespace rather than with `/\S+:\/\/\S+/`, which backtracked over a
 // million-character token with no `://` in it one character at a time: a provider error of 1 MB parked the request
 // for longer than its whole budget. `includes('://')` decides per token, and a token is at most a word.
+//
+// A **relative** URL carries a credential too (`backend said: /session?token=SECRET42 failed`, and a debug detail whose
+// endpoint has no host): requiring `://` skipped the query masking as well, so the value went out in clear although the
+// rule ("a URL is masked") already promised it. A token needs nothing but a `=` to be a candidate for that; the
+// per-token `maskUrlQuery()` call decides, and it cannot mask ordinary prose (`x=1:` carries no pair separator).
 export function maskUrlsInText(text) {
     const value = String(text);
-    if (!value.includes('://')) return value;
+    if (!value.includes('://') && !value.includes('=')) return value;
     return value
         .split(/(\s+)/)
-        .map((token) => (token.includes('://') ? maskUrlQuery(maskUrlCredentials(token)) : token))
+        .map((token) => {
+            const url = token.includes('://') ? maskUrlCredentials(token) : token;
+            return url.includes('=') ? maskUrlQuery(url) : url;
+        })
         .join('');
 }
 
@@ -348,7 +435,7 @@ export function maskFreeText(value, maxChars = MAX_UPSTREAM_TEXT_CHARS) {
     // characters left into the retained window - and the final truncation below still applies unchanged.
     const window = Number.isFinite(maxChars) && maxChars > 0 ? maxChars * MASK_TEXT_WINDOW_FACTOR : 0;
     const bounded = window && text.length > window ? text.slice(0, window) : text;
-    const masked = maskQuotedCredentials(maskUrlsInText(bounded));
+    const masked = redactRegisteredValues(maskQuotedCredentials(maskUrlsInText(bounded)));
     if (!Number.isFinite(maxChars) || masked.length <= maxChars) return masked;
     return `${masked.slice(0, maxChars)}…[truncated ${text.length - maxChars} chars]`;
 }
@@ -378,9 +465,8 @@ export function loggableError(error) {
 export function maskHeaders(headers) {
     const masked = {};
     Object.keys(headers || {}).forEach((name) => {
-        const lower = String(name).toLowerCase();
         const value = headers[name];
-        setOwnProperty(masked, name, isSensitiveHeader(lower) ? maskSecret(value) : value);
+        setOwnProperty(masked, name, isSensitiveHeader(name) ? maskSecret(value) : value);
     });
     return masked;
 }
@@ -416,12 +502,19 @@ export function maskDetail(value, seen = new WeakSet(), depth = 0) {
     let out;
     if (Array.isArray(value)) {
         out = value.slice(0, 100).map((item) => maskDetail(item, seen, depth + 1));
+        // The cap is lower than `safeClone()`'s because masking walks every member; leaving it silent made a debug dump
+        // of a long conversation look complete. `debugBounded()` skips the second walk that would have annotated it, so
+        // the marker has to be added here.
+        if (value.length > 100) out.push(`[+${value.length - 100} more items]`);
     } else {
         out = {};
-        Object.keys(value).slice(0, 100).forEach((key) => {
+        const allKeys = Object.keys(value);
+        const keys = allKeys.length > 100 ? allKeys.slice(0, 100) : allKeys;
+        keys.forEach((key) => {
             const entry = value[key];
-            setOwnProperty(out, key, isSensitiveHeader(String(key).toLowerCase()) ? maskSecret(entry) : maskDetail(entry, seen, depth + 1));
+            setOwnProperty(out, key, isSensitiveHeader(key) ? maskSecret(entry) : maskDetail(entry, seen, depth + 1));
         });
+        if (allKeys.length > keys.length) out['[hiddenKeys]'] = allKeys.length - keys.length;
     }
     seen.delete(value);
     return out;

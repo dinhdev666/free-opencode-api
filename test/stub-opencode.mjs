@@ -732,6 +732,31 @@ const server = http.createServer(async (req, res) => {
                 setTimeout(() => process.kill(process.pid, 'SIGKILL'), 25);
                 return;
             }
+            if (session.promptText.includes('LONGPAUSE')) {
+                // Silent past the gateway's 15 s SSE keep-alive interval, so a stream that never writes the
+                // `: keep-alive` comment is dropped by an idle proxy - and finished just before the idle recovery gives
+                // up on the text it already has (8 s idle + 8 s of polls), which is what ends such a stream around 16 s.
+                // Checked before PAUSE, whose marker it contains.
+                const message = {
+                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
+                    parts: [{ type: 'text', text: '' }]
+                };
+                session.messages.push(message);
+                sendJson(res, 200, { info: message.info, parts: [] });
+                streamAssistantReply(id, ANSWER, REASONING, {
+                    delayMs: 2,
+                    pauseAfterFirstMs: 15600,
+                    onSnapshot: (text) => {
+                        message.parts[0].text = text;
+                    }
+                })
+                    .then(() => {
+                        message.info.finish = 'stop';
+                        message.info.time = { created: Date.now(), completed: Date.now() };
+                    })
+                    .catch(() => {});
+                return;
+            }
             if (session.promptText.includes('PAUSE')) {
                 // Silenced for longer than the SSE idle timeout and finished only afterwards: the gateway must recover
                 // through polling instead of ending the stream on the text it already had

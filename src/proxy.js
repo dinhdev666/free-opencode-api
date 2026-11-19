@@ -9,7 +9,7 @@ import os from 'os';
 import { timingSafeEqual, randomBytes } from 'crypto';
 import {
     logger, loggableError, maskBackendUrl, maskDetail, maskFreeText, maskHeaders, maskUrlCredentials, maskUrlQuery,
-    MAX_LOGGED_STACK_CHARS, setOwnProperty
+    MAX_LOGGED_STACK_CHARS, registerSensitiveValue, setOwnProperty
 } from './logger.js';
 
 
@@ -191,15 +191,10 @@ const urlPath = (url) => {
  */
 export const clientFacingText = (value) => {
     if (typeof value !== 'string' || value === '') return '';
-    const masked = maskFreeText(value);
-    // The one credential this process actually holds is removed by value as well. `maskQuotedCredentials()` needs 16
-    // characters to tell a token from prose ("basic setup"), and `base64("user:pass")` is 12: a proxy in front of the
-    // backend that echoes the `Authorization` header it refused published the gateway's backend credential in a `502`
-    // body and in the error log. The token is a substring of a string already bounded to 512 characters, so the scan
-    // is bounded too, and it leaves every other sentence alone.
-    if (!BACKEND_AUTHORIZATION) return masked;
-    const token = BACKEND_AUTHORIZATION.slice(BACKEND_AUTHORIZATION.indexOf(' ') + 1);
-    return token ? masked.split(token).join('***') : masked;
+    // The by-value removal of the gateway's own backend credential lives in `maskFreeText()` now
+    // (`registerSensitiveValue()`): the log-side chain needed the same rule, and a second copy here is how the two
+    // would drift - the body was masked while the `stack` field of the same record printed the token.
+    return maskFreeText(value);
 };
 
 /**
@@ -424,8 +419,26 @@ function findExecutableInDirs(dirs, names) {
  * verify the installation" for a backend that had resolved perfectly well elsewhere, and the 2.x warning that names a
  * wrong major version never ran.
  */
+// Resolving the value walks PATH and every known install location (`readdirSync` over the nvm/asdf/fnm trees), and it
+// runs twice per start: the entry point's version probe asks, then the spawn asks. That printed the same "does not
+// exist" warning twice and scanned twice, on a spawn that can also be retried. The answer is memoised per requested
+// value for a minute - long enough to collapse one start and a restart loop, short enough that an installation made
+// while the gateway is running is picked up without restarting it.
+const RESOLVE_CACHE_TTL_MS = 60 * 1000;
+let resolveCache = null;
+
 export function resolveOpencodePath(requestedPath) {
     const input = (requestedPath || '').trim();
+    const now = Date.now();
+    if (resolveCache && resolveCache.input === input && now - resolveCache.at < RESOLVE_CACHE_TTL_MS) {
+        return resolveCache.value;
+    }
+    const value = searchOpencodePath(input);
+    resolveCache = { input, at: now, value };
+    return value;
+}
+
+function searchOpencodePath(input) {
     const names = getOpencodeCandidateNames();
 
     if (input) {
@@ -804,7 +817,12 @@ export function resolveBackendAuth(serverUrl) {
     const scheme = `${parsed.protocol}//`;
     const authority = raw.slice(scheme.length).split(/[/?#]/)[0];
     const withoutUserInfo = `${scheme}${authority.slice(authority.lastIndexOf('@') + 1)}${raw.slice(scheme.length + authority.length)}`;
-    return { url: withoutUserInfo, authorization: `Basic ${Buffer.from(`${user}:${password}`, 'utf8').toString('base64')}` };
+    const authorization = `Basic ${Buffer.from(`${user}:${password}`, 'utf8').toString('base64')}`;
+    // The credential this process holds is masked by value wherever text leaves it, because
+    // `maskQuotedCredentials()` needs 16 characters to tell a token from prose and this one can be 8.
+    registerSensitiveValue(authorization.slice(authorization.indexOf(' ') + 1));
+    registerSensitiveValue(`${user}:${password}`);
+    return { url: withoutUserInfo, authorization };
 }
 
 // How long one health probe may take, start to finish. The deadline has to cover the phases `req.setTimeout()` does not:
@@ -1030,6 +1048,21 @@ export function resolveJailParent(isWindows, tmpDir = os.tmpdir()) {
 // external backend (`OPENCODE_SERVER_URL`) keeps them in its store forever - one per restart. `killBackend()` drains
 // this set, so shutdown leaves the backend as it found it.
 const liveSessions = new Set();
+// The set is bounded, because a backend that refuses every delete keeps its ids here for the drain to retry: without a
+// cap that is one short string per served request for the life of the process, and it is invisible - the warning above
+// is rate-limited to one line a minute. The newest ids are the ones worth retrying; the backend's own sessions cannot
+// be cleaned up by this process either way, and the drain reports what it manages to delete.
+const MAX_TRACKED_SESSIONS = 1000;
+let liveSessionsOverflowReported = false;
+const trackLiveSession = (sessionId) => {
+    liveSessions.add(sessionId);
+    if (liveSessions.size <= MAX_TRACKED_SESSIONS) return;
+    // Insertion order is iteration order for a Set, so the first value is the oldest id
+    liveSessions.delete(liveSessions.values().next().value);
+    if (liveSessionsOverflowReported) return;
+    liveSessionsOverflowReported = true;
+    logger.warn(`[Proxy] More than ${MAX_TRACKED_SESSIONS} sessions are waiting to be deleted; tracking the newest ones only. A backend that refuses deletes keeps accumulating them.`);
+};
 
 // A session delete that fails is the only signal that a backend is accumulating sessions, so it must not be silent -
 // but a backend that refuses every delete would otherwise write one warning per completion. One line per minute names
@@ -3158,7 +3191,7 @@ function createApp(config) {
                             upstreamStatus
                         );
                     }
-                    liveSessions.add(sessionId);
+                    trackLiveSession(sessionId);
                     logDebug('Session created', { sessionId });
 
                     // A session is created per completion, so it must also be deleted per completion: otherwise the
@@ -3696,7 +3729,14 @@ function createApp(config) {
                         errorMessage = `OpenCode backend is not reachable (${clientFacingText(error.message)})`;
                     }
                     if (error.message && error.message.includes('ENOENT')) {
-                        errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
+                        // Appended to the cause, never instead of it: this branch used to replace every `ENOENT` on
+                        // every platform with one sentence about Windows and a restart - advice that cannot fix a
+                        // missing file, and it hid the start failure ("Failed to start OpenCode backend: …") that the
+                        // contract says a backend the gateway cannot start must name. A POSIX host reaches this with a
+                        // configured executable whose interpreter is missing, which has nothing to do with Windows.
+                        errorMessage = process.platform === 'win32'
+                            ? `${errorMessage} (the path could not be opened; on Windows this is usually a quoting or path problem)`
+                            : `${errorMessage} (a file the backend needs is missing)`;
                     }
                     // OpenAI clients branch on the type: a gateway/upstream failure is a server_error, and the
                     // constructor name of an internal exception is not part of any contract
@@ -3735,7 +3775,11 @@ function createApp(config) {
                     // is simply nothing to clean up
                     if (cleanupSession) await cleanupSession();
                 }
-            }, REQUEST_TIMEOUT_MS + 20000);
+            // Clamped to the largest timer Node accepts, like every other delay built from the budget: the budget itself
+            // is clamped to MAX_TIMER_MS, and adding the grace to it overflowed `setTimeout` - which fires after 1 ms
+            // with a TimeoutOverflowWarning, so a budget at the documented maximum turned every completion into an
+            // instant 504 that named a deadline the client never had.
+            }, Math.min(REQUEST_TIMEOUT_MS + 20000, MAX_TIMER_MS));
         } catch (error) {
             // Rejected before any backend work happened: this is a capacity signal, not a gateway failure
             if (error && error.name === 'QueueFullError') {
@@ -4379,8 +4423,13 @@ export function startProxy(options) {
     const backendUrl = normalizeBackendUrl(options.OPENCODE_SERVER_URL || 'http://127.0.0.1:4097');
 
     const requestTimeout = resolveRequestTimeoutMs(options);
+    // A blank option means "not configured" and keeps the default; anything else - `0` included - is the caller's
+    // number. Port 0 is a legitimate request ("listen on a free port") and it is what an embedder and the smoke suite
+    // pass to avoid colliding with a gateway already on the default one. Read with `||` it bound 8083 instead, silently,
+    // because the embedder path has no entry-point validator in front of it.
+    const portOption = options.PORT;
     const config = {
-        PORT: options.PORT || 8083,
+        PORT: (portOption === undefined || portOption === null || String(portOption).trim() === '') ? 8083 : portOption,
         // Empty/blank values fall back to DEFAULT_API_KEY: authentication is always on
         API_KEY: resolveApiKey(options.API_KEY),
         OPENCODE_SERVER_URL: backendUrl.url,

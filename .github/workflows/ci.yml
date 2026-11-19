@@ -33,6 +33,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history, because the commit-message step below judges a *range*: with the default depth of 1 the fetched
+          # base (`github.event.before`, a pull request's base SHA) is a second shallow graft and
+          # `git rev-list before..HEAD` answers only the tip - a two-commit push had its first subject checked by nobody.
+          # The repository is small; a complete fetch costs a second.
+          fetch-depth: 0
 
       # No `version` input: the action installs the pnpm release pinned by "packageManager" in package.json
       - name: Install pnpm

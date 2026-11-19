@@ -181,8 +181,9 @@ const apiKeyFromFile = String(process.env.API_KEY ?? '').trim() === '' &&
 //
 // Which tools are on is the other half, and it used to be named only for a *custom* key: the built-in key is public and
 // reachable from any origin, and it handed out the same shell and file-write capability in silence. `DISABLE_TOOLS=true`
-// turns the execution tools off; the read-only ones (`read`, `glob`, `list`) stay on, so the line says "tools" and
-// points at the README rather than promising a backend that cannot read anything.
+// turns the execution tools off; the two read-only tools the backend cannot run a prompt without (`read` and `glob`, see
+// `warmToolOverrides()` in `src/proxy.js`) stay on, so the line says "tools" and points at the README rather than
+// promising a backend that cannot read anything.
 if (!finalConfig.DISABLE_TOOLS) {
     const capability = 'the OpenCode backend runs model-directed tools (shell commands, file writes) as the same user as ' +
         'the gateway, so a prompt can change this host';

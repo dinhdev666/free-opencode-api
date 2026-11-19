@@ -4,7 +4,14 @@
 # image packages `opencode-ai` and the runtime carries `fastify` and `@opencode-ai/sdk`, and a security fix in any of
 # them should arrive as a reviewable pull request rather than as a CVE nobody looked at. Dependabot opens one pull
 # request per ecosystem on the schedule below; every one of them goes through the same CI (the smoke suite and the
-# commit-message check), so a bump that breaks the contract is caught before it can be merged.
+# image build), so a bump that breaks the contract is caught before it can be merged.
+#
+# The commit subject is the one part Dependabot writes itself and cannot be configured into this repository's
+# convention: `prefix` is the **type** (not the scope, which is what `deps` is), it capitalises the verb ("Bump fastify
+# from …") and `include: scope` derives the scope from the dependency kind ("dependencies"), none of which
+# CONTRIBUTING.md accepts. `build` is the documented type for a dependency bump, so that part is right; the rest is
+# handled by `test/check-commit-messages.mjs`, which reports and skips commits authored by the bot instead of failing
+# them. Without that exemption every bump - a security fix included - arrived red.
 version: 2
 updates:
   # Runtime dependencies (package.json + pnpm-lock.yaml). Dependabot reads the lockfile, so the update it proposes is
@@ -16,8 +23,7 @@ updates:
       day: monday
     open-pull-requests-limit: 5
     commit-message:
-      # The repository's convention (CONTRIBUTING.md): `deps` is the scope for a dependency bump
-      prefix: deps
+      prefix: build
       include: scope
 
   # The workflow actions are pinned to full commit SHAs on purpose (ci.yml enforces it), so an update is a new SHA plus
@@ -29,11 +35,16 @@ updates:
       day: monday
     open-pull-requests-limit: 5
     commit-message:
-      prefix: ci
+      prefix: build
       include: scope
 
-  # The base image and the `opencode-ai` CLI version (docker/Dockerfile): a digest or a CLI release that is no longer
-  # fetched is a supply-chain question an operator should see, not one buried in a rebuild.
+  # The base image reference in docker/Dockerfile, which is pinned by tag **and** digest (the digest is what makes two
+  # builds of one commit identical): Dependabot proposes the new tag and digest together, which is the review an
+  # operator needs before a rebuilt upstream image becomes this image's base.
+  #
+  # It does **not** update `ARG OPENCODE_VERSION`: that is an npm package installed inside the image, and the docker
+  # ecosystem only reads `FROM` and `image:` references. The CLI version is bumped by hand, and `npm` in the image
+  # resolves its transitive dependencies at build time (there is no lockfile for a global install).
   - package-ecosystem: docker
     directory: /docker
     schedule:
@@ -41,5 +52,5 @@ updates:
       day: monday
     open-pull-requests-limit: 5
     commit-message:
-      prefix: docker
+      prefix: build
       include: scope

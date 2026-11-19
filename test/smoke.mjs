@@ -18,7 +18,7 @@ import {
 import { readConfigFile, findUnknownKeys, envOrFile, CONFIG_FILE_KEYS } from '../src/config.js';
 import {
     createLogger, loggableError, maskBackendUrl, maskDetail, maskHeaders, maskQuotedCredentials, maskSecret,
-    maskUrlCredentials, maskUrlQuery, serializeDetail,
+    maskUrlCredentials, maskUrlQuery, registerSensitiveValue, serializeDetail,
     MAX_SERIALIZED_LENGTH, SENSITIVE_NAME_ALTERNATIVES
 } from '../src/logger.js';
 import path from 'node:path';
@@ -52,6 +52,20 @@ const record = (name, ok, detail) => {
 };
 
 const check = (name, condition, detail) => record(name, Boolean(condition), detail);
+
+// A check whose *setup* is impossible on this host is reported as skipped, never as a pass: a Windows file or directory
+// name cannot carry a control character, so the two "a newline in a name cannot forge a record" checks cannot be built
+// there. Recording a green tick for a check that never ran is worse than a shorter run, and the summary says both.
+const skipped = [];
+const skip = (name, reason) => {
+    skipped.push({ name, reason });
+    console.log(`  [skip] ${name} — ${reason}`);
+};
+
+// A run that dies halfway reports which check stopped it and how much never ran, instead of leaving the reader to infer
+// it from a smaller total (the suite aborted at a Windows-only setup failure and printed "2 of 266 failed", with the
+// remaining ~175 checks never executed and nothing saying so).
+let runError = null;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -92,15 +106,33 @@ async function waitForOk(url, timeoutMs = 20000, headers = undefined) {
 }
 
 // SIGTERM first, SIGKILL if a child ignores it: a leaked stub keeps the port and the next run silently tests the
-// previous checkout's code
+// previous checkout's code.
+//
+// On Windows there is no signal delivery: `kill()` terminates that one process and every backend it spawned survives
+// holding the port (measured: the stub a fake CLI started outlived the gateway, and the next run's gateway on the same
+// port answered the suite's own requests with the stub's 404). `taskkill /T` takes the tree, and the graceful
+// shutdown the earlier checks assert is never what this is used for.
 const stop = (child) => {
     if (!child || child.exitCode !== null) return;
+    if (process.platform === 'win32' && child.pid) {
+        try {
+            execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+            return;
+        } catch { /* already gone: fall through to the signal path */ }
+    }
     child.kill('SIGTERM');
     const timer = setTimeout(() => {
         if (child.exitCode === null) child.kill('SIGKILL');
     }, 2000);
     timer.unref();
     child.once('exit', () => clearTimeout(timer));
+};
+
+// Best-effort removal of a scratch directory. On Windows a directory that a child process still uses as its working
+// directory cannot be deleted (EPERM), and a leaked backend can hold it for a moment after the gateway is gone - that is
+// not a test failure, and one stuck directory must not abort the run.
+const removeTempDir = (dir) => {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* still held by a child */ }
 };
 
 const waitForExit = (child) => new Promise((resolve) => {
@@ -114,6 +146,17 @@ const waitForExit = (child) => new Promise((resolve) => {
         resolve();
     });
 });
+
+// Ctrl-C mid-run used to leave the stub, the gateway and every child behind, still holding the ports the next run needs
+// (the next failure then read "port 4199 is already in use" with nothing pointing at the abandoned run). The suite owns
+// those processes, so it reaps them and exits with the conventional status for the signal it received.
+for (const [signal, status] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+    process.once(signal, () => {
+        for (const child of children) stop(child);
+        console.error(`\n[smoke] ${signal}: stopping ${children.length} child process(es)`);
+        process.exit(status);
+    });
+}
 
 // A process already listening on the port would answer the checks with someone else's build
 async function assertPortFree(port, label) {
@@ -295,7 +338,7 @@ async function run() {
             probePort(null, 'not-a-port'));
         check('the health check falls back to 8083 without a stored config', probePort(null, null) === '8083',
             probePort(null, null));
-        fs.rmSync(probeDir, { recursive: true, force: true });
+        removeTempDir(probeDir);
     }
 
     const readmeSource = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
@@ -409,6 +452,10 @@ async function run() {
         ['Bearer sk-dummy-123 is not a URL', 'Bearer sk-dummy-123 is not a URL'],
         ['http://127.0.0.1:4097/session', 'http://127.0.0.1:4097/session'],
         ['mailto:someone@example.com', 'mailto:someone@example.com'],
+        // The scheme is optional: this is the form `normalizeBackendUrl()` repairs and then quotes back, and the form a
+        // hand-written sentence uses - both used to keep the credential in clear because the pattern wanted `scheme://`
+        ['connect alice:s3cr3t@proxy failed', 'connect ***@proxy failed'],
+        ['OPENCODE_SERVER_URL=alice:s3cr3t@host:4398 is repaired', 'OPENCODE_SERVER_URL=***@host:4398 is repaired'],
         ['an @ in a path is not userinfo: http://host:4097/a@b', 'an @ in a path is not userinfo: http://host:4097/a@b']
     ];
     const maskedTextResults = maskedTextCases.map(([input, expected]) => [input, maskUrlCredentials(input), expected]);
@@ -521,6 +568,31 @@ async function run() {
     const longSentence = clientFacingText('e'.repeat(600));
     check('a server-side sentence is bounded, so a throwing library cannot answer with a body-sized reason',
         longSentence.length === 533 && longSentence.slice(512) === '…[truncated 88 chars]', longSentence.slice(500));
+
+    // A credential the gateway knows **by value** - the backend's own token and `user:password`, lifted out of
+    // `OPENCODE_SERVER_URL` - is removed from any sentence, not only from a URL-shaped one. `base64("u:pw")` is 8
+    // characters, below the floor `maskQuotedCredentials()` needs to tell a token from prose, so a proxy that echoed
+    // the Basic header it refused published the credential through a rule that could not see it.
+    const registeredSecret = 'backend-credential-value-7';
+    registerSensitiveValue(registeredSecret);
+    const registeredText = clientFacingText(`the proxy refused ${registeredSecret} for this request`);
+    check('a credential the gateway holds by value is removed from any sentence',
+        !registeredText.includes(registeredSecret) && registeredText.includes('the proxy refused'), registeredText);
+    check('masking a registered value leaves the rest of the sentence readable',
+        clientFacingText('a sentence with nothing to mask') === 'a sentence with nothing to mask',
+        clientFacingText('a sentence with nothing to mask'));
+
+    // A header name is whatever the client sends, and the match is on the *shape* of the name - so a camelCase
+    // spelling (`x-apiKey`, `xAuthToken`) was compared in lower case nowhere and dumped in clear.
+    const camelHeaders = maskHeaders({ 'x-apiKey': 'secret-value', 'xAuthToken': 'another-secret', 'content-type': 'application/json' });
+    check('a credential header name is matched whatever its casing',
+        !JSON.stringify(camelHeaders).includes('secret-value') && !JSON.stringify(camelHeaders).includes('another-secret') &&
+        camelHeaders['content-type'] === 'application/json',
+        JSON.stringify(camelHeaders));
+    // The same name list reaches a request URL, where `;` separates pairs as well as `&`
+    check('a query pair separated by a semicolon is masked too',
+        maskUrlQuery('/v1/models;api_key=secret;model=x') === '/v1/models;api_key=***;model=x',
+        maskUrlQuery('/v1/models;api_key=secret;model=x'));
 
     // The helper matters only where it is used. A 5xx written by an unexpected throw cannot be provoked from outside -
     // no request the gateway accepts makes a handler throw - so the wiring is asserted on the source: the sentence a
@@ -805,6 +877,22 @@ async function run() {
         fs.writeFileSync(objectKeyPath, JSON.stringify({ LOG_LEVEL: { level: 'debug' } }));
         check('readConfigFile refuses an object value for a known key',
             /LOG_LEVEL/.test(String(readConfigFile(objectKeyPath).error)), String(readConfigFile(objectKeyPath).error));
+        // The sentence names the type the key actually takes: a key that is only ever a string was reported as
+        // "must be a string or a number", so the operator's next attempt was a number the gateway then rejected too.
+        check('a string-only key is reported as needing a string',
+            readConfigFile(boolKeyPath).error === 'API_KEY must be a string, found a boolean',
+            String(readConfigFile(boolKeyPath).error));
+        const numberKeyPath = path.join(configDir, 'number-key.json');
+        fs.writeFileSync(numberKeyPath, JSON.stringify({ PORT: true }));
+        check('a numeric key still accepts a string or a number and says so',
+            readConfigFile(numberKeyPath).error === 'PORT must be a string or a number, found a boolean',
+            String(readConfigFile(numberKeyPath).error));
+        // A number written as a string is what a JSON template or a shell-substituted document produces, and the gateway
+        // reads it: the message must not claim otherwise.
+        const numericStringPath = path.join(configDir, 'numeric-string.json');
+        fs.writeFileSync(numericStringPath, JSON.stringify({ PORT: '8083' }));
+        check('a numeric key accepts its value written as a string',
+            readConfigFile(numericStringPath).error === null, String(readConfigFile(numericStringPath).error));
         const flagKeyPath = path.join(configDir, 'flag-key.json');
         fs.writeFileSync(flagKeyPath, JSON.stringify({ DISABLE_TOOLS: 'yes', USE_ISOLATED_HOME: false }));
         check('readConfigFile accepts the documented flag values',
@@ -872,7 +960,7 @@ async function run() {
         check('readConfigFile refuses a file over the size cap', /maximum is/.test(String(readConfigFile(hugePath).error)),
             String(readConfigFile(hugePath).error));
     } finally {
-        fs.rmSync(configDir, { recursive: true, force: true });
+        removeTempDir(configDir);
     }
 
     await assertPortFree(STUB_PORT, 'stub');
@@ -2289,7 +2377,9 @@ async function run() {
     // A module embedder calls startProxy() directly, with no entry point to resolve the option first: the environment
     // fallback has to report the value too, or the tool guard is off with nothing in the log about it.
     const embedDriver = [
-        `import { startProxy } from ${JSON.stringify(path.join(ROOT, 'src', 'proxy.js'))};`,
+        // An import specifier has to be a URL: a bare Windows path (`C:\…\src\proxy.js`) is read as the scheme `c:` and
+        // the whole check died with ERR_UNSUPPORTED_ESM_URL_SCHEME on every Windows run
+        `import { startProxy } from ${JSON.stringify(pathToFileURL(path.join(ROOT, 'src', 'proxy.js')).href)};`,
         `process.env.DISABLE_TOOLS = 'definitely';`,
         `await startProxy({ PORT: 0, BIND_HOST: '127.0.0.1', OPENCODE_SERVER_URL: ${JSON.stringify(STUB_URL)}, API_KEY: 'sk-embedded' });`,
         `process.exit(0);`
@@ -2346,6 +2436,9 @@ async function run() {
     // detail object (whose newline `JSON.stringify` escapes): `spawn` repeats the command it was handed back inside an
     // OS sentence. A configured path that exists is used as-is (no shell, so the quoting guard above does not run), and
     // a non-executable file of that name answers EACCES - so the path under test can carry a newline into that message.
+    if (process.platform === 'win32') {
+        skip('a newline in a spawn error cannot forge a second log record', 'a Windows file name cannot hold a newline');
+    } else {
     const spawnDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-spawn-'));
     const spawnBinary = path.join(spawnDir, 'opencode\n[Shutdown] Not really spawning');
     fs.writeFileSync(spawnBinary, 'not a program');
@@ -2385,7 +2478,8 @@ async function run() {
         JSON.stringify(spawnFailLine).slice(0, 240));
     stopGateway(spawnFailGateway);
     await waitForExit(spawnFailGateway);
-    fs.rmSync(spawnDir, { recursive: true, force: true });
+    removeTempDir(spawnDir);
+    }
 
     // The same rule reaches the values `[Config]` names: `readLimit()` builds its note out of the operator's text, and
     // the port and the three timing knobs interpolated the raw value, so a newline in any of them forged a record too.
@@ -2453,8 +2547,11 @@ async function run() {
     // The note about a `config.json` in the wrong directory names two paths, and one of them comes from the shell's
     // working directory - a directory name can carry a newline on any POSIX host. It is the line that tells an operator
     // which file was ignored, so a forged record after it hides the real advice.
+    if (process.platform === 'win32') {
+        skip('a newline in the working directory cannot forge a config note', 'a Windows directory name cannot hold a newline');
+    } else {
     const forgedCwdDir = path.join(os.tmpdir(), `gateway-cwd-${process.pid}\n[Config] Not really a gateway line`);
-    fs.rmSync(forgedCwdDir, { recursive: true, force: true });
+    removeTempDir(forgedCwdDir);
     fs.mkdirSync(forgedCwdDir, { recursive: true });
     fs.writeFileSync(path.join(forgedCwdDir, 'config.json'), JSON.stringify({ PORT: 1 }));
     const forgedCwdPort = GATEWAY_PORT + 71;
@@ -2479,7 +2576,8 @@ async function run() {
         JSON.stringify(forgedCwdLines));
     stopGateway(forgedCwdGateway);
     await waitForExit(forgedCwdGateway);
-    fs.rmSync(forgedCwdDir, { recursive: true, force: true });
+    removeTempDir(forgedCwdDir);
+    }
 
     // --- the key a tool-using backend can still read --------------------------------------------------------
     // `spawnBackend()` deletes `API_KEY` from the child's environment, which is hygiene and not a boundary: the backend
@@ -2559,10 +2657,10 @@ async function run() {
                 path.basename(chosen).startsWith('opencode-proxy-jail-') &&
                     (fs.statSync(chosen).mode & 0o777) === 0o700,
                 `${path.basename(chosen)} mode ${(fs.statSync(chosen).mode & 0o777).toString(8)}`);
-            fs.rmSync(chosen, { recursive: true, force: true });
+            removeTempDir(chosen);
         } finally {
-            fs.rmSync(plantedParent, { recursive: true, force: true });
-            fs.rmSync(symlinkTarget, { recursive: true, force: true });
+            removeTempDir(plantedParent);
+            removeTempDir(symlinkTarget);
         }
         // A parent this process owns is reused instead of replaced, which is what keeps one tree per running gateway
         const ownedParent = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-jail-'));
@@ -2574,7 +2672,7 @@ async function run() {
                     (fs.statSync(first).mode & 0o777) === 0o700,
                 `${first} mode ${(fs.statSync(first).mode & 0o777).toString(8)}`);
         } finally {
-            fs.rmSync(ownedParent, { recursive: true, force: true });
+            removeTempDir(ownedParent);
         }
     }
 
@@ -2832,7 +2930,10 @@ async function run() {
     // a limit that is configured but not applied is worse than none.
     stopGateway(limitGateway);
     await waitForExit(limitGateway);
-    const bodyPort = GATEWAY_PORT + 7;
+    // A port of its own: this block shared `GATEWAY_PORT + 7` with the spawned-backend case far below, so a stub that
+    // one run leaked held the port and the next run's `/health` was answered by that stub - the 413 checks then failed
+    // with the stub's own 404, which looks like a gateway bug.
+    const bodyPort = GATEWAY_PORT + 90;
     const bodyUrl = `http://127.0.0.1:${bodyPort}`;
     const bodyGateway = spawn(process.execPath, ['index.js'], {
         cwd: ROOT,
@@ -3054,6 +3155,45 @@ async function run() {
     check('the recovered stream still ends with [DONE]', pauseResponse.includes('data: [DONE]'),
         pauseResponse.slice(-120));
     check('the recovery waited for the answer instead of trusting the silence', pauseMs >= 12000, `${pauseMs} ms`);
+
+    // --- the stream keeps itself warm through a longer silence ---------------------------------------------
+    // A `: keep-alive` comment line is written after 15 s of silence so an idle proxy or browser does not drop a stream
+    // whose model is still thinking. Nothing covered it: the quiet-stream case above pauses 12.5 s, deliberately under
+    // the threshold. It costs ~16 s, so it runs only when asked - `SMOKE_SLOW=1 pnpm test`.
+    if (process.env.SMOKE_SLOW === '1') {
+        const keepWarmStartedAt = Date.now();
+        const keepWarmResponse = await fetch(`${BASE}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ messages: [{ role: 'user', content: 'LONGPAUSE please' }], stream: true })
+        }).then((response) => response.text());
+        const keepWarmMs = Date.now() - keepWarmStartedAt;
+        check('a stream silent for longer than the keep-alive interval writes a comment line',
+            keepWarmResponse.includes(': keep-alive'), keepWarmResponse.slice(0, 160));
+        const keepWarmContent = parseSseFrames(keepWarmResponse)
+            .filter((frame) => frame !== '[DONE]')
+            .map((frame) => {
+                try {
+                    return JSON.parse(frame);
+                } catch {
+                    return null;
+                }
+            })
+            .filter(Boolean)
+            .map((chunk) => chunk.choices?.[0]?.delta?.content || '')
+            .join('');
+        // The comment line must never become answer text, and the stream must still be terminated. How much of the
+        // answer arrives is not the keep-alive's business: 15 s of silence is past the idle timeout, so the recovery
+        // poll has already accepted what the backend stored (see "An idle stream is recovered, not ended") - asserting
+        // the whole answer here would only assert how long this pause is.
+        check('the keep-alive line never reaches the client as answer text',
+            ANSWER.startsWith(keepWarmContent) && !keepWarmContent.includes('keep-alive')
+                && keepWarmResponse.includes('data: [DONE]'),
+            `${keepWarmContent.length} chars after ${keepWarmMs} ms, terminates ${keepWarmResponse.includes('data: [DONE]')}`);
+    } else {
+        skip('a stream silent for longer than the keep-alive interval writes a comment line', 'slow check, run with SMOKE_SLOW=1');
+        skip('the keep-alive line never reaches the client as answer text', 'slow check, run with SMOKE_SLOW=1');
+    }
 
     // --- a tool-call block split across deltas -----------------------------------------------------------
     // With tools disabled, the markup has to be removed even when the backend cuts it in the middle of a tag:
@@ -3300,11 +3440,19 @@ async function run() {
     stopGateway(queueShutdownGateway);
     const queuedAnswer = await queuedDuringShutdown;
     await holdsOnlySlot;
+    // `child.kill('SIGINT')` on Windows terminates the child instead of delivering the signal (there is no console event
+    // to forward), so the handler that drains the queue and answers this request never runs. The check can only fail
+    // there for a reason that has nothing to do with the gateway, so it is skipped rather than reported as a pass.
+    if (process.platform === 'win32') {
+        skip('a request still queued when shutdown begins is answered 503 gateway_shutting_down',
+            'SIGINT is not delivered to a child process on Windows');
+    } else {
     check('a request still queued when shutdown begins is answered 503 gateway_shutting_down',
         queuedAnswer.status === 503 &&
             queuedAnswer.json?.error?.code === 'gateway_shutting_down' &&
             queuedAnswer.retryAfter === '1',
         `status ${queuedAnswer.status} retry-after ${queuedAnswer.retryAfter} ${JSON.stringify(queuedAnswer.json)?.slice(0, 160)}`);
+    }
     await waitForExit(queueShutdownGateway);
 
     // --- a non-ASCII key ----------------------------------------------------------------
@@ -3344,7 +3492,10 @@ async function run() {
     // --- shutdown keeps the backend until the answers are done -------------------------------------------
     // The gateway spawns its own backend here (a script that starts the stub on the requested port), because only a
     // backend the gateway owns is killed on shutdown - and that is the one an in-flight completion depends on.
-    const spawnPort = GATEWAY_PORT + 7;
+    // The port moves with the suite's own process id: a gateway terminated instead of asked to stop (Windows) leaves
+    // that backend running, and reusing the port made the next run's checks pass against the abandoned stub - a
+    // backend the suite never started. Costs nothing and keeps one run's leftovers out of the next one's evidence.
+    const spawnPort = GATEWAY_PORT + 200 + (process.pid % 20);
     const spawnUrl = `http://127.0.0.1:${spawnPort}`;
     const fakeBin = path.join(os.tmpdir(), `free-opencode-api-fake-opencode-${process.pid}.sh`);
     const fakePidFile = `${fakeBin}.pid`;
@@ -3497,7 +3648,10 @@ async function run() {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
         body: JSON.stringify({ messages: [{ role: 'user', content: 'HOLD in flight' }] })
-    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }))
+        // The gateway is stopped below: on a host that cannot deliver the signal the socket is reset, and an unhandled
+        // rejection here took the whole suite down (Node exits on one by default) instead of failing this check
+        .catch((error) => ({ status: 0, json: null, error: String(error?.message) }));
     await sleep(150);
     const spawnExit = await new Promise((resolve) => {
         const timer = setTimeout(() => resolve('timeout'), 15000);
@@ -3508,18 +3662,29 @@ async function run() {
         stopGateway(spawnGateway);
     });
     const heldAnswer = await heldInFlight;
+    if (process.platform === 'win32') {
+        // Three more checks that only a delivered SIGINT/SIGTERM can make true (see the queue block above)
+        skip('a completion in flight is answered while shutting down', 'SIGINT is not delivered to a child process on Windows');
+        skip('the answer served during shutdown is complete', 'SIGINT is not delivered to a child process on Windows');
+        skip('shutdown exits cleanly with a spawned backend', 'SIGINT is not delivered to a child process on Windows');
+    } else {
     check('a completion in flight is answered while shutting down', heldAnswer.status === 200,
         `status ${heldAnswer.status} ${JSON.stringify(heldAnswer.json)?.slice(0, 120)}`);
     check('the answer served during shutdown is complete',
         heldAnswer.json?.choices?.[0]?.message?.content === ANSWER,
         JSON.stringify(heldAnswer.json?.choices?.[0]?.message));
     check('shutdown exits cleanly with a spawned backend', spawnExit === 0, `exit ${spawnExit}`);
+    }
     let backendGone = false;
     for (let i = 0; i < 20 && !backendGone; i += 1) {
         backendGone = await fetch(`${spawnUrl}/health`).then(() => false).catch(() => true);
         if (!backendGone) await sleep(100);
     }
+    if (process.platform === 'win32') {
+        skip('the spawned backend does not outlive the gateway', 'a forcibly terminated gateway cannot reap its child');
+    } else {
     check('the spawned backend does not outlive the gateway', backendGone, 'still answering');
+    }
     try { fs.unlinkSync(fakeBin); } catch { /* best effort */ }
     try { fs.unlinkSync(fakePidFile); } catch { /* best effort */ }
 
@@ -4105,7 +4270,9 @@ async function run() {
         cwdWarnOutput.split('\n').find((line) => line.includes('is ignored')) || cwdWarnOutput.slice(0, 160));
     stopGateway(cwdWarnGateway);
     await waitForExit(cwdWarnGateway);
-    fs.rmSync(cwdWarnDir, { recursive: true, force: true });
+    // Best effort: on Windows a backend the gateway spawned still holds this directory as its cwd for a moment, and a
+    // failed cleanup is not what the check above asserts.
+    removeTempDir(cwdWarnDir);
 
     // --- a poll that fails while the answer is being written ---------------------------------------------
     // One failed poll used to end the completion: a 5xx was silently skipped and a dropped connection threw out of the
@@ -4813,7 +4980,9 @@ async function run() {
         method: 'POST',
         headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
         body: JSON.stringify({ messages: [{ role: 'user', content: 'HOLD in flight' }] })
-    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }))
+        // Without this the reset a forcible kill produces is an unhandled rejection, which takes the whole suite down
+        .catch((error) => ({ status: 0, json: null, error: String(error?.message) }));
     await sleep(150);
     const longLivedExit = await new Promise((resolve) => {
         const timer = setTimeout(() => resolve('timeout'), 10000);
@@ -4824,9 +4993,14 @@ async function run() {
         stopGateway(gateway);
     });
     const heldLongLivedAnswer = await heldLongLived;
+    if (process.platform === 'win32') {
+        skip('SIGINT shuts the gateway down cleanly', 'SIGINT is not delivered to a child process on Windows');
+        skip('the shutdown leaves no truncated answer behind', 'SIGINT is not delivered to a child process on Windows');
+    } else {
     check('SIGINT shuts the gateway down cleanly', longLivedExit === 0, `exit ${longLivedExit}`);
     check('the shutdown leaves no truncated answer behind', heldLongLivedAnswer.status === 200,
         `status ${heldLongLivedAnswer.status}`);
+    }
 
     // --- a session left behind by an interrupted completion ---------------------------------------------
     // A completion that shutdown interrupts never reaches its `cleanupSession()`: the process exits while the task is
@@ -4868,11 +5042,15 @@ async function run() {
     });
     const sessionsAfterShutdown = await sessionsAfterCleanup(STUB_URL, 3000);
     await interruptedCompletion;
+    if (process.platform === 'win32') {
+        skip('a completion interrupted by shutdown deletes its session', 'SIGINT is not delivered to a child process on Windows');
+    } else {
     check('a completion interrupted by shutdown deletes its session',
         sessionsDuringShutdown?.live === 1 && drainExitCode === 0 &&
         sessionsAfterShutdown?.live === 0,
         `live ${sessionsDuringShutdown?.live} -> ${sessionsAfterShutdown?.live}, exit ${drainExitCode}, ` +
         `${Date.now() - drainStoppedAt}ms`);
+    }
 
     // --- a session the backend refuses to delete --------------------------------------------------------
     // The SDK resolves a refused DELETE with `{ error, response }` instead of throwing, so a drain that only caught
@@ -4919,11 +5097,15 @@ async function run() {
     });
     await refusedCompletion;
     const refuseSessions = await fetch(`http://127.0.0.1:${refuseStubPort}/__sessions`).then((r) => r.json()).catch(() => null);
+    if (process.platform === 'win32') {
+        skip('a delete the backend refuses is not counted as a deletion', 'SIGINT is not delivered to a child process on Windows');
+    } else {
     check('a delete the backend refuses is not counted as a deletion',
         refuseExit === 0 && refuseSessions?.live === 1 && refuseSessions?.deleted === 0 &&
         /Could not delete every session/.test(refuseOut) && /remaining/.test(refuseOut),
         `exit ${refuseExit}, ${JSON.stringify(refuseSessions)}, ` +
         `${refuseOut.split('\n').filter((line) => line.includes('delete')).join(' | ').slice(0, 200)}`);
+    }
     stop(refuseStub);
     await waitForExit(refuseStub);
 
@@ -4994,7 +5176,7 @@ async function run() {
             reported[2].suggestion === null,
             JSON.stringify(reported));
     } finally {
-        fs.rmSync(unknownKeyDir, { recursive: true, force: true });
+        removeTempDir(unknownKeyDir);
     }
 
     const blankEnvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'free-opencode-api-blank-env-'));
@@ -5067,7 +5249,7 @@ async function run() {
         stopGateway(blankEnvGateway);
         await waitForExit(blankEnvGateway);
     } finally {
-        fs.rmSync(blankEnvDir, { recursive: true, force: true });
+        removeTempDir(blankEnvDir);
     }
 
     // --- the poll fallback shares the request budget instead of buying a second one -----------------------
@@ -5342,7 +5524,7 @@ async function run() {
             dump ? `home=${dump.home} xdgData=${dump.xdgData} tmp=${dump.tmp}` : 'no dump');
         check('the spawned backend does not inherit the gateway backend URL',
             dump !== null && dump.serverUrl === null, dump ? String(dump.serverUrl) : 'no dump');
-        fs.rmSync(childEnvDir, { recursive: true, force: true });
+        removeTempDir(childEnvDir);
     }
 }
 
@@ -5396,7 +5578,7 @@ if (process.platform !== 'win32') {
     check('a start attempt in flight spawns no backend once the gateway is stopping', spawnedPid === null,
         `spawned pid ${spawnedPid}`);
     await new Promise((resolve) => silent.close(resolve));
-    fs.rmSync(shutdownDir, { recursive: true, force: true });
+    removeTempDir(shutdownDir);
 
     // --- a backend that ignores SIGTERM does not outlive the gateway ---------------------------------------
     // killBackend() bounds its whole teardown and spends what is left of that budget on the escalation, so SIGKILL is
@@ -5466,11 +5648,17 @@ if (process.platform !== 'win32') {
     if (stubbornPid && stubbornAlive) {
         try { process.kill(stubbornPid, 'SIGKILL'); } catch { /* best effort */ }
     }
+    if (process.platform === 'win32') {
+        // Both checks need the signal to be delivered and the child to be signalled on its way out
+        skip('a backend that ignores SIGTERM is killed before the gateway exits', 'SIGTERM is not delivered to a child process on Windows');
+        skip('the teardown finishes inside its budget instead of the hard exit', 'SIGTERM is not delivered to a child process on Windows');
+    } else {
     check('a backend that ignores SIGTERM is killed before the gateway exits',
         stubbornPid !== null && stubbornExit === 0 && !stubbornAlive,
         `pid=${stubbornPid} alive=${stubbornAlive} exit=${stubbornExit} after ${stubbornShutdownMs}ms`);
     check('the teardown finishes inside its budget instead of the hard exit',
         stubbornShutdownMs < 12000, `${stubbornShutdownMs}ms`);
+    }
 
     // --- a session created while the gateway is shutting down is still deleted -----------------------------
     // The drain used to take one snapshot of `liveSessions`: a `session.create` that answered after it was read added an
@@ -5521,12 +5709,16 @@ if (process.platform !== 'win32') {
     });
     const slowCreateStatus = await slowCreateAnswer;
     const afterSlowCreate = await sessionsAfterCleanup(`http://127.0.0.1:${slowCreateStubPort}`);
+    if (process.platform === 'win32') {
+        skip('a session created while the gateway shuts down is deleted, not orphaned', 'SIGINT is not delivered to a child process on Windows');
+    } else {
     check('a session created while the gateway shuts down is deleted, not orphaned',
         slowCreateExit === 0 && afterSlowCreate && afterSlowCreate.live === 0,
         `exit=${slowCreateExit} status=${slowCreateStatus} ${JSON.stringify(afterSlowCreate)}`);
+    }
     stop(slowCreateStub);
     await waitForExit(slowCreateStub);
-    fs.rmSync(stubbornDir, { recursive: true, force: true });
+    removeTempDir(stubbornDir);
 
 // --- a closed log reader does not take the gateway down ---------------------------------------------------
 // `node index.js | head -3`, a log shipper that restarts, `docker logs` closing mid-write: the next write emits EPIPE
@@ -5647,6 +5839,7 @@ try {
         })
     ]);
 } catch (error) {
+    runError = error;
     record('smoke run completed without throwing', false, error.message);
 } finally {
     for (const child of children) stop(child);
@@ -5660,8 +5853,16 @@ if (failed.length) {
     console.error('\n--- stub output ---\n' + stubOutput.trim());
     console.error(`\n${failed.length} of ${results.length} checks failed:`);
     for (const failure of failed) console.error(` - ${failure.name}${failure.detail ? ` (${failure.detail})` : ''}`);
+    if (runError) {
+        // The rest of the suite never ran, so the counts above are not a verdict on it
+        console.error(`\nthe run stopped after ${results.length} checks (${runError.message}): every check after it was not executed`);
+    }
     process.exit(1);
 }
 
+if (skipped.length) {
+    console.log(`\n${skipped.length} check(s) skipped on this platform:`);
+    for (const entry of skipped) console.log(` - ${entry.name} (${entry.reason})`);
+}
 console.log(`\nAll ${results.length} checks passed.`);
 process.exit(0);

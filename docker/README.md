@@ -17,6 +17,7 @@ The image bundles Node.js 22, the project source, and the OpenCode CLI (npm pack
 - [API Self-Check](#api-self-check)
 - [Configuration](#configuration)
 - [Logging](#logging)
+- [Stopping the Container](#stopping-the-container)
 - [Exposing the 4097 Backend Port](#exposing-the-4097-backend-port)
 - [Known Issues and Compatibility Fixes](#known-issues-and-compatibility-fixes)
 - [Publishing a Release](#publishing-a-release)
@@ -261,6 +262,36 @@ Example `docker logs` output per level:
 # invalid level fallback warning
 [gateway] 2026-11-06T12:02:00.000Z [WARN] Invalid LOG_LEVEL 'verbose', fallback to 'info' (valid values: error/warn/info/debug)
 ```
+
+---
+
+## Stopping the Container
+
+`docker stop` sends `SIGTERM`, and the gateway uses that signal to finish what it is doing: requests still waiting for a
+completion slot are answered `503 gateway_shutting_down` (`Retry-After: 1`) instead of being dropped, responses already
+streaming are allowed to finish, and the `opencode serve` child it spawned is stopped and its leftover sessions deleted
+before the process exits. That teardown is bounded — a 6 s connection watchdog plus an 8 s teardown budget, with a hard
+exit 10 s after the teardown starts.
+
+**Docker's default is 10 s**, which is shorter than the worst case: the runtime sends `SIGKILL` while the gateway is
+still draining, and a client's stream ends in a reset instead of the documented refusal. Give the stop a longer grace
+period than the default:
+
+```bash
+docker run -d --name free-opencode-api --stop-timeout=20 -p 8083:8083 dinhdev666/free-opencode-api
+```
+
+Compose uses a different key for the same thing:
+
+```yaml
+services:
+  free-opencode-api:
+    image: dinhdev666/free-opencode-api
+    stop_grace_period: 20s
+```
+
+Swarm services take `stop_grace_period` in the service definition; Kubernetes uses
+`terminationGracePeriodSeconds: 20` (its default is 30, so only a lowered value needs attention).
 
 ---
 

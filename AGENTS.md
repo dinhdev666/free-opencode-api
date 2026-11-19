@@ -74,12 +74,15 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 456 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, ~440 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
 `pnpm test` needs no OpenCode CLI and no network: it starts `test/stub-opencode.mjs` on port 4199 and the gateway on
-port 8199 (override with `SMOKE_STUB_PORT` / `SMOKE_PORT`). CI runs `pnpm run check` and `pnpm test` on Node 20, 22
+port 8199 (override with `SMOKE_STUB_PORT` / `SMOKE_PORT`). The run prints the exact number of checks it executed, so
+quote that number rather than this line. `SMOKE_SLOW=1 pnpm test` adds the checks that are slow by nature (the SSE
+keep-alive line, written only after 15 s of silence); they are skipped otherwise. CI runs `pnpm run check` and
+`pnpm test` on Node 20, 22
 and 24, plus `test/check-commit-messages.mjs` over the added commits. No linter or formatter exists: style is a review
 concern. Do not claim checks passed if they were not run.
 
@@ -94,7 +97,8 @@ messages and SSE events, plus a test-only `GET /__sessions` reporting created/de
 (an answer slow enough to abort mid-stream), `STALL` (silence after two deltas), `TOOLTAG` (a tool-call block cut inside
 both of its tags), `FAIL` (a provider error with no content), `ENDONLY` (a finish event carrying only `time.completed`),
 `GROW` (an answer still being written when the prompt returns), `SUICIDE` (the stub SIGKILLs itself after accepting the
-prompt), `PAUSE` (silence longer than the idle timeout), `HOLD` (finishes after 400 ms, so a completion stays in
+prompt), `PAUSE` (silence longer than the idle timeout), `LONGPAUSE` (silence past the 15 s keep-alive interval, so the stream
+carries a `: keep-alive` comment line; slow by nature, see `SMOKE_SLOW`), `HOLD` (finishes after 400 ms, so a completion stays in
 flight while the backend is killed or the gateway shuts down), `SLOWFINISH` (finishes after 3 s), `TAILTAG` (a last
 delta ending in a tag prefix that never becomes a tag), `REJECTPROMPT` (a 500 for `POST /session/:id/message`),
 `PROMPTDONE` (the prompt response already carries the finished message), `PROMPTTOOLCALLS` (the prompt response carries a

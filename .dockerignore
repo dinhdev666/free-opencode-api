@@ -7,11 +7,29 @@ node_modules
 .gitignore
 .github
 # Credentials: the exact names were the only ones kept out, so `.env.local` / `config.local.json` / a private key
-# sitting in the working tree were baked into the image layer that `COPY . .` creates
+# sitting in the working tree were baked into the image layer that `COPY . .` creates.
+# The package-manager and git credential files are the same class and were still missing: `.npmrc` (where a pnpm/npm
+# registry token lives), `.netrc`, `.git-credentials`, an SSH private key and a PKCS#12 bundle were copied into the image
+# and pushed to Docker Hub, where a layer stays pullable. `.pnpmrc`/`.yarnrc*` carry registry auth too.
 .env
 .env.*
 config.json
 config.*.json
+.npmrc
+.pnpmrc
+.yarnrc
+.yarnrc.yml
+.netrc
+_netrc
+.git-credentials
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*.p12
+*.pfx
+*.keystore
+*.jks
 *.pem
 *.key
 *.log

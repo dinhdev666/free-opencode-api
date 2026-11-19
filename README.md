@@ -246,10 +246,12 @@ in; if a `config.json` sits in that working directory instead, startup says so:
 `[Config] config.json is read from …; the file at … is ignored`.
 
 The file must be a regular file of at most 1 MiB; a UTF-8 BOM (which a Windows editor writes) is tolerated. A key the
-gateway knows but whose value has the wrong type stops it with the key named
-(`[Config] config.json API_KEY must be a string or a number, found a boolean`) instead of being coerced: a boolean
-`API_KEY` would make the literal string `true` the gateway's credential, which every client can guess while the
-startup summary still reports a custom key.
+gateway knows but whose value has the wrong type stops it with the key named and the type it found
+(`[Config] config.json API_KEY must be a string, found a boolean`) instead of being coerced: a boolean `API_KEY` would
+make the literal string `true` the gateway's credential, which every client can guess while the startup summary still
+reports a custom key. The message names the type each key actually takes — a string (`API_KEY`, `BIND_HOST`,
+`OPENCODE_BIND_HOST`, `OPENCODE_SERVER_URL`, `OPENCODE_PATH`, `LOG_LEVEL`) or a number (`PORT` and the
+`OPENCODE_PROXY_*` tuning keys, which are also accepted as a numeric string).
 
 A key the gateway does **not** read is reported and ignored, because a misspelled key used to change nothing at all
 while the gateway ran the default you thought you had replaced:

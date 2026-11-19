@@ -15,7 +15,13 @@
 # slim instead of alpine: a glibc environment is more reliable for node native dependencies and the opencode binary,
 # avoiding musl pitfalls
 # If Docker Hub pulls are slow on your host, configure a registry mirror on the builder beforehand
-FROM node:22-bookworm-slim
+# Pinned by digest as well as by tag: every GitHub action in .github/workflows is pinned by SHA and checked in CI, while
+# the base image - the layer everything else is built on - was the one mutable reference left, so two builds of the same
+# commit could differ by a Debian point release or a rebuilt upstream image. The digest is the multi-arch index for
+# `22-bookworm-slim`; Dependabot's docker ecosystem refreshes it (and the tag) when upstream publishes a new one.
+# Refresh by hand with:
+#   docker buildx imagetools inspect node:22-bookworm-slim --format '{{.Manifest.Digest}}'
+FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
 
 # OCI image metadata. The copyright holder is part of the project's invariants (AGENTS.md), and an image without any
 # LABEL leaves registries, scanners and `docker inspect` with nothing to attribute it to.
@@ -97,16 +103,15 @@ EXPOSE 8083
 # (Fastify included) take their production path
 ENV NODE_ENV=production
 
-# Health check uses the same /health endpoint the CI smoke suite asserts. The port comes from PORT when it is set and
-# from /app/config.json otherwise, because that file is the documented fallback for `-e PORT` (an image whose probe only
-# looked at the environment reported a healthy gateway as unhealthy forever when the port came from the file). It is
-# read through the entry point's own rule - trimmed, digits only, 1-65535 - because the gateway trims `PORT` before it
-# listens: `PORT=' 8083'` made the gateway bind 8083 while the probe built `http://127.0.0.1: 8083/health`, which curl
-# refuses (exit 3), so the container was restarted in a loop for a value the gateway accepted. The digit class is
-# spelled `[0-9]`: a `\d` here reaches the shell-embedded program as a literal backslash and a `d`, so every port read
-# as invalid and the probe fell back to 8083 - a container configured for another port reported itself unhealthy.
+# Health check uses the same /health endpoint the CI smoke suite asserts. The port is resolved with the gateway's own
+# rule (`envOrFile()` plus `index.js`'s validator), not a second one: a `PORT` that is present and readable wins and is
+# validated on its own, a blank or absent one falls back to /app/config.json, and anything else falls back to 8083. The
+# probe used to fall through to the file when the environment value was invalid, which the gateway never does - so
+# `-e PORT=8086x` with 8086 in the file made the gateway serve 8083 while the probe watched 8086, and a container that
+# was serving every request reported itself unhealthy for its whole life. The value is trimmed and digit-checked with
+# `[0-9]` (a `\d` reaches the shell-embedded program as a literal backslash and a `d`, so every port read as invalid).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD port=$(node -e 'const fs=require("fs");const ok=(v)=>/^[0-9]{1,5}$/.test(v)&&Number(v)>0&&Number(v)<65536;const raw=String(process.env.PORT??"").trim();if(ok(raw)){process.stdout.write(raw);process.exit(0)}let fromFile="";try{fromFile=String(JSON.parse(fs.readFileSync("/app/config.json","utf8")).PORT??"").trim()}catch(e){}process.stdout.write(ok(fromFile)?fromFile:"8083")') && curl -fsS "http://127.0.0.1:${port}/health" || exit 1
+    CMD port=$(node -e 'const fs=require("fs");const ok=(v)=>/^[0-9]{1,5}$/.test(v)&&Number(v)>0&&Number(v)<65536;const fromEnv=String(process.env.PORT??"").trim();if(fromEnv!==""){process.stdout.write(ok(fromEnv)?fromEnv:"8083");process.exit(0)}let fromFile="";try{fromFile=String(JSON.parse(fs.readFileSync("/app/config.json","utf8")).PORT??"").trim()}catch(e){}process.stdout.write(ok(fromFile)?fromFile:"8083")') && curl -fsS "http://127.0.0.1:${port}/health" || exit 1
 
 # Log level: one of error/warn/info/debug, case-insensitive; invalid values fall back to info with a warning. The
 # precedence is the project-wide one - env > config.json > default - so no ENV line is set here: an image-level

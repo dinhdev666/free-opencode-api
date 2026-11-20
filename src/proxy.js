@@ -9,7 +9,7 @@ import https from 'https';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { timingSafeEqual, randomBytes } from 'crypto';
+import { createHmac, timingSafeEqual, randomBytes } from 'crypto';
 import {
     logger, loggableError, maskBackendUrl, maskDetail, maskFreeText, maskHeaders, maskUrlCredentials, maskUrlQuery,
     MAX_LOGGED_STACK_CHARS, registerSensitiveValue, setOwnProperty
@@ -31,7 +31,7 @@ import {
 import { DEFAULT_API_KEY, resolveApiKey } from './api-key.js';
 import { backendAuthorizationHeader, resolveBackendAuth, resolveBackendPassword } from './backend-auth.js';
 import {
-    backendDeadline, DEFAULT_REQUEST_TIMEOUT_MS, isUnusableMilliseconds, MAX_TIMER_MS, METADATA_TIMEOUT_CAP_MS,
+    backendDeadline, DEFAULT_REQUEST_TIMEOUT_MS, MAX_TIMER_MS, METADATA_TIMEOUT_CAP_MS,
     readLimit, readMilliseconds, resolveRequestTimeoutMs
 } from './settings.js';
 import { parseBoolean, readFlag } from './options.js';
@@ -72,11 +72,25 @@ const DEFAULT_POLL_INTERVAL_MS = 500;
 const POLL_BACKOFF_MS = [25, 50, 100, 200];
 // How many polls in a row may fail before a completion is reported as an upstream error
 const MAX_POLL_FAILURES = 5;
-// How many messages one poll asks for. A completion is one session with one prompt, so a small page covers it; the
-// 2.x list answers newest-first by default and this bound keeps a session that somehow accumulated history from
-// pushing the whole transcript across the wire on every poll.
-const DEFAULT_POLLED_MESSAGE_LIMIT = 50;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
+// A fixed, non-secret domain separator for the API-key digest. It is not a secret and does not need to be one: its job
+// is to keep the digest of a key from being a value anyone can look up in a precomputed table of plain SHA-256 hashes,
+// and a constant in the source does that, because the unknown an attacker lacks is the key itself.
+const API_KEY_DIGEST_PEPPER = 'free-opencode-api:api-key:v1';
+// The event types the streaming collector handles. The 2.x multiplexer filters per subscriber through the `types`
+// option, so naming them here keeps the collector from receiving - and discarding - every event of every session on a
+// busy backend, and keeps the per-event work proportional to the answer rather than to the backend's total traffic.
+const COLLECTOR_EVENT_TYPES = [
+    'session.text.delta',
+    'session.reasoning.delta',
+    'session.text.ended',
+    'session.reasoning.ended',
+    'session.execution.failed',
+    'session.step.failed',
+    'session.step.ended',
+    'session.idle',
+    'session.execution.succeeded'
+];
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
 // A stream that has written nothing for this long gets a comment line, so a proxy or client does not drop the
 // connection while the backend is still thinking. The tick is much shorter than the interval on purpose: it used to be
@@ -257,13 +271,25 @@ export function getQueueLimits(fileConfig = {}) {
     return { concurrency: concurrency.value, queue: queue.value, notes };
 }
 
+/**
+ * The sentence a refused completion carries, in one place because two paths refuse one: the `onRequest` hook (before
+ * the body is parsed, so a full queue does not buffer a body it will refuse) and `lock()` (the race-free backstop that
+ * still decides when a slot frees up between the hook and the handler). Two hand-written copies drifted the first time
+ * the early refusal was added: with `OPENCODE_PROXY_MAX_QUEUE=0` the hook answered "0 completions are already waiting",
+ * which reads like a gateway bug rather than the setting it is.
+ * @returns {string} the client-facing refusal sentence
+ */
+function queueFullMessage() {
+    // `0` is a supported setting ("never queue"), so the default wording would report a full queue that is configured
+    // to hold zero requests - a number that reads like a bug in the report, not like the setting it is.
+    return MAX_QUEUE_LENGTH === 0
+        ? 'Queue full: waiting is disabled (OPENCODE_PROXY_MAX_QUEUE=0), retry later'
+        : `Queue full: ${MAX_QUEUE_LENGTH} completions are already waiting, retry later`;
+}
+
 class QueueFullError extends Error {
     constructor() {
-        // `0` is a supported setting ("never queue"), so the default wording would report a full queue that is
-        // configured to hold zero requests - a number that reads like a bug in the report, not like the setting it is.
-        super(MAX_QUEUE_LENGTH === 0
-            ? 'Queue full: waiting is disabled (OPENCODE_PROXY_MAX_QUEUE=0), retry later'
-            : `Queue full: ${MAX_QUEUE_LENGTH} completions are already waiting, retry later`);
+        super(queueFullMessage());
         this.name = 'QueueFullError';
     }
 }
@@ -495,11 +521,11 @@ async function checkHealth(serverUrl, authorizations = BACKEND_HEALTH_AUTHORIZAT
     throw lastError || new Error('Backend health probe failed');
 }
 
-let BACKEND_HEALTH_CACHE_MS = readMilliseconds('OPENCODE_PROXY_HEALTH_CACHE_MS', 2000);
+let BACKEND_HEALTH_CACHE_MS = readMilliseconds('OPENCODE_PROXY_HEALTH_CACHE_MS', 2000).value;
 
 // After a failed start attempt (missing binary, backend never became healthy) requests fail fast for this long
 // instead of repeating a multi-minute startup wait on every single request
-let BACKEND_START_RETRY_COOLDOWN_MS = readMilliseconds('OPENCODE_PROXY_START_RETRY_MS', 15000);
+let BACKEND_START_RETRY_COOLDOWN_MS = readMilliseconds('OPENCODE_PROXY_START_RETRY_MS', 15000).value;
 
 // Jail directories this process created. Another gateway (a second instance, or one in a container sharing /tmp)
 // may be using the same parent directory, so the exit hook must never delete a directory it does not own.
@@ -509,6 +535,13 @@ const ownedJailRoots = new Set();
 // `<tmp>/opencode-proxy-jail` (which disappears with the last instance, since `rmdir` refuses a non-empty one) and a
 // private one when the shared directory turned out to belong to somebody else (see `resolveJailParent()`).
 const ownedJailParents = new Set();
+
+// The private parent built for the shared directory being unusable, kept across respawns. `resolveJailParent()` runs on
+// every spawn, so without this a machine where `<tmp>/opencode-proxy-jail` belongs to another account (a shared `/tmp`,
+// the documented case) got a fresh `mkdtempSync()` directory per respawn - each one added to `ownedJailParents`, which is
+// only reclaimed at process exit. That made this the one module-level container not bounded by a constant. The parent is
+// reused while it still exists, so a respawn loop reuses one directory instead of accumulating them.
+let privateJailParent = null;
 
 /**
  * The directory the per-spawn jail lives in, or a private one when the shared directory cannot be trusted.
@@ -554,7 +587,23 @@ export function resolveJailParent(isWindows, tmpDir = os.tmpdir()) {
         logger.warn('[Proxy] Could not prepare the shared backend jail directory; using a private one',
             { path: shared, error: error.message });
     }
+    // Reuse the private parent this process already made while it is still there, instead of creating another one per
+    // respawn. `lstatSync` (not `statSync`): a symlink planted in its place is exactly the redirect the ownership check
+    // above refuses for the shared directory, and this one is checked the same way.
+    if (privateJailParent) {
+        try {
+            const stats = fs.lstatSync(privateJailParent);
+            const reusable = stats.isDirectory() && !stats.isSymbolicLink()
+                && (currentUid === null || stats.uid === currentUid);
+            if (reusable) return privateJailParent;
+        } catch (error) {
+            // Gone, or replaced: fall through and build a new one
+        }
+        ownedJailParents.delete(privateJailParent);
+        privateJailParent = null;
+    }
     const privateParent = fs.mkdtempSync(path.join(tmpDir, 'opencode-proxy-jail-'));
+    privateJailParent = privateParent;
     ownedJailParents.add(privateParent);
     return privateParent;
 }
@@ -622,6 +671,9 @@ function cleanupTempDirs() {
         }
     }
     ownedJailParents.clear();
+    // The reused-parent cache must not outlive the directory it names: the next `resolveJailParent()` call would hand
+    // back a path this process just removed.
+    privateJailParent = null;
 }
 
 // Register cleanup on exit
@@ -638,6 +690,15 @@ process.on('exit', cleanupTempDirs);
  * `UnauthorizedError`, `InvalidRequestError`, …) and no status, or a `ClientError` wrapping Node's `fetch` failure.
  * `upstreamErrorStatus()` maps the tag back onto the status the server sent, so the sentence a client reads still names
  * one.
+ *
+ * **Which branches below the pinned 2.x client can actually reach.** A status the client declares throws
+ * `declared(await json(response))`, which copies the *body's* own fields onto the thrown value - so `error.data` /
+ * `error.body` are populated when the body has those keys. A status it does **not** declare throws a `ClientError` that
+ * keeps `cause.status` and discards the payload, so `error.error`, `error.responseBody` and `error.response` are never
+ * set by it. Those three are kept anyway, and `response.status`/`response.data` with them: they cost two property reads
+ * on an error path, and they are the shape a translating proxy in front of the backend, or a future client, produces -
+ * the same tolerance `completedPromptMessage()` keeps for the 1.x prompt shape. They are deliberately **not** covered by
+ * the smoke suite, which speaks only 2.x; treat them as unverified tolerance, not as tested behaviour.
  * @param {unknown} error the resolved tuple or the thrown value
  * @returns {{status: number|null, bodySummary: string|null}}
  */
@@ -957,19 +1018,24 @@ function createApp(config) {
         ...(backendSdkAuthorization ? { headers: { Authorization: backendSdkAuthorization } } : {})
     });
 
-    // Precomputed once: comparing against a ready-made buffer avoids rebuilding the token on every request.
+    // Precomputed once: the configured key is hashed once here, not once per request.
     // resolveApiKey() guarantees a non-empty key, so authentication can never be switched off.
     const apiKeyToken = resolveApiKey(API_KEY);
-    const apiKeyTokenBuffer = Buffer.from(apiKeyToken);
-    // Constant-time comparison, built once for the whole app: the length checks are required because
-    // timingSafeEqual throws on a size mismatch, and they have to compare bytes - a token with non-ASCII
-    // characters can match in string length while differing in byte length, which used to throw and turn a wrong
-    // key into a 500 instead of a 401. It lives here rather than in the auth hook because that hook runs on every
-    // request, and `/health` and the 404 path never compare anything at all.
+    // The comparison runs over fixed-size HMAC digests rather than the keys themselves, so **no length ever enters
+    // it**: `timingSafeEqual` is constant-time only once the two lengths are known to be equal, and the length guard
+    // it needs answered "wrong length" measurably faster than "right length, wrong bytes" - a signal an attacker can
+    // average out of many requests to learn how long the configured key is. Both digests are always 32 bytes, so the
+    // remaining comparison is over two equally long values whatever the client sent. The digest is keyed with the
+    // configured key and carries a fixed pepper, so it is a keyed value the client cannot steer into a collision of its
+    // choosing. It lives here rather than in the auth hook because that hook runs on every request, and `/health` and
+    // the 404 path never compare anything at all.
+    const apiKeyTokenDigest = createHmac('sha256', apiKeyToken).update(API_KEY_DIGEST_PEPPER).digest();
+    const digestToken = (value) => createHmac('sha256', value).update(API_KEY_DIGEST_PEPPER).digest();
     const matchesToken = (provided) => {
-        if (typeof provided !== 'string' || provided.length !== apiKeyToken.length) return false;
-        const providedBuffer = Buffer.from(provided);
-        return providedBuffer.length === apiKeyTokenBuffer.length && timingSafeEqual(providedBuffer, apiKeyTokenBuffer);
+        if (typeof provided !== 'string' || provided === '') return false;
+        // Compared as bytes, never as strings: a key with non-ASCII characters matches in string length but not in byte
+        // length, and comparing strings threw a `RangeError` that turned a wrong key into a 500 instead of a 401.
+        return timingSafeEqual(digestToken(provided), apiKeyTokenDigest);
     };
     const AUTH_SCHEME_RE = /^Bearer[ \t]+/i;
     // Pulls the token out of an `Authorization` value; returns '' when the value does not carry one
@@ -1106,10 +1172,11 @@ function createApp(config) {
             logged = true;
             if (!summaryEnabled) return;
             // `meta.model` is client input (the model id from the request body) and `request.url` is bounded only by
-            // the HTTP parser's header limit: the model id is normalised where it is stored, and a pathological URL
-            // is cut here, so neither can forge a second log line or turn one request into an arbitrarily large log
-            // record. Both are logged, never echoed to the client, so truncation loses nothing a reader needs.
-            const model = meta.model || '-';
+            // the HTTP parser's header limit: the model id is normalised here rather than where it is stored, so the
+            // scan costs nothing when this line is not written, and a pathological URL is cut, so neither can forge a
+            // second log line or turn one request into an arbitrarily large log record. Both are logged, never echoed
+            // to the client, so truncation loses nothing a reader needs.
+            const model = meta.model ? loggableModelId(meta.model) : '-';
             // A credential sent in the query string (`?api_key=…`, a convention some OpenAI-compatible clients still
             // use) used to be copied into the log verbatim at the default level; only the values whose name looks like
             // a credential are masked
@@ -1126,6 +1193,12 @@ function createApp(config) {
         // `X-Api-Key` is accepted as an alias for the bearer token below, and a browser only sends it when the
         // preflight advertises it: a rejected preflight breaks those clients before they ever reach the auth check.
         reply.raw.setHeader('X-Content-Type-Options', NO_SNIFF);
+        // Every answer here is a response to an `Authorization`-bearing request and every completion body is the
+        // client's own conversation. RFC 9111 §3.5 forbids a *shared* cache from reusing such a response unless it is
+        // explicitly public, and nothing here is: a misconfigured intermediary or an embedding host that retained the
+        // model list or a completion would serve one client's conversation to another. The SSE path narrows this back
+        // to `no-cache` when it opens the stream, because a rewindable stream is a normal client feature.
+        reply.raw.setHeader('Cache-Control', 'no-store');
         reply.raw.setHeader('Access-Control-Allow-Origin', '*');
         reply.raw.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         reply.raw.setHeader('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS);
@@ -1163,6 +1236,23 @@ function createApp(config) {
                     ? 'the X-Api-Key header does not carry the gateway API key; send Authorization: Bearer <API_KEY>'
                     : 'the request carries no API key; send Authorization: Bearer <API_KEY>';
             reply.code(401).send({ error: { message, type: 'invalid_request_error', code: 'invalid_api_key' } });
+            return;
+        }
+
+        // An authenticated completion request whose body has not been parsed yet must not be buffered when the queue is
+        // already full: Fastify's content-type parser runs in the preValidation phase (after this hook), so without this
+        // check N concurrent 50 MiB bodies are each fully in memory before the 65th is refused by lock() - the documented
+        // memory bound (MAX_BODY_MB x queue) does not hold. The route handler's own lock() call stays as the race-free
+        // backstop; this is the early refusal that stops the body from being read at all.
+        if (request.method === 'POST' && path === '/v1/chat/completions'
+            && activeTasks >= MAX_CONCURRENCY && queue.length >= MAX_QUEUE_LENGTH) {
+            reply.raw.setHeader('Retry-After', '1');
+            reply.code(503).send({
+                error: {
+                    message: queueFullMessage(),
+                    type: 'queue_full'
+                }
+            });
             return;
         }
 
@@ -1928,10 +2018,19 @@ function createApp(config) {
                 // carries `get`) - and is **newest first** unless `order: 'asc'` is asked for. The caller scans for the
                 // newest assistant message and treats the tail as the answer, so the order is pinned here rather than
                 // left to the server's default.
+                //
+                // `type: 'assistant'` and `order: 'desc'` narrow the query to exactly the message the answer is written
+                // into: without the type filter the poll ships every user/tool/shell message in the session on every
+                // 500 ms tick, and with `order: 'asc'` a session that accumulated more than one page of messages
+                // returned the *oldest* messages - the newest assistant message was outside the page, so the poll
+                // served a stale finished step or polled out the budget. `desc` + `limit: 1` makes the newest assistant
+                // message the first element, and the "tail is the answer" scan below handles both the one-message and the
+                // multi-message shapes the stub and the real backend produce.
                 messagesRes = await client.message.list({
                     sessionID: sessionId,
-                    order: 'asc',
-                    limit: DEFAULT_POLLED_MESSAGE_LIMIT
+                    type: 'assistant',
+                    order: 'desc',
+                    limit: 1
                 }, backendDeadline(Math.max(1, timeoutMs - (Date.now() - startedAt))));
             } catch (error) {
                 // The deadline is the caller's budget, not a failed poll: it still surfaces as a timeout
@@ -1984,7 +2083,11 @@ function createApp(config) {
                 // silently see "no assistant message" (and poll to its budget) because the envelope moved.
                 let newest = null;
                 let newestIsV2 = false;
-                for (let i = messages.length - 1; i >= 0; i -= 1) {
+                // Walk forward from index 0: the poll asks for `order: 'desc'` (newest first), so the first assistant
+                // message in the list is the newest. The old `asc` + `limit: 50` shape walked backward from the end,
+                // which was the same message under ascending order - but with `desc` the end is the *oldest* message,
+                // so the scan direction had to flip with the query.
+                for (let i = 0; i < messages.length; i += 1) {
                     const message = messages[i];
                     if (message?.info?.role === 'assistant') {
                         newest = message;
@@ -2059,13 +2162,19 @@ function createApp(config) {
      */
     async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs) {
         const controller = new AbortController();
-        // The 2.x client returns the event iterator directly (`client.event.subscribe(input?, {signal})`), where 1.x
-        // resolved with `{stream}` and never threw. A subscription the server refuses therefore arrives as a rejected
-        // promise; the failure is reported with its status, exactly as the missing 1.x stream was.
+        // The 2.x client's `OpenCode.make()` replaces the generated `event` route with a shared multiplexer whose
+        // `subscribe()` takes a **single** options object (`{types?, signal}`), not the declared `(input?, {signal})`
+        // two-argument form. Passing the signal as the second argument left it in a position the runtime ignores: the
+        // collector received every event type from every session (no `types` filter) and `controller.abort()` was a
+        // no-op (the multiplexer registers its abort listener from `options.signal`). Both features were silently inert.
+        // Passing one object restores the filter (the nine event types the collector handles) and a real abort.
         let eventStream;
         let eventStreamError = null;
         try {
-            eventStream = await client.event.subscribe(undefined, { signal: controller.signal });
+            eventStream = await client.event.subscribe({
+                types: COLLECTOR_EVENT_TYPES,
+                signal: controller.signal
+            });
         } catch (error) {
             eventStreamError = error;
         }
@@ -2314,7 +2423,12 @@ function createApp(config) {
                             receivedDelta = true;
                             let snapshotKey = partSnapshotKey(partKey, isReasoning);
                             const held = partTotals.get(snapshotKey);
-                            const running = (held ? held.total : '') + delta;
+                            // `appendCapped` bounds the bookkeeping text to `MAX_ANSWER_CHARS` (16 M), the same cap the
+                            // visible `content`/`reasoning` buffers already carry: without it `partTotals`/`partTexts`
+                            // held the full answer in addition to the capped copies, so a 200 MB answer took the gateway
+                            // from ~75 MB to ~432 MB RSS. Every comparison on this path (`isLiveSnapshot`, `snapshotDelta`,
+                            // `startsWith`) is prefix-based, so a prefix cap is safe here.
+                            const running = appendCapped(held ? held.total : '', delta);
                             if (held && held.slot && held.slot.text === held.total && isLiveSnapshot(snapshotKey, held.slot)) {
                                 // The entry this key's deltas have been extending is still live and still holds the base
                                 // `running` was built from: the delta *is* the increment, so it is written straight in.
@@ -2373,7 +2487,7 @@ function createApp(config) {
                             // an empty increment here, and one that streamed nothing gets the whole part.
                             if (typeof data.text !== 'string' || data.text === '') continue;
                             const isReasoning = event.type === 'session.reasoning.ended';
-                            const delta = recordPartSnapshot(`${isReasoning ? 'r' : 't'}${partKey}`, data.text);
+                            const delta = recordPartSnapshot(`${isReasoning ? 'r' : 't'}${partKey}`, appendCapped('', data.text));
                             // An empty increment means the deltas already delivered this text: the closing event is
                             // bookkeeping, and treating it as output is what duplicated the answer.
                             if (!delta) continue;
@@ -2403,7 +2517,7 @@ function createApp(config) {
                                     sessionId,
                                     ms: Date.now() - startedAt,
                                     deltaChars,
-                                    error: data.error?.name || data.error?.message || null
+                                    error: clientFacingText(data.error?.message) || null
                                 });
                             }
                             settle({ content, reasoning, error: data.error || null });
@@ -2692,9 +2806,14 @@ function createApp(config) {
                     // "not streaming" - a **blank string** included, which is what `parseBoolean()` reports as
                     // unreadable: `stream: ""` is the shape a form field or an unset template variable produces, and it
                     // answered `400` here while the sentence above promised blank was accepted.
-                    const readableFlag = (value) =>
-                        value === undefined || value === null || value === '' || parseBoolean(value, undefined) !== undefined;
-                    if (!readableFlag(stream)) {
+                    // Parsed once per field instead of twice through a per-request `readableFlag` closure: the closure
+                    // was rebuilt for every completion and `parseBoolean()` ran up to four times (validate, then read)
+                    // for two fields whose answer never changes. `blank` is the documented "not configured" spelling,
+                    // kept separate from `parsed` because `parseBoolean()` reports a blank string as unreadable while
+                    // this endpoint accepts it - the shape a form field or an unset template variable produces.
+                    const parsedStream = parseBoolean(stream, undefined);
+                    const streamBlank = stream === undefined || stream === null || stream === '';
+                    if (!streamBlank && parsedStream === undefined) {
                         return reply.code(400).send({
                             error: {
                                 message: `stream must be a boolean (or one of true/false, yes/no, on/off, 1/0), found ${jsonTypeName(stream)}`,
@@ -2716,17 +2835,20 @@ function createApp(config) {
                             }
                         });
                     }
-                    if (!readableFlag(streamOptions?.include_usage)) {
+                    const includeUsageFlag = streamOptions?.include_usage;
+                    const parsedIncludeUsage = parseBoolean(includeUsageFlag, undefined);
+                    const includeUsageBlank = includeUsageFlag === undefined || includeUsageFlag === null || includeUsageFlag === '';
+                    if (!includeUsageBlank && parsedIncludeUsage === undefined) {
                         return reply.code(400).send({
                             error: {
                                 message: `stream_options.include_usage must be a boolean ` +
-                                    `(or one of true/false, yes/no, on/off, 1/0), found ${jsonTypeName(streamOptions?.include_usage)}`,
+                                    `(or one of true/false, yes/no, on/off, 1/0), found ${jsonTypeName(includeUsageFlag)}`,
                                 type: 'invalid_request_error'
                             }
                         });
                     }
-                    const wantsStream = parseBoolean(stream, false) === true;
-                    const includeUsage = wantsStream && parseBoolean(streamOptions?.include_usage, false) === true;
+                    const wantsStream = parsedStream === true;
+                    const includeUsage = wantsStream && parsedIncludeUsage === true;
 
                     // Split on the first slash only: a model id may itself contain slashes
                     // (`vendor/family/version`), and `split('/')` used to drop everything after the second one
@@ -2746,8 +2868,12 @@ function createApp(config) {
                         });
                     }
                     if (request.gatewayLog) {
-                        // Logged copy only (see loggableModelId): the request log line is one record per request
-                        request.gatewayLog.model = loggableModelId(`${pID}/${mID}`);
+                        // The **raw** id only. The masked, bounded copy is built inside `logSummary()` after its
+                        // `summaryEnabled` check: building it here ran a template string, a length check and a control-
+                        // character scan on every `/v1/*` request even at `LOG_LEVEL=warn`, where the line it feeds is
+                        // never written. Every other masked value on this path (`loggableUrl()`, the header and body
+                        // dumps) is level-guarded the same way; the backend still receives the id verbatim.
+                        request.gatewayLog.model = `${pID}/${mID}`;
                         request.gatewayLog.stream = wantsStream;
                     }
 
@@ -2838,9 +2964,13 @@ function createApp(config) {
                     };
 
                     const buildPromptParts = (rawMessages) => {
+                        // Strings, not `{type, text}` objects: the `type` field had no reader anywhere - the only
+                        // consumers are `parts.length` (a count) and `parts.map(p => p.text).join('\n\n')` (the
+                        // prompt text) - so building one object per message was a per-request allocation with no
+                        // payoff. A string array halves the allocation and removes the field lookup.
                         const parts = [];
                         const systemChunks = [];
-                        const userContents = [];
+                        let lastUserMsg = '';
                         let unsupported = null;
                         rawMessages.forEach((m, messageIndex) => {
                             const role = (m?.role || 'user').toLowerCase();
@@ -2865,7 +2995,7 @@ function createApp(config) {
                                 return;
                             }
                             if (!content) return;
-                            if (role === 'user') userContents.push(content);
+                            if (role === 'user') lastUserMsg = content;
                             // The role is client input as well, and it was interpolated raw: a role carrying a newline
                             // (`"user\nASSISTANT: …"`) forged a second conversation line in the text the model reads,
                             // which is the failure the `name` sanitising below exists for. Bound before transforming (a
@@ -2884,15 +3014,12 @@ function createApp(config) {
                                 ? m.name.slice(0, MAX_ECHOED_VALUE_LENGTH).replace(CONTROL_CHARS_RE, '?').trim()
                                 : '';
                             const nameSuffix = nameLabel ? `(${nameLabel})` : '';
-                            parts.push({
-                                type: 'text',
-                                text: `${roleLabel}${nameSuffix}: ${content}`
-                            });
+                            parts.push(`${roleLabel}${nameSuffix}: ${content}`);
                         });
                         return {
                             parts,
                             system: systemChunks.join('\n\n'),
-                            lastUserMsg: userContents[userContents.length - 1] || '',
+                            lastUserMsg,
                             unsupported
                         };
                     };
@@ -3144,8 +3271,8 @@ function createApp(config) {
                     const promptParams = {
                         sessionID: sessionId,
                         text: systemWithGuard
-                            ? `${systemWithGuard}\n\n${parts.map((part) => part.text).join('\n\n')}`
-                            : parts.map((part) => part.text).join('\n\n')
+                            ? `${systemWithGuard}\n\n${parts.join('\n\n')}`
+                            : parts.join('\n\n')
                     };
                     if (logger.isEnabled('debug')) {
                         // Masked like the earlier dump of the same body: the prompt text is client text, and a prompt
@@ -3176,9 +3303,12 @@ function createApp(config) {
                         let sseChunkCount = 0;
 
                         // The envelope fields are identical for every chunk of this stream, so they are serialized
-                        // once up front; per delta only the escaped text is stringified and appended.
+                        // once up front; per delta only the escaped text is appended. The model id is stringified once
+                        // for all three frames rather than once per frame: it is the same value, and a model id carrying
+                        // a quote or a control character is exactly the value that must not be re-escaped differently.
                         const createdAt = Math.floor(Date.now() / 1000);
-                        const chunkHead = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${JSON.stringify(`${pID}/${mID}`)},"choices":[{"index":0,"delta":{"`;
+                        const modelJson = JSON.stringify(`${pID}/${mID}`);
+                        const chunkHead = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${modelJson},"choices":[{"index":0,"delta":{"`;
                         // OpenAI opens every stream with the assistant role in the delta, and clients that drive a chat
                         // state machine (they create the message on `delta.role`) had to infer it themselves; the role
                         // rides along with the first real frame instead of adding an empty one.
@@ -3195,11 +3325,11 @@ function createApp(config) {
                         const chunkTail = '},"finish_reason":null}]}\n\n';
                         // The terminal frame carries the same envelope as every delta: clients that validate each chunk
                         // (`object`, `created`, `model`) treated a bare {id, choices} frame as a different object type.
-                        const stopFrame = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${JSON.stringify(`${pID}/${mID}`)},"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`;
+                        const stopFrame = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${modelJson},"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`;
                         // OpenAI sends the usage of a stream in a chunk of its own: empty `choices`, after the
                         // finish chunk and before [DONE]. The counts are zero because the backend does not report
                         // token counts, which is the same answer the non-streaming path gives.
-                        const usageFrame = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${JSON.stringify(`${pID}/${mID}`)},"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}\n\n`;
+                        const usageFrame = `data: {"id":"${id}","object":"chat.completion.chunk","created":${createdAt},"model":${modelJson},"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}\n\n`;
 
                         // A client that disappears mid-stream must not hold the completion queue until the backend
                         // timeout: note the disconnect and abort the collector so the slot is released immediately.
@@ -3246,11 +3376,16 @@ function createApp(config) {
                         // unbounded await left the task - and with it the only completion slot - parked forever
                         // while /health still answered 200. A reader that makes no progress for the whole window is
                         // treated as gone and its socket destroyed.
-                        const writeFrame = async (frame) => {
+                        //
+                        // Returns `undefined` on the normal path (the socket accepted the write) and a `Promise` only
+                        // when it has to wait for a drain: an `async` function returned a promise for every delta,
+                        // allocating two promises and taking two microtask turns per delta on the hot path. The callers
+                        // `await` the result, which is a no-op on a non-thenable.
+                        const writeFrame = (frame) => {
                             if (clientGone || raw.writableEnded || raw.destroyed) return;
                             lastWriteAt = Date.now();
                             if (raw.write(frame)) return;
-                            await new Promise((resolve) => {
+                            return new Promise((resolve) => {
                                 let timer = null;
                                 const settleDrain = () => {
                                     if (timer) clearTimeout(timer);
@@ -3275,7 +3410,10 @@ function createApp(config) {
                             });
                         };
 
-                        const sendDelta = async (delta, isReasoning = false) => {
+                        // Not `async`: the caller only needs to await when `writeFrame` returns a promise (the slow
+                        // backpressure path). On the normal path every delta is written synchronously, so making this
+                        // async allocated a promise per delta for no reason.
+                        const sendDelta = (delta, isReasoning = false) => {
                             if (!delta || clientGone) return;
                             const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
                             if (!filtered) return;
@@ -3284,22 +3422,24 @@ function createApp(config) {
                             } else {
                                 streamedContent = appendCapped(streamedContent, filtered);
                             }
-                            await writeFrame(`${frameHead()}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(filtered)}${chunkTail}`);
+                            const pending = writeFrame(`${frameHead()}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(filtered)}${chunkTail}`);
                             sseChunkCount++;
+                            return pending;
                         };
 
                         // Writes a delta the tool-call filter has already released (the held tail at end of stream).
                         // Sending it through sendDelta() would hold the same tag prefix back again - and this time
                         // nothing follows, so the fragment would be lost and the answer truncated.
-                        const sendReleasedDelta = async (delta, isReasoning = false) => {
+                        const sendReleasedDelta = (delta, isReasoning = false) => {
                             if (!delta || clientGone) return;
                             if (isReasoning) {
                                 streamedReasoning = appendCapped(streamedReasoning, delta);
                             } else {
                                 streamedContent = appendCapped(streamedContent, delta);
                             }
-                            await writeFrame(`${frameHead()}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(delta)}${chunkTail}`);
+                            const pending = writeFrame(`${frameHead()}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(delta)}${chunkTail}`);
                             sseChunkCount++;
+                            return pending;
                         };
 
                         const collectDeferred = collectFromEvents(
@@ -4057,10 +4197,16 @@ async function ensureBackend(config, options = {}) {
                 // Unparseable: the spawn below reports that on its own
             }
             if (configuredHost && !isLoopbackHost(configuredHost)) {
-                logger.warn(
-                    `[Proxy] ${maskBackendUrl(OPENCODE_SERVER_URL)} is not on this machine, so a backend started here ` +
-                    'cannot satisfy it. Start `opencode serve` on that host, or point OPENCODE_SERVER_URL at ' +
-                    '127.0.0.1 to let this gateway manage one.'
+                // A backend on another machine is not this process's to start: a local child binds a local port, which
+                // can never make `http://otherhost:4097` answer. Refuse before the spawn rather than warning and
+                // spawning anyway: the old behaviour started a local child on the configured port, spent 60 probe/backoff
+                // rounds (at least 112 s of sleeping) before answering 502, set the 15 s cooldown, and kept the useless
+                // child until the next attempt - the no-port refusal (see the `port === ''` check in `spawnBackend`)
+                // already threw before the spawn, so the two are consistent now.
+                throw backendUnavailable(
+                    `OpenCode backend is not reachable: ${maskBackendUrl(OPENCODE_SERVER_URL)} is not on this machine, ` +
+                    'so a backend started here cannot satisfy it. Start `opencode serve` on that host, or point ' +
+                    'OPENCODE_SERVER_URL at 127.0.0.1 to let this gateway manage one.'
                 );
             }
 
@@ -4452,23 +4598,23 @@ export function startProxy(options) {
     );
     MAX_BODY_MB = resolvedBodyLimit.value;
     if (resolvedBodyLimit.note) logger.warn(`[Config] ${resolvedBodyLimit.note}`);
-    // The two backend timings follow the same precedence, and an unusable value is named for the same reason
-    BACKEND_HEALTH_CACHE_MS = readMilliseconds(
+    // The two backend timings follow the same precedence, and an unusable value is named for the same reason. The
+    // note is read from the resolver, not rebuilt here: it is the single copy of the env > file precedence, so the
+    // note names the value that actually took effect rather than the other source's spelling.
+    const resolvedHealthCache = readMilliseconds(
         'OPENCODE_PROXY_HEALTH_CACHE_MS',
         2000,
         options.OPENCODE_PROXY_HEALTH_CACHE_MS
     );
-    if (isUnusableMilliseconds(options.OPENCODE_PROXY_HEALTH_CACHE_MS ?? process.env.OPENCODE_PROXY_HEALTH_CACHE_MS)) {
-        logger.warn(`[Config] OPENCODE_PROXY_HEALTH_CACHE_MS='${loggableConfigValue(String(options.OPENCODE_PROXY_HEALTH_CACHE_MS ?? process.env.OPENCODE_PROXY_HEALTH_CACHE_MS).trim())}' is not a number, using ${BACKEND_HEALTH_CACHE_MS}`);
-    }
-    BACKEND_START_RETRY_COOLDOWN_MS = readMilliseconds(
+    BACKEND_HEALTH_CACHE_MS = resolvedHealthCache.value;
+    if (resolvedHealthCache.note) logger.warn(`[Config] ${resolvedHealthCache.note}`);
+    const resolvedStartCooldown = readMilliseconds(
         'OPENCODE_PROXY_START_RETRY_MS',
         15000,
         options.OPENCODE_PROXY_START_RETRY_MS
     );
-    if (isUnusableMilliseconds(options.OPENCODE_PROXY_START_RETRY_MS ?? process.env.OPENCODE_PROXY_START_RETRY_MS)) {
-        logger.warn(`[Config] OPENCODE_PROXY_START_RETRY_MS='${loggableConfigValue(String(options.OPENCODE_PROXY_START_RETRY_MS ?? process.env.OPENCODE_PROXY_START_RETRY_MS).trim())}' is not a number, using ${BACKEND_START_RETRY_COOLDOWN_MS}`);
-    }
+    BACKEND_START_RETRY_COOLDOWN_MS = resolvedStartCooldown.value;
+    if (resolvedStartCooldown.note) logger.warn(`[Config] ${resolvedStartCooldown.note}`);
 
     // Log level resolution (calibrated at startup; all later log output follows this level):
     // 1) LOG_LEVEL (options/env, case-insensitive) 2) when not explicitly set but the legacy DEBUG switch is on,

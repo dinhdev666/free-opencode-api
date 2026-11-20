@@ -2849,18 +2849,22 @@ function createApp(config) {
                             failure instanceof Error ? failure : undefined
                         );
                     };
+                    // The 2.x server takes the model on the session, not on the prompt: `session.create({model})`.
+                    // `{providerID, id}` is the 2.x `Model.Ref` shape (a 1.x `modelID` field is not read).
+                    // Built **once** because it is sent twice: the retry below is the same call, and a duplicated
+                    // literal is what dropped the ruleset from it. Both call sites read the same object, so
+                    // `DISABLE_TOOLS` cannot be enforced on the first attempt and skipped by the second.
+                    const sessionCreateArgs = {
+                        title: `chat ${new Date().toISOString()}`,
+                        model: { providerID: pID, id: mID },
+                        ...(permissionRules ? { permissions: permissionRules } : {})
+                    };
                     try {
                         // What is left of the request budget, not a fresh one: with a full budget here a
                         // completion that had waited in the queue was granted a second create deadline and could
                         // answer past the timeout it had already advertised (measured: 3.66 s for a 2 s budget,
                         // 1.67 s of it spent queued).
-                        // The 2.x server takes the model on the session, not on the prompt: `session.create({model})`.
-                        // `{providerID, id}` is the 2.x `Model.Ref` shape (a 1.x `modelID` field is not read).
-                        sessionRes = await client.session.create({
-                            title: `chat ${new Date().toISOString()}`,
-                            model: { providerID: pID, id: mID },
-                            ...(permissionRules ? { permissions: permissionRules } : {})
-                        }, backendDeadline(remainingBudget()));
+                        sessionRes = await client.session.create(sessionCreateArgs, backendDeadline(remainingBudget()));
                     } catch (createError) {
                         // A backend that died between the cached "healthy" answer and this call fails here with a
                         // connection error. ensureBackend() trusted a probe from up to OPENCODE_PROXY_HEALTH_CACHE_MS
@@ -2896,17 +2900,13 @@ function createApp(config) {
                             // request actually hit, not the start error an internal retry produced
                             throw createError;
                         }
-                        // The same call as above, `permissions` included: this retry is what a *refused* connection
-                        // takes, which is the ordinary "the backend just restarted" case. Omitting the ruleset here
-                        // ran that completion on a session with the server's default permissions - `shell`, `edit`,
-                        // `write` and `patch` allowed again - while the prompt still carried TOOL_GUARD_MESSAGE, so
-                        // DISABLE_TOOLS was enforced only by a sentence asking the model not to use tools. The
-                        // client could not tell: the answer looked normal either way.
-                        sessionRes = await client.session.create({
-                            title: `chat ${new Date().toISOString()}`,
-                            model: { providerID: pID, id: mID },
-                            ...(permissionRules ? { permissions: permissionRules } : {})
-                        }, backendDeadline(remainingBudget()));
+                        // The same call as above, `sessionCreateArgs` included: this retry is what a *refused* connection
+                        // takes, which is the ordinary "the backend just restarted" case. It used to repeat the object
+                        // literal without `permissions`, so that completion ran on a session with the server's default
+                        // permissions - `shell`, `edit`, `write` and `patch` allowed again - while the prompt still carried
+                        // TOOL_GUARD_MESSAGE, and DISABLE_TOOLS was enforced only by a sentence asking the model not to
+                        // use tools. The client could not tell: the answer looked normal either way.
+                        sessionRes = await client.session.create(sessionCreateArgs, backendDeadline(remainingBudget()));
                     }
                     // A 2.x server answers 200 with `{"data":{…}}`; the id is read from the envelope. A 1.x server
                     // answered it at the top level, so reading only one shape is what makes this fail loudly instead of

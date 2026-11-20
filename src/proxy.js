@@ -25,7 +25,7 @@ import {
     upstreamErrorStatus, upstreamFailureReason
 } from './upstream.js';
 import { closeSocketAfterFlush } from './socket.js';
-import { normalizeBackendUrl, normalizeBindHost, isLoopbackHost, resolveOpencodePath } from './env.js';
+import { normalizeBackendUrl, normalizeBindHost, isLoopbackHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
 import { DEFAULT_API_KEY, resolveApiKey } from './api-key.js';
 import { backendAuthorizationHeader, resolveBackendAuth, resolveBackendPassword } from './backend-auth.js';
 import {
@@ -39,7 +39,7 @@ import { parseBoolean, readFlag } from './options.js';
 export { DEFAULT_API_KEY, resolveApiKey } from './api-key.js';
 export { backendAuthorizationHeader, resolveBackendAuth, resolveBackendPassword } from './backend-auth.js';
 export { clientFacingText, handlerFailureMessage } from './errors.js';
-export { normalizeBackendUrl, normalizeBindHost, resolveOpencodePath } from './env.js';
+export { normalizeBackendUrl, normalizeBindHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
 export { parseBoolean, readFlag } from './options.js';
 export { DEFAULT_REQUEST_TIMEOUT_MS, resolveRequestTimeoutMs } from './settings.js';
 export { echoedValue, jsonTypeName, loggableConfigValue, loggableModelId, loggableUpstreamText, loggableUrl,
@@ -780,7 +780,7 @@ function createApp(config) {
         // The id goes into the response header, so it belongs in the log line that reports the same request: a client
         // report quotes the id, and without it here there was nothing to search for it by (`AGENTS.md`: the response id
         // is the one the request log line ends with)
-        logger.warn(`[Proxy] Rejected malformed request: ${error?.code || 'parse error'} [${reqId}]`);
+        logger.warn(`[Proxy] Rejected malformed request: ${code || 'parse error'} [${reqId}]`);
         const body = JSON.stringify({ error: { message: reason, type: 'invalid_request_error', ...(code ? { code } : {}) } });
         if (socket.writable) {
             socket.write(
@@ -919,6 +919,16 @@ function createApp(config) {
     // resolveApiKey() guarantees a non-empty key, so authentication can never be switched off.
     const apiKeyToken = resolveApiKey(API_KEY);
     const apiKeyTokenBuffer = Buffer.from(apiKeyToken);
+    // Constant-time comparison, built once for the whole app: the length checks are required because
+    // timingSafeEqual throws on a size mismatch, and they have to compare bytes - a token with non-ASCII
+    // characters can match in string length while differing in byte length, which used to throw and turn a wrong
+    // key into a 500 instead of a 401. It lives here rather than in the auth hook because that hook runs on every
+    // request, and `/health` and the 404 path never compare anything at all.
+    const matchesToken = (provided) => {
+        if (typeof provided !== 'string' || provided.length !== apiKeyToken.length) return false;
+        const providedBuffer = Buffer.from(provided);
+        return providedBuffer.length === apiKeyTokenBuffer.length && timingSafeEqual(providedBuffer, apiKeyTokenBuffer);
+    };
     const AUTH_SCHEME_RE = /^Bearer[ \t]+/i;
     // Pulls the token out of an `Authorization` value; returns '' when the value does not carry one
     const authorizationToken = (value) => {
@@ -1092,17 +1102,8 @@ function createApp(config) {
         // Constant-time comparison. The length checks are required because timingSafeEqual throws on a size
         // mismatch, and they have to compare bytes: a token with non-ASCII characters can match in string length
         // while differing in byte length, which used to throw and turn a wrong key into a 500 instead of a 401.
-        const matchesToken = (provided) => {
-            if (typeof provided !== 'string' || provided.length !== apiKeyToken.length) return false;
-            const providedBuffer = Buffer.from(provided);
-            return providedBuffer.length === apiKeyTokenBuffer.length && timingSafeEqual(providedBuffer, apiKeyTokenBuffer);
-        };
-
-        // `Authorization: Bearer <key>` is the contract; the scheme is case-insensitive per RFC 7235, and a client
-        // that sends `bearer <key>`, `BEARER <key>` or `Bearer   <key>` (extra whitespace) is not wrong. `X-Api-Key`
-        // is accepted as an alias because the preflight above advertises it and clients configured with an api-key
-        // header send it. Presence decides, not a parsed token: an `Authorization` header that is present always
-        // wins, so a wrong one - or one a proxy injected with another scheme - is never overridden by the alias.
+        // Defined once, outside the hook: the closure and its two captured values were rebuilt on every request,
+        // including `/health` and the 404 path where no comparison happens at all.
         const hasAuthorization = Object.prototype.hasOwnProperty.call(request.headers, 'authorization');
         const hasApiKeyHeader = Object.prototype.hasOwnProperty.call(request.headers, 'x-api-key');
         const presented = hasAuthorization
@@ -2026,6 +2027,27 @@ function createApp(config) {
         // A bounded list: a part whose text is rewritten (SHRINK) starts a new entry, and a backend that rewrites on
         // every event must not grow this per completion.
         const MAX_PART_SNAPSHOTS = 4;
+        // The same bound for the *number of parts*: `partKey()` builds its key out of backend-controlled text, so a
+        // backend that varies it on every event grew `partTexts` for as long as the answer streamed, and the map is
+        // only read for keys it already holds. Dropping the oldest key is safe because a part that has not been seen
+        // again is over: the answer is append-only and the totals below are keyed by the same string, so a part
+        // dropped here simply loses its snapshot bookkeeping and is re-based if it reappears.
+        const MAX_PART_KEYS = 64;
+        const partKeyOrder = [];
+        const notePartKey = (key) => {
+            if (partTexts.size > MAX_PART_KEYS) {
+                const oldest = partKeyOrder.shift();
+                if (oldest !== undefined && oldest !== key) partTexts.delete(oldest);
+                else {
+                    // The order list is empty or already points at this key: drop the first key the map itself reports,
+                    // which is insertion order, so the bound is honoured either way.
+                    const first = partTexts.keys().next();
+                    if (!first.done && first.value !== key) partTexts.delete(first.value);
+                }
+            }
+            partKeyOrder.push(key);
+            if (partKeyOrder.length > MAX_PART_KEYS) partKeyOrder.shift();
+        };
         // The increment for a part snapshot, and the bookkeeping that keeps its base current. `snapshotDelta()` returns
         // the whole text when the new snapshot is not an extension of the base - the rewrite case, and also the first
         // update of a *different* id-less part of the same type - so that answer is what selects the base: an existing
@@ -2033,7 +2055,14 @@ function createApp(config) {
         const recordPartSnapshot = (key, text) => {
             const snapshots = partTexts.get(key);
             if (!snapshots) {
-                if (text) partTexts.set(key, [text]);
+                // The first text for this part: no earlier snapshot, so the whole text is the increment. Without a
+                // key on the map, every part of this completion accumulated one permanent entry here - the map is
+                // per completion and the key is built from backend-controlled text, so a backend that varies it grew
+                // the map without bound for as long as the answer streamed.
+                if (text) {
+                    partTexts.set(key, [text]);
+                    notePartKey(key);
+                }
                 return text;
             }
             for (let i = snapshots.length - 1; i >= 0; i -= 1) {
@@ -2502,9 +2531,11 @@ function createApp(config) {
                     // keep the historical non-streaming default: a typo answered `200 application/json` to a client
                     // parsing SSE, which is the failure the string spellings exist to prevent, and the same class the
                     // other body fields are refused for. It is refused by name now; absent, blank or `null` still means
-                    // "not streaming".
+                    // "not streaming" - a **blank string** included, which is what `parseBoolean()` reports as
+                    // unreadable: `stream: ""` is the shape a form field or an unset template variable produces, and it
+                    // answered `400` here while the sentence above promised blank was accepted.
                     const readableFlag = (value) =>
-                        value === undefined || value === null || parseBoolean(value, undefined) !== undefined;
+                        value === undefined || value === null || value === '' || parseBoolean(value, undefined) !== undefined;
                     if (!readableFlag(stream)) {
                         return reply.code(400).send({
                             error: {
@@ -2865,9 +2896,16 @@ function createApp(config) {
                             // request actually hit, not the start error an internal retry produced
                             throw createError;
                         }
+                        // The same call as above, `permissions` included: this retry is what a *refused* connection
+                        // takes, which is the ordinary "the backend just restarted" case. Omitting the ruleset here
+                        // ran that completion on a session with the server's default permissions - `shell`, `edit`,
+                        // `write` and `patch` allowed again - while the prompt still carried TOOL_GUARD_MESSAGE, so
+                        // DISABLE_TOOLS was enforced only by a sentence asking the model not to use tools. The
+                        // client could not tell: the answer looked normal either way.
                         sessionRes = await client.session.create({
                             title: `chat ${new Date().toISOString()}`,
-                            model: { providerID: pID, id: mID }
+                            model: { providerID: pID, id: mID },
+                            ...(permissionRules ? { permissions: permissionRules } : {})
                         }, backendDeadline(remainingBudget()));
                     }
                     // A 2.x server answers 200 with `{"data":{…}}`; the id is read from the envelope. A 1.x server
@@ -3326,7 +3364,13 @@ function createApp(config) {
                                     // about the same payload in size and in masking.
                                     message: clientFacingText(error.data?.message || error.message) || 'OpenCode provider error',
                                     type: 'server_error',
-                                    code: error.name || 'OpenCodeError'
+                                    // The same three stable values the outer handler maps to (see below), not
+                                    // `error.name`: this catch runs for a provider that answered before the first frame,
+                                    // so it is the same "the provider failed" case the outer path reports as
+                                    // `ProviderError`. Leaking `error.name` put an internal exception class in a public
+                                    // body - and a plain `Error` put the literal string `Error` in a field documented as
+                                    // taking one of three values.
+                                    code: 'ProviderError'
                                 }
                             });
                             release();
@@ -3379,12 +3423,17 @@ function createApp(config) {
                     });
                     // A rejection that is not an `Error` is not masked by `safeClone()` on its way to the line, so the
                     // value goes through the masking helper here: this is the same handler that needs
-                    // `handlerFailureMessage()` to read a sentence out of whatever threw.
-                    logger.debug('[Proxy] Error details', {
-                        reqId,
-                        sessionId,
-                        error: error instanceof Error ? loggableError(error) : maskDetail(error)
-                    });
+                    // `handlerFailureMessage()` to read a sentence out of whatever threw. Guarded, because both
+                    // `loggableError()` and `maskDetail()` build a bounded copy of the error - the `cause` chain and
+                    // the own properties - and at the default `info` level that copy was thrown away: this is the
+                    // first statement of every failed completion, before the queue slot is released.
+                    if (logger.isEnabled('debug')) {
+                        logger.debug('[Proxy] Error details', {
+                            reqId,
+                            sessionId,
+                            error: error instanceof Error ? loggableError(error) : maskDetail(error)
+                        });
+                    }
 
                     // A dead/unreachable backend must not stay cached as healthy: drop the timestamp so the next
                     // request performs a real probe (and restarts the backend if needed)
@@ -4013,7 +4062,7 @@ async function ensureBackend(config, options = {}) {
             // ran whatever followed it as a second shell line.
             let spawnTarget = opencodeBin;
             if (useShell) {
-                if (/["$`\u0000-\u001f\u007f]/.test(opencodeBin)) {
+                if (isShellUnsafePath(opencodeBin)) {
                     throw new Error(`OPENCODE_PATH cannot be passed through a shell: ${loggableConfigValue(opencodeBin)}`);
                 }
                 spawnTarget = `"${opencodeBin}"`;
@@ -4311,7 +4360,7 @@ export function startProxy(options) {
             if (deletedThisRound === 0) {
                 // Nothing was deleted: the backend refuses (or is gone). Retrying the same calls until the budget runs
                 // out cannot turn a refusal into a success, so the remaining ids are reported once instead.
-                failed = ids.length;
+                failed = Math.max(0, ids.length - deletedThisRound);
                 break;
             }
         }

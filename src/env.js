@@ -15,10 +15,33 @@ import { loggableConfigValue } from './text.js';
 
 const OPENCODE_BASENAME = 'opencode';
 
-/** Splits `PATH` into its entries (empty when the variable is unset). */
+/**
+ * Splits `PATH` into its entries.
+ *
+ * **Absolute entries only.** A relative entry (`PATH=bin:/usr/bin`, or a stray `.`) made `path.join(dir, name)` a
+ * relative string, and `spawnBackend()` spawns with `cwd` set to the 0700 jail: libuv resolves a slash-less program
+ * *after* that `chdir`, so the entry now pointed inside the jail and a perfectly installed CLI was reported as a
+ * backend that "exited during startup". Empty entries are dropped too - an empty one is an implicit cwd entry, which is
+ * the same hazard in a different spelling.
+ * @returns {string[]} the absolute directories to search, in order
+ */
 function splitPathEnv() {
     const raw = process.env.PATH || '';
-    return raw.split(path.delimiter).filter(Boolean);
+    return raw.split(path.delimiter).filter((dir) => dir && path.isAbsolute(dir));
+}
+
+/**
+ * Whether a configured program path can be handed to a shell.
+ *
+ * `spawn()` joins `[file, ...args]` with spaces when `shell: true`, so quoting the program only protects spaces - an
+ * embedded `"` ends the quoted run and whatever follows is parsed as more commands. That is why the spawn refuses
+ * these paths outright instead of quoting them, and the entry point's version probe has to apply the same rule: it
+ * builds the same kind of command line, and a probe that ran `x" ; id ; echo "` executed `id`.
+ * @param {string} value the program path
+ * @returns {boolean} true when the value must not be passed through a shell
+ */
+export function isShellUnsafePath(value) {
+    return /["$`\u0000-\u001f\u007f]/.test(String(value));
 }
 
 function pushDir(list, dir) {
@@ -59,12 +82,25 @@ function getOpencodeCandidateNames() {
     return [OPENCODE_BASENAME];
 }
 
+/**
+ * The first candidate that is a **regular file**.
+ *
+ * `existsSync` alone accepted a directory named `opencode` (and any non-executable file), which then reached `spawn()`
+ * and failed as an opaque `EACCES`/`EISDIR`. `statSync` follows a symlink on purpose: an install that is a symlink
+ * into a version manager's tree is the normal shape, and `lstat` would reject it.
+ * @param {string[]} dirs absolute directories to search
+ * @param {string[]} names candidate file names
+ * @returns {string|null} the absolute path, or null
+ */
 function findExecutableInDirs(dirs, names) {
     for (const dir of dirs) {
         for (const name of names) {
             const full = path.join(dir, name);
-            if (fs.existsSync(full)) {
-                return full;
+            if (!fs.existsSync(full)) continue;
+            try {
+                if (fs.statSync(full).isFile()) return full;
+            } catch (e) {
+                // Unreadable or raced away: keep looking rather than reporting a binary that cannot be run
             }
         }
     }

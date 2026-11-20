@@ -49,6 +49,11 @@ const REJECT_PERMISSIONS = process.env.STUB_REJECT_PERMISSIONS === '1';
 // Accept the session and then drop the connection before answering: what a backend that dies between accepting the call
 // and writing the answer looks like. A gateway that retries it creates a second session and loses the id of the first
 const DROP_CREATE = process.env.STUB_DROP_CREATE === '1';
+// A `POST /api/session` that answers with the headers and a body that stops in the middle of the JSON, then destroys the
+// socket: what a backend that died *while writing its answer* looks like. Nothing is recorded, so `/__sessions` reports
+// `created: 0` and the id in the truncated body never reaches the gateway - a gateway that read it would try to delete
+// a session nobody ever created.
+const PARTIAL_CREATE = process.env.STUB_PARTIAL_CREATE === '1';
 // A backend that wedges on this session creation (1-based) and never answers
 const HANG_CREATE_AFTER = Number(process.env.STUB_HANG_CREATE_AFTER || 0);
 // A backend whose socket dies for the first `n` session creations, before a session is made: what a backend that
@@ -117,6 +122,19 @@ const FAIL_MID_ANSWER = 'partial answer';
 // LEAKYFAIL): a provider says exactly this when it rejects a key, and both answer modes have to mask and bound it
 // before the text becomes a client-facing body or log line.
 const LEAKY_ERROR_TEXT = `provider rejected http://alice:s3cr3t-value@127.0.0.1:4097/proxy?token=abc123 and the upstream answered with a very long explanation ${'y'.repeat(2000)}`;
+// Prompt marker MANYMESSAGES: a session with more messages than one page holds, all of them finished and each carrying a
+// distinguishable text, so a poll that asks for the oldest page (or forgets `order=desc`, `limit` or `type`) serves one
+// of the archived answers instead of the message the request just produced. Kept in step with the copies in
+// test/smoke.mjs.
+const MANY_MESSAGES_OLDER = 60;
+const MANY_MESSAGES_OLD_PREFIX = 'archived answer';
+const MANY_MESSAGES_NEWEST = 'the newest stored answer wins';
+// Prompt marker BIGANSWER: an answer larger than the gateway's per-answer buffer cap (`MAX_ANSWER_CHARS`, 16 M chars),
+// streamed in pieces so the deltas - not one closing snapshot - are what carries it. Kept in step with the copy in
+// test/smoke.mjs.
+const BIG_ANSWER_CHARS = 17 * 1024 * 1024;
+const BIG_ANSWER_PIECES = 34;
+const bigAnswerText = `${'0123456789abcdef'.repeat(BIG_ANSWER_CHARS / 16)}`;
 
 const sessions = new Map();
 let sessionSeq = 0;
@@ -139,8 +157,15 @@ let lastPermissionRules = null;
 const sessionCreatePermissions = [];
 // How many `POST /api/session` calls the stub has seen, so a refusal can be limited to the first few
 let createCalls = 0;
+// The largest number of messages any session has held. A poll over a "long session" is only over a long session if the
+// backend really stored that many, and this is how a test proves it instead of trusting the prompt marker.
+let largestSessionMessages = 0;
 const eventClients = new Set();
 let eventSeq = 0;
+// The `types` parameter of every `GET /api/event` subscription, in order (one entry per subscription, each entry the
+// list that request asked for). A streaming answer is incremental only because the collector subscribes with the event
+// types it collects, and the query it sends is the one thing about that subscription a test can observe.
+const eventSubscriptionQueries = [];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const eventId = () => `evt_${++eventSeq}`;
@@ -488,6 +513,17 @@ const server = http.createServer(async (req, res) => {
         lastPermissionRules = body.permissions ?? null;
         sessionCreatePermissions.push(body.permissions ?? null);
         createCalls += 1;
+        if (PARTIAL_CREATE) {
+            // Headers and a body that stops mid-JSON, then the socket goes away: a backend that read the call and died
+            // while writing its answer. No session is recorded, so `created` stays 0 - and the id in the truncated body
+            // (`ses_partial`) must never reach the gateway, because a gateway that read it would answer from a session it
+            // cannot see and then try to delete a session nobody made. The bytes are written before the destroy: dropping
+            // the socket with them still buffered is the `ECONNRESET`-before-any-body shape, not a truncated answer.
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.write('{"data":{"id":"ses_partial","time":');
+            setTimeout(() => res.destroy(), 10).unref();
+            return;
+        }
         if (createCalls <= RESET_CREATE_TIMES) {
             // The connection is dropped before the session exists, so the id never reaches the gateway: what a backend
             // that accepted the call and then died looks like. `fetch` reports `ECONNRESET`/`socket hang up`, which is
@@ -523,7 +559,9 @@ const server = http.createServer(async (req, res) => {
             lastSystemPrompt,
             lastPromptText,
             lastPermissionRules,
-            sessionCreatePermissions
+            sessionCreatePermissions,
+            eventSubscriptionQueries,
+            largestSessionMessages
         });
     }
 
@@ -531,6 +569,9 @@ const server = http.createServer(async (req, res) => {
     // `sessionID`. A subscriber that has not appeared when an answer is emitted is simply a non-streaming request.
     if (req.method === 'GET' && path === '/api/event') {
         if (FAIL_EVENTS) return sendError(res, 500, 'ServiceUnavailableError', 'event stream unavailable');
+        // Recorded before the stream is opened, so even a subscription the gateway aborts immediately is visible: the
+        // generated client sends an array as a repeated `types` parameter
+        eventSubscriptionQueries.push(url.searchParams.getAll('types'));
         res.writeHead(200, {
             'content-type': 'text/event-stream',
             'cache-control': 'no-cache',
@@ -604,6 +645,21 @@ const server = http.createServer(async (req, res) => {
             const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: TOOL_SPAM_ANSWER }]);
             session.messages.push(message);
             session.messageId = message.id;
+        } else if (text.includes('MANYMESSAGES')) {
+            // More messages than one page holds, every one of them finished and distinguishable, and the newest pushed
+            // last: a poll that asks for the oldest page - or forgets `order=desc`, `limit` or `type` - serves one of
+            // the archived answers instead of the message this request just produced. Nothing is streamed, so the
+            // non-streaming poll loop is what answers.
+            for (let i = 0; i < MANY_MESSAGES_OLDER; i += 1) {
+                session.messages.push(assistantMessage(session.id, `msg_${session.id}_old_${i}`, [
+                    { type: 'text', text: `${MANY_MESSAGES_OLD_PREFIX} ${i}` }
+                ], { finish: 'stop' }));
+            }
+            const newest = assistantMessage(session.id, `msg_${session.id}_newest`, [
+                { type: 'text', text: MANY_MESSAGES_NEWEST }
+            ], { finish: 'stop' });
+            session.messages.push(newest);
+            session.messageId = newest.id;
         } else if (text.includes('TWOSTEP')) {
             // The step that used a tool, then the step that answers. The second is still *being written* when the
             // prompt returns, so a gateway that reads the first finished message answers with the preamble
@@ -881,11 +937,16 @@ const server = http.createServer(async (req, res) => {
                             // Many deltas need a long answer: the default sentence splits into one delta per character,
                             // which is not the "an idle timer re-armed on every one" case this marker exists for
                             : text.includes('MANYDELTAS') ? MANY_DELTAS_ANSWER
-                                : ANSWER;
+                                // The big answer is one 17 M-character text, not the default sentence repeated: the
+                                // point is a single answer past the gateway's cap, and a short one would not reach it
+                                : text.includes('BIGANSWER') ? bigAnswerText
+                                    : ANSWER;
             const withReasoning = !text.includes('TOOLTAG') && !text.includes('TAILTAG')
                 && !text.includes('STRAYTAG') && !text.includes('OPENTAIL')
                 // The many-deltas marker is about the delta count, so a reasoning part would only add noise
-                && !text.includes('MANYDELTAS');
+                && !text.includes('MANYDELTAS')
+                // A reasoning part would double the traffic of an answer that exists to be large
+                && !text.includes('BIGANSWER');
             const message = assistantMessage(session.id, `msg_${session.id}`, [
                 ...(withReasoning ? [{ type: 'reasoning', text: REASONING }] : []),
                 { type: 'text', text: answerText }
@@ -897,6 +958,12 @@ const server = http.createServer(async (req, res) => {
                 steps = answerSteps(session, { text: answerText, reasoning: REASONING, pieces: 10, delayMs: 200 });
             } else if (text.includes('MANYDELTAS')) {
                 steps = answerSteps(session, { text: answerText, pieces: 200, delayMs: 0 });
+            } else if (text.includes('BIGANSWER')) {
+                // An answer past the gateway's per-answer buffer cap (`MAX_ANSWER_CHARS`, 16 M chars): the deltas carry
+                // it in pieces (no event is a second copy of the whole answer), and the closing `session.text.ended`
+                // still carries the part's whole text the way the protocol says. A gateway that truncates a delta, or
+                // that appends that closing snapshot instead of diffing it, answers a cut or a doubled answer.
+                steps = answerSteps(session, { text: answerText, pieces: BIG_ANSWER_PIECES, delayMs: 0 });
             } else if (text.includes('TOOLTAG')) {
                 // The boundary falls inside both of the closing tag's two halves
                 steps = answerSteps(session, { text: answerText, chunks: ['hello ', '<function_ca', 'lls>secret</function_ca', 'lls> world'], delayMs: 1 });
@@ -930,6 +997,8 @@ const server = http.createServer(async (req, res) => {
         if (UNREADABLE_MESSAGES) return sendJson(res, 200, { result: 'unexpected', items: null });
         const session = sessions.get(messageMatch[1]);
         if (!session) return sendError(res, 404, 'SessionNotFoundError', `unknown session ${messageMatch[1]}`);
+        // Read on the way past, so the suite can prove a "many messages" scenario really stored that many
+        largestSessionMessages = Math.max(largestSessionMessages, session.messages.length);
         // 2.x answers newest first, and `order` cannot be combined with `cursor`: a client that passes both is asking
         // for two orderings at once, so it is refused instead of being answered one of them
         const order = url.searchParams.get('order');

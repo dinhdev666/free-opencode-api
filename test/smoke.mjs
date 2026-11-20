@@ -12,10 +12,12 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import {
-    clientFacingText, handlerFailureMessage, isShellUnsafePath, isUsableBindHost, parseBoolean, resolveBackendAuth,
-    resolveBackendPassword, resolveJailParent, resolveRequestTimeoutMs, timeoutMessage, upstreamErrorStatus
+    clientFacingText, handlerFailureMessage, isConnectionError, isConnectionRefused, isShellUnsafePath,
+    isTimeoutError, isUsableBindHost, parseBoolean, resolveBackendAuth, resolveBackendPassword, resolveJailParent,
+    resolveRequestTimeoutMs, timeoutMessage, upstreamErrorStatus
 } from '../src/proxy.js';
 import { readConfigFile, findUnknownKeys, envOrFile, CONFIG_FILE_KEYS } from '../src/config.js';
+import { readMilliseconds } from '../src/settings.js';
 import {
     createLogger, loggableError, maskBackendUrl, maskDetail, maskHeaders, maskQuotedCredentials, maskSecret,
     maskUrlCredentials, maskUrlQuery, registerSensitiveValue, serializeDetail,
@@ -43,6 +45,20 @@ const LAGSTORE_ANSWER = 'The frames carry the whole answer, but the stored messa
 const REASONING = 'Thinking about the request.';
 // Kept in step with MANY_DELTAS_ANSWER in test/stub-opencode.mjs (separate process, so the suite carries its own copy)
 const MANY_DELTAS_ANSWER = Array.from({ length: 60 }, (_, index) => `part${index}`).join(' ');
+// Kept in step with the MANY_MESSAGES_* constants in test/stub-opencode.mjs: a session with more finished messages than
+// one page holds, each carrying a distinguishable text
+const MANY_MESSAGES_OLDER = 60;
+const MANY_MESSAGES_OLD_PREFIX = 'archived answer';
+const MANY_MESSAGES_NEWEST = 'the newest stored answer wins';
+// Kept in step with BIG_ANSWER_CHARS in test/stub-opencode.mjs: an answer one megacharacter past the per-answer buffer
+// cap. `MAX_ANSWER_CHARS_FOR_TEST` is that cap duplicated as a number rather than imported, for the same reason
+// `MODELS_CACHE_TTL_MS_FOR_TEST` is: the point of the check is the documented bound, so a test that read the value out
+// of the module would follow a change to it instead of noticing.
+const BIG_ANSWER_CHARS = 17 * 1024 * 1024;
+// The same text the stub streams for the BIGANSWER marker, built the same way (a repeated alphabet rather than one
+// character, so a delta boundary that fell inside a slice is visible in the comparison)
+const BIG_ANSWER_TEXT = '0123456789abcdef'.repeat(BIG_ANSWER_CHARS / 16);
+const MAX_ANSWER_CHARS_FOR_TEST = 16 * 1024 * 1024;
 
 const results = [];
 const children = [];
@@ -668,6 +684,99 @@ async function run() {
         upstreamErrorStatus({ status: 503, cause: { _tag: 'SessionNotFoundError' } }) === 503,
         String(upstreamErrorStatus({ status: 503, cause: { _tag: 'SessionNotFoundError' } })));
 
+    // The five tags the map gained after the first table was written. Each names the status the server already sent, so
+    // without its entry a `403` from an auth gate in front of the backend reached the client as the generic 502 and a
+    // `429`-style retry decision was made from the wrong number.
+    const addedTagStatuses = [
+        ['ForbiddenError', 403], ['UnsupportedModelError', 400], ['SessionBusyError', 409],
+        ['MessageNotFoundError', 404], ['ProviderRequestError', 502]
+    ];
+    const addedTagResults = addedTagStatuses.map(([tag, expected]) => [tag, upstreamErrorStatus({ _tag: tag }), expected]);
+    check('the refusal tags added to the map keep the status the server sent',
+        addedTagResults.every(([, actual, expected]) => actual === expected),
+        JSON.stringify(addedTagResults.filter(([, actual, expected]) => actual !== expected)));
+    // An explicit status is more precise than a tag default: a `ProviderRequestError` that a translating proxy answered
+    // with `429` must keep its 429, or the retry-after a client needs is replaced by "the provider is down". Every
+    // spelling the classifier reads (`response.status`, `status`, `statusCode`) is asserted, because a wrapper that
+    // carries the number under one of the other names was silently ignored.
+    const explicitStatuses = [
+        { _tag: 'ProviderRequestError', status: 429, expected: 429 },
+        { _tag: 'ProviderRequestError', response: { status: 429 }, expected: 429 },
+        { _tag: 'ProviderRequestError', statusCode: 429, expected: 429 },
+        { _tag: 'ForbiddenError', status: 401, expected: 401 }
+    ];
+    const explicitStatusResults = explicitStatuses.map((error) => [error._tag, upstreamErrorStatus(error), error.expected]);
+    check('an explicit status on the error beats the tag default',
+        explicitStatusResults.every(([, actual, expected]) => actual === expected),
+        JSON.stringify(explicitStatusResults));
+
+    // What the backend *threw* is classified by walking the whole `cause` chain, because the 2.x client wraps Node's
+    // own error: `ClientError("Transport: fetch failed")` → `TypeError("fetch failed")` → `Error(ECONNREFUSED)`. A
+    // classifier that read only `error.cause.code` therefore found nothing, and the one retry the gateway performs (a
+    // refused connection, which proves the request never reached the backend) never ran. Table-driven, because every row
+    // is a shape a real client or a real `fetch` produces.
+    const timeoutCases = [
+        [{ name: 'TimeoutError' }, true],
+        [{ code: 'ETIMEDOUT' }, true],
+        [{ cause: { code: 'ETIMEDOUT' } }, true],
+        // The 2.x client rethrows an expired deadline as its own transport failure carrying only the message
+        [{ message: 'Transport: The operation was aborted due to timeout' }, true],
+        // A plain abort is a transport failure, not a deadline: `AbortError` is deliberately not a timeout name
+        [{ name: 'AbortError' }, false],
+        [{ message: 'Transport: This operation was aborted' }, false],
+        // A body the backend answered with is never this gateway's own deadline, however it is spelled
+        [{ name: 'TimeoutError', _tag: 'TimeoutError' }, false],
+        [{ status: 504, message: 'aborted due to timeout' }, false],
+        [new Error('boom'), false],
+        [null, false]
+    ];
+    check('isTimeoutError recognises a deadline and nothing that only looks like one',
+        timeoutCases.every(([error, expected]) => isTimeoutError(error) === expected),
+        JSON.stringify(timeoutCases.map(([error, expected]) =>
+            `${JSON.stringify(error instanceof Error ? error.message : error)}=${isTimeoutError(error)}(want ${expected})`)));
+
+    const connectionCases = [
+        [{ code: 'ECONNREFUSED' }, true],
+        [{ code: 'ECONNRESET' }, true],
+        [{ code: 'UND_ERR_SOCKET' }, true],
+        [{ message: 'fetch failed' }, true],
+        [{ message: 'socket hang up' }, true],
+        [{ message: 'other side closed' }, true],
+        [{ cause: { code: 'UND_ERR_CLOSED' } }, true],
+        // A backend that answered is not a transport failure of any kind
+        [{ _tag: 'ProviderRequestError', status: 502 }, false],
+        [{ name: 'TimeoutError' }, false],
+        [new Error('boom'), false],
+        [undefined, false]
+    ];
+    check('isConnectionError recognises every transport shape a dying backend produces',
+        connectionCases.every(([error, expected]) => isConnectionError(error) === expected),
+        JSON.stringify(connectionCases.map(([error, expected]) =>
+            `${JSON.stringify(error instanceof Error ? error.message : error)}=${isConnectionError(error)}(want ${expected})`)));
+
+    // `fetch failed` and `socket hang up` are what a backend that *accepted* `POST /api/session` and then died looks
+    // like: retrying those created a second session while the first one kept existing with no id in this process, so
+    // neither `cleanupSession()` nor the shutdown drain could ever delete it.
+    const refusedCases = [
+        [{ code: 'ECONNREFUSED' }, true],
+        [{ message: 'connect ECONNREFUSED 127.0.0.1:4097' }, true],
+        [{ cause: { code: 'ECONNREFUSED' } }, true],
+        // Node's `fetch` wraps the per-address failures in an AggregateError
+        [{ cause: { errors: [{ code: 'ECONNREFUSED' }] } }, true],
+        // The 2.x client adds a wrapper of its own, so the code sits two levels down
+        [{ message: 'fetch failed', cause: { message: 'fetch failed', cause: { code: 'ECONNREFUSED' } } }, true],
+        [{ cause: { code: 'ECONNRESET' } }, false],
+        [{ message: 'socket hang up' }, false],
+        [{ cause: { errors: [{ code: 'ENOTFOUND' }] } }, false],
+        [{ _tag: 'SessionNotFoundError' }, false],
+        [new Error('boom'), false],
+        [null, false]
+    ];
+    check('only a refused connection is reported as refused, at any depth of the cause chain',
+        refusedCases.every(([error, expected]) => isConnectionRefused(error) === expected),
+        JSON.stringify(refusedCases.map(([error, expected]) =>
+            `${JSON.stringify(error instanceof Error ? error.message : error)}=${isConnectionRefused(error)}(want ${expected})`)));
+
     // `OPENCODE_PATH` and `OPENCODE_BIND_HOST` are arguments of a child that may be started through a shell, which
     // concatenates them into one command line instead of quoting them. Both guards are pure functions, so they are
     // asserted here rather than through a spawn that would prove the same thing more slowly.
@@ -1057,6 +1166,69 @@ async function run() {
         const zeroBudget = resolveRequestTimeoutMs({ OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '0' }, {});
         check('zero is not a budget', zeroBudget.value === 300000 && Boolean(zeroBudget.note),
             JSON.stringify(zeroBudget));
+        // A fractional budget below one millisecond is a typo (a budget written as seconds). It used to floor to `0`
+        // *after* the positivity test, which armed every deadline at 1 ms and answered every completion `504` with no
+        // `[Config]` note at all; the floored value is what is tested now, so it takes the documented default.
+        const fractionalBudget = resolveRequestTimeoutMs({ OPENCODE_PROXY_REQUEST_TIMEOUT_MS: 0.5 }, {});
+        check('a fractional request budget is named and replaced by the default',
+            fractionalBudget.value === 300000 &&
+            /OPENCODE_PROXY_REQUEST_TIMEOUT_MS='0.5' is not a positive number, using 300000/.test(String(fractionalBudget.note)),
+            JSON.stringify(fractionalBudget));
+        const stringFractionalBudget = resolveRequestTimeoutMs({}, { OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '0.5' });
+        check('a fractional request budget written as an env string is named the same way',
+            stringFractionalBudget.value === 300000 && /'0.5' is not a positive number/.test(String(stringFractionalBudget.note)),
+            JSON.stringify(stringFractionalBudget));
+        // The whole-millisecond cases either side of the floor: `1` is legal and must stay 1, not become the default
+        const millisecondBudget = resolveRequestTimeoutMs({}, { OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '1' });
+        const secondBudget = resolveRequestTimeoutMs({}, { OPENCODE_PROXY_REQUEST_TIMEOUT_MS: '1000' });
+        check('a whole-millisecond request budget is honoured without a note',
+            millisecondBudget.value === 1 && millisecondBudget.note === null &&
+            secondBudget.value === 1000 && secondBudget.note === null,
+            JSON.stringify([millisecondBudget, secondBudget]));
+
+        // `readMilliseconds()` is the reader behind the health-cache and start-retry knobs. The precedence (environment,
+        // then `config.json`, then the fallback) lives inside it, so the note has to name the value that actually took
+        // effect: a warning built from `options.X ?? process.env.X` reported a valid file value under the environment's
+        // spelling and an unusable environment value under the file's, which sends the operator to the wrong place.
+        // The variable is one no deployment sets, and every path below restores it.
+        const readMsName = 'SMOKE_TEST_READ_MILLISECONDS';
+        // Each row is `[fromEnv, fromFile, fallback, expectedValue, expectedNote]`: the value the reader has to return
+        // and the note it has to carry, so a row that *should* use a valid value is asserted as such instead of being
+        // compared against the fallback it replaced.
+        const readMsCases = [
+            ['abc', undefined, 1234, 1234, "'abc' is not a number, using 1234"],
+            ['-5', undefined, 1234, 1234, "'-5' is negative, using 1234"],
+            // Floored before the sign test, like every other reader: a budget written as seconds armed a 0 ms timer
+            // that fired after 1 ms, and the note said "not a number" about a value whose only sin was the point
+            ['0.5', undefined, 1234, 1234, "'0.5' is less than one millisecond, using 1234"],
+            ['250', undefined, 1234, 250, null],
+            // The environment wins over config.json, and the note names the environment's value
+            ['abc', '9000', 1234, 1234, "'abc' is not a number, using 1234"],
+            ['150', '9000', 1234, 150, null]
+        ];
+        const readMsResults = [];
+        try {
+            for (const [fromEnv, fromFile, fallback, expectedValue, expectedNote] of readMsCases) {
+                process.env[readMsName] = fromEnv;
+                const resolved = readMilliseconds(readMsName, fallback, fromFile);
+                readMsResults.push([`env=${fromEnv} file=${String(fromFile)}`, resolved, expectedValue, expectedNote]);
+            }
+            // A blank environment value counts as unset, the rule every other key follows (`??` would end the chain
+            // there and the file value would never be read)
+            process.env[readMsName] = '   ';
+            readMsResults.push(['env=blank file=9000', readMilliseconds(readMsName, 1234, '9000'), 9000, null]);
+            delete process.env[readMsName];
+            readMsResults.push(['env unset file=9000', readMilliseconds(readMsName, 1234, '9000'), 9000, null]);
+            readMsResults.push(['env unset file=abc', readMilliseconds(readMsName, 1234, 'abc'), 1234,
+                "'abc' is not a number, using 1234"]);
+            readMsResults.push(['nothing set', readMilliseconds(readMsName, 4321, undefined), 4321, null]);
+        } finally {
+            delete process.env[readMsName];
+        }
+        check('readMilliseconds names the value it could not use, whichever source it came from',
+            readMsResults.every(([, resolved, expectedValue, expectedNote]) => resolved.value === expectedValue &&
+                (expectedNote === null ? resolved.note === null : String(resolved.note).includes(expectedNote))),
+            JSON.stringify(readMsResults));
         const unknownKeyPath = path.join(configDir, 'unknown-key.json');
         fs.writeFileSync(unknownKeyPath, JSON.stringify({ FUTURE_KEY: { nested: true } }));
         check('readConfigFile keeps keys it does not know',
@@ -1067,6 +1239,29 @@ async function run() {
         fs.mkdirSync(dirPath);
         check('readConfigFile refuses a directory', /regular file/.test(String(readConfigFile(dirPath).error)),
             String(readConfigFile(dirPath).error));
+        // A symbolic link at the config path is refused **by name**: following it would read a target the operator did
+        // not configure, so the file is opened with `O_NOFOLLOW` and described with `fstat()` on that descriptor. A
+        // plain `statSync` check would have accepted the link and then read through it. Where the platform has no
+        // `O_NOFOLLOW` (Windows) the refusal is not implemented, so the check is skipped rather than asserted against
+        // behaviour the source documents as degraded.
+        const linkTargetPath = path.join(configDir, 'link-target.json');
+        fs.writeFileSync(linkTargetPath, JSON.stringify({ API_KEY: 'sk-via-symlink' }));
+        const linkPath = path.join(configDir, 'as-symlink.json');
+        let symlinkError = null;
+        if (fs.constants.O_NOFOLLOW === undefined) symlinkError = { code: 'O_NOFOLLOW unsupported' };
+        else {
+            try {
+                fs.symlinkSync(linkTargetPath, linkPath);
+            } catch (error) {
+                symlinkError = error;
+            }
+        }
+        if (symlinkError) skip('readConfigFile refuses a symbolic link',
+            `this host cannot build the setup: ${symlinkError.code || symlinkError.message}`);
+        else
+            check('readConfigFile refuses a symbolic link instead of reading its target',
+                /must be a regular file, found a symbolic link/.test(String(readConfigFile(linkPath).error)),
+                String(readConfigFile(linkPath).error));
         if (process.platform !== 'win32') {
             const fifoPath = path.join(configDir, 'as-fifo');
             execFileSync('mkfifo', [fifoPath]);
@@ -1798,6 +1993,12 @@ async function run() {
         body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'hi' }] }
     });
     check('non-streaming completion returns 200', completion.response.status === 200, `status ${completion.response.status}`);
+    // Every completion POSTs to the same `/v1/chat/completions`, so the only thing that separated two users' answers was
+    // that nothing told a shared cache not to reuse them: the gateway writes no `ETag`, `Last-Modified` or `Vary` of its
+    // own. `no-store` is the header OpenAI's own API sends.
+    check('a JSON response is not cacheable',
+        (completion.response.headers.get('cache-control') || '') === 'no-store',
+        completion.response.headers.get('cache-control'));
     check('non-streaming completion has object chat.completion', completion.json?.object === 'chat.completion', completion.text.slice(0, 160));
     check('non-streaming completion returns the stubbed content',
         completion.json?.choices?.[0]?.message?.content === ANSWER,
@@ -1810,6 +2011,10 @@ async function run() {
         JSON.stringify(completion.json?.choices?.[0]?.finish_reason));
 
     // --- streaming completion ---------------------------------------------------------------------------
+    // The stub records the query of every backend event subscription (`GET /__sessions` → `eventSubscriptionQueries`),
+    // so the subscription a streaming completion opens is observable instead of inferred from the frames. The suite is
+    // sequential, so the entries that appear between the two reads are this request's.
+    const subscriptionsBefore = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
     const streamed = await request('/v1/chat/completions', {
         method: 'POST',
         body: { model: 'opencode/kimi-k2.5-free', messages: [{ role: 'user', content: 'hi' }], stream: true },
@@ -1819,6 +2024,38 @@ async function run() {
     check('streaming completion uses text/event-stream',
         (streamed.response.headers.get('content-type') || '').includes('text/event-stream'),
         streamed.response.headers.get('content-type'));
+    // A stream is long-lived and must be revalidated rather than stored, which is the one place `no-cache` is the right
+    // answer instead of `no-store`
+    check('an SSE response is revalidated instead of stored',
+        (streamed.response.headers.get('cache-control') || '') === 'no-cache',
+        streamed.response.headers.get('cache-control'));
+
+    const subscriptionsAfter = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    const priorSubscriptions = Array.isArray(subscriptionsBefore?.eventSubscriptionQueries)
+        ? subscriptionsBefore.eventSubscriptionQueries.length : 0;
+    const newSubscriptions = Array.isArray(subscriptionsAfter?.eventSubscriptionQueries)
+        ? subscriptionsAfter.eventSubscriptionQueries.slice(priorSubscriptions)
+        : [];
+    // A completion whose answer arrives as deltas has an open event subscription: a gateway that fell back to polling
+    // would open none, and the stub sees the request the moment it is made. It is asserted here rather than only through
+    // the frames because the frames look the same either way.
+    check('a streaming completion opens a backend event subscription',
+        newSubscriptions.length >= 1, JSON.stringify(newSubscriptions).slice(0, 200));
+    // The *shape* of that subscription is asserted in the source, not on the wire: the pinned 2.3.2 client replaces the
+    // generated `event` route with a shared multiplexer (`make7`) whose `subscribe({types, signal})` filters in-process
+    // and calls the raw route as `raw.event.subscribe(undefined, { signal, onActivity })` - no `types` parameter ever
+    // reaches the backend, which is why every recorded query above is empty. Two things follow, and both are asserted
+    // where they live: the collector must pass **one** options object (`{types, signal}`), because the declared
+    // two-argument form left `types` unread and `controller.abort()` a no-op (the collector then received every event
+    // type from every session, and an aborted stream kept its queue slot), and the effect of the filter is that a
+    // `session.tool.*` event never becomes model text - the tool-tag markers below assert that.
+    const collectorSource = fs.readFileSync(path.join(ROOT, 'src', 'proxy.js'), 'utf8');
+    const subscribeCalls = collectorSource.match(/client\.event\.subscribe\(/g) || [];
+    check('the collector subscribes with one options object carrying the types it collects',
+        subscribeCalls.length === 1 &&
+        /client\.event\.subscribe\(\{\s*types:\s*COLLECTOR_EVENT_TYPES,\s*signal:\s*controller\.signal\s*\}\)/
+            .test(collectorSource),
+        `${subscribeCalls.length} call site(s)`);
 
     const frames = parseSseFrames(streamed.text);
     check('stream ends with the [DONE] frame', frames[frames.length - 1] === '[DONE]', frames[frames.length - 1]);
@@ -2199,6 +2436,13 @@ async function run() {
         `status ${afterAbort.response.status}`);
     check('an aborted stream releases its queue slot before the backend finishes', afterAbortMs < 1200,
         `${afterAbortMs} ms (the slow reply takes ~2000 ms)`);
+    // Freeing the slot is only half of the abort contract: the completion created a backend session, and a client that
+    // walked away must not leave one behind per aborted request. The gateway answers the client *before* it deletes the
+    // session (its own backend round trip), so this goes through `sessionsAfterCleanup()` - one immediate read raced the
+    // delete and reported `live: 1`.
+    const afterAbortSessions = await sessionsAfterCleanup(STUB_URL);
+    check('an aborted stream still deletes the backend session it created', afterAbortSessions?.live === 0,
+        JSON.stringify(afterAbortSessions));
 
     // --- a request abandoned while queued never reaches the backend ---------------------------------------
     // The aborted stream above frees the slot; this one proves the queue itself drops work nobody waits for, so an
@@ -2425,6 +2669,25 @@ async function run() {
     check('a completion answers its newest assistant message, not an earlier finished step',
         twoStep.json?.choices?.[0]?.message?.content === 'THE FINAL ANSWER',
         JSON.stringify(twoStep.json?.choices?.[0]?.message?.content || '').slice(0, 160));
+
+    // The same rule with more messages than one page holds: the stub stored 60 finished answers around the one this
+    // request produced, so a poll that asked for `order=asc` (or left `type` out) answered an archived one instead. The
+    // stub's own counters prove the session really held that many - a check that passes against a one-message session
+    // would be asserting nothing.
+    const manyMessages = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'MANYMESSAGES please' }], stream: false }
+    });
+    const manyMessagesContent = manyMessages.json?.choices?.[0]?.message?.content;
+    check('a poll over a session with many finished messages serves the newest one',
+        manyMessages.response.status === 200 &&
+        manyMessagesContent === MANY_MESSAGES_NEWEST &&
+        !String(manyMessagesContent).includes(MANY_MESSAGES_OLD_PREFIX),
+        `status ${manyMessages.response.status} ${JSON.stringify(String(manyMessagesContent).slice(0, 120))}`);
+    const manyMessagesStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
+    check('the newest-message poll really ran over a session of many messages',
+        manyMessagesStats?.largestSessionMessages >= MANY_MESSAGES_OLDER,
+        `largest session ${manyMessagesStats?.largestSessionMessages} messages`);
 
     // --- a provider failure that arrives after the text ---------------------------------------------------
     // The event that ends the message carries the error next to `time.completed`. Dropping it served the truncated text
@@ -4215,6 +4478,161 @@ async function run() {
     await waitForExit(createResetGateway);
     stop(createResetStub);
     await waitForExit(createResetStub);
+
+    // --- a session creation whose answer is cut short --------------------------------------------------
+    // A backend that read `POST /api/session` and then died *while writing its answer*: the headers and half the JSON
+    // arrive, then the socket goes away. `fetch` reports `terminated` (`other side closed`) rather than the
+    // `socket hang up` of a call that never got a status line, and the partial body carries a session id the backend
+    // never created - a gateway that parsed it would answer from a session it cannot see and then try to delete a
+    // session nobody made. It is also not a refused connection, so it is not the case the retry rule covers.
+    const partialStubPort = GATEWAY_PORT + 94;
+    const partialStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(partialStubPort), STUB_PARTIAL_CREATE: '1' }
+    });
+    children.push(partialStub);
+    partialStub.stdout.on('data', () => {});
+    partialStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${partialStubPort}/health`);
+    const partialGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(partialStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${partialStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(partialGateway);
+    partialGateway.stdout.on('data', () => {});
+    partialGateway.stderr.on('data', () => {});
+    const partialUrl = `http://127.0.0.1:${partialStubPort + 1}`;
+    await waitForOk(`${partialUrl}/health`);
+    const partialCreation = await fetch(`${partialUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi while the creation answer is truncated' }] }),
+        signal: AbortSignal.timeout(25000)
+    }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => null) }))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    check('a session creation whose answer is cut short is an unreachable backend',
+        partialCreation.status === 502 &&
+        partialCreation.json?.error?.code === 'backend_unreachable' &&
+        partialCreation.json?.error?.type === 'server_error' &&
+        !partialCreation.json?.choices,
+        `status ${partialCreation.status} ${JSON.stringify(partialCreation.json)?.slice(0, 160)}`);
+    const partialStats = await fetch(`http://127.0.0.1:${partialStubPort}/__sessions`)
+        .then((r) => r.json()).catch(() => null);
+    const partialAttempts = Array.isArray(partialStats?.sessionCreatePermissions)
+        ? partialStats.sessionCreatePermissions
+        : [];
+    // One attempt (a truncated answer is not a refused connection, so the retry rule does not apply) and no session: the
+    // id in the truncated body never became a session this process could address.
+    check('a truncated creation answer creates no session and is attempted once',
+        partialAttempts.length === 1 && partialStats?.created === 0 && partialStats?.live === 0,
+        `attempts ${partialAttempts.length}, created ${partialStats?.created}, live ${partialStats?.live}`);
+    stopGateway(partialGateway);
+    await waitForExit(partialGateway);
+    stop(partialStub);
+    await waitForExit(partialStub);
+
+    // --- an answer larger than the per-answer buffer cap ------------------------------------------------
+    // `appendCapped()` bounds the gateway's answer buffers at `MAX_ANSWER_CHARS` (16 M chars): nothing bounds what a
+    // backend may write, and both buffers used to grow with it (measured 572 MB RSS for a 64 MiB answer). The cap is a
+    // **prefix** cap, which is what keeps the streaming path correct - every comparison on it is a `startsWith()` against
+    // one of these prefixes - so a streaming answer past the cap is still served whole: the deltas carry it, and the
+    // closing `session.text.ended` snapshot is diffed against them instead of appended again.
+    const bigStubPort = GATEWAY_PORT + 96;
+    const bigStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(bigStubPort) }
+    });
+    children.push(bigStub);
+    bigStub.stdout.on('data', () => {});
+    bigStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${bigStubPort}/health`);
+    const bigAnswerGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(bigStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${bigStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(bigAnswerGateway);
+    bigAnswerGateway.stdout.on('data', () => {});
+    bigAnswerGateway.stderr.on('data', () => {});
+    const bigAnswerUrl = `http://127.0.0.1:${bigStubPort + 1}`;
+    await waitForOk(`${bigAnswerUrl}/health`);
+    const bigAnswerStartedAt = Date.now();
+    const bigAnswerResponse = await fetch(`${bigAnswerUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+            model: 'opencode/kimi-k2.5-free',
+            messages: [{ role: 'user', content: 'BIGANSWER please' }],
+            stream: true
+        }),
+        // The suite's own 30 s request budget would be tight for 17 M chars on a loaded runner
+        signal: AbortSignal.timeout(120000)
+    });
+    const bigAnswerBody = await bigAnswerResponse.text();
+    const bigAnswerMs = Date.now() - bigAnswerStartedAt;
+    const bigAnswerFrames = parseSseFrames(bigAnswerBody);
+    const bigAnswerChunks = bigAnswerFrames
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        });
+    const bigAnswerContent = bigAnswerChunks
+        .filter((chunk) => chunk?.choices?.[0]?.delta?.content)
+        .map((chunk) => chunk.choices[0].delta.content)
+        .join('');
+    const bigAnswerFinish = bigAnswerChunks
+        .filter((chunk) => chunk?.choices?.[0]?.finish_reason)
+        .pop();
+    check('an answer past the answer cap is streamed to the end',
+        bigAnswerResponse.status === 200 &&
+        bigAnswerFrames[bigAnswerFrames.length - 1] === '[DONE]' &&
+        bigAnswerFinish?.choices?.[0]?.finish_reason === 'stop',
+        `status ${bigAnswerResponse.status}, ${bigAnswerFrames.length} frames, finish ${JSON.stringify(bigAnswerFinish?.choices?.[0]?.finish_reason)}`);
+    // The cap is internal: the client is served the whole answer, because the deltas are increments and the closing
+    // snapshot is capped to the same prefix they added up to. A gateway that truncated a delta, or that appended the
+    // snapshot instead of diffing it, answers a cut or a doubled answer here.
+    check('an answer past the answer cap reaches the client whole',
+        bigAnswerContent === BIG_ANSWER_TEXT && bigAnswerContent.length === BIG_ANSWER_CHARS,
+        `${bigAnswerContent.length} of ${BIG_ANSWER_CHARS} chars, ${bigAnswerMs} ms`);
+    // A loose bound, and deliberately generous: the point is that the buffers stay bounded at all, not that the process
+    // is small. The sample is taken after the stream (the collector's text has been released by then, but no GC has
+    // necessarily run), so it is a lower bound on the peak - a cap that regressed would show up as an order of
+    // magnitude more than the threshold, not as a few hundred megabytes. No `ps`, no check.
+    const bigAnswerRssKb = (() => {
+        if (process.platform === 'win32') return null;
+        try {
+            return Number(execFileSync('ps', ['-o', 'rss=', '-p', String(bigAnswerGateway.pid)], { encoding: 'utf8' }).trim());
+        } catch {
+            return null;
+        }
+    })();
+    if (bigAnswerRssKb === null || !Number.isFinite(bigAnswerRssKb)) {
+        skip('an answer past the answer cap keeps the gateway within a loose memory bound',
+            'this host cannot report a child process RSS');
+    } else {
+        check('an answer past the answer cap keeps the gateway within a loose memory bound',
+            bigAnswerRssKb < 1200 * 1024,
+            `${Math.round(bigAnswerRssKb / 1024)} MiB RSS (the cap is ${MAX_ANSWER_CHARS_FOR_TEST} chars)`);
+    }
+    stopGateway(bigAnswerGateway);
+    await waitForExit(bigAnswerGateway);
+    stop(bigStub);
+    await waitForExit(bigStub);
 
     // --- a backend error body larger than the summary --------------------------------------------------
     // The 500 characters the gateway keeps as a log summary used to come from `JSON.stringify(body).slice(0, 500)`:

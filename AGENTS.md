@@ -85,7 +85,9 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `src/socket.js` | `closeSocketAfterFlush()`: `end()` then a 250 ms `destroy()` fallback, for the paths that answer outside Fastify's reply lifecycle (`clientErrorHandler`, `badUrlHandler`, a hijacked stream). `destroy()` alone discards buffered writes, so a client under backpressure got a reset instead of its envelope. |
 | `src/api-key.js` | The built-in key `sk-dummy-123` and `resolveApiKey()` (a blank or missing `API_KEY` falls back to it). Never add a "disable auth" switch. |
 | `src/backend-auth.js` | The `Authorization` header for the **backend**: `backendAuthorizationHeader()` (Basic, user `opencode`), `resolveBackendAuth()` (splits userinfo out of a credential-bearing `OPENCODE_SERVER_URL` and registers it as sensitive) and `resolveBackendPassword()` (an explicit password, or a generated one — there is no variable that switches generation off: `options.generate === false` suppresses it for a caller that needs to match a spawned child, and no production caller passes it). |
-| `src/env.js` | Resolving the two configured environment values: `resolveOpencodePath()` (memoised per requested value for a minute; PATH, then the package/version-manager install locations — a candidate that exists but is not a regular file, a directory being the realistic case, is skipped rather than handed to `spawn()`, which fails with `EACCES`/`EISDIR` on every start) and `normalizeBackendUrl()` / `normalizeBindHost()` (trim, add a missing scheme, drop a trailing slash — each with a `[Config]` note naming the value that was corrected, and `normalizeBackendUrl()` also notes that a URL without an explicit port resolves to the scheme default), plus `isLoopbackHost()`. |
+| `src/env.js` | Resolving the two configured environment values: `resolveOpencodePath()` (memoised per requested value for a minute; PATH, then the package/version-manager install locations — a candidate that exists but is not a regular file, a directory being the realistic case, is skipped rather than handed to `spawn()`, which fails with `EACCES`/`EISDIR` on every start) and `normalizeBackendUrl()` / `normalizeBindHost()` (trim, add a missing scheme, drop a trailing slash — each with a `[Config]` note naming the value that was corrected, and `normalizeBackendUrl()` also notes that a URL without an explicit port resolves to the scheme default), plus `isLoopbackHost()`, and `isUsableBindHost()` - the check `OPENCODE_BIND_HOST` gets before it becomes an
+  argument of the child: the child may be started through a shell, so a value outside `[A-Za-z0-9.\-:\[\]%]` falls
+  back to loopback with a `[Config]` note instead of being concatenated into a command line. |
 | `src/options.js` | `parseBoolean()` and `readFlag()`, the **single** boolean parser for `index.js`, `startProxy()` and request bodies. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off" in the container); do not add a third. |
 | `src/settings.js` | The tuning keys' readers: `readLimit()`, `readMilliseconds()`, `resolveRequestTimeoutMs()`, `isUnusableMilliseconds()`, `backendDeadline()`, and the named defaults they quote (`DEFAULT_REQUEST_TIMEOUT_MS`, `MAX_TIMER_MS`, `METADATA_TIMEOUT_CAP_MS`). The resolved values are held by their consumers in `src/proxy.js`. |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. A BOM is tolerated. |
@@ -113,7 +115,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway (476 contract assertions on Linux, 464 on Windows)
+pnpm test                        # smoke suite: stub backend + gateway (500 contract assertions on Linux; fewer on Windows, where the POSIX-only checks are skipped)
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -148,7 +150,8 @@ item only: the 1.x shapes are still recognised, so the markers keep their meanin
 starts answering that way again - `CUTSTREAM` (two cumulative snapshots then
 a dropped event connection), `LAGSTORE` (the stream delivers the whole answer while the stored message keeps only its
 first characters, then the stream is cut), `MULTIPART` (one message whose two text parts send their own cumulative snapshots,
-interleaved), `MULTIPARTNOID` (the same without part ids, so both parts are of type `text`), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `MIXED` (part updates
+interleaved), `MULTIPARTNOID` (the same without part ids, so both parts are of type `text`), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it, which must not be re-sent after
+the deltas that already delivered it), `MIXED` (part updates
 carrying both a `delta` and the part's cumulative text, then one closing update with neither),
 `CUTTOOL`/`OPENTOOL` (a tool-call answer whose stream is cut inside the closing/opening tag), `TOOLSPAM` (a tool-call
 block repeated by the answer), `TWOSTEP` (the answer arrives as two steps, the first unfinished), `FAILMID` (a provider
@@ -274,6 +277,14 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   the same class: `m?.role`/`m?.content` read it as an empty user message, so the client was told
   `messages must include at least one non-system text message` about text it never sent; every entry is now named by
   position and type (`messages[0] must be a message object, found a string`).
+- **A request is bounded by its element counts, not only by its bytes.** `MAX_BODY_MB` bounds the body, but a 20 MiB
+  body of empty message objects is still 20 000 messages, and one message may carry 20 000 content parts: both were
+  normalised, prompt-built and stored per completion (measured 75 MB → 312 MB RSS for a 20 MiB body, about 12x, which
+  made the documented queue bound - `MAX_BODY_MB` x concurrency - off by the same factor). `messages` over
+  `MAX_MESSAGES_PER_REQUEST` (10 000) and a `content` array over `MAX_CONTENT_PARTS_PER_MESSAGE` (10 000) are a `400`
+  naming the limit and what arrived; the answer buffers (`appendCapped()`) stop at `MAX_ANSWER_CHARS` (16 M chars) with
+  a prefix-safe append, because every snapshot comparison is a `startsWith()` on that text and truncating it must not
+  make a later delta look like a rewrite.
 - A `messages[].role` that is present but not a string (`5`, `{}`, `[]`, `true`) is a `400`
   (`messages[0].role must be a string`): `(role || 'user').toLowerCase()` threw on a truthy non-string, so a client's
   bad field was answered `500` with the internal expression. A missing or `null` role keeps its lenient
@@ -422,7 +433,11 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   The failure can arrive **on the event that finishes the message** (`error` next to `time.completed`), after text was
   already written: `collectFromEvents` carries it out and both modes fail (the in-band frame with the text so far, or
   the `502`), where dropping it served the truncated text as `finish_reason: "stop"`. Both modes describe it through
-  `describeProviderFailure()` (masked and bounded, like every other upstream sentence), so they cannot disagree.
+  `describeProviderFailure()` (masked and bounded, like every other upstream sentence), so they cannot disagree. The
+  sentence is the provider's own text and nothing else: the thrown error's `name` used to be prefixed on the
+  streaming side only, so one failed completion read `ProviderError: Provider Error: …` as a stream and
+`Provider Error: …` as JSON, and that prefix is a name the wire chose - a place backend-controlled text could enter
+  a public message. `PROVIDER_FAILURE_FALLBACK` is the sentence when the throw carries none.
 - A client that disconnects mid-stream releases its queue slot immediately: the event subscription is aborted and
   the polling fallbacks are skipped (the backend keeps finishing on its own). A reader that stops reading without
   closing the connection (a tab that stops consuming, a buffering proxy, a stalled phone link) is treated the same
@@ -464,7 +479,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `onRequest` hook, `clientErrorHandler` and `badUrlHandler`. It carries `X-Request-Id` because the gateway echoes
   that header, and a browser client setting its own trace id had it refused by its own preflight.
 - A request the HTTP parser rejects (a malformed request line or header, an oversized header block, a header
-  timeout) never reaches a hook, so the `clientErrorHandler` Fastify option answers it: `400` for a parse error,
+  timeout, or an HTTP/1.1 request line with **no `Host` header** - `serverFactory` passes `requireHostHeader: false`,
+  because Node's bare check answered `400 Bad Request` in its own HTML before any hook ran, with no `type`, no CORS,
+  no `X-Request-Id` and no log line) never reaches a hook, so the `clientErrorHandler` Fastify option answers it: `400` for a parse error,
   `431` for `HPE_HEADER_OVERFLOW`, `408` for `ERR_HTTP_REQUEST_TIMEOUT`, all in the OpenAI envelope
   (`type: "invalid_request_error"`, the parser's code in `code` when it is a plain `[A-Z_]+` token) with CORS headers,
   an `X-Request-Id` and a `warn` log line that **carries that same id** (`[gw-…]`): the id a client quotes in a report
@@ -603,7 +620,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   spelling is five characters; a client-sized `stream` value cost 10 ms per call and the handler reads each boolean
   twice) and stays the only parser (it is also used on request bodies, where a warning would be wrong: an unreadable `stream` or
   `stream_options.include_usage` there is a `400` naming the field, because a typo answered JSON to a client parsing
-  SSE, and `stream_options` must be an object). A **number** counts only as `1`/`0`: every other number used to read as
+  SSE, and `stream_options` must be an object). `stream_options` on a body that is **not** streaming is ignored, not
+  refused: the usage chunk exists to carry numbers a streaming client cannot get any other way, the non-streaming body
+  already has `usage`, and a `400` would refuse an otherwise valid request - so a shared body that sets the option and
+  sometimes sends `stream: false` reads `usage` from the JSON it gets back. A **number** counts only as `1`/`0`: every other number used to read as
   "on", so `{"stream": 0}` answered SSE to a client waiting for a JSON body, and `{"stream": 2}` did the same; `readFlag()` only reports. The label repeats the name the operator used (`config.json DISABLE_TOOLS` or the variable); the value goes
   through `loggableConfigValue()` too, because it lands in a log line.
   `startProxy()` applies the same rule to its own fallbacks (`flagOption()`), for an embedder with no

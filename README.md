@@ -215,7 +215,7 @@ harness at the time; the Fastify rewrite answers ~110,000 req/s on the same endp
 
 | Requirement | Details |
 | --- | --- |
-| **Node.js** | 20.0 or newer (required by Fastify 5) |
+| **Node.js** | 20.0 or newer (required by Fastify 5; `index.js` refuses to start on an older major version and says so) |
 | **pnpm** | 12.0 or newer (the project's package manager) |
 | **OpenCode CLI** | A **2.x** release (the client the gateway uses, `@opencode/client`, drives the 2.x `opencode serve` API), installed and authenticated once (`opencode auth login`) |
 
@@ -357,7 +357,7 @@ Advanced tuning (environment or `config.json`; the environment wins when both se
 | `OPENCODE_PROXY_START_RETRY_MS` | `15000` | Cooldown after a failed backend start attempt; requests fail fast instead of retrying immediately |
 | `OPENCODE_PROXY_MAX_CONCURRENCY` | `1` | Number of chat completions processed in parallel (1..32). `1` keeps the historical serialized behaviour; raise it only if the backend/provider tolerates concurrent sessions |
 | `OPENCODE_PROXY_MAX_QUEUE` | `64` | How many completions may wait for a free slot before the gateway answers `503 queue_full` instead of accepting more work (the queue holds request bodies, so it is bounded). Counts waiting requests only: `0` rejects a completion when no slot is free instead of queueing it. A slot frees as soon as its response is written (the session cleanup that follows does not hold it) |
-| `OPENCODE_PROXY_MAX_BODY_MB` | `50` | Largest accepted request body in MiB (1..200). It is the other half of the memory bound: a waiting completion pins its parsed body, so the worst case is this value times `OPENCODE_PROXY_MAX_QUEUE`. Prompts are small, so lowering it is the cheap way to bound a gateway whose clients are not trusted. A larger body is refused with `413` naming this limit, after the upload is drained (bounded to 5 s) so the client reads that error instead of a reset connection |
+| `OPENCODE_PROXY_MAX_BODY_MB` | `50` | Largest accepted request body in MiB (1..200). It is the other half of the memory bound: a waiting completion pins its parsed body, so the worst case is this value times `OPENCODE_PROXY_MAX_QUEUE`. Prompts are small, so lowering it is the cheap way to bound a gateway whose clients are not trusted. A larger body is refused with `413` naming this limit, after the upload is drained (bounded to 5 s) so the client reads that error instead of a reset connection. Bytes are only half the bound: a 20 MiB body of empty message objects parsed into about 12x its size in heap, so `messages` over 10 000 entries and a `content` array over 10 000 parts are refused with a `400` naming the limit and what arrived (both far above any real conversation) |
 | `OPENCODE_PROXY_DEBUG` | unset | `1`/`true` promotes logging to `debug` **when no explicit `LOG_LEVEL` is set** — an explicit level wins and the switch is then ignored with a `[Config]` warning. This is the **environment name** of the switch (the `config.json` key is `DEBUG`, and the environment variable `DEBUG` has no effect); `LOG_LEVEL=debug` is the preferred way |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Fallback bind address when `BIND_HOST` is not set — **environment only**: `config.json` has just `BIND_HOST`, and this name in the file is reported as an unknown key and ignored |
 
@@ -413,6 +413,12 @@ A `stream` or `stream_options.include_usage` value that is **present but cannot 
 non-streaming default in silence, so a typo answered `200 application/json` to a client that was parsing SSE, or
 dropped the usage chunk its SDK was waiting for. A missing, blank or `null` value still means "not streaming", and
 every spelling listed above keeps working; `stream_options` itself must be an object when it is sent.
+
+`stream_options` only means something on a stream. A body that sends `stream_options` with `stream` false (or absent)
+is answered as **JSON**, and the option is ignored rather than refused: the usage chunk it asks for exists to carry
+numbers a streaming client cannot get any other way, a non-streaming body already carries `usage`, and answering `400`
+would refuse a request whose payload is otherwise valid. A client that sets the option on a shared body and sometimes
+sends `stream: false` should read `usage` from the JSON it gets back.
 
 The request body is JSON, but a JSON body sent under `application/x-www-form-urlencoded` (what `curl -d '{…}'` labels
 it when you omit the header) or `text/plain` is parsed from the string it carries and served all the same. A leading
@@ -639,11 +645,12 @@ Two GitHub Actions workflows live in `.github/workflows/`; the CI checks need no
 
 | Workflow | Trigger | What it does |
 | --- | --- | --- |
-| `ci.yml` | every push to `main`, every pull request, manual dispatch | Runs `pnpm run check`, `sh -n docker/docker-entrypoint.sh` and `pnpm test` (the smoke suite in `test/`, which needs no OpenCode CLI or network) on Node 20, 22 and 24, plus an advisory `pnpm audit --audit-level high` on the Node 22 entry only (`continue-on-error: true`, never a gate), plus two gate steps — every action pinned to a commit SHA, and every added commit subject checked against the commit convention; a fourth job builds the Docker image, starts the container and waits for `/health` to answer. |
+| `ci.yml` | every push to `main`, every pull request, manual dispatch | Three jobs. **Test** runs `pnpm run check`, `sh -n` + `shellcheck` on `docker/docker-entrypoint.sh` and `pnpm test` (the smoke suite in `test/`, which needs no OpenCode CLI or network) on Node 20, 22 and 24, plus an advisory `pnpm audit --audit-level high` on the Node 22 entry only (`continue-on-error: true`, never a gate), plus a gate step — every action pinned to a commit SHA. **Commit messages follow the convention** runs `pnpm run check:commits` over the commits this run adds, in its own job so it cannot disappear with a matrix entry. **Build the container image** builds the image for the runner's architecture, builds it again for `linux/amd64,linux/arm64` (the two published platforms, no registry involved), starts the container and waits for `/health` to answer. |
 | `docker-publish.yml` | pushing a `v*.*.*` tag, or a manual dispatch from a tag | Fails if the tag does not match `version` in `package.json`, then builds `linux/amd64` + `linux/arm64` and pushes `<version>` and `latest` to Docker Hub. Needs the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. The tagged commit must already be on `main` and every check run on it must have concluded `success`, `skipped` or `neutral`: a tag on a commit CI never ran is refused. |
 
-The four required status checks on `main` are `Test on Node 20`, `Test on Node 22`, `Test on Node 24` and
-`Build the container image`, so renaming those jobs also changes the branch protection rules.
+The required status checks on `main` are `Test on Node 20`, `Test on Node 22`, `Test on Node 24`,
+`Build the container image` and `Commit messages follow the convention`, so renaming those jobs also changes the
+branch protection rules.
 
 Publishing a release is therefore just a tag:
 

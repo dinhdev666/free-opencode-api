@@ -102,6 +102,18 @@ if [ ! -f "$CONFIG" ]; then
         // Normalised like the shell branch below, and like loggableConfigValue() in src/proxy.js: one log record.
         const levelShown = String(env("LOG_LEVEL", "info")).replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 128);
         console.log("[entrypoint] log level (LOG_LEVEL env, higher priority than config.json):", levelShown);
+        // The two settings that decide who can reach the gateway are also the container defaults: the built-in key and
+        // a bind address on every interface. Both stay documented defaults - changing either would be a breaking change
+        // for every existing `docker run` - but a first boot that runs with them says so once, with the fix, because
+        // `docker logs` is where an operator looks after `docker run` has already returned. Loopback is decided here
+        // rather than by a list of names, the same rule as isLoopbackHost() in src/proxy.js.
+        const usable = (value) => String(value).replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 128);
+        const loopback = ["127.0.0.1", "::1", "localhost", ""].includes(String(cfg.BIND_HOST).trim().toLowerCase());
+        if (cfg.API_KEY === "sk-dummy-123" && !loopback) {
+            console.log("[entrypoint] WARNING: API_KEY is the built-in default and BIND_HOST is " + usable(cfg.BIND_HOST)
+                + " (every interface), so anyone who can reach port " + usable(cfg.PORT)
+                + " can use the gateway. Set API_KEY to a private value, and publish the port only on a trusted network.");
+        }
     ' /app/src/logger.js
 else
     echo "[entrypoint] /app/config.json exists, keeping it (environment variables still win over the file)"

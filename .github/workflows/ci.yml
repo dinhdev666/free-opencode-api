@@ -15,7 +15,11 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A superseded run is cancelled on a pull request, where only the newest head is worth a runner. A push to main is
+  # never cancelled: the publish gate in docker-publish.yml requires at least one *completed* check run with a
+  # successful conclusion on the tagged SHA, and a cancelled run concluded `cancelled` - so a commit whose run was
+  # superseded by the next push could never be released.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
@@ -36,12 +40,9 @@ jobs:
         with:
           # No step in this job talks to the remote (every git call is local), so the token is only ever a liability:
           # left in .git/config it is readable by anything that runs in the workspace.
+          # A shallow checkout is enough here: the step that judged a commit *range* moved to the `commit-messages`
+          # job below, and nothing left in this job reads history.
           persist-credentials: false
-          # Full history, because the commit-message step below judges a *range*: with the default depth of 1 the fetched
-          # base (`github.event.before`, a pull request's base SHA) is a second shallow graft and
-          # `git rev-list before..HEAD` answers only the tip - a two-commit push had its first subject checked by nobody.
-          # The repository is small; a complete fetch costs a second.
-          fetch-depth: 0
 
       # No `version` input: the action installs the pnpm release pinned by "packageManager" in package.json
       - name: Install pnpm
@@ -69,8 +70,16 @@ jobs:
       - name: Syntax check
         run: pnpm run check
 
+      # Shellcheck is a runner tool, not a project dependency: ubuntu-latest ships apt and its universe repository
+      # carries the package, so the entrypoint is linted without adding anything to package.json. `sh -n` only parses,
+      # which is why a script with a real defect still passed it; `-S warning` adds the checks that name one (an
+      # unquoted expansion, a command that can fail unnoticed) and `-s sh` selects the POSIX dialect the shebang
+      # declares.
       - name: Shell check (container entrypoint)
-        run: sh -n docker/docker-entrypoint.sh
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          sh -n docker/docker-entrypoint.sh
+          shellcheck -S warning -s sh docker/docker-entrypoint.sh
 
       # Supply chain: the publishing workflow leaves a Docker Hub token with write scope on the runner, so an action
       # resolved through a movable major tag is code nobody reviewed at a version nobody froze (a retagged
@@ -111,13 +120,50 @@ jobs:
           test "$status" = "0" || exit 1
           echo "every action reference is pinned to a 40-character commit SHA with its release in a comment"
 
+      - name: Smoke test (OpenAI contract)
+        run: pnpm test
+
+  # Its own job rather than one step inside the matrix above, where it was gated on `if: matrix.node == '24'`: a gate
+  # keyed to a matrix value disappears with the value, so dropping or renaming that Node line silently stopped checking
+  # commit messages while the branch protection still required the check by name. The job name is the check name now,
+  # so it no longer depends on any matrix entry. It is independent of the other jobs and needs nothing from them.
+  commit-messages:
+    name: Commit messages follow the convention
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing in this job talks to the remote with a credential: the fetches below are anonymous reads of a
+          # public repository, and a token left in .git/config is readable by anything that runs in the workspace.
+          persist-credentials: false
+          # Full history, because the step below judges a *range*: with the default depth of 1 the fetched base
+          # (`github.event.before`, a pull request's base SHA) is a second shallow graft and
+          # `git rev-list before..HEAD` answers only the tip - a two-commit push had its first subject checked by nobody.
+          # The repository is small; a complete fetch costs a second.
+          fetch-depth: 0
+
+      # No `version` input: the action installs the pnpm release pinned by "packageManager" in package.json
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # The Node line this step ran on while it lived in the matrix (`if: matrix.node == '24'`)
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
       # The convention in CONTRIBUTING.md is only as good as the check that sees it before the commit lands: a subject
       # over 72 characters, an undocumented scope or a generated merge title cannot be corrected afterwards without
       # rewriting published history. Only the commits this run adds are checked - the range starts at the pull
       # request's base, or at the previous tip of `main` for a push - because history that already shipped is not
       # something a contributor can fix.
       - name: Commit messages follow the convention
-        if: matrix.node == '24'
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.number }}
@@ -145,22 +191,22 @@ jobs:
           fi
           if [ -n "$range" ]; then
             echo "checking $range"
-            node test/check-commit-messages.mjs "$range"
+            pnpm run check:commits "$range"
           else
             # A dispatch, a branch whose first push has no previous tip, or a range that could not be fetched: the
             # checked-out commit is still checked
             echo "checking the checked-out commit only"
-            node test/check-commit-messages.mjs
+            pnpm run check:commits
           fi
-
-      - name: Smoke test (OpenAI contract)
-        run: pnpm test
 
   docker:
     # Also referenced by the branch protection required checks on main
     name: Build the container image
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The job now builds the image three times: once for the runner's architecture (the container assertions run
+    # against it) and once for both published architectures, where the arm64 half is emulated under QEMU and takes
+    # several times as long as the native build. Twenty minutes was the budget for the native build alone.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -170,6 +216,11 @@ jobs:
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # arm64 is built on an amd64 runner, so the QEMU binfmt handlers have to be registered before a build names a
+      # foreign platform - without them the arm64 `RUN` steps fail with "exec format error"
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       # Build only (no registry push): proves the Dockerfile and the pnpm install path still work
       - name: Build image
@@ -182,6 +233,25 @@ jobs:
           tags: free-opencode-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The publish workflow (docker-publish.yml) builds linux/amd64 + linux/arm64, so until now a Dockerfile that only
+      # builds for the runner's own architecture was discovered after a tag had been pushed and the registry login had
+      # already happened. This is the same build with both published platforms and no registry involved: it proves the
+      # Dockerfile still builds for each architecture the release ships.
+      # `load` is deliberately absent - the local daemon holds one architecture, so a multi-platform result cannot be
+      # loaded into it, and nothing below starts a container from this build. The container assertions use the native
+      # image built above (`free-opencode-api:ci`), which is the one that has to run on this runner.
+      - name: Build image for both published architectures
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          # Its own cache scope: both builds share the repository's type=gha cache, and two writers on one scope would
+          # let the emulated arm64 layers overwrite the native ones the build above just cached
+          cache-from: type=gha,scope=multiarch
+          cache-to: type=gha,mode=max,scope=multiarch
 
       # The image must not run as root: the gateway, the backend it spawns and every tool that backend runs would
       # otherwise all be UID 0. `--entrypoint id` bypasses the image entrypoint, so this reads the user the image
@@ -197,8 +267,14 @@ jobs:
           echo "uid inside the container -> $uid"
           test "$uid" != "0"
 
+      # This is the container the later steps assert against: "The image's own HEALTHCHECK reports healthy" inspects it
+      # by name and "Container enforces authentication" curls 127.0.0.1:8083, which is the port published here. The
+      # removal first is what makes the job idempotent - a runner that kept the container (a re-run, a job that failed
+      # before its teardown) would otherwise fail this step with "container name is already in use" - and the final
+      # step of this job removes it again.
       - name: Container health check
         run: |
+          docker rm -f gateway-ci >/dev/null 2>&1 || true
           docker run -d --name gateway-ci -p 127.0.0.1:8083:8083 free-opencode-api:ci
           for attempt in $(seq 1 30); do
             if curl -fsS --max-time 2 --connect-timeout 1 http://127.0.0.1:8083/health >/dev/null; then
@@ -353,7 +429,8 @@ jobs:
           exit 1
 
       # The image must behave like the source tree: the root index answers without a key and everything else
-      # is authenticated with the built-in key
+      # is authenticated with the built-in key. This talks to the container "Container health check" started - the
+      # published 127.0.0.1:8083 is that container, not a fresh one - so the step only means anything after it.
       - name: Container enforces authentication
         run: |
           root=$(curl -fsS --max-time 30 http://127.0.0.1:8083/)
@@ -365,3 +442,15 @@ jobs:
           code=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer sk-dummy-123' http://127.0.0.1:8083/v1/models)
           echo "GET /v1/models with the default key -> $code"
           test "$code" = "200"
+
+      # The containers this job starts are removed here so the job leaves nothing behind and can be re-run: the step
+      # above asserts against `gateway-ci`, and a second `docker run --name gateway-ci` would fail on the name that is
+      # still taken. Every removal is best-effort - a container that never started is not a failure - and `always()`
+      # keeps the teardown running when an earlier step failed and the job is already red.
+      - name: Remove the CI containers
+        if: always()
+        run: |
+          for name in gateway-ci gateway-ci-env gateway-ci-file gateway-ci-fresh cli-session-check; do
+            docker rm -f "$name" >/dev/null 2>&1 || true
+          done
+          echo "removed the containers this job started"

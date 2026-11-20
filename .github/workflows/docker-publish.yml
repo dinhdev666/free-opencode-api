@@ -44,6 +44,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # This job holds a write-scoped Docker Hub credential and runs no step that needs the workflow token: the
+          # ancestry test below fetches `main` anonymously over HTTPS (the repository is public). Left in .git/config
+          # the token is readable by anything that runs in the workspace, right next to the registry secret.
+          persist-credentials: false
           # The ancestry test below walks real history: with the default depth of 1 both sides are shallow grafts and
           # `merge-base --is-ancestor` cannot answer
           fetch-depth: 0

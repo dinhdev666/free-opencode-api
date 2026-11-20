@@ -243,6 +243,24 @@ function searchOpencodePath(input) {
     return { path: null, source: 'not-found' };
 }
 
+// A bind address is a host name, an IPv4 address or an IPv6 literal (optionally bracketed, with a `%zone` id). The
+// gateway's own `BIND_HOST` is handed to `listen()`, but `OPENCODE_BIND_HOST` is an argument of a child that may be
+// started through a shell (`spawn(..., {shell: true})`, which concatenates the arguments into one command line instead
+// of quoting them), so anything outside this set is either a typo or an argument-injection attempt: a value such as
+// `0.0.0.0 & curl …` would run as a second command, as the gateway's user. `OPENCODE_PATH` has the same rule
+// (`isShellUnsafePath()`), because the same shell parses it.
+const USABLE_BIND_HOST_RE = /^[A-Za-z0-9.\-:\[\]%]{1,253}$/;
+
+/**
+ * Whether a configured value is a bind address the gateway can pass to a child verbatim.
+ * @param {*} value the configured value
+ * @returns {boolean} true for a host name, an IPv4 address or an IPv6 literal
+ */
+export function isUsableBindHost(value) {
+    if (typeof value !== 'string' || value === '') return false;
+    return USABLE_BIND_HOST_RE.test(value);
+}
+
 /**
  * A bind address is handed to `net` verbatim, and surrounding whitespace is not a host: a unit file, a Compose value or
  * a rendered template that leaves a trailing space answered `getaddrinfo ENOTFOUND " 127.0.0.1"` and the gateway refused

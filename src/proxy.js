@@ -19,13 +19,15 @@ import {
     loggableUpstreamText, loggableUrl, MAX_ECHOED_VALUE_LENGTH, newCompletionId, requestId, sleep, timeoutMessage,
     urlPath
 } from './text.js';
-import { clientFacingText, handlerFailureMessage } from './errors.js';
+import { clientFacingText, handlerFailureMessage, PROVIDER_FAILURE_FALLBACK } from './errors.js';
 import {
     backendUnavailable, errorCauseChain, isConnectionError, isConnectionRefused, isTimeoutError,
     upstreamErrorStatus, upstreamFailureReason
 } from './upstream.js';
 import { closeSocketAfterFlush } from './socket.js';
-import { normalizeBackendUrl, normalizeBindHost, isLoopbackHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
+import {
+    normalizeBackendUrl, normalizeBindHost, isLoopbackHost, isUsableBindHost, resolveOpencodePath, isShellUnsafePath
+} from './env.js';
 import { DEFAULT_API_KEY, resolveApiKey } from './api-key.js';
 import { backendAuthorizationHeader, resolveBackendAuth, resolveBackendPassword } from './backend-auth.js';
 import {
@@ -39,7 +41,7 @@ import { parseBoolean, readFlag } from './options.js';
 export { DEFAULT_API_KEY, resolveApiKey } from './api-key.js';
 export { backendAuthorizationHeader, resolveBackendAuth, resolveBackendPassword } from './backend-auth.js';
 export { clientFacingText, handlerFailureMessage } from './errors.js';
-export { normalizeBackendUrl, normalizeBindHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
+export { normalizeBackendUrl, normalizeBindHost, isUsableBindHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
 export { parseBoolean, readFlag } from './options.js';
 export { DEFAULT_REQUEST_TIMEOUT_MS, resolveRequestTimeoutMs } from './settings.js';
 export { echoedValue, jsonTypeName, loggableConfigValue, loggableModelId, loggableUpstreamText, loggableUrl,
@@ -77,9 +79,13 @@ const DEFAULT_POLLED_MESSAGE_LIMIT = 50;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
 // A stream that has written nothing for this long gets a comment line, so a proxy or client does not drop the
-// connection while the backend is still thinking. The tick is shorter so the silence stays close to the interval.
+// connection while the backend is still thinking. The tick is much shorter than the interval on purpose: it used to be
+// exactly a third of it, and a tick that lands on the interval loses to the sub-millisecond gap between the timer and
+// the first frame - `Date.now() - lastWriteAt` read 14 999 at the 15 s tick, the comment slipped to the 20 s one, and
+// a stream that fell silent for 16 s (the `LONGPAUSE` marker) ended with no comment at all. A one-second tick puts the
+// line within a second of the documented 15 s and costs one integer comparison per stream per second.
 const SSE_KEEPALIVE_INTERVAL_MS = 15000;
-const SSE_KEEPALIVE_TICK_MS = 5000;
+const SSE_KEEPALIVE_TICK_MS = 1000;
 // How long a streaming write may wait for a client that is not reading before the client is treated as gone. Without
 // a bound, one stalled reader parked the completion in `await drain` forever and held the only completion slot.
 const SSE_CLIENT_WRITE_TIMEOUT_MS = 30000;
@@ -127,6 +133,35 @@ let MAX_CONCURRENCY = readLimit('OPENCODE_PROXY_MAX_CONCURRENCY', { min: 1, max:
 // clients it does not trust. Resolved again by startProxy() so a value in config.json takes effect too.
 const DEFAULT_MAX_BODY_MB = 50;
 let MAX_BODY_MB = readLimit('OPENCODE_PROXY_MAX_BODY_MB', { min: 1, max: 200, fallback: DEFAULT_MAX_BODY_MB }).value;
+
+// A parsed body costs several times its wire size in heap: every message becomes an object and every content part
+// becomes an entry in the array `buildPromptParts()` builds from it (measured end to end: a 20 MiB body of 1.7 M tiny
+// messages held 237 MB while the completion was in flight, about 12x). `MAX_BODY_MB` bounds the bytes, so these two
+// bounds are what stop a small body from becoming a large object graph. Both sit far above any real conversation - a
+// 10 000-turn chat is already around 1 MB of prompt text - and both are refused as a 400, the shape every other
+// unusable field gets, because dropping the extra entries would answer a question the client did not ask.
+const MAX_MESSAGES_PER_REQUEST = 10000;
+const MAX_CONTENT_PARTS_PER_MESSAGE = 10000;
+
+// The assistant's answer is held twice while it streams (the collector's text and the copy the deltas were filtered
+// into), so an answer costs about 8x its own size in RSS - a 64 MiB answer measured 572 MB peak. Nothing bounds what
+// a backend may write, so both buffers stop growing at this many characters. The cap is a *prefix* cap, which is what
+// keeps the streaming logic correct: every comparison on this path is a startsWith() against one of these prefixes, so
+// a capped copy is still a prefix of the same answer and the remainder is still the text the client is missing. Only
+// the non-streaming answer is cut, and only past 16 M characters - roughly four million tokens.
+const MAX_ANSWER_CHARS = 16 * 1024 * 1024;
+
+// Appends `chunk` to a growing answer without passing MAX_ANSWER_CHARS. The result is always a *prefix* of the full
+// answer, which is the only property the streaming code relies on: every comparison against these buffers is a
+// `startsWith()` (does the text the backend just polled extend what the SSE frames already delivered), so a capped copy
+// still answers it correctly - the remainder sent is simply the part the client is still missing. The one visible effect
+// is a non-streaming answer longer than the cap being cut, which needs roughly four million tokens of output.
+const appendCapped = (current, chunk) => {
+    if (!chunk) return current;
+    const room = MAX_ANSWER_CHARS - current.length;
+    if (room <= 0) return current;
+    return room >= chunk.length ? current + chunk : current + chunk.slice(0, room);
+};
 
 let activeTasks = 0;
 
@@ -850,7 +885,14 @@ function createApp(config) {
         routerOptions: { ignoreTrailingSlash: true, onBadUrl: badUrlHandler },
         trustProxy: false,
         // Replaces Fastify's default handler for requests the HTTP parser rejects (see clientErrorHandler)
-        clientErrorHandler
+        clientErrorHandler,
+        // A request with no `Host` header is rejected by Node's own parser before Fastify sees it, and that answer was
+        // the one rejection that did not look like the others: a bare `400` with no OpenAI envelope, no CORS headers, no
+        // `X-Request-Id` and no log line, while every other parse error got all four. Letting the request reach the
+        // router makes it an ordinary request - `/v1/models` is refused by the auth hook, an unknown path by the 404
+        // envelope, and both are logged like everything else. Node >= 24 honours the option; older runtimes ignore an
+        // unknown `createServer` option, so their behaviour is unchanged.
+        serverFactory: (handler) => http.createServer({ requireHostHeader: false }, handler)
     });
 
     // Fastify parses `application/json` (and `text/plain` as an opaque string the handler reads as JSON), but a body
@@ -1452,7 +1494,16 @@ function createApp(config) {
     const SNAPSHOT_EDGE_CHARS = 32;
     const snapshotDelta = (previous, text) => {
         if (!previous) return text;
-        if (text.length <= previous.length) return text === previous ? '' : text;
+        if (text.length <= previous.length) {
+            if (text === previous) return '';
+            // A snapshot that is a *prefix* of what was already delivered is a truncated view of text the client has:
+            // the dropped tail cannot be retracted, so forwarding it appended the answer a second time (a backend that
+            // rewrote `alpha beta gamma` to `alpha beta` made the stream read `alpha beta gammaalpha beta`, while the
+            // same completion without `stream` answered `alpha beta`). A rewrite that is not a prefix is still
+            // forwarded - there is no way to correct an already-written delta, and dropping it would lose text.
+            if (previous.startsWith(text)) return '';
+            return text;
+        }
         const edge = Math.min(previous.length, SNAPSHOT_EDGE_CHARS);
         const tailAt = previous.length - edge;
         if (text.startsWith(previous.slice(0, edge)) && text.startsWith(previous.slice(tailAt), tailAt)) {
@@ -1698,23 +1749,27 @@ function createApp(config) {
             // The streaming collector (`typeof part.text === 'string'`) and the request parser (`… .text must be a
             // string`) already refuse that shape; this was the one reader that did not.
             if (typeof part.text !== 'string' || part.text === '') continue;
-            if (part.type === 'text') content += part.text;
-            else if (part.type === 'reasoning') reasoning += part.text;
+            if (part.type === 'text') content = appendCapped(content, part.text);
+            else if (part.type === 'reasoning') reasoning = appendCapped(reasoning, part.text);
         }
         return { content, reasoning };
     }
 
     /**
-     * A provider failure as one client-facing sentence: the provider's name and its own text, masked and bounded.
+     * A provider failure as one client-facing sentence: the provider's own text, masked and bounded.
      *
      * Both answer modes end with this sentence - the 502 body, the in-band error frame, the log line - because it is
      * provider-controlled text that routinely quotes the credential it rejected. One helper keeps the two modes from
      * disagreeing about the same payload (they did: the streaming path masked it, the non-streaming one did not).
+     *
+     * The sentence is the provider's text alone. It used to be prefixed with `error.name`, which is a value the
+     * **wire** chose (`@opencode/client` copies the backend's error name onto the error it throws), so a backend could
+     * put anything in a public message - and the same string differed between the two modes, because the non-streaming
+     * path did not use this helper at all. A 5xx message must never carry an internal exception class name; this is the
+     * provider's sentence, and nothing else.
      */
-    const describeProviderFailure = (error) => {
-        const detail = clientFacingText(error?.data?.message || error?.message) || 'Unknown error';
-        return `${error?.name || 'OpenCodeError'}: ${detail}`;
-    };
+    const describeProviderFailure = (error) =>
+        clientFacingText(error?.data?.message || error?.message) || PROVIDER_FAILURE_FALLBACK;
 
     /**
      * The assistant message `client.session.prompt` already returned, when the provider is done writing it.
@@ -2052,7 +2107,31 @@ function createApp(config) {
         // again is over: the answer is append-only and the totals below are keyed by the same string, so a part
         // dropped here simply loses its snapshot bookkeeping and is re-based if it reappears.
         const MAX_PART_KEYS = 64;
+        // The `partTexts`/`partTotals` key for each part, built the first time the part is seen instead of once per
+        // delta: it is a template over the backend-controlled `assistantMessageID` and the part ordinal, and the same
+        // string was rebuilt for every delta of every part (about 16 ns/delta of the streaming loop). Two slots per
+        // part, because a text part and a reasoning part of the same assistant message can share an ordinal - the
+        // snapshot keys differ by their first character, and this map is keyed by `partKey` alone.
+        const partKeysByKind = new Map();
+        const partKeyOrderForCache = [];
         const partKeyOrder = [];
+        // The `partTexts`/`partTotals` key for one part, built once per part (see `partKeysByKind`). Bounded by the
+        // same MAX_PART_KEYS rule as the maps themselves: a part that has not been seen for a long answer is dropped
+        // and simply rebuilt if it reappears.
+        const partSnapshotKey = (partKey, isReasoning) => {
+            let byKind = partKeysByKind.get(partKey);
+            if (!byKind) {
+                if (partKeysByKind.size >= MAX_PART_KEYS) {
+                    partKeysByKind.delete(partKeyOrderForCache.shift());
+                }
+                byKind = {};
+                partKeysByKind.set(partKey, byKind);
+                partKeyOrderForCache.push(partKey);
+            }
+            const kind = isReasoning ? 'r' : 't';
+            if (byKind[kind] === undefined) byKind[kind] = kind + partKey;
+            return byKind[kind];
+        };
         const notePartKey = (key) => {
             // Both maps are keyed by this string, so both are bounded here: `partTotals` used to grow one permanent
             // entry per delta for a backend that varies the part id (`assistantMessageID` is backend-controlled text),
@@ -2233,7 +2312,7 @@ function createApp(config) {
                             const delta = typeof data.delta === 'string' ? data.delta : '';
                             if (!delta) continue;
                             receivedDelta = true;
-                            const snapshotKey = `${isReasoning ? 'r' : 't'}${partKey}`;
+                            let snapshotKey = partSnapshotKey(partKey, isReasoning);
                             const held = partTotals.get(snapshotKey);
                             const running = (held ? held.total : '') + delta;
                             if (held && held.slot && held.slot.text === held.total && isLiveSnapshot(snapshotKey, held.slot)) {
@@ -2257,10 +2336,10 @@ function createApp(config) {
                                 }
                                 partTotals.set(snapshotKey, { total: running, slot });
                             }
-                            // The returned increment is deliberately ignored: the delta is already the increment, and it
-                            // is what the timers and `deltaChars` below count. Recording it keeps the base current so the
-                            // closing event diffs to nothing.
-                            recordPartSnapshot(snapshotKey, running);
+                            // No `recordPartSnapshot()` here: both branches above leave `partTexts` holding an entry whose
+                            // text is `running` (the fast path writes the slot it validated, the slow path records and
+                            // finds it), which is all the closing event needs to diff to nothing. The second call this
+                            // replaced re-walked the same list with the same text and returned the same empty increment.
                             // Nulled here as well as on the budget path: the timer has fired by the time a delta
                             // arrives (it is cleared here), so every later delta cleared an already-dead handle
                             if (firstDeltaTimer) {
@@ -2279,10 +2358,10 @@ function createApp(config) {
                                 }
                             }
                             if (isReasoning) {
-                                reasoning += delta;
+                                reasoning = appendCapped(reasoning, delta);
                                 if (onDelta) await onDelta(delta, true);
                             } else {
-                                content += delta;
+                                content = appendCapped(content, delta);
                                 if (onDelta) await onDelta(delta, false);
                             }
                             deltaChars += delta.length;
@@ -2306,10 +2385,10 @@ function createApp(config) {
                             scheduleIdleTimer();
                             if (!firstDeltaAt) firstDeltaAt = Date.now();
                             if (isReasoning) {
-                                reasoning += delta;
+                                reasoning = appendCapped(reasoning, delta);
                                 if (onDelta) await onDelta(delta, true);
                             } else {
-                                content += delta;
+                                content = appendCapped(content, delta);
                                 if (onDelta) await onDelta(delta, false);
                             }
                             deltaChars += delta.length;
@@ -2587,6 +2666,20 @@ function createApp(config) {
                     if (messages.length === 0) {
                         return reply.code(400).send({ error: { message: 'messages must contain at least one message', type: 'invalid_request_error' } });
                     }
+                    // The body limit bounds *bytes*, not objects. A request made of millions of tiny messages parses
+                    // into millions of objects, and `buildPromptParts()` builds a second array from them, so a 20 MiB
+                    // body measured 237 MB of heap while the completion was in flight - the "50 MB body" in the queue
+                    // comment is a wire figure, and this is the object graph behind it. Refused rather than truncated:
+                    // dropping entries would answer a question the client did not send. The cap is far above any real
+                    // conversation (10 000 turns is already around 1 MB of prompt text).
+                    if (messages.length > MAX_MESSAGES_PER_REQUEST) {
+                        return reply.code(400).send({
+                            error: {
+                                message: `messages must not contain more than ${MAX_MESSAGES_PER_REQUEST} entries, found ${messages.length}`,
+                                type: 'invalid_request_error'
+                            }
+                        });
+                    }
                     if (typeof model !== 'undefined' && typeof model !== 'string') {
                         return reply.code(400).send({ error: { message: 'model must be a string', type: 'invalid_request_error' } });
                     }
@@ -2665,6 +2758,11 @@ function createApp(config) {
                     const normalizeMessageContent = (content) => {
                         if (typeof content === 'string') return { text: content };
                         if (Array.isArray(content)) {
+                            // The same object-graph bound as the messages array, one level down: a single message whose
+                            // `content` is a million tiny parts costs a million objects plus a million `parts` entries.
+                            if (content.length > MAX_CONTENT_PARTS_PER_MESSAGE) {
+                                return { text: '', unsupported: { tooManyParts: content.length } };
+                            }
                             let text = '';
                             for (let i = 0; i < content.length; i += 1) {
                                 const part = content[i];
@@ -2754,7 +2852,8 @@ function createApp(config) {
                                     type: parsed.unsupported.type,
                                     field: parsed.unsupported.field,
                                     required: parsed.unsupported.required,
-                                    found: parsed.unsupported.found
+                                    found: parsed.unsupported.found,
+                                    tooManyParts: parsed.unsupported.tooManyParts
                                 };
                             }
                             const content = parsed.text;
@@ -2841,7 +2940,9 @@ function createApp(config) {
                         // message for all three used to call a `text` part unsupported - naming the only part type the
                         // gateway does forward - and dropped a scalar part in silence, so the request ended at
                         // "messages must include at least one non-system text message" instead.
-                        const message = unsupported.field
+                        const message = unsupported.tooManyParts
+                            ? `${at} must not contain more than ${MAX_CONTENT_PARTS_PER_MESSAGE} parts, found ${unsupported.tooManyParts}`
+                            : unsupported.field
                             ? unsupported.required
                                 ? `${at}.${unsupported.field} is required for a text part`
                                 : `${at}.${unsupported.field} must be a string, found ${unsupported.found}`
@@ -3179,9 +3280,9 @@ function createApp(config) {
                             const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
                             if (!filtered) return;
                             if (isReasoning) {
-                                streamedReasoning += filtered;
+                                streamedReasoning = appendCapped(streamedReasoning, filtered);
                             } else {
-                                streamedContent += filtered;
+                                streamedContent = appendCapped(streamedContent, filtered);
                             }
                             await writeFrame(`${frameHead()}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(filtered)}${chunkTail}`);
                             sseChunkCount++;
@@ -3193,9 +3294,9 @@ function createApp(config) {
                         const sendReleasedDelta = async (delta, isReasoning = false) => {
                             if (!delta || clientGone) return;
                             if (isReasoning) {
-                                streamedReasoning += delta;
+                                streamedReasoning = appendCapped(streamedReasoning, delta);
                             } else {
-                                streamedContent += delta;
+                                streamedContent = appendCapped(streamedContent, delta);
                             }
                             await writeFrame(`${frameHead()}${isReasoning ? 'reasoning_content' : 'content'}":${JSON.stringify(delta)}${chunkTail}`);
                             sseChunkCount++;
@@ -3428,10 +3529,11 @@ function createApp(config) {
                             reply.code(502).send({
                                 error: {
                                     // The provider's own text, masked and bounded like every other upstream reason: a
-                                    // provider error routinely quotes the credential it rejected, and the streaming
-                                    // path already ran this through clientFacingText(), so the two modes disagreed
-                                    // about the same payload in size and in masking.
-                                    message: clientFacingText(error.data?.message || error.message) || 'OpenCode provider error',
+                                    // provider error routinely quotes the credential it rejected. The sentence comes from
+                                    // the same helper the streaming path uses (`describeProviderFailure()`), so one
+                                    // failed completion reads the same whatever the client asked for - the two paths used
+                                    // to build it by hand and disagreed about the words.
+                                    message: describeProviderFailure(error),
                                     type: 'server_error',
                                     // The same three stable values the outer handler maps to (see below), not
                                     // `error.name`: this catch runs for a provider that answered before the first frame,
@@ -3627,6 +3729,12 @@ function createApp(config) {
             const timedOut = typeof error?.message === 'string' && error.message.includes('Request timeout');
             if (timedOut) {
                 logger.warn('[Proxy] Completion timed out:', { message: error.message });
+            } else if (error?.gatewayShuttingDown) {
+                // A refusal the gateway chose to send because SIGINT/SIGTERM arrived: the request is answered `503` with
+                // a `Retry-After`, the same class of lifecycle signal as the queue's `503`. It used to fall through to
+                // the line below, so every rolling restart printed an ERROR record with a stack trace for a request that
+                // was correctly refused - and an ERROR is what alerting pages on.
+                logger.warn('[Proxy] Request refused during shutdown:', { message: handlerMessage });
             } else {
                 logger.error('[Proxy] Request Handler Error:', { message: handlerMessage, stack: maskFreeText(error?.stack, MAX_LOGGED_STACK_CHARS) });
             }
@@ -4164,8 +4272,16 @@ async function ensureBackend(config, options = {}) {
             };
 
             // Backend listen address: OPENCODE_BIND_HOST (default 127.0.0.1; set to 0.0.0.0 inside Docker so port 4097
-            // can be exposed)
-            const bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
+            // can be exposed). The value is an argument of the child, which `useShell` above may hand to a shell as one
+            // concatenated command line: only a host literal is passed through, and anything else falls back to loopback
+            // with a note naming it - the safe direction, because a value the gateway cannot quote must never widen the
+            // bind the operator asked for. (`0.0.0.0 & curl …` ran the second command as this process's user.)
+            let bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
+            if (!isUsableBindHost(bindHost)) {
+                logger.warn(`[Config] OPENCODE_BIND_HOST='${loggableConfigValue(bindHost)}' is not a usable bind address ` +
+                    '(a host name, an IPv4 address or an IPv6 literal); using 127.0.0.1 instead');
+                bindHost = '127.0.0.1';
+            }
             logger.info(`[Proxy] Starting OpenCode backend: --port ${loggableConfigValue(port)} --hostname ${loggableConfigValue(bindHost)}`);
             state.process = spawn(spawnTarget, ['serve', '--port', port, '--hostname', bindHost], spawnOptions);
 

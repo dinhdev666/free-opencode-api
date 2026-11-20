@@ -45,3 +45,13 @@ export const handlerFailureMessage = (error) => {
     const raw = typeof error?.message === 'string' ? error.message : String(error);
     return clientFacingText(raw) || raw;
 };
+
+/**
+ * The sentence a provider failure shows a client when the provider gave no text of its own.
+ *
+ * One constant for both answer modes: the streaming path and the non-streaming one each had their own fallback
+ * (`Unknown error`, `OpenCode provider error`), so the same failed completion read differently depending on whether the
+ * client asked for a stream.
+ * @type {string}
+ */
+export const PROVIDER_FAILURE_FALLBACK = 'the model provider returned an error';

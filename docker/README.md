@@ -61,6 +61,12 @@ The service is then reachable at `http://<your-ip>:8083`.
 > container's default isolation. `DISABLE_TOOLS=true` (the image default) denies every tool action that can execute
 > something or write a file (`edit`, `shell`, `write`, `grep`, `webfetch`, `task`…); the two read-only ones `read` and
 > `glob` stay allowed, because denying either of them makes the backend hang on a free zen model (see **Fix 1** below).
+>
+> The container's defaults combine that built-in key with `BIND_HOST=0.0.0.0` (every interface inside the container, so
+> a published port reaches it), so a **first boot** that uses both writes one `[entrypoint] WARNING` line to
+> `docker logs` naming the port and the fix. The defaults are unchanged — a different one would break every existing
+> `docker run` — and the line is a warning, not a refusal: set `-e API_KEY=…` and publish the port only on a trusted
+> network.
 
 ---
 

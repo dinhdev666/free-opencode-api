@@ -1458,7 +1458,16 @@ function createApp(config) {
     const SNAPSHOT_EDGE_CHARS = 32;
     const snapshotDelta = (previous, text) => {
         if (!previous) return text;
-        if (text.length <= previous.length) return text === previous ? '' : text;
+        if (text.length <= previous.length) {
+            if (text === previous) return '';
+            // A snapshot that is a *prefix* of what was already delivered is a truncated view of text the client has:
+            // the dropped tail cannot be retracted, so forwarding it appended the answer a second time (a backend that
+            // rewrote `alpha beta gamma` to `alpha beta` made the stream read `alpha beta gammaalpha beta`, while the
+            // same completion without `stream` answered `alpha beta`). A rewrite that is not a prefix is still
+            // forwarded - there is no way to correct an already-written delta, and dropping it would lose text.
+            if (previous.startsWith(text)) return '';
+            return text;
+        }
         const edge = Math.min(previous.length, SNAPSHOT_EDGE_CHARS);
         const tailAt = previous.length - edge;
         if (text.startsWith(previous.slice(0, edge)) && text.startsWith(previous.slice(tailAt), tailAt)) {

@@ -19,7 +19,7 @@ import {
     loggableUpstreamText, loggableUrl, MAX_ECHOED_VALUE_LENGTH, newCompletionId, requestId, sleep, timeoutMessage,
     urlPath
 } from './text.js';
-import { clientFacingText, handlerFailureMessage } from './errors.js';
+import { clientFacingText, handlerFailureMessage, PROVIDER_FAILURE_FALLBACK } from './errors.js';
 import {
     backendUnavailable, errorCauseChain, isConnectionError, isConnectionRefused, isTimeoutError,
     upstreamErrorStatus, upstreamFailureReason
@@ -1720,16 +1720,20 @@ function createApp(config) {
     }
 
     /**
-     * A provider failure as one client-facing sentence: the provider's name and its own text, masked and bounded.
+     * A provider failure as one client-facing sentence: the provider's own text, masked and bounded.
      *
      * Both answer modes end with this sentence - the 502 body, the in-band error frame, the log line - because it is
      * provider-controlled text that routinely quotes the credential it rejected. One helper keeps the two modes from
      * disagreeing about the same payload (they did: the streaming path masked it, the non-streaming one did not).
+     *
+     * The sentence is the provider's text alone. It used to be prefixed with `error.name`, which is a value the
+     * **wire** chose (`@opencode/client` copies the backend's error name onto the error it throws), so a backend could
+     * put anything in a public message - and the same string differed between the two modes, because the non-streaming
+     * path did not use this helper at all. A 5xx message must never carry an internal exception class name; this is the
+     * provider's sentence, and nothing else.
      */
-    const describeProviderFailure = (error) => {
-        const detail = clientFacingText(error?.data?.message || error?.message) || 'Unknown error';
-        return `${error?.name || 'OpenCodeError'}: ${detail}`;
-    };
+    const describeProviderFailure = (error) =>
+        clientFacingText(error?.data?.message || error?.message) || PROVIDER_FAILURE_FALLBACK;
 
     /**
      * The assistant message `client.session.prompt` already returned, when the provider is done writing it.
@@ -3443,10 +3447,11 @@ function createApp(config) {
                             reply.code(502).send({
                                 error: {
                                     // The provider's own text, masked and bounded like every other upstream reason: a
-                                    // provider error routinely quotes the credential it rejected, and the streaming
-                                    // path already ran this through clientFacingText(), so the two modes disagreed
-                                    // about the same payload in size and in masking.
-                                    message: clientFacingText(error.data?.message || error.message) || 'OpenCode provider error',
+                                    // provider error routinely quotes the credential it rejected. The sentence comes from
+                                    // the same helper the streaming path uses (`describeProviderFailure()`), so one
+                                    // failed completion reads the same whatever the client asked for - the two paths used
+                                    // to build it by hand and disagreed about the words.
+                                    message: describeProviderFailure(error),
                                     type: 'server_error',
                                     // The same three stable values the outer handler maps to (see below), not
                                     // `error.name`: this catch runs for a provider that answered before the first frame,

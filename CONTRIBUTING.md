@@ -23,7 +23,7 @@ purpose is to disable authentication.
 | --- | --- | --- |
 | Node.js | `>=20` (developed on Node 26) | ESM-only project, no build step |
 | pnpm | `>=12` (`packageManager: pnpm@12.18.0`) | use pnpm, never npm, for this repository |
-| OpenCode CLI | **1.x** release | `npm install -g "opencode-ai@1"` (the 2.x `serve` is a different server), or `curl -fsSL https://opencode.ai/install \| bash` followed by `opencode --version`; authenticate with `opencode auth login` |
+| OpenCode CLI | **2.x** release | `npm install -g @opencode/cli` (the newest release), or `curl -fsSL https://opencode.ai/install \| bash` followed by `opencode --version`; authenticate with `opencode auth login` |
 
 ## Local setup
 

@@ -41,8 +41,10 @@
 - **Zero extra infrastructure** — one Node.js process; the OpenCode backend is launched and supervised automatically.
 - **Mandatory authentication** — every request needs `Authorization: Bearer <key>` (the scheme is case-insensitive, and `X-Api-Key: <key>` works as an alias). The default key is `sk-dummy-123`, and authentication cannot be disabled: a blank `API_KEY` simply falls back to that default.
 - **Tool guard** — `DISABLE_TOOLS=true` switches off every OpenCode tool that can execute something or write a file
-  (`bash`, `edit`, `write`, `task`, `webfetch`…). The two read-only tools `read` and `glob` stay enabled on purpose:
-  disabling either of them makes the backend hang on opencode ≥ 1.19, and they can only read.
+  (`edit`, `shell`, `write`, `task`, `webfetch`…). On the 2.x server that is a **permission ruleset** handed to
+  `session.create()`, so a denied tool is refused by the backend itself instead of being a request the model is asked
+  to obey. The two read-only tools `read` and `glob` stay enabled on purpose: denying either of them hangs prompt
+  requests with the free zen models, and they can only read.
 - **The backend never sees the gateway key** — the `opencode serve` child is spawned without `API_KEY` in its
   environment (it authenticates nothing with it), and its throwaway working directory is created with mode `0700`, so
   neither the credential nor the backend's sandbox is exposed to other local users. That is hygiene, not a boundary:
@@ -65,6 +67,50 @@ OpenAI client  ──HTTP──▶  Free OpenCode API (default :8083)  ──▶
 ```
 
 The gateway accepts OpenAI-shaped requests, translates them into OpenCode sessions and prompts, streams the results back as standard SSE chunks or a single JSON body, and hides the lifecycle of the backend process (startup, health checks, teardown). Each completion gets its own session, which is deleted as soon as the answer has been delivered, so the backend does not accumulate history (a completion that `SIGINT`/`SIGTERM` interrupts is deleted by the shutdown sequence before the gateway exits, which matters when the backend is an external one it does not own).
+
+### The OpenCode 2.x backend
+
+The gateway is a client of the 2.x server's own HTTP API, so it is worth knowing what that API looks like when a
+completion succeeds — and when one fails:
+
+- **Every route lives under `/api/...`**: `POST /api/session`, `POST /api/session/{id}/prompt`,
+  `GET /api/session/{id}/message`, `DELETE /api/session/{id}`, `GET /api/model`, `GET /api/provider`,
+  `GET /api/event` (SSE) and `GET /api/info`. A 1.x server has no `/api` route at all, which is what a 404 there means.
+- **Responses are enveloped**: a single resource is `{"data": …}` (sometimes `{"location": …, "data": …}`), a
+  collection is `{"data": […]}`. The gateway reads the envelope, which is how it tells a payload it cannot read from an
+  error body instead of reporting an empty answer.
+- **Authentication is HTTP Basic**, username `opencode`, with the server's own password. When `OPENCODE_SERVER_PASSWORD`
+  is blank (the default) the gateway generates a random password for its own process and hands it to the child it
+  spawns through the same-named environment variable — the variable the server itself reads, which also suppresses its
+  printed `server password …` line, so no secret is ever scraped out of the backend's output. Set it only to drive an
+  *external* 2.x server, and set the same value there; the value is registered as sensitive and masked wherever it is
+  printed (including the container's first-boot config dump), and it is never logged.
+- **The readiness probe asks `GET /api/info` and requires a JSON body** (the first non-whitespace character must be `{`
+  or `[`). 2.x serves the HTML web UI from `GET /` and `/health` with `200`, so the earlier "any 200 is healthy" rule
+  accepted a backend that then answered every API call with `401` or `404`: the probe passed, the child was considered
+  up, and every completion failed.
+- **A prompt answers with the user inbox item, not the answer.** `POST /api/session/{id}/prompt` returns the message it
+  just enqueued; the assistant's answer is written afterwards and read from the SSE event stream, or by polling
+  `GET /api/session/{id}/message?order=asc`. The message list is **newest first** unless `order=asc` is asked for
+  (`cursor` cannot be combined with `order`), and an assistant message is flat —
+  `{id, type:'assistant', content:[{type:'text'|'reasoning'|'tool', text}], finish, rawFinish, time, cost, tokens, error}`
+  — where 1.x nested those fields under `info` and kept the fragments in `parts`.
+- **A delete answers `204` with an empty body**, and a second delete answers
+  `404 {"_tag":"SessionNotFoundError"}`. The gateway treats 404/410 as "already gone", which is what its session
+  cleanup and its shutdown drain both rely on.
+- **Failures are thrown, not resolved.** The 2.x client throws a typed error carrying a `_tag`
+  (`SessionNotFoundError`, `UnauthorizedError`, `InvalidRequestError`, `ConflictError`, …) but **no HTTP status**, so
+  the gateway maps the tag back onto the status the server sent before it reports one; a refused connection surfaces as
+  `ClientError("Transport: fetch failed")` wrapping Node's `fetch` error, with the `ECONNREFUSED` code two `cause`
+  levels down.
+- **The event stream names its events with dots**: `session.text.delta` / `session.reasoning.delta` (each carries a real
+  `delta` increment), `session.text.ended` / `session.reasoning.ended` (each carries the part's full cumulative `text`),
+  `session.step.ended` (`finish`, `rawFinish`), `session.execution.failed` / `session.step.failed` (each carries
+  `error`), `session.idle` and `session.execution.succeeded`. The envelope is `{id, type, data}` and every payload names
+  its `sessionID`, so an event belonging to another session cannot move a completion.
+- **There is no tool-list route and no `tools`/`parts`/`system` field on the prompt.** `DISABLE_TOOLS` is a session
+  `permissions` ruleset passed at session creation (see [Configuration](#configuration)), and the tool-ids cache the
+  1.x gateway kept for its per-tool override map is gone with the route it read.
 
 ---
 
@@ -126,10 +172,12 @@ summary, CORS headers, bearer auth) and no plugin-level middleware chain. Additi
   event subscription and a non-streaming one stops polling at the next tick, so the queue moves on instead of
   holding a slot for an answer nobody will read. A client that stops *reading* without closing is dropped after 30 s
   instead of parking the slot forever, and no single backend call is left without a deadline.
-- **No redundant round trip per completion** — `POST /session/:id/message` already returns the message the provider
-  produced, so when that message is finished the gateway serves it directly instead of asking for it again with
-  `GET /session/:id/message` (one fewer backend call per non-streaming completion, plus the poll interval it used to
-  wait for). A message that is still being written keeps using the poll loop, so a partial answer is never served.
+- **The answer is read where 2.x writes it** — `POST /api/session/{id}/prompt` answers with the *user inbox item* it
+  just enqueued, so the assistant's answer is read from the SSE event stream (streaming mode) or by polling
+  `GET /api/session/{id}/message?order=asc` (non-streaming mode) rather than out of the prompt response. A finished
+  message in the prompt response is still served directly when one arrives — the 1.x shape is recognised on purpose, so
+  a proxy translating the two APIs keeps the round trip it saves — but a 2.x server never spends a call on an answer it
+  already holds, and a message that is still being written keeps the poll loop, so a partial answer is never served.
 
 Local benchmarks, `autocannon`, same machine (Node.js 26, macOS 27 on an Apple M4, loopback), against the
 smoke-test stub (`test/stub-opencode.mjs`). The stub answers in ~1 ms and streams its answer with deliberate 5 ms
@@ -169,7 +217,7 @@ harness at the time; the Fastify rewrite answers ~110,000 req/s on the same endp
 | --- | --- |
 | **Node.js** | 20.0 or newer (required by Fastify 5) |
 | **pnpm** | 12.0 or newer (the project's package manager) |
-| **OpenCode CLI** | A **1.x** release (the SDK the gateway uses, `@opencode-ai/sdk`, drives the 1.x `opencode serve` API), installed and authenticated once (`opencode auth login`) |
+| **OpenCode CLI** | A **2.x** release (the client the gateway uses, `@opencode/client`, drives the 2.x `opencode serve` API), installed and authenticated once (`opencode auth login`) |
 
 Install pnpm if you do not have it yet:
 
@@ -179,23 +227,32 @@ corepack enable pnpm
 npm install -g pnpm
 ```
 
-Install the OpenCode CLI if you do not have it yet — a **1.x** release, which is what the gateway drives:
+Install the OpenCode CLI if you do not have it yet — a **2.x** release, which is what the gateway drives:
 
 ```bash
-# Every platform with npm: pins the 1.x line (the Docker image uses the same pin)
-npm install -g "opencode-ai@1"
+# Every platform with npm: installs the newest published release (2.x today)
+npm install -g @opencode/cli
 
 # Linux / macOS alternative: the install script fetches the newest release, so check what you got
 curl -fsSL https://opencode.ai/install | bash
-opencode --version   # must report 1.x; if it reports 2.x, use the npm command above
+opencode --version   # must report 2.x; if it reports 1.x, use the npm command above
 ```
+
+`npm install -g @opencode/cli` installs whatever is newest — 2.3.2 today, and the version the Docker image pins
+itself. If a later major ever changes the `serve` API, name the line this gateway is written against instead:
+`npm install -g "@opencode/cli@2"`.
 
 > npm appears above only for third-party CLI installation; the project's own dependencies are managed with pnpm.
 
-The 2.x CLI is a different server: its `opencode serve` serves the web UI (and answers `/health` with an HTML page),
-not the session API this gateway calls, so a 2.x binary on `PATH` produces
-`502 … rejected session creation (status 405)` on every completion. Install a 1.x release (for example
-`npm install -g opencode-ai@1`) or point `OPENCODE_PATH` at one.
+2.x is a **different upstream** from the 1.x line, not a newer build of it: 1.x was the npm package `opencode-ai`
+(repository `opencode-ai`), while 2.x is `@opencode/cli` (repository `github.com/anomalyco/opencode`, a native binary).
+The executable is still `opencode`, so `OPENCODE_PATH` and the `PATH` lookup are unchanged.
+
+A 1.x binary is a different server: its `opencode serve` predates the `/api/*` routes this gateway drives (there is no
+`/api` route on it at all), so a 1.x binary on `PATH` makes every completion fail with
+`502 … rejected session creation` while the readiness probe never passes. Install a 2.x release (for example
+`npm install -g @opencode/cli`) or point `OPENCODE_PATH` at one; at startup the gateway reads `opencode --version`
+and warns when the major version is below 2.
 
 ---
 
@@ -250,8 +307,8 @@ gateway knows but whose value has the wrong type stops it with the key named and
 (`[Config] config.json API_KEY must be a string, found a boolean`) instead of being coerced: a boolean `API_KEY` would
 make the literal string `true` the gateway's credential, which every client can guess while the startup summary still
 reports a custom key. The message names the type each key actually takes — a string (`API_KEY`, `BIND_HOST`,
-`OPENCODE_BIND_HOST`, `OPENCODE_SERVER_URL`, `OPENCODE_PATH`, `LOG_LEVEL`) or a number (`PORT` and the
-`OPENCODE_PROXY_*` tuning keys, which are also accepted as a numeric string).
+`OPENCODE_BIND_HOST`, `OPENCODE_SERVER_URL`, `OPENCODE_SERVER_PASSWORD`, `OPENCODE_PATH`, `LOG_LEVEL`) or a number
+(`PORT` and the `OPENCODE_PROXY_*` tuning keys, which are also accepted as a numeric string).
 
 A key the gateway does **not** read is reported and ignored, because a misspelled key used to change nothing at all
 while the gateway ran the default you thought you had replaced:
@@ -268,9 +325,10 @@ while the gateway ran the default you thought you had replaced:
 | `BIND_HOST` | `127.0.0.1` | Gateway bind address; use `0.0.0.0` to expose it on all interfaces |
 | `API_KEY` | `sk-dummy-123` | Bearer token clients must send. Authentication is always on — an empty or blank value falls back to `sk-dummy-123` |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend managed by the gateway; a trailing slash is stripped and a missing scheme is read as `http://` (both are reported in the startup log, *before* the summary, so the `Backend:` line always shows the value the gateway actually uses). Surrounding whitespace is trimmed silently. A credential in the URL (`http://user:secret@host:4097`, a proxy in front of the backend) is sent to the backend as a Basic `Authorization` header — the SDK calls every endpoint through `fetch`, which refuses a URL that carries credentials, so such a URL could not work at all — and it is masked wherever the value is logged or returned (`/health`), including inside an upstream error message |
-| `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend. Keep it on loopback: the backend has no authentication of its own, so publishing it bypasses the gateway's key |
+| `OPENCODE_SERVER_PASSWORD` | *(blank — generate one per process)* | The password the OpenCode 2.x server requires on every `/api/*` route (HTTP Basic, username `opencode`). Left blank, the gateway generates a random password for its own process and passes it to the backend it spawns through the same-named environment variable — the variable the server itself reads, which also suppresses its printed `server password …` line — so a self-hosted backend needs no configuration and no secret is ever scraped out of the backend's output. Set it only to drive an **external** 2.x server, and set the same value there; it is registered as a sensitive value and masked wherever it is printed (including the container's first-boot config dump), and it is never logged |
+| `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend. Keep it on loopback: the 2.x server authenticates its `/api/*` routes with `OPENCODE_SERVER_PASSWORD`, but publishing the port still exposes the backend (and its web UI) outside the gateway, so it bypasses the gateway's key |
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name |
-| `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files. It switches off every tool that can execute something or write a file (`bash`, `edit`, `write`, `task`, `webfetch`…); the two read-only tools `read` and `glob` stay enabled, because disabling either of them makes opencode ≥ 1.19 hang on the prompt. With a custom `API_KEY` and tools enabled, a model-directed tool can read that key from the same host, so startup warns (`[Security]`) and names this switch; `true` is the recommended setting whenever the gateway is exposed. Booleans accept `true`/`false` (JSON) or `1`/`0`, `yes`/`no`, `y`/`n`, `on`/`off` (environment or string); a value none of those match is reported in a `[Config]` warning together with the value actually used (`DISABLE_TOOLS='maybe' is not a boolean …, using false`), for `DISABLE_TOOLS`, `USE_ISOLATED_HOME` and `DEBUG` alike |
+| `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files. On the 2.x server it is a session **permission ruleset** passed at session creation: every action the default agent can use is denied (`edit`, `shell`, `write`, `grep`, `webfetch`, `websearch`, `subagent`, `external_directory`, `question`, `skill`, `task`, `todowrite`, `todoread`, `lsp`, `browser`, `patch`, `multiedit`, `invalid`), then `*` catches an action a newer server grows, and the two read-only tools `read` and `glob` are re-allowed last as the single exception — denying either of them hangs prompt requests with the free zen models. With a custom `API_KEY` and tools enabled, a model-directed tool can read that key from the same host, so startup warns (`[Security]`) and names this switch; `true` is the recommended setting whenever the gateway is exposed. Booleans accept `true`/`false` (JSON) or `1`/`0`, `yes`/`no`, `y`/`n`, `on`/`off` (environment or string); a value none of those match is reported in a `[Config]` warning together with the value actually used (`DISABLE_TOOLS='maybe' is not a boolean …, using false`), for `DISABLE_TOOLS`, `USE_ISOLATED_HOME` and `DEBUG` alike |
 | `USE_ISOLATED_HOME` | `false` | Run the backend with a throwaway `HOME` instead of the real one, so it cannot pick up your machine's OpenCode state. `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`, `TMPDIR`, `TMP` and `TEMP` point inside the same throwaway directory, because the CLI resolves them before `HOME` and an inherited value would otherwise send it back to your real store, config and cache |
 | `DEBUG` | `false` | Switch logging to `debug` **when no explicit `LOG_LEVEL` is set** (an explicit level wins and the switch is ignored with a `[Config]` warning; the environment name for the same switch is `OPENCODE_PROXY_DEBUG`, and `LOG_LEVEL=debug` is the preferred way) |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (case-insensitive) |
@@ -283,6 +341,7 @@ Environment variables:
 | `BIND_HOST` | `BIND_HOST` |
 | `API_KEY` | `API_KEY` |
 | `OPENCODE_SERVER_URL` | `OPENCODE_SERVER_URL` |
+| `OPENCODE_SERVER_PASSWORD` | `OPENCODE_SERVER_PASSWORD` |
 | `OPENCODE_BIND_HOST` | `OPENCODE_BIND_HOST` |
 | `OPENCODE_PATH` | `OPENCODE_PATH` |
 | `DISABLE_TOOLS` | `DISABLE_TOOLS` (`OPENCODE_DISABLE_TOOLS` is still read as an alias, for setups that predate the rename) |
@@ -406,7 +465,7 @@ gateway cannot read, `502` for an upstream/provider failure (streaming requests 
 provider failure that arrives before the first token is an HTTP error, not an empty answer, and a backend that dies
 mid-request is an upstream failure rather than a `500` — the next request starts it again, a backend that refuses
 to create a session reports its status and reason in the message instead of a bare `500`, a backend the gateway cannot
-start at all (a missing CLI, a 2.x release, a port already taken, a restart cooldown after a failed attempt) is the
+start at all (a missing CLI, a 1.x release, a port already taken, a restart cooldown after a failed attempt) is the
 same upstream failure, and a backend that keeps failing while the answer is polled gives up after 5 consecutive
 failures instead of waiting out the whole request budget), `503` in two cases — the completion queue is full
 (`type: "queue_full"`) or the gateway is shutting down (`code: "gateway_shutting_down"`), both with a `Retry-After: 1`
@@ -630,11 +689,12 @@ git push origin v3.0.0
 | `Cannot verify OpenCode installation` | The `opencode` binary is not on `PATH`; install the CLI or set `OPENCODE_PATH` to its absolute path. |
 | `401 Unauthorized` | The request has a missing or mismatched `Authorization: Bearer …` header (the message says which: no key, a wrong `Authorization` header, or a wrong `X-Api-Key` header); send the configured `API_KEY` (default `sk-dummy-123`). |
 | Requests time out | The backend is slow or unavailable; check `/health`, verify `opencode auth login` was completed, and consider raising `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`. |
-| Empty streaming responses | Update the OpenCode CLI; the gateway already handles the SSE event changes in opencode ≥ 1.19. |
+| Empty streaming responses | Check `opencode --version`: the gateway reads the 2.x event stream (`session.text.delta`, `session.step.ended`, …), and a 1.x backend that answers at all speaks a different one. |
 | `503 queue_full` with `Retry-After: 1` | Every completion slot is busy and the wait queue is full (`OPENCODE_PROXY_MAX_QUEUE`, default 64). Retry after the advertised delay, or raise `OPENCODE_PROXY_MAX_CONCURRENCY` — only if the backend tolerates concurrent sessions. |
 | `400 model "…" must be a "provider/model" id` | The `model` value had an empty half (`opencode/` or `/big-pickle`). Send a full id from `/v1/models`, or omit `model` to use `opencode/big-pickle`. |
 | `502 OpenCode backend rejected …` | The backend answered a non-2xx to a gateway call (session creation, prompt, message poll, event stream). The message carries the upstream status and reason; check `opencode --version` and the backend log. |
-| `502 … rejected session creation (status 405)` | The `opencode` on `PATH` is a 2.x release, whose `serve` exposes the web UI instead of the 1.x session API. Install a 1.x version (`npm install -g opencode-ai@1`) or set `OPENCODE_PATH` to one; the gateway logs a warning naming this cause. |
+| `502 … rejected session creation (status 404 or 405)`, or a backend that never becomes ready | The `opencode` on `PATH` is a **1.x** release: its `serve` predates the `/api/*` routes this gateway drives (a 1.x server has no `/api` route at all), so the readiness probe (`GET /api/info`) never passes and every completion answers `502 backend_unreachable`; when something does answer, `POST /api/session` answers 404/405 and the gateway logs a warning naming this cause. Install a 2.x version (`npm install -g @opencode/cli`) or point `OPENCODE_PATH` at one. |
+| `502 … rejected session creation (status 401)` | The backend refused the gateway's credentials. A spawned backend is handed the password the gateway generated (or the one you configured), so this means an **external** 2.x server whose `OPENCODE_SERVER_PASSWORD` differs from the gateway's: set the same value in both. |
 | `502 … Failed to start OpenCode backend …` (`code: "backend_unreachable"`) | The gateway could not start its backend: `OPENCODE_PATH` is wrong, the CLI is not on `PATH`, the backend port (`OPENCODE_BIND_HOST`:`4097`) is taken, or a previous start failed and its cooldown is still running. The message names the cause; `/health` keeps answering `200` throughout, and the next request retries the start. |
 | `503` with `code: "gateway_shutting_down"` | The gateway received `SIGINT`/`SIGTERM` and is finishing the responses it already accepted. Retry after the advertised `Retry-After` (1 s) against a gateway that is up — a load balancer should stop sending new work on the first signal. |
 | Requests fail while a body uploads | The gateway answers `408` when a declared body stops arriving (no bytes for 30 s or the request budget, whichever is shorter). A slow but steady upload is served; a stalled one is closed so it cannot hold a socket without a credential. |

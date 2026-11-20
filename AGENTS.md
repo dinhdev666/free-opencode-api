@@ -41,21 +41,33 @@ These are product decisions, not implementation details. Do not "improve" them w
 4. **English only.** Code, comments, log messages, documentation and commit messages are written in English. The
    copyright holder remains `Phạm Văn Định` (LICENSE, `package.json`, Docker image labels).
 5. **pnpm for project dependencies.** `package.json` pins `packageManager: pnpm@12.18.0`. `npm` appears only for
-   installing the `opencode-ai` CLI, never for this project's dependency tree.
-6. **Two runtime dependencies.** `fastify` and `@opencode-ai/sdk`. Adding one requires a clear, stated reason; the
-   project deliberately avoids helper packages (routing, CORS, logging, body parsing are in-tree or built in).
+   installing the `opencode` CLI — the 2.x line is the separate `@opencode/cli` package (`npm install -g @opencode/cli`,
+   which installs the newest release; the 1.x package was `opencode-ai`), never for this project's dependency tree.
+6. **Two runtime dependencies.** `fastify` and `@opencode/client` (pinned exactly, currently `2.3.2`, which pulls
+   `@opencode/schema` and `@opencode/protocol` at the same version). `@opencode/client` **replaces** the 1.x
+   `@opencode-ai/sdk`: it is the same role — the generated client for the backend's own HTTP API — not a new
+   dependency, so the count stays at two. Two consequences are worth recording rather than rediscovering:
+   - the package describes itself in its own README as a *"Private generation target for clients derived directly from
+     OpenCode's authoritative Effect `HttpApi`"*, and its build regenerates a committed surface
+     (`script/generate.ts`, `bun run check:generated`). Its API can therefore move with an upstream release, so the
+     version is pinned exactly and never widened to a range.
+   - a version bump is a **client-compatibility** question, not a feature one: the routes, the envelope and the thrown
+     error tags are what `src/proxy.js` is written against (see "API contract").
+   Adding another dependency requires a clear, stated reason; the project deliberately avoids helper packages
+   (routing, CORS, logging, body parsing are in-tree or built in).
 
 ## Repository map
 
 | Path | Responsibility |
 | --- | --- |
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved queue limits, via `getQueueLimits()`), calls `startProxy()` and awaits its `ready` promise (a listen failure is reported and exits there, not inside the proxy), wires `SIGINT`/`SIGTERM` shutdown. |
-| `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe). |
+| `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe against `/api/info`), and the `@opencode/client` calls every completion is built from (`session.create` / `prompt` / `message.list` / `remove`, `model.list`, `event.subscribe`). |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. A BOM is tolerated. |
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses) for debug logging. |
+| `src/polyfills.js` | Node 20 shims, imported for its side effect first thing in `src/proxy.js`: `Promise.withResolvers()` is Node 22+, and `@opencode/client`'s SSE subscription calls it unconditionally, so without it every stream silently fell back to polling (one delta per answer). A no-op on a runtime that has the API. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
-| `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (health, providers, sessions, messages, SSE events) used by the smoke suite. |
+| `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (the `/api/*` routes the client drives: info/health, models, sessions, messages, SSE events) used by the smoke suite. |
 | `test/smoke.mjs` | End-to-end contract checks: boots stub and gateway, asserts status codes, envelopes, SSE frames and clean shutdown. |
 | `test/check-syntax.mjs` | Walks the repository and runs `node --check` on every `.js`/`.mjs` file, so a new file is checked without editing a list. |
 | `test/check-commit-messages.mjs` | Applies the CONTRIBUTING.md rules to every commit in a range, and fails when its own type/scope lists and the document's tables disagree. |
@@ -64,8 +76,9 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `README.md` | User-facing documentation: features, configuration, API reference, client examples, performance, troubleshooting. |
 
 Request flow (short version): `index.js` → Fastify hooks → auth → route handler → queue (`lock()`) → validate and
-normalise messages → `ensureBackend()` → `client.session.create()` → prompt + event stream in parallel (streaming) or
-prompt then polling (non-streaming) → OpenAI response → session cleanup.
+normalise messages → `ensureBackend()` → `client.session.create({model, permissions})` → `client.session.prompt()`
+with `client.event.subscribe()` alongside it (streaming) or `client.message.list({order:'asc'})` polling
+(non-streaming) → OpenAI response → `client.session.remove()` session cleanup.
 
 ## Commands
 
@@ -74,7 +87,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, ~440 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 439 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -91,18 +104,20 @@ Releases come from tags, not from a laptop: bump `version` in `package.json`, th
 
 ## Verifying without the OpenCode CLI
 
-`pnpm test` covers the HTTP contract against the stub in `test/stub-opencode.mjs` (health, providers, sessions,
-messages and SSE events, plus a test-only `GET /__sessions` reporting created/deleted/live counts, `lastSystemPrompt`,
-`lastPromptText`, `messagePolls` and `toolIdCalls`). Behaviour is selected by markers in the prompt text - `SLOW`
+`pnpm test` covers the HTTP contract against the stub in `test/stub-opencode.mjs` (the `/api/*` info, model, session,
+message and SSE routes, plus a test-only `GET /__sessions` reporting created/deleted/live counts, `lastSystemPrompt`,
+`lastPromptText`, `lastPermissionRules`, `messagePolls` and `toolIdCalls`). Behaviour is selected by markers in the prompt text - `SLOW`
 (an answer slow enough to abort mid-stream), `STALL` (silence after two deltas), `TOOLTAG` (a tool-call block cut inside
 both of its tags), `FAIL` (a provider error with no content), `ENDONLY` (a finish event carrying only `time.completed`),
 `GROW` (an answer still being written when the prompt returns), `SUICIDE` (the stub SIGKILLs itself after accepting the
 prompt), `PAUSE` (silence longer than the idle timeout), `LONGPAUSE` (silence past the 15 s keep-alive interval, so the stream
 carries a `: keep-alive` comment line; slow by nature, see `SMOKE_SLOW`), `HOLD` (finishes after 400 ms, so a completion stays in
 flight while the backend is killed or the gateway shuts down), `SLOWFINISH` (finishes after 3 s), `TAILTAG` (a last
-delta ending in a tag prefix that never becomes a tag), `REJECTPROMPT` (a 500 for `POST /session/:id/message`),
-`PROMPTDONE` (the prompt response already carries the finished message), `PROMPTTOOLCALLS` (the prompt response carries a
-finished `finish: "tool-calls"` step while the real answer is only stored), `CUTSTREAM` (two cumulative snapshots then
+delta ending in a tag prefix that never becomes a tag), `REJECTPROMPT` (a 400 for the prompt route),
+`PROMPTDONE` and `PROMPTTOOLCALLS` (the prompt response already carries a finished message, or a finished
+`finish: "tool-calls"` step) - both **accepted no-ops** against a 2.x backend, whose prompt answers with the user inbox
+item only: the 1.x shapes are still recognised, so the markers keep their meaning if a release or a translating proxy
+starts answering that way again - `CUTSTREAM` (two cumulative snapshots then
 a dropped event connection), `LAGSTORE` (the stream delivers the whole answer while the stored message keeps only its
 first characters, then the stream is cut), `MULTIPART` (one message whose two text parts send their own cumulative snapshots,
 interleaved), `MULTIPARTNOID` (the same without part ids, so both parts are of type `text`), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `MIXED` (part updates
@@ -111,17 +126,27 @@ carrying both a `delta` and the part's cumulative text, then one closing update 
 block repeated by the answer), `BADPART` (a text part whose `text` is a number, next to a normal part), `REASONONLY`
 (a message carrying reasoning and no text that is never marked finished), `LEAKYFAIL` (a provider error quoting a
 credential-bearing URL behind a long message) and `MANYDELTAS` (a 470-character answer split into ~180 deltas, for the
-idle timer that is re-armed on every one) - and by the variables `STUB_FAIL_SESSION=1` (a 405 for
-`POST /session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 502 whose message quotes a
+idle timer that is re-armed on every one) - and by the variables `STUB_FAIL_SESSION=1` (a 404 for
+`POST /api/session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 400 whose message quotes a
 credential-bearing URL), `STUB_ECHO_AUTH=1` (a 401 quoting the header it refused), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every creation after the n-th goes
 unanswered), `STUB_DROP_CREATE=1` (the session is created and the connection dropped before the answer),
 `STUB_REJECT_DELETES=1` (a `500` for `DELETE /session/:id`, so the session stays), `STUB_HANG_DELETES=1` (a delete that is
-never answered), `STUB_FAIL_TOOL_IDS=1` (a `500` for `GET /experimental/tool/ids`), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
+never answered), `STUB_FAIL_TOOL_IDS=1` (a `500` for the 1.x `GET /experimental/tool/ids`; **accepted as a no-op**, because 2.x has
+no tool-list route and the gateway builds no override map), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
 body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. Session-cleanup
 assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the session (its own
 backend round trip), so one read of `/__sessions` raced it and failed with `live: 1`; wait for `live: 0`.
+
+**An error status the stub can use is a status the generated client declares.** `@opencode/client` throws a typed error
+only for the statuses its routes declare (`POST /api/session` and `.../prompt`: `400`, `401`, `404`) and keeps the
+backend's sentence as the message. Any other status (`405`, `500`, `502`) arrives as a bare `ClientError`
+(`UnexpectedStatus: <code>`) that keeps `cause.status` and **discards the body** - and for `session.create` it keeps
+nothing else at all. So a marker whose point is a *reason* (`STUB_URL_IN_ERROR`, `STUB_BIG_ERROR_BODY`,
+`STUB_FAIL_SESSION`, the `REJECTPROMPT` prompt) answers `400`/`404`, and the checks assert the upstream status that
+marker sends rather than the one that would have been realistic on a 1.x server. A marker whose point is only the
+status (`STUB_REJECT_PERMISSIONS`'s sibling checks, the delete failures) may keep any status.
 
 For exploratory work, start a throwaway stub on a spare port (`STUB_PORT=4405 node test/stub-opencode.mjs`) and point the
 gateway at it:
@@ -160,9 +185,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   routes it to whichever model it serves and never publishes which, so it is the only id worth hardcoding and its entry
   carries just the four OpenAI fields - do not add capabilities, limits or pricing describing a model the gateway
   cannot see.
-  An empty provider list takes the same fallback: an unreadable payload (a changed shape, a version reporting
-  nothing) answers `200 {"providers":[]}`, and `{"data":[]}` is as useless as an error. A non-empty list that yields no
-  model (no `models` map, an empty one) does too: the empty check runs after the extraction.
+  An empty model list takes the same fallback: an unreadable payload (a changed shape, a version reporting nothing)
+  answers `200 {"providers":[]}`, and an empty `data` array out of `client.model.list()` is as useless as an error.
+  A non-empty list that yields no usable entry does too: the empty check runs after the extraction.
 - `GET /v1/models/:modelId` and `GET /v1/models/<id with slashes>` → `200 {id,name,object,owned_by}` from the same
   cache; an id the provider list does not contain is described from the id itself (`provider` = text before `/`,
   default `opencode`) rather than 404, because `/v1/chat/completions` does not restrict the model either — the one
@@ -190,8 +215,9 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   chunk and before `[DONE]`: the OpenAI SDK reads the stream's usage from exactly that frame, and ignoring the option
   left it with no numbers. It is emitted only when the client asks for it — a stream that did not request it
   must not grow an extra frame.
-- **`system` and `developer` messages are the system prompt.** Both roles are folded into the prompt's `system`
-  field (joined with blank lines) and never appear as conversation parts; every other role is labelled
+- **`system` and `developer` messages are the system prompt.** Both roles are joined with blank lines and prepended to
+  the prompt's `text` (2.x has no `system` field — the whole prompt is one text string) and never appear as
+  conversation parts; every other role is labelled
   (`USER: …`, `ASSISTANT: …`) and sent as text. `developer` is OpenAI's newer name for the system role, so a client
   using it must not end up with "DEVELOPER: …" inside the conversation. The stub reports the last system prompt it
   received (`GET /__sessions` → `lastSystemPrompt`) so the suite can assert it.
@@ -283,7 +309,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   (`type: "queue_full"`, the wait queue is full, with `Retry-After: 1` so an OpenAI SDK backs off instead of failing
   the request) or `type: "server_error"` with `code: "gateway_shutting_down"` (also with `Retry-After: 1`, when
   `SIGINT`/`SIGTERM` arrived and the request is not one of the responses being finished), `504` (timeout), `500`
-  (anything else). A backend the gateway cannot start (a missing CLI, a 2.x release, a taken port, a start cooldown) is
+  (anything else). A backend the gateway cannot start (a missing CLI, a 1.x release, a taken port, a start cooldown) is
   the same `502 backend_unreachable` as a backend that died mid-request: the tagged `backendUnavailable()` error is
   what tells the two paths apart, and the message names the start failure. Every error body carries a
   `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name, and its message is
@@ -298,38 +324,52 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   through `loggableError()` - masked, stack bounded (`MAX_LOGGED_STACK_CHARS`).
   A backend that disappears mid-request is an upstream failure (`502`), not a bug (`500`): the client is told the upstream is gone and the next request
   restarts it.
-- A backend that rejects `POST /session` (a version whose API moved, a proxy in front of it, an error body) is an
+- A backend that rejects `POST /api/session` (a version whose API moved, a proxy in front of it, an error body) is an
   upstream failure too: `502` with the upstream status and reason in the message
-  (`OpenCode backend rejected session creation (status 405): …`), not a bare `500`
-  that blames the gateway and explains nothing. The SDK hands back the parsed body as-is, so the extraction handles
-  `{error:{message}}`, `{message}` and a plain string, and never prints `[object Object]`. A `405` on that call also
-  logs a warning naming the likeliest cause — a 2.x `opencode` CLI, whose `serve` is the web UI and answers `/health`
-  with HTML, so the readiness probe passes and every completion fails here. The README's Requirements table states
-  the supported major version for the same reason.
-- A **rejected prompt** is an upstream failure in both modes: the SDK resolves a non-2xx `POST /session/:id/message`
-  with `{ error, response }` instead of throwing, so the tuple is inspected and answered `502` with the upstream status
-  and reason (`OpenCode backend rejected the prompt (status 500): …`). Ignoring it made a rejected prompt look like a
-  slow answer - no assistant message was created, so the gateway polled until its budget ran out and reported `504`. A streaming request keeps streaming only when deltas already reached the client.
-- **A finished message in the prompt response is the answer.** `POST /session/:id/message` returns the message it
-  produced; when it already carries `finish` or `time.completed`, the non-streaming path serves it instead of spending
-  a `GET …/message` round trip (plus a poll interval) on data it holds. A message still being written has no `finish`
-  and keeps the poll loop, so a partial answer is never served.
+  (`OpenCode backend rejected session creation (status 404): …`), not a bare `500`
+  that blames the gateway and explains nothing. The 2.x client **throws** instead of resolving a tuple, so the status
+  comes from `upstreamErrorStatus()` and the reason from the thrown message; the body extraction still handles
+  `{error:{message}}`, `{message}` and a plain string, and never prints `[object Object]`. The session id is read from
+  the envelope (`sessionRes.data.id`) — a call that resolves without one is a failure, because a session whose id
+  nobody can see can never be deleted. A `404`/`405` on that call also logs a warning naming the likeliest cause — a
+  **1.x** `opencode` CLI, whose `serve` has no `/api/*` route at all, so the readiness probe (`GET /api/info`, which
+  requires JSON) never passed for one in the first place. The README's Requirements table states the supported major
+  version for the same reason.
+- A **rejected prompt** is an upstream failure in both modes: the 2.x client **throws** on a non-2xx
+  `POST /api/session/{id}/prompt`, so the rejection reaches the handler's own catch, and `throwIfPromptRejected()`
+  still inspects a resolved `{ error, response }` (a translating proxy, a future client) and answers `502` with the
+  upstream status and reason (`OpenCode backend rejected the prompt (status 500): …`). Ignoring it made a rejected
+  prompt look like a slow answer - no assistant message was created, so the gateway polled until its budget ran out and reported `504`. A streaming request keeps streaming only when deltas already reached the client.
+- **A 2.x prompt does not return the answer.** `POST /api/session/{id}/prompt` answers with the *user inbox item* it
+  just enqueued, so `completedPromptMessage()` returns `null` for every 2.x answer and the answer is read from the
+  event stream (streaming) or by polling `GET /api/session/{id}/message?order=asc` (non-streaming; the list is newest
+  first otherwise, and `cursor` cannot be combined with `order`). The 1.x shape — a finished message inside the prompt
+  response, with `info`/`parts` nested — is still recognised on purpose, so a translating proxy or a release that
+  starts answering that way again keeps the round trip it saves. A message that is still being written has no `finish`
+  and keeps the poll loop either way, so a partial answer is never served.
 - **Only a refused connection is retried.** `session.create` is retried once, after dropping the cached health and
   restarting the backend - but only when the connection was *refused* (`isConnectionRefused()`: `ECONNREFUSED`, also
   through the `AggregateError` Node's `fetch` builds per address), because that proves the request never reached the
-  backend. `fetch failed` and `socket hang up` are what a backend that accepted `POST /session` and then died looks
+  backend. `fetch failed` and `socket hang up` are what a backend that accepted `POST /api/session` and then died looks
   like: retrying those created a second session while the first one kept existing with no id in this process, so
   neither `cleanupSession()` nor the shutdown drain could ever delete it. Those answer `502 backend_unreachable`, the
   documented answer for "the backend disappeared mid-request", and the next request recovers.
-- Every SDK call hands back an error tuple instead of throwing, and every tuple is inspected: `session.create`,
-  `session.prompt`, `session.messages`, `session.delete`, `config.providers`, `tool.ids` and `event.subscribe`.
-  A refused `event.subscribe` carries no stream, so the streaming path falls back to polling and still answers.
-  Reading any of these as "the backend returned nothing" turned a refusal into a missing answer (`tool.ids` was worst:
-  an error tuple cached an empty override map, so `DISABLE_TOOLS` sent no tool switches for the whole
-  cache window). The tool list is read once after the warmup probe (`warmToolOverrides()`, so the first completion does not
-  pay for it) and then served stale-while-revalidate for `TOOL_IDS_CACHE_MS` (5 min) behind one in-flight refresh; a
-  failed refresh **keeps the last known map** and is retried at most once per `TOOL_IDS_FAILURE_TTL_MS` (60 s), because
-  an absent `tools` field means "the backend defaults", i.e. every tool enabled.
+- **Every 2.x client call throws on failure**, and every call site handles the rejection: `session.create`,
+  `session.prompt`, `message.list`, `session.remove`, `model.list` and `event.subscribe`. A thrown error carries a
+  `_tag` (`SessionNotFoundError`, `UnauthorizedError`, `InvalidRequestError`, `ConflictError`, …) but **no HTTP
+  status**, so `upstreamErrorStatus()` maps the tags in `V2_ERROR_TAG_STATUS` back onto the status the server sent
+  (`SessionNotFoundError`/`NotFoundError` 404, `SessionArchivedError` 410, `UnauthorizedError` 401,
+  `InvalidRequestError` 400, `ConflictError` 409, `ServiceUnavailableError` 503). `NotFoundError` is the tag a
+  **404 on `POST /api/session`** carries; the older `LocationNotFoundError` in the same map is a different route's
+  error, so without `NotFoundError` the "this looks like a 1.x CLI" case answered a bare `500` and never reached the
+  warning that names the fix. A refused connection surfaces as
+  `ClientError("Transport: fetch failed")` wrapping Node's `fetch` error, so the `ECONNREFUSED` code sits two `cause`
+  levels down and `isConnectionRefused()` walks the `cause` chain to find it. A refused `event.subscribe` carries no
+  stream, so the streaming path falls back to polling and still answers.
+  Reading a rejection as "the backend returned nothing" turns a refusal into a missing answer: a swallowed
+  `session.prompt` rejection made a rejected prompt look like a slow answer and polled out the whole budget. The 2.x
+  API has **no tool-list route**, so the 1.x tool-ids cache (`warmToolOverrides()`, `TOOL_IDS_CACHE_MS`,
+  `TOOL_IDS_FAILURE_TTL_MS`) and its per-tool override map are gone with the route they were built from.
 - A provider failure is an upstream error in both modes. Non-streaming answers `502`; a streaming request whose
   provider failed before the first frame answers the same `502` envelope (the stream never started), and one that
   fails after frames are on the wire ends with the in-band error frame. It must never be streamed as assistant text:
@@ -496,10 +536,14 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   to forward the stray tag and to swallow everything after an unclosed one - 2 800 of 3 905 fuzzed tag-soup answers
   disagreed with the non-streaming scan.
   `DISABLE_TOOLS` is read
-  from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`. The per-tool override map is
-  built with `setOwnProperty()` for the same reason the masking helpers are: a backend tool id of `__proto__` assigned
-  through `overrides[id] = …` changed the map's prototype instead of adding the switch, so the prompt silently omitted
-  it.
+  from the environment under both its bare name and the legacy `OPENCODE_DISABLE_TOOLS`. On the 2.x server it is a
+  session **permission ruleset** handed to `session.create()` (`toolPermissionRules()`): every action the default agent
+  can use is denied first (`edit`, `shell`, `write`, `grep`, `webfetch`, `websearch`, `subagent`, `external_directory`,
+  `question`, `skill`, `task`, `todowrite`, `todoread`, `lsp`, `browser`, `patch`, `multiedit`, `invalid`), then
+  `deny *` catches an action a newer server grows, and `read` and `glob` are re-allowed **last** as the single
+  exception — denying either of them hung prompt requests with the free zen models. The set lives in constants
+  (`TOOL_DENY_ACTIONS`, `TOOLS_ALLOWED_WHEN_DISABLED`) and the rules go out only when the switch is on; the prompt
+  text still carries `TOOL_GUARD_MESSAGE`, because a permission rule refuses a call the model may still attempt.
 - **Boolean options go through `parseBoolean()`** (exported from `src/proxy.js`), the single parser used by
   `index.js` and `startProxy()`. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off"
   in the container); do not add a third. A value that is present but cannot be read is **named with the
@@ -619,8 +663,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `streamEnded: true` and the streaming path polls for the rest of the answer, appending only what the client does not
   have yet — exactly like the idle-timeout path. Before that it stayed silent until the whole budget ran out and then
   wrote an in-band error, for an answer the backend had finished.
-- **A cumulative part snapshot is diffed against that part, not against the answer.** opencode ≥ 1.19 sends no
-  `delta`: `part.text` is the part's current full text, so the gateway derives the increment. It belongs to the part
+- **A cumulative part snapshot is diffed against that part, not against the answer.** A 2.x `session.text.ended` /
+  `session.reasoning.ended` event carries no `delta`: its `text` is the part's current full text, so the gateway
+  derives the increment (the `*.delta` events carry a real increment and are appended directly). It belongs to the part
   it came from (`partTexts` in `collectFromEvents`): measuring it against the accumulated `content` never matched a
   second part, so a multi-part answer repeated each part once per event (`alpha beta gamma ALPHA BETA GAMMA` arrived
   as `alpha alpha beta alpha beta gamma …`). The compare is also O(1) per event (`snapshotDelta()`: a length check
@@ -642,27 +687,27 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - **A finished message ends the stream, whatever the finish reason.** The collector settles on any non-empty
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.
-- **Every backend call carries a deadline.** `client.session.create`, `client.session.messages`,
-  `client.session.delete`, `client.session.prompt`, `client.config.providers` and `client.tool.ids` are all called
+- **Every backend call carries a deadline.** `client.session.create`, `client.message.list`,
+  `client.session.remove`, `client.session.prompt`, `client.model.list` and `client.event.subscribe` are all called
   with an `AbortSignal` (`backendDeadline()`), and an expired one answers `504` ("did not answer within …ms") instead
   of `500`. The health probe is bounded too, and by a deadline armed **before** the request exists
   (`HEALTH_PROBE_TIMEOUT_MS`, 2 s, `checkHealth()`): `request.setTimeout()` starts its clock only once a socket is
   assigned, so DNS and the TCP handshake were unbounded - and this probe runs on the completion path with the slot
   already taken, so a backend host that drops SYNs (a firewall, a wrong port on a black-holed address) suspended the
-  request for the OS connect timeout (~2 min on Linux) without any of the SDK calls above being involved. Node's `fetch` has no default timeout: a backend that answers `/health` but never `/session` left the
+  request for the OS connect timeout (~2 min on Linux) without any of the SDK calls above being involved. Node's `fetch` has no default timeout: a backend that answers `GET /api/info` but never `POST /api/session` left the
   handler waiting forever, so the client got nothing and the slot was never released - at concurrency 1 that stops the
   gateway. Session cleanup uses its own shorter budget
   (`SESSION_CLEANUP_TIMEOUT_MS`): it runs after the client already has its answer, so it must not hold the slot for
-  the full budget. The metadata calls (`/v1/models`, the tool list) are capped separately
-  (`METADATA_TIMEOUT_CAP_MS`, never above `REQUEST_TIMEOUT_MS`), because they fall back — a listing must get the fallback
+  the full budget. The metadata call (`/v1/models`) is capped separately
+  (`METADATA_TIMEOUT_CAP_MS`, never above `REQUEST_TIMEOUT_MS`), because it falls back — a listing must get the fallback
   quickly, not a completion budget.
 - **A promise that loses a race needs a handler.** `promptWithTimeout` races the prompt against its own timer and the
   losing promise keeps running: a rejection arriving afterwards (the backend dies, the deadline aborts the fetch)
   reached nothing and became an unhandled rejection, which terminates the process: one slow completion could take the
   whole gateway down. Every raced promise gets a `.catch(() => {})`.
 - **Timeouts and fallbacks are behavioural contracts.** The polling fallback, the shortened first-delta wait, the
-  health-probe cache and the start-failure cooldown exist because of real OpenCode protocol quirks (opencode ≥ 1.19
-  event payloads, free zen models). Do not remove them without replacing the behaviour they cover.
+  health-probe cache and the start-failure cooldown exist because of real OpenCode protocol quirks (2.x event
+  payloads, free zen models). Do not remove them without replacing the behaviour they cover.
 - **Signals belong to the entry point.** `index.js` owns `SIGINT`/`SIGTERM`: it closes the HTTP server, lets the
   responses in flight finish (1.5 s grace), stops the backend and exits, with a watchdog so an open SSE stream cannot
   block shutdown. The backend is stopped *after* that grace period, not before it: killing it first turned a
@@ -696,7 +741,8 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   there must be readable — and a credentials directory writable — by uid 1000 (`docker/README.md`); CI asserts the uid
   is not 0. It writes that file through a temporary file and an atomic `rename` (a container killed mid-write must not
   leave a truncated `config.json`, which made every later start exit with "is not valid JSON"), and it keeps
-  `OPENCODE_BIND_HOST` on `127.0.0.1`: publishing 4097 would bypass the gateway's key. The image's `HEALTHCHECK`
+  `OPENCODE_BIND_HOST` on `127.0.0.1`: publishing 4097 would expose the backend's API and web UI outside the gateway,
+  which is the only thing that checks a key. The image's `HEALTHCHECK`
   resolves the port itself (`PORT`, else the stored `config.json`, else 8083) and validates it the way the gateway trims
   it, so `PORT=' 8083'` does not build `http://127.0.0.1: 8083/health`; the digit class is spelled `[0-9]` because a
   `\d` inside the shell-quoted program arrives as a literal backslash and a `d`, which made every port read as invalid
@@ -706,16 +752,16 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   movable ref reappears: `docker-publish.yml` leaves a write-scoped registry token on the runner, so an action resolved
   through a retagged major tag is code nobody froze. The check skips the comment itself (a comment explains the rule in
   those words) and requires the `# vX` marker, so `@v4`, `@main` and a `docker://` image reference all fail.
-- **The image pins the CLI, and the pin is the 1.x line.** `docker/Dockerfile` installs `opencode-ai` with
-  `ARG OPENCODE_VERSION=1.19.5` (the newest 1.x release, matching the bundled `@opencode-ai/sdk`). `latest` now
-  resolves to the 2.x line, whose `opencode serve` serves the web UI — it answers `/health` with HTML (so the readiness
-  probe passes) and `405` for `POST /session` (so every completion failed). Bumping that default means checking the
-  session API still exists.
+- **The image pins the CLI, and the pin is the 2.x line.** `docker/Dockerfile` installs `@opencode/cli` with
+  `ARG OPENCODE_VERSION=2.3.2`, matching the `@opencode/client` version in `package.json`. A 1.x `opencode-ai` release
+  is a different upstream: its `serve` has no `/api/*` route, so the readiness probe (`GET /api/info`) never passes and
+  every completion fails. Bumping that default means checking that the session API and the bundled client still
+  correspond — the image installs one CLI, and the client is what drives it.
 - **The CLI version probe never blocks the start.** `opencode --version` is read with the asynchronous `execFile`
   *after* the server is listening and reported as its own line (or, on failure, as the installation warning): the
   synchronous probe sat in the startup path with a 5 s timeout, so a wrapper script waiting for input delayed the
   bind by the whole timeout and the process reached Ctrl-C without its signal handlers installed - not a
-  graceful shutdown. The 2.x warning it feeds is unchanged, and it now arrives while the gateway is already serving.
+  graceful shutdown. The 1.x warning it feeds is unchanged, and it now arrives while the gateway is already serving.
 - **The backend command survives the shell it runs in.** `opencodeBin` is quoted whenever the spawn uses a shell
   (`C:\Program Files\...opencode.cmd` does not start unquoted, and `;`/`&` in a path would be read as operators);
   paths carrying `"`, `$`, a backtick or a control character are refused instead, because quoting cannot neutralise
@@ -740,19 +786,37 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   spawn `opencode serve` *after* the promise resolved, leaving a running caller with an untracked backend holding the
   port. A pending attempt is waited for (`waitForPendingStart()`, bounded by the largest step it can be inside and the
   teardown budget), and each respawn deletes its predecessor's path from `ownedJailRoots` before replacing it.
+- **The readiness probe asks `GET /api/info` and requires `200` with a JSON body** (`HEALTH_PROBE_PATH`,
+  `isJsonHealthBody()`, `probeBackendOnce()`): 2.x serves the HTML web UI from `GET /` and `/health` with `200`, so the
+  earlier "any 200 is healthy" rule accepted a backend that then answered every API call with `401` or `404` — the probe
+  passed, the child was considered up, and every completion failed. The **status** is checked before the body is
+  classified, because `GET /api/info` answers an unauthenticated request with `401 {"_tag":"UnauthorizedError"}`: the
+  probe used to settle on the first bytes of the body, so a JSON refusal read as a healthy backend and the spawn loop
+  logged `backend ready` for a server whose every route would refuse the SDK's own credential.
+  The probe carries a **list** of credentials (`BACKEND_HEALTH_AUTHORIZATIONS`, server password first, URL userinfo
+  second) because one `Authorization` header can only hold one hop's secret: the server authenticates its own API while a
+  proxy in front authenticates the URL's. Only a `401` moves on to the next candidate — a refused connection, a timeout
+  or an HTML answer means there is no backend to authenticate against, and retrying would double the wait on the path
+  that concludes the backend is gone.
 - **Backend lifecycle changes** must keep these properties: `ensureBackend()` trusts a successful probe for
   `OPENCODE_PROXY_HEALTH_CACHE_MS`, connection failures clear that trust, a spawned process that exits during startup
   aborts the readiness wait, and a failed start triggers a cooldown instead of a retry storm. A backend that is known
   to be healthy but whose trust window has expired is re-probed **in the background** (`refreshBackendHealthInBackground()`,
   at most one probe in flight) and the request proceeds: with the default 2 s window almost every interactive
-  completion arrived after it and paid a `/health` round trip before `session.create`. A backend that died is still recovered by the request that hits it (`session.create` fails on the
+  completion arrived after it and paid a `GET /api/info` round trip before `session.create`. A backend that died is still recovered by the request that hits it (`session.create` fails on the
   connection error, clears `healthyAt` and calls `ensureBackend()` again), a backend that never answered still takes
   the blocking path, and `OPENCODE_PROXY_HEALTH_CACHE_MS=0` keeps its documented "probe on every request" meaning.
 - **The backend child does not inherit the gateway's credentials.** The `opencode serve` spawn deletes `API_KEY`
   (and `OPENCODE_PROXY_DEBUG`) from the environment it passes on, and the version probe does the same: the child runs
   model-directed tools and authenticates nothing with a key that guards only this gateway.
   `OPENCODE_SERVER_URL` goes the same way: it is the gateway's own configuration, and it can carry a credential.
-  Provider credentials the CLI needs live in its own auth store or under their own names, so they stay. The jail
+  Provider credentials the CLI needs live in its own auth store or under their own names, so they stay.
+  The one value deliberately **added** is `OPENCODE_SERVER_PASSWORD`: the 2.x server authenticates every `/api/*` route
+  with HTTP Basic (username `opencode`), so a spawned child with no password would answer `401` to every call.
+  `resolveBackendPassword()` generates a random one per process when the key is blank and passes it through the
+  same-named variable the server itself reads — which also suppresses the `server password …` line it would otherwise
+  print, so no secret has to be scraped out of the backend's output. It is registered as a sensitive value and masked
+  in the container's first-boot dump, and never logged. The jail
   directory (`<tmp>/opencode-proxy-jail/<salt>`, the child's cwd and its whole `HOME` under `USE_ISOLATED_HOME`) is
   created `0700`: on a shared `/tmp` the default `0755` let every other local user list and traverse it, and it is
   removed on every platform (a Windows skip left the directory behind for good).

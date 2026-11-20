@@ -1,7 +1,7 @@
 # Dependency updates in one place: the three ecosystems this project actually pins something in.
 #
 # Nothing here runs code from a dependency at start-up, so an outdated entry is not automatically an incident - but the
-# image packages `opencode-ai` and the runtime carries `fastify` and `@opencode-ai/sdk`, and a security fix in any of
+# image packages `@opencode/cli` and the runtime carries `fastify` and `@opencode/client`, and a security fix in any of
 # them should arrive as a reviewable pull request rather than as a CVE nobody looked at. Dependabot opens one pull
 # request per ecosystem on the schedule below; every one of them goes through the same CI (the smoke suite and the
 # image build), so a bump that breaks the contract is caught before it can be merged.

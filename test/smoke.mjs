@@ -2055,9 +2055,11 @@ async function run() {
         JSON.stringify(growing.json?.choices?.[0]?.message?.content));
 
     // --- a finished message in the prompt response is used as-is -----------------------------------------
-    // The backend answers POST /session/:id/message with the message it produced, so a finished one is the answer and
-    // the follow-up GET is pure overhead. The stub stores nothing for this marker: answering 200 at all proves the
-    // prompt response was used, and the poll counter proves no round trip was spent on it.
+    // A 1.x backend answers `POST /api/session/{id}/prompt` with the message it produced, so a finished one is the answer
+    // and the follow-up GET is pure overhead. 2.x answers with the user inbox item instead, but the gateway still knows
+    // the 1.x shape (a translating proxy, or a release that starts answering that way again), so the fast path stays
+    // covered: the stub keeps producing that shape for this marker. It stores nothing for it, so answering 200 at all
+    // proves the prompt response was used, and the poll counter proves no round trip was spent on it.
     const pollsBeforeFastPath = (await fetch(`${STUB_URL}/__sessions`).then((r) => r.json())).messagePolls;
     const fastPath = await request('/v1/chat/completions', {
         method: 'POST',
@@ -2111,9 +2113,13 @@ async function run() {
     const promptRejectedMs = Date.now() - promptRejectedAt;
     check('a rejected prompt answers 502, not a timeout',
         promptRejected.response.status === 502, `status ${promptRejected.response.status}`);
+    // 400 is the status the stub answers with, because 400/401/404 are the ones the generated 2.x client declares for
+    // this route: it throws a typed `InvalidRequestError` carrying the backend's sentence, while an undeclared status
+    // arrives as a bare `ClientError("UnexpectedStatus: 500")` whose body is discarded - the gateway still answers 502
+    // either way, but only a declared status lets it name the reason.
     check('the rejected prompt reports the upstream status and reason',
         typeof promptRejected.json?.error?.message === 'string' &&
-        promptRejected.json.error.message.includes('status 500') &&
+        promptRejected.json.error.message.includes('status 400') &&
         promptRejected.json.error.message.includes('provider refused the prompt'),
         String(promptRejected.json?.error?.message));
     check('a rejected prompt fails fast instead of waiting for the budget', promptRejectedMs < 5000,
@@ -3332,25 +3338,40 @@ async function run() {
     check('stripping a 1 MB answer of tool-call tags does not stall the gateway',
         spamMs < 4000, `${spamMs} ms`);
 
-    // --- the tool list the switch map is built from ---------------------------------------------------------
-    // With tools disabled the gateway asks the backend for its tool ids and sends one switch per tool. Reading that list
-    // is what makes the map complete: it used to be requested lazily on the first completion, and a failed request was
-    // cached as "the backend has no tools" - so no switches were sent at all and every tool stayed enabled for the
-    // whole cache window while DISABLE_TOOLS was on.
-    // The stub counts the requests, so the "it was read" half is asserted against the gateway that has tools off.
+    // --- the permission ruleset DISABLE_TOOLS sends ---------------------------------------------------------
+    // 2.x has no tool-list route: the switch is a session permission ruleset handed to `session.create`, so what has to be
+    // asserted is the ruleset the backend received, not a round trip the gateway no longer makes. The stub reports it
+    // (`GET /__sessions` -> `lastPermissionRules`) and still counts tool-list calls, which must stay at zero.
     const toolStats = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
-    check('tools disabled: the backend tool list is read for the switch map',
-        Number(toolStats?.toolIdCalls) > 0, `toolIdCalls=${toolStats?.toolIdCalls}`);
+    const permissionRules = Array.isArray(toolStats?.lastPermissionRules) ? toolStats.lastPermissionRules : [];
+    const deniedActions = new Set(
+        permissionRules.filter((rule) => rule?.effect === 'deny').map((rule) => rule?.action)
+    );
+    check('tools disabled: the session carries a ruleset that denies the execution tools',
+        deniedActions.has('shell') && deniedActions.has('write') && deniedActions.has('edit'),
+        JSON.stringify(permissionRules).slice(0, 200));
+    check('tools disabled: the ruleset also denies every action it does not name',
+        deniedActions.has('*'), JSON.stringify(permissionRules).slice(0, 200));
+    // Denying `read` or `glob` is what hung prompt requests with the free zen models, so the allow pair is the single
+    // exception and must be the last word on those two actions.
+    const allowedActions = new Set(
+        permissionRules.filter((rule) => rule?.effect === 'allow').map((rule) => rule?.action)
+    );
+    check('tools disabled: read and glob stay allowed as the single exception',
+        allowedActions.size === 2 && allowedActions.has('read') && allowedActions.has('glob'),
+        JSON.stringify(permissionRules).slice(0, 200));
+    check('tools disabled: no backend tool list is requested (2.x has no such route)',
+        Number(toolStats?.toolIdCalls) === 0, `toolIdCalls=${toolStats?.toolIdCalls}`);
 
-    // The failure half needs a backend that refuses the list. The completion must still answer (the backend defaults
-    // apply), and the reason has to be said once rather than per request - a refusal retried on every completion was one
-    // extra failed round trip each time.
+    // The failure half needs a backend that refuses the ruleset. A 2.x server answers `400 InvalidRequestError` for one it
+    // cannot parse, and that has to reach the client as an upstream failure: a rejection that surfaced as a timeout would
+    // send the reader after a slow model instead of a bad request.
     const failToolStubPort = GATEWAY_PORT + 76;
     const failToolStubUrl = `http://127.0.0.1:${failToolStubPort}`;
-    await assertPortFree(failToolStubPort, 'tool-list stub');
+    await assertPortFree(failToolStubPort, 'permission-ruleset stub');
     const failToolStub = spawn(process.execPath, [path.join(ROOT, 'test', 'stub-opencode.mjs')], {
         cwd: ROOT,
-        env: { ...process.env, STUB_PORT: String(failToolStubPort), STUB_FAIL_TOOL_IDS: '1' }
+        env: { ...process.env, STUB_PORT: String(failToolStubPort), STUB_REJECT_PERMISSIONS: '1' }
     });
     children.push(failToolStub);
     failToolStub.stdout.on('data', () => {});
@@ -3359,7 +3380,7 @@ async function run() {
 
     const failToolPort = GATEWAY_PORT + 77;
     const failToolUrl = `http://127.0.0.1:${failToolPort}`;
-    await assertPortFree(failToolPort, 'tool-list gateway');
+    await assertPortFree(failToolPort, 'permission-ruleset gateway');
     const failToolGateway = spawn(process.execPath, ['index.js'], {
         cwd: ROOT,
         env: {
@@ -3372,9 +3393,8 @@ async function run() {
         }
     });
     children.push(failToolGateway);
-    let failToolOutput = '';
-    failToolGateway.stdout.on('data', (chunk) => { failToolOutput += chunk; });
-    failToolGateway.stderr.on('data', (chunk) => { failToolOutput += chunk; });
+    failToolGateway.stdout.on('data', () => {});
+    failToolGateway.stderr.on('data', () => {});
     await waitForOk(`${failToolUrl}/health`);
 
     const failToolResponses = [];
@@ -3385,13 +3405,9 @@ async function run() {
             body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
         }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) })));
     }
-    check('a tool list the backend refuses still answers every completion',
-        failToolResponses.every((r) => r.status === 200 && r.json?.choices?.[0]?.message?.content === ANSWER),
-        JSON.stringify(failToolResponses.map((r) => r.status)));
-    const failToolLines = failToolOutput.split('\n').filter((line) => line.includes('tool list'));
-    check('a refused tool list is named once, not once per completion',
-        /DISABLE_TOOLS is on but the backend tool list could not be read/.test(failToolOutput) && failToolLines.length === 1,
-        JSON.stringify(failToolLines).slice(0, 240));
+    check('a permissions ruleset the backend refuses is an upstream failure, not a timeout',
+        failToolResponses.every((r) => r.status === 502 && /status 400/.test(r.json?.error?.message || '')),
+        JSON.stringify(failToolResponses.map((r) => [r.status, r.json?.error?.message])).slice(0, 240));
     stopGateway(failToolGateway);
     await waitForExit(failToolGateway);
 
@@ -3591,13 +3607,13 @@ async function run() {
         JSON.stringify(killedAnswer.json?.error)?.slice(0, 160));
 
     // --- a backend the gateway cannot start at all ----------------------------------------------------
-    // The "CLI missing, wrong OPENCODE_PATH, 2.x CLI, port taken, start cooldown" set answered `500 server_error` with
+    // The "CLI missing, wrong OPENCODE_PATH, 1.x CLI, port taken, start cooldown" set answered `500 server_error` with
     // no `code`: that is what this gateway says about its own defect, so a client had no way to tell a retryable
     // upstream failure from a bug in the gateway, and the README's own troubleshooting rows promised a backend problem.
     // A backend URL nothing listens on plus a CLI that exits during startup reaches the start-failure branch. The CLI is
     // a script of our own rather than a missing path: a configured `OPENCODE_PATH` that does not exist falls back to
-    // the PATH search on some setups, and a real 2.x `opencode` there answers `405` for `POST /session` - a different
-    // failure (that one has its own block below).
+    // the PATH search on some setups, and a real `opencode` there may be a 1.x release - a different failure (that one
+    // has its own block below).
     const deadBackendScript = path.join(os.tmpdir(), `free-opencode-api-dead-backend-${process.pid}.sh`);
     fs.writeFileSync(deadBackendScript, ['#!/usr/bin/env node', 'process.exit(1);', ''].join('\n'));
     fs.chmodSync(deadBackendScript, 0o755);
@@ -3690,8 +3706,8 @@ async function run() {
 
     // --- a backend that rejects session creation --------------------------------------------------------
     // An incompatible backend (a version whose API moved, a proxy in front of it) answers /health but refuses
-    // POST /session. That is an upstream failure, so it answers 502 with the upstream status and reason instead of a
-    // bare 500 that blames the gateway and explains nothing.
+    // POST /api/session. That is an upstream failure, so it answers 502 with the upstream status and reason instead of
+    // a bare 500 that blames the gateway and explains nothing.
     const rejectStubPort = GATEWAY_PORT + 13;
     const rejectStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
         cwd: ROOT,
@@ -3726,8 +3742,11 @@ async function run() {
     check('a backend that rejects session creation is an upstream error',
         rejected.status === 502 && rejected.json?.error?.type === 'server_error',
         `status ${rejected.status} ${JSON.stringify(rejected.json)?.slice(0, 160)}`);
+    // The stub answers 404 rather than 405 because 404 is a status the 2.x client declares for this route: the typed
+    // error it throws carries the backend's sentence, while an undeclared 405 is reduced to `UnexpectedStatus: 405` and
+    // the body is dropped. The gateway's warning names a 1.x CLI for both, which is what the marker is really about.
     check('the rejection names the upstream status and reason',
-        /status 405/.test(String(rejected.json?.error?.message)) && /not supported by this build/.test(String(rejected.json?.error?.message)),
+        /status 404/.test(String(rejected.json?.error?.message)) && /not supported by this build/.test(String(rejected.json?.error?.message)),
         JSON.stringify(rejected.json?.error?.message)?.slice(0, 160));
     stopGateway(rejectGateway);
     await waitForExit(rejectGateway);
@@ -4030,10 +4049,10 @@ async function run() {
     check('a refused provider listing falls back to the static model',
         failProvidersList?.data?.length === 1 && failProvidersList.data[0].id === 'opencode/big-pickle',
         JSON.stringify(failProvidersList)?.slice(0, 140));
-    check('a refused provider listing is reported as a refused call, not as an empty one',
-        /rejected the provider listing \(status 500\)/.test(failProvidersOutput) &&
+    check('a refused model listing is reported as a refused call, not as an empty one',
+        /rejected the model listing \(status 500\)/.test(failProvidersOutput) &&
         !/reported no models/.test(failProvidersOutput),
-        JSON.stringify(failProvidersOutput.split('\n').find((line) => line.includes('provider listing')) || '').slice(0, 200));
+        JSON.stringify(failProvidersOutput.split('\n').find((line) => line.includes('model listing')) || '').slice(0, 200));
     // The fallback is deliberately not cached so a recovering backend is picked up, but "not cached" was one backend
     // round trip per listing: a provider answering 500 was asked again for every request in front of it
     const failProvidersUrl = `http://127.0.0.1:${failProvidersStubPort + 1}`;
@@ -4074,12 +4093,12 @@ async function run() {
     const basicStubPort = GATEWAY_PORT + 23;
     const basicStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
         cwd: ROOT,
-        env: { ...process.env, STUB_PORT: String(basicStubPort), STUB_BASIC_AUTH: 'ops:s3cr3t-value' }
+        env: { ...process.env, STUB_PORT: String(basicStubPort), STUB_BASIC_AUTH: 'opencode:s3cr3t-value' }
     });
     children.push(basicStub);
     basicStub.stdout.on('data', () => {});
     basicStub.stderr.on('data', () => {});
-    await waitForOk(`http://127.0.0.1:${basicStubPort}/health`, 2000, { authorization: `Basic ${Buffer.from('ops:s3cr3t-value').toString('base64')}` });
+    await waitForOk(`http://127.0.0.1:${basicStubPort}/health`, 2000, { authorization: `Basic ${Buffer.from('opencode:s3cr3t-value').toString('base64')}` });
     const basicPort = BASIC_GATEWAY_PORT;
     const basicGateway = spawn(process.execPath, ['index.js'], {
         cwd: ROOT,
@@ -4087,7 +4106,11 @@ async function run() {
             ...process.env,
             PORT: String(basicPort),
             BIND_HOST: '127.0.0.1',
-            OPENCODE_SERVER_URL: `http://ops:s3cr3t-value@127.0.0.1:${basicStubPort}`,
+            OPENCODE_SERVER_URL: `http://opencode:s3cr3t-value@127.0.0.1:${basicStubPort}`,
+            // The 2.x server authenticates with its own password, whose Basic user name is fixed (`opencode`). Pinning the
+            // same secret here is what makes the URL credential, the server password and the probe's credential one value -
+            // which is exactly the shape an operator runs: the password is configured once, not once per hop.
+            OPENCODE_SERVER_PASSWORD: 's3cr3t-value',
             LOG_LEVEL: 'info'
         }
     });
@@ -4352,9 +4375,13 @@ async function run() {
     }).then((r) => r.json().then((json) => ({ status: r.status, json })))
         .catch((error) => ({ status: 0, json: { error: error.message } }));
     const failPollMs = Date.now() - failPollStart;
+    // A 500 on `GET /api/session/:id/message` is **not** a status the generated 2.x client declares, so it throws a
+    // `ClientError` with an empty message and the body on `.error` - there is no status on it to report. The reason the
+    // backend gave is, and that is what the sentence has to carry: naming neither left "failed while polling the answer"
+    // with nothing after the colon.
     check('a backend that keeps failing the poll is an upstream error',
         failPolled.status === 502 && failPolled.json?.error?.type === 'server_error' &&
-        /status 500/.test(String(failPolled.json?.error?.message)),
+        /transient poll failure/.test(String(failPolled.json?.error?.message)),
         `status ${failPolled.status} ${JSON.stringify(failPolled.json)?.slice(0, 160)}`);
     check('the failed poll gives up well before the request timeout', failPollMs < 7000, `${failPollMs}ms`);
     const failPollSessions = await sessionsAfterCleanup(`http://127.0.0.1:${failPollStubPort}`);
@@ -4411,16 +4438,17 @@ async function run() {
     stop(oddPollStub);
     await waitForExit(oddPollStub);
 
-    // --- a backend that answers /health but nothing else -------------------------------------------------
-    // A wedged opencode process (health OK, /session silent) used to hang the request handler forever: fetch has no
-    // default timeout, so the promise never settled, the client got no answer at all and the queue slot was never
-    // freed - at the default concurrency of 1 that stops the whole gateway. The wedged backend never answers, so the
-    // request can only end if the gateway itself sets a deadline.
+    // --- a backend that answers the readiness probe but nothing else -------------------------------------------------
+    // A wedged opencode process used to hang the request handler forever: fetch has no default timeout, so the promise
+    // never settled, the client got no answer at all and the queue slot was never freed - at the default concurrency of
+    // 1 that stops the whole gateway. The wedged backend answers the 2.x readiness route (`GET /api/info`, JSON, which
+    // is what `checkHealth()` requires) and nothing else, so the gateway accepts it and every completion can only end
+    // through the gateway's own deadline.
     const wedgedPort = GATEWAY_PORT + 9;
     const wedgedBackend = http.createServer((request, response) => {
-        if (request.url === '/health') {
+        if (request.url === '/api/info') {
             response.writeHead(200, { 'content-type': 'application/json' });
-            response.end('{"status":"ok"}');
+            response.end(JSON.stringify({ version: '2.3.2' }));
             return;
         }
         // Every other path is accepted and never answered

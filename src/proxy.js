@@ -3729,6 +3729,12 @@ function createApp(config) {
             const timedOut = typeof error?.message === 'string' && error.message.includes('Request timeout');
             if (timedOut) {
                 logger.warn('[Proxy] Completion timed out:', { message: error.message });
+            } else if (error?.gatewayShuttingDown) {
+                // A refusal the gateway chose to send because SIGINT/SIGTERM arrived: the request is answered `503` with
+                // a `Retry-After`, the same class of lifecycle signal as the queue's `503`. It used to fall through to
+                // the line below, so every rolling restart printed an ERROR record with a stack trace for a request that
+                // was correctly refused - and an ERROR is what alerting pages on.
+                logger.warn('[Proxy] Request refused during shutdown:', { message: handlerMessage });
             } else {
                 logger.error('[Proxy] Request Handler Error:', { message: handlerMessage, stack: maskFreeText(error?.stack, MAX_LOGGED_STACK_CHARS) });
             }

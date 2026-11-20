@@ -52,8 +52,14 @@ const documentedLists = () => {
     const typesSection = section('Types');
     const scopesSection = section('Scopes');
     if (typesSection === null || scopesSection === null) return null;
-    const types = new Set([...typesSection.matchAll(/^\|\s*`([a-z]+)`\s*\|/gm)].map((m) => m[1]));
-    const scopes = new Set([...scopesSection.matchAll(/`([a-z-]+)`/g)].map((m) => m[1]));
+    // The heading test is not enough on its own: the sections are found by name, and a `### Types` that survived a
+    // heading rename elsewhere while its rows were edited produced an empty set, which made every enforced value a
+    // "difference" or - with both sides empty - passed the mirror check without checking anything. An empty list is a
+    // broken parse, so it is reported as one.
+    const types = new Set([...typesSection.matchAll(/^\|\s*`([a-z][a-z0-9]*)`\s*\|/gm)].map((m) => m[1]));
+    const scopes = new Set([...scopesSection.matchAll(/`([a-z][a-z0-9-]*)`/g)].map((m) => m[1]));
+    // Digits and upper case are legal in a name this project may grow (`websearch2`, `OpenCode`): excluding them made
+    // the checker silently ignore a commit that used such a value instead of rejecting it.
     return { types, scopes };
 };
 
@@ -69,9 +75,17 @@ const assertMirrors = () => {
         console.error(`[commits] cannot read CONTRIBUTING.md (${String(error.message).split('\n')[0]}); skipping the mirror check`);
         return;
     }
-    if (!documented) {
+    // A missing section is the same class of problem as an empty one: `documentedLists()` finds the tables by heading,
+    // so a heading rename elsewhere - or a reworded `### Scopes` - is what makes them disappear. Renaming one silently
+    // skipped the mirror check, so the document and this script could disagree with nothing failing.
+    if (documented === null) {
         console.error('[commits] CONTRIBUTING.md has no "### Types" / "### Scopes" section; skipping the mirror check');
         return;
+    }
+    if (documented.types.size === 0 || documented.scopes.size === 0) {
+        console.error('[commits] CONTRIBUTING.md "### Types" / "### Scopes" parsed to an empty list; the table rows were not found');
+        console.error('[commits] each type is a `code` first cell in the Types table, each scope a `code` in the Scopes section');
+        process.exit(1);
     }
     const differences = [];
     for (const [label, documentedSet, enforcedSet] of [
@@ -115,7 +129,10 @@ const subjectProblems = (subject) => {
     }
     if (subject.endsWith('.')) problems.push('the subject ends with a period');
 
-    const match = /^([a-z]+)(?:\(([^)]*)\))?(!)?: (.+)$/.exec(subject);
+    // Same character rule as the documented lists: a type containing a digit or an upper-case letter is not
+    // recognised here, and an unrecognised type used to fall through to "no prefix" - a message that said the writer
+    // had no type at all when they had written one the document does not list.
+    const match = /^([a-z][a-z0-9]*)(?:\(([^)]*)\))?(!)?: (.+)$/.exec(subject);
     if (!match) {
         // Named apart because they are fixed differently: a missing prefix is a reword, while a GitHub merge title is
         // avoided by merging with an explicit subject

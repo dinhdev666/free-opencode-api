@@ -8,6 +8,7 @@ import {
     normalizeBindHost,
     resolveOpencodePath,
     loggableConfigValue,
+    isShellUnsafePath,
     readFlag
 } from './src/proxy.js';
 import { readConfigFile, envOrFile, findUnknownKeys } from './src/config.js';
@@ -268,6 +269,16 @@ function probeOpencodeVersion(binPath) {
         // verified and a 2.x release - the one case this check exists for - was never named. Quoted for the same reason
         // `spawnBackend()` quotes it: a shell splits `C:\Program Files\...` on the space.
         const needsShell = process.platform === 'win32' || /\.(cmd|bat)$/i.test(binPath);
+        // The same refuse-list `spawnBackend()` applies before it hands a path to a shell, and for the same reason:
+        // `execFile` joins `[file, ...args]` with spaces when `shell: true`, so quoting protects a space and nothing
+        // else - `x" ; id ; echo "` ends the quoted run and the rest is parsed as more commands. Without this the probe
+        // was outside the documented guarantee while presenting the identical shell surface, and it runs at every
+        // start, before the gateway listens. The refusal becomes the existing "cannot verify the installation"
+        // warning through reportOpencodeVersion(), so no new behaviour is introduced.
+        if (needsShell && isShellUnsafePath(binPath)) {
+            resolve({ error: new Error(`OPENCODE_PATH cannot be passed through a shell: ${loggableConfigValue(binPath)}`) });
+            return;
+        }
         execFile(needsShell ? `"${binPath}"` : binPath, ['--version'], {
             timeout: 5000,
             encoding: 'utf8',

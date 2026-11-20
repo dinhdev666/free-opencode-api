@@ -14,34 +14,50 @@ import {
     logger, loggableError, maskBackendUrl, maskDetail, maskFreeText, maskHeaders, maskUrlCredentials, maskUrlQuery,
     MAX_LOGGED_STACK_CHARS, registerSensitiveValue, setOwnProperty
 } from './logger.js';
+import {
+    CONTROL_CHARS_RE, echoedValue, generatedRequestId, jsonTypeName, loggableConfigValue, loggableModelId,
+    loggableUpstreamText, loggableUrl, MAX_ECHOED_VALUE_LENGTH, newCompletionId, requestId, sleep, timeoutMessage,
+    urlPath
+} from './text.js';
+import { clientFacingText, handlerFailureMessage } from './errors.js';
+import {
+    backendUnavailable, errorCauseChain, isConnectionError, isConnectionRefused, isTimeoutError,
+    upstreamErrorStatus, upstreamFailureReason
+} from './upstream.js';
+import { closeSocketAfterFlush } from './socket.js';
+import { normalizeBackendUrl, normalizeBindHost, isLoopbackHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
+import { DEFAULT_API_KEY, resolveApiKey } from './api-key.js';
+import { backendAuthorizationHeader, resolveBackendAuth, resolveBackendPassword } from './backend-auth.js';
+import {
+    backendDeadline, DEFAULT_REQUEST_TIMEOUT_MS, isUnusableMilliseconds, MAX_TIMER_MS, METADATA_TIMEOUT_CAP_MS,
+    readLimit, readMilliseconds, resolveRequestTimeoutMs
+} from './settings.js';
+import { parseBoolean, readFlag } from './options.js';
 
+// The gateway's public surface stays `src/proxy.js`: the entry point, the smoke suite and an embedder import these names
+// from here, so a helper moving into its own module does not move for a caller.
+export { DEFAULT_API_KEY, resolveApiKey } from './api-key.js';
+export { backendAuthorizationHeader, resolveBackendAuth, resolveBackendPassword } from './backend-auth.js';
+export { clientFacingText, handlerFailureMessage } from './errors.js';
+export { normalizeBackendUrl, normalizeBindHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
+export { parseBoolean, readFlag } from './options.js';
+export { DEFAULT_REQUEST_TIMEOUT_MS, resolveRequestTimeoutMs } from './settings.js';
+export { echoedValue, jsonTypeName, loggableConfigValue, loggableModelId, loggableUpstreamText, loggableUrl,
+    newCompletionId, timeoutMessage } from './text.js';
+export {
+    backendUnavailable, errorCauseChain, isConnectionError, isConnectionRefused, isTimeoutError,
+    upstreamErrorStatus, upstreamFailureReason
+} from './upstream.js';
 
 // --- Mutex Logic with Timeout ---
 const queue = [];
 
 const STARTUP_WAIT_ITERATIONS = 60;
-const STARTUP_WAIT_INTERVAL_MS = 2000;
 // The delays between the readiness probes of a child that is still binding: short at first (a backend that answers in
 // 100 ms must not wait a full interval), then the documented interval. The iteration budget is unchanged.
 const STARTUP_BACKOFF_MS = [100, 250, 500, 1000, 2000];
 const STARTING_WAIT_ITERATIONS = 120;
 const STARTING_WAIT_INTERVAL_MS = 1000;
-const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
-// The largest delay `setTimeout` (and `AbortSignal.timeout`, which arms one internally) accepts. A millisecond value
-// above it does not wait longer: Node warns `TimeoutOverflowWarning` and fires the timer after 1 ms, so every completion
-// answered `504` in ~13 ms with a budget the operator believed was in force. Values are clamped rather than dropped, so
-// "as long as possible" stays expressible.
-const MAX_TIMER_MS = 2 ** 31 - 1;
-/**
- * The message for a phase that ran into its deadline.
- * `remainingBudget()` floors what is left at 1 ms so a timer never gets 0 or a negative value, and interpolating that
- * floor into the message told a client and the log that a 1 500 ms request budget had timed out "after 1ms": an
- * operator reading `docker logs` could not tell a 1.5 s timeout from a 300 s one. A phase that is handed the floor was
- * given nothing to wait with, so the message says that instead of reporting the floor as if it were the budget.
- */
-export const timeoutMessage = (timeoutMs) => (timeoutMs <= 1
-    ? 'Request timeout: the request budget was used up'
-    : `Request timeout after ${timeoutMs}ms`);
 // Deleting the OpenCode session that a completion created is cleanup: it must finish quickly or not at all, because the
 // client already has its answer and a wedged delete would otherwise hold a queue slot for the full request budget.
 const SESSION_CLEANUP_TIMEOUT_MS = 10000;
@@ -77,69 +93,10 @@ const BODY_DRAIN_TIMEOUT_MS = 5000;
 // The effective deadline is bounded by the request budget (see createApp): receiving a body is part of receiving the
 // request, so no phase may outlive the budget the operator configured.
 const BODY_RECEIVE_TIMEOUT_MS = 30000;
-// How long a written response may take to leave before its socket is destroyed. `socket.destroy()` discards buffered
-// writes, so a response that is written and then destroyed in the same tick can be lost entirely.
-const SOCKET_CLOSE_TIMEOUT_MS = 250;
 // After the idle timeout the gateway polls for the rest of the answer; this is how many identical polls (a full idle
 // window worth) that recovery tolerates before it accepts a message the backend never marks finished.
 const IDLE_RECOVERY_STALL_POLLS = Math.max(3, Math.ceil(DEFAULT_EVENT_IDLE_TIMEOUT_MS / DEFAULT_POLL_INTERVAL_MS));
 
-// Two completions that reach this counter in the same millisecond used to receive the same
-// `chatcmpl-<epoch>` id (a client that keys its messages by id merged two answers); the counter keeps ids distinct
-// without a random source, and the millisecond stamp keeps them roughly sortable.
-let completionIdSeq = 0;
-const newCompletionId = () => `chatcmpl-${Date.now().toString(36)}${String(completionIdSeq++).padStart(3, '0')}`;
-
-// `socket.destroy()` throws away whatever is still buffered in userland, so a response that is written and then
-// destroyed in the same tick can be lost: the client sees a reset instead of the envelope. `end()` flushes and closes,
-// and the fallback timer only destroys a socket whose close never completes (a peer that stopped reading).
-const closeSocketAfterFlush = (socket) => {
-    if (!socket || socket.destroyed) return;
-    // The parser sees the body of this request end in the middle of what the client announced (the gateway hung up on
-    // purpose), raises HPE_INVALID_EOF_STATE and hands it to `clientErrorHandler`, which logged a warn line reading
-    // "the client sent garbage" and wrote a `400` nobody would read on top of the answer that had just gone out. The
-    // flag is what tells the two causes apart: this socket was closed by the gateway, not by a broken peer.
-    socket.gatewayClosed = true;
-    if (socket.writableEnded) {
-        // Everything was already handed to the kernel by an earlier end(): there is nothing left to flush, and the
-        // socket has to go now because the client is still sending a body that will never be read.
-        socket.destroy();
-        return;
-    }
-    const forceClose = () => {
-        if (!socket.destroyed) socket.destroy();
-    };
-    const timer = setTimeout(forceClose, SOCKET_CLOSE_TIMEOUT_MS);
-    timer.unref();
-    socket.once('close', () => clearTimeout(timer));
-    try {
-        socket.end();
-    } catch (error) {
-        forceClose();
-    }
-};
-
-// The client's own trace id, when it sent one that can be copied into a header and a log line: a short printable token
-// only, because the value reaches both. Module scope because the two handlers that answer a request the router or the
-// parser rejected - they run before any Fastify hook, and one of them is handed the raw request - echo it too: a client
-// that sets its own trace id must find the same id in the response and in the gateway's log line, on every path.
-const CLIENT_REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
-const requestId = (request) => {
-    const raw = request?.headers?.['x-request-id'];
-    if (typeof raw !== 'string') return null;
-    const trimmed = raw.trim();
-    return CLIENT_REQUEST_ID_RE.test(trimmed) ? trimmed : null;
-};
-// A generated id for the refusals that answer before routing (a parse error, a URL that cannot be decoded): those
-// paths log a `warn` line a client cannot otherwise connect to its response.
-const generatedRequestId = () => `gw-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-
-// One log line is one record. A client-controlled value carrying a newline would be read as a *second* record (a
-// forged request summary, a fake `[Security]` or `[Shutdown]` line), an ANSI escape would reach the operator's
-// terminal and the log shipper, and an unbounded value would turn one request body into an arbitrarily large log
-// record - a 2 MB model id produced a 2 MB info line. The values are normalised for logging only; the backend still
-// receives the id verbatim, because the contract does not restrict model ids.
-const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
 // Fastify refuses a JSON body carrying `__proto__` or `constructor` before any handler runs, and the refusal reaches the
 // client as `FST_ERR_CTP_INVALID_JSON_BODY` - the code a syntax error produces too, so the sentence has to name both
 // causes. One copy: the mapping in the route handler's catch and the text-body guard below answer identically, because a
@@ -147,458 +104,16 @@ const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
 const FORBIDDEN_BODY_MESSAGE = 'request body is not valid JSON, or it carries a forbidden property name '
     + '(__proto__, constructor); send Content-Type: application/json';
 const FORBIDDEN_BODY_KEYS = new Set(['__proto__', 'constructor']);
-const MAX_LOGGED_MODEL_LENGTH = 128;
-const MAX_LOGGED_URL_LENGTH = 512;
-const loggableModelId = (id) => {
-    // The bound is applied *before* the replace: the regex is per character, so the output is identical, and a client
-    // value at the 50 MiB body limit is no longer transformed in full (measured 3.9 ms for 5 MiB) just to keep 128
-    // characters of it.
-    const raw = String(id);
-    const clean = (raw.length > MAX_LOGGED_MODEL_LENGTH ? raw.slice(0, MAX_LOGGED_MODEL_LENGTH) : raw)
-        .replace(CONTROL_CHARS_RE, '?');
-    return raw.length > MAX_LOGGED_MODEL_LENGTH ? `${clean}…` : clean;
-};
-// The same treatment for the request URL, which every log site used to copy raw: credential query values are masked
-// (`?api_key=…` is an OpenAI-compatible convention some clients still send) and an unbounded URL is cut, because the
-// URL is client input bounded only by the HTTP parser's header limit.
-// A URL can carry credentials in its userinfo as well, which `maskUrlQuery()` does not touch: an HTTP client may send
-// an **absolute-form** request target (`GET http://user:secret@host:4097/v1/models HTTP/1.1`), Node hands that target
-// over verbatim, and the string reaches a log line and a 404 body. The chain is the same one `maskFreeText()` uses.
-const loggableUrl = (url) => {
-    const masked = maskUrlCredentials(maskUrlQuery(url));
-    return masked.length > MAX_LOGGED_URL_LENGTH
-        ? `${masked.slice(0, MAX_LOGGED_URL_LENGTH)}…[truncated ${masked.length - MAX_LOGGED_URL_LENGTH} chars]`
-        : masked;
-};
-
-// The request target without its query string, which the access log and the 404 body want. `url.split('?')[0]`
-// allocated an array plus a second string on every request - including the ones that carry no query at all - where an
-// index scan answers the same value with no allocation in the common `no '?'` case.
-const urlPath = (url) => {
-    const query = url.indexOf('?');
-    return query === -1 ? url : url.slice(0, query);
-};
-
-
-// Upstream text on its way to a client or a log line: masked and bounded. Module scope because the top-level error
-// handler writes 5xx sentences too, and those are written by whatever threw.
-//
-// A backend (or a proxy in front of it) can quote a URL inside an error payload, and a configured backend URL may
-// carry a credential - Node's `fetch` answered `Request cannot be constructed from a URL that includes
-// credentials: http://user:secret@host:4097/session`, which reached the client-facing 502 body and this process's
-// log verbatim. A proxy can also echo the `Authorization: Basic …` header it refused, which is the credential the
-// gateway lifted out of `OPENCODE_SERVER_URL` and sent as a header.
-//
-// The chain itself lives in `src/logger.js` (`maskFreeText()`), because the same sentence is written to a response
-// body *and* to a log line, and a second copy of it here is how the two drifted apart: the 500 body was masked while
-// the `stack` field of the same log record printed it verbatim.
-/**
- * @param {*} value any text (non-strings become '')
- * @returns {string} the masked, bounded text
- */
-export const clientFacingText = (value) => {
-    if (typeof value !== 'string' || value === '') return '';
-    // The by-value removal of the gateway's own backend credential lives in `maskFreeText()` now
-    // (`registerSensitiveValue()`): the log-side chain needed the same rule, and a second copy here is how the two
-    // would drift - the body was masked while the `stack` field of the same record printed the token.
-    return maskFreeText(value);
-};
-
-/**
- * The sentence a failed completion shows a client and logs, read from whatever the route handler caught.
- *
- * `error.message` is the usual shape, but the handler can also be rejected with something else - a thrown string, an
- * object without a `message`, a library that throws `undefined` - and reading `.message` off that put `undefined` in
- * the body of a `500`. Masked by `clientFacingText()` when there is anything to mask, and otherwise kept exactly as it
- * arrived: an empty message stays empty instead of becoming the word `Error`, which would invent a cause.
- * @param {*} error whatever was thrown or rejected with
- * @returns {string} the sentence to send and log
- */
-export const handlerFailureMessage = (error) => {
-    const raw = typeof error?.message === 'string' ? error.message : String(error);
-    return clientFacingText(raw) || raw;
-};
-
-// A client-supplied value on its way into a response body, under one rule.
-//
-// The `415` media-type message already replaced control characters and cut the echoed type; the other sites copied the
-// value through verbatim, so a 4,000-character content-part type produced a 4,000-character error body, and a value
-// carrying a newline put a second line into a body the client reads as one record. The marker matches
-// `loggableUrl()`, so a truncated value reads the same wherever it appears.
 // The endpoints a client that hit the wrong path is looking for, in one place: the 404 message names them and the
 // smoke suite asserts the message carries this exact list. Each entry carries its method, because the same request
 // reaches this handler when the path is right and the method is not (`PUT /v1/chat/completions`), and a list without
 // methods answered that case with the path it had just declared missing.
 const SERVED_ROUTES = 'POST /v1/chat/completions, GET /v1/models and GET /health';
-const MAX_ECHOED_VALUE_LENGTH = 64;
 // A message role becomes the `USER:`/`ASSISTANT:` label a model reads, so it is bounded like every other client value
 // that reaches the prompt: the known roles are short, and anything longer is a label nobody wrote.
 const MAX_ROLE_LABEL_LENGTH = 32;
-const echoedValue = (value) => {
-    // Bound first, transform second (see `loggableModelId()`): the replace runs on at most 64 characters of a value a
-    // client can send 50 MiB of, and the output is unchanged because the regex is per character.
-    const raw = String(value);
-    const clean = (raw.length > MAX_ECHOED_VALUE_LENGTH ? raw.slice(0, MAX_ECHOED_VALUE_LENGTH) : raw)
-        .replace(CONTROL_CHARS_RE, '?');
-    return raw.length > MAX_ECHOED_VALUE_LENGTH
-        ? `${clean}…[truncated ${raw.length - MAX_ECHOED_VALUE_LENGTH} chars]`
-        : clean;
-};
-
-// An operator-supplied value on its way into a log line, under the rule `loggableModelId()` applies to client input.
-//
-// `config.json` and the environment are text a script can write, so a value carrying a newline starts a second log
-// record the gateway never wrote - the same forgery class as a model id, and these lines quote the value so the
-// operator can see what was in force (a path typo, a misspelled level). The value is kept; it just stays on one line
-// and bounded.
-const MAX_LOGGED_CONFIG_LENGTH = 128;
-export const loggableConfigValue = (value) => {
-    const clean = String(value).replace(CONTROL_CHARS_RE, '?');
-    return clean.length > MAX_LOGGED_CONFIG_LENGTH
-        ? `${clean.slice(0, MAX_LOGGED_CONFIG_LENGTH)}…[truncated ${clean.length - MAX_LOGGED_CONFIG_LENGTH} chars]`
-        : clean;
-};
-
-// Text from the OS or from upstream on its way into a log *message*, rather than into a detail object.
-//
-// A detail is serialised with `JSON.stringify()`, so a newline inside it is escaped and stays on one line. A value
-// interpolated into the message is not: `Failed to spawn OpenCode: ${err.message}` puts an OS message there, and that
-// message quotes `OPENCODE_PATH`, which `config.json`/the environment can spell with a line break - so one spawn error
-// could write a record the gateway never wrote (`[gateway] … [ERROR] …` of the attacker's choosing) into `docker logs`.
-// Same rule as `loggableConfigValue()`, applied to text this process did not compose.
-const MAX_LOGGED_UPSTREAM_LENGTH = 256;
-const loggableUpstreamText = (value) => {
-    const raw = typeof value === 'string' ? value : String(value);
-    const clean = (raw.length > MAX_LOGGED_UPSTREAM_LENGTH ? raw.slice(0, MAX_LOGGED_UPSTREAM_LENGTH) : raw)
-        .replace(CONTROL_CHARS_RE, '?');
-    return raw.length > MAX_LOGGED_UPSTREAM_LENGTH
-        ? `${clean}…[truncated ${raw.length - MAX_LOGGED_UPSTREAM_LENGTH} chars]`
-        : clean;
-};
-
-/**
- * The type of a value from a request body as a word, for an error message that names what arrived. `Array.isArray`
- * comes first because `typeof []` is 'object': the reader of "found an object" would be told the field they sent is
- * the wrong kind of object without ever learning what it actually was.
- */
-function jsonTypeName(value) {
-    if (value === null) return 'null';
-    if (Array.isArray(value)) return 'an array';
-    const type = typeof value;
-    if (type === 'object') return 'an object';
-    if (type === 'number') return 'a number';
-    if (type === 'boolean') return 'a boolean';
-    if (type === 'string') return 'a string';
-    return type;
-}
-
-// Authentication is mandatory by design: when API_KEY is missing or blank the gateway falls back to this
-// built-in key instead of running without authentication.
-export const DEFAULT_API_KEY = 'sk-dummy-123';
-
-export const resolveApiKey = (value) => {
-    const key = value === undefined || value === null ? '' : String(value).trim();
-    return key || DEFAULT_API_KEY;
-};
-
-/**
- * Boolean option parsing shared by the entry point and startProxy, so the two cannot disagree about what
- * `DISABLE_TOOLS=yes` means. A number is read as a switch only when it is exactly `1` or `0` (`2` is not "on", it is
- * unreadable); an unrecognised value returns the fallback instead of being coerced.
- */
-// The accepted spellings, module scope so a call does not rebuild them: `parseBoolean()` runs several times per
-// completion (a request body's `stream`, `stream_options.include_usage`, and the read that validates each one).
-const TRUE_SPELLINGS = ['1', 'true', 'yes', 'y', 'on'];
-const FALSE_SPELLINGS = ['0', 'false', 'no', 'n', 'off'];
-
-export function parseBoolean(value, fallback = undefined) {
-    if (typeof value === 'boolean') return value;
-    // A number is a switch only when it is exactly 1 or 0. Returning `value === 1` for every number made `2`, `-1` and
-    // `1.5` mean `false` instead of "unreadable", so the rule the string branch follows (report it, or refuse the field)
-    // depended on the JSON type a client or a config file happened to use: `{"stream": 2}` was served as JSON for a
-    // client parsing SSE, and a numeric `DISABLE_TOOLS: 2` in config.json left the tool filter off with no warning.
-    if (typeof value === 'number') {
-        if (value === 1) return true;
-        if (value === 0) return false;
-        return fallback;
-    }
-    if (typeof value === 'string') {
-        // The longest accepted spelling is five characters, so a value over 64 characters is rejected before it is
-        // trimmed or lowercased: a request body is bounded by `OPENCODE_PROXY_MAX_BODY_MB`, and `{"stream": "aaaa…"}`
-        // (50 MiB) was copied and lowercased twice per completion - 10 ms per call on the single serving thread, ~100 MB
-        // of garbage - to answer a question the length already answers. `readableFlag()` in the handler calls this once
-        // to validate and once to read, so the cost was paid twice per field.
-        const trimmed = value.length > 64 ? '' : value.trim();
-        if (!trimmed) return fallback;
-        const normalized = trimmed.toLowerCase();
-        if (TRUE_SPELLINGS.includes(normalized)) return true;
-        if (FALSE_SPELLINGS.includes(normalized)) return false;
-    }
-    return fallback;
-}
-
-/**
- * A boolean option read from the environment or `config.json`, with the rule the numeric tuning keys follow: a value
- * that is present but cannot be read is named together with the value actually used, instead of falling back in
- * silence. `DISABLE_TOOLS: "maybe"` (or `OPENCODE_PROXY_DEBUG=ture`) used to leave the feature off while the operator
- * believed it was on - and for DISABLE_TOOLS that means the model's `<function_calls>` markup reaches the client,
- * which is exactly what the switch exists to hide. `parseBoolean()` stays the single parser; this only reports.
- */
-export function readFlag(label, value, fallback) {
-    const parsed = parseBoolean(value, undefined);
-    if (parsed !== undefined) return parsed;
-    if (value === undefined || value === null) return fallback;
-    const shown = String(value).trim();
-    if (shown === '') return fallback;
-    // The value is operator input and the line is one log record: control characters out, length bounded
-    logger.warn(
-        `[Config] ${label}='${loggableConfigValue(shown)}' is not a boolean ` +
-        `(use true/false, yes/no, on/off or 1/0), using ${fallback}`
-    );
-    return fallback;
-}
 
 const OPENCODE_BASENAME = 'opencode';
-
-function splitPathEnv() {
-    const raw = process.env.PATH || '';
-    return raw.split(path.delimiter).filter(Boolean);
-}
-
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function pushDir(list, dir) {
-    if (!dir) return;
-    if (!list.includes(dir)) list.push(dir);
-}
-
-function pushExistingDir(list, dir) {
-    if (!dir) return;
-    if (!fs.existsSync(dir)) return;
-    if (!list.includes(dir)) list.push(dir);
-}
-
-function addVersionedDirs(list, baseDir, subpath) {
-    if (!baseDir || !fs.existsSync(baseDir)) return;
-    let entries = [];
-    try {
-        entries = fs.readdirSync(baseDir, { withFileTypes: true });
-    } catch (e) {
-        return;
-    }
-    entries.forEach((entry) => {
-        if (!entry.isDirectory()) return;
-        const full = path.join(baseDir, entry.name, subpath || '');
-        pushExistingDir(list, full);
-    });
-}
-
-function prefixToBin(prefix) {
-    if (!prefix) return null;
-    return process.platform === 'win32' ? prefix : path.join(prefix, 'bin');
-}
-
-function getOpencodeCandidateNames() {
-    if (process.platform === 'win32') {
-        return [`${OPENCODE_BASENAME}.cmd`, `${OPENCODE_BASENAME}.exe`, `${OPENCODE_BASENAME}.bat`, OPENCODE_BASENAME];
-    }
-    return [OPENCODE_BASENAME];
-}
-
-function findExecutableInDirs(dirs, names) {
-    for (const dir of dirs) {
-        for (const name of names) {
-            const full = path.join(dir, name);
-            if (fs.existsSync(full)) {
-                return full;
-            }
-        }
-    }
-    return null;
-}
-
-/**
- * Resolves `OPENCODE_PATH` to the binary `spawnBackend()` will run (PATH, PATHEXT candidates, npm prefixes).
- *
- * Exported so the entry point's version probe asks the same question: probing the configured value answered "cannot
- * verify the installation" for a backend that had resolved perfectly well elsewhere, and the 2.x warning that names a
- * wrong major version never ran.
- */
-// Resolving the value walks PATH and every known install location (`readdirSync` over the nvm/asdf/fnm trees), and it
-// runs twice per start: the entry point's version probe asks, then the spawn asks. That printed the same "does not
-// exist" warning twice and scanned twice, on a spawn that can also be retried. The answer is memoised per requested
-// value for a minute - long enough to collapse one start and a restart loop, short enough that an installation made
-// while the gateway is running is picked up without restarting it.
-const RESOLVE_CACHE_TTL_MS = 60 * 1000;
-let resolveCache = null;
-
-export function resolveOpencodePath(requestedPath) {
-    const input = (requestedPath || '').trim();
-    const now = Date.now();
-    if (resolveCache && resolveCache.input === input && now - resolveCache.at < RESOLVE_CACHE_TTL_MS) {
-        return resolveCache.value;
-    }
-    const value = searchOpencodePath(input);
-    resolveCache = { input, at: now, value };
-    return value;
-}
-
-function searchOpencodePath(input) {
-    const names = getOpencodeCandidateNames();
-
-    if (input) {
-        const looksLikePath = path.isAbsolute(input) || input.includes('/') || input.includes('\\');
-        if (looksLikePath) {
-            if (fs.existsSync(input)) return { path: input, source: 'config' };
-            const resolved = path.resolve(process.cwd(), input);
-            if (fs.existsSync(resolved)) return { path: resolved, source: 'config' };
-            // A configured path that does not exist is almost always a typo or a moved installation. Say so: the
-            // PATH search below would otherwise hide it behind a binary the operator did not choose
-            logger.warn(`[Proxy] OPENCODE_PATH '${loggableConfigValue(input)}' does not exist; using the OpenCode found on PATH instead`);
-        }
-    }
-
-    const pathDirs = splitPathEnv();
-    const fromPath = findExecutableInDirs(pathDirs, names);
-    if (fromPath) return { path: fromPath, source: 'PATH' };
-
-    const extraDirs = [];
-    if (process.env.OPENCODE_HOME) {
-        pushDir(extraDirs, path.join(process.env.OPENCODE_HOME, 'bin'));
-    }
-    if (process.env.OPENCODE_DIR) {
-        pushDir(extraDirs, path.join(process.env.OPENCODE_DIR, 'bin'));
-    }
-    pushDir(extraDirs, prefixToBin(process.env.npm_config_prefix || process.env.NPM_CONFIG_PREFIX));
-    pushDir(extraDirs, process.env.PNPM_HOME);
-    if (process.env.YARN_GLOBAL_FOLDER) {
-        pushDir(extraDirs, path.join(process.env.YARN_GLOBAL_FOLDER, 'bin'));
-    }
-    if (process.env.VOLTA_HOME) {
-        pushDir(extraDirs, path.join(process.env.VOLTA_HOME, 'bin'));
-    }
-    pushDir(extraDirs, process.env.NVM_BIN);
-    pushDir(extraDirs, path.dirname(process.execPath));
-
-    const home = os.homedir();
-    if (home) {
-        pushDir(extraDirs, path.join(home, '.opencode', 'bin'));
-        pushDir(extraDirs, path.join(home, '.local', 'bin'));
-        pushDir(extraDirs, path.join(home, '.npm-global', 'bin'));
-        pushDir(extraDirs, path.join(home, '.npm', 'bin'));
-        pushDir(extraDirs, path.join(home, '.pnpm-global', 'bin'));
-        pushDir(extraDirs, path.join(home, '.local', 'share', 'pnpm'));
-        pushDir(extraDirs, path.join(home, '.fnm', 'node-versions', 'v1', 'installations'));
-        pushDir(extraDirs, path.join(home, '.asdf', 'shims'));
-    }
-
-    if (process.platform === 'win32') {
-        pushDir(extraDirs, process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : null);
-        pushDir(extraDirs, process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'pnpm') : null);
-        pushDir(extraDirs, process.env.NVM_HOME);
-        pushDir(extraDirs, process.env.NVM_SYMLINK);
-        pushDir(extraDirs, process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'nodejs') : null);
-        pushDir(extraDirs, process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], 'nodejs') : null);
-    } else {
-        pushDir(extraDirs, '/usr/local/bin');
-        pushDir(extraDirs, '/usr/bin');
-        pushDir(extraDirs, '/bin');
-        pushDir(extraDirs, '/opt/homebrew/bin');
-        pushDir(extraDirs, '/snap/bin');
-    }
-
-    // nvm (unix) versions
-    const nvmDir = process.env.NVM_DIR || (home ? path.join(home, '.nvm') : null);
-    if (nvmDir) {
-        addVersionedDirs(extraDirs, path.join(nvmDir, 'versions', 'node'), 'bin');
-    }
-
-    // asdf nodejs installs
-    const asdfDir = process.env.ASDF_DATA_DIR || (home ? path.join(home, '.asdf') : null);
-    if (asdfDir) {
-        addVersionedDirs(extraDirs, path.join(asdfDir, 'installs', 'nodejs'), 'bin');
-    }
-
-    // fnm installs
-    if (home) {
-        addVersionedDirs(extraDirs, path.join(home, '.fnm', 'node-versions', 'v1'), 'installation' + path.sep + 'bin');
-    }
-
-    const fromExtras = findExecutableInDirs(extraDirs, names);
-    if (fromExtras) return { path: fromExtras, source: 'known-locations' };
-
-    return { path: null, source: 'not-found' };
-}
-
-// A backend URL that ends in a slash makes every SDK call a path with a double slash (`//session`), which an
-// OpenCode server answers with 404: the gateway then looks like it cannot start its backend at all. Normalising the
-// value once at startup is cheaper than wondering why nothing works. Exported so the entry point can normalise before
-// it prints the startup summary: the summary is where an operator copies the value from, and it used to show the raw
-// form - a trailing slash or a trailing space the gateway never used - right beside a note saying it was corrected.
-/**
- * A bind address is handed to `net` verbatim, and surrounding whitespace is not a host: a unit file, a Compose value or
- * a rendered template that leaves a trailing space answered `getaddrinfo ENOTFOUND " 127.0.0.1"` and the gateway refused
- * to start - with the padded value in the summary as the only clue. Trimmed, with a `[Config]` note naming the value
- * that changed, the same rule `normalizeBackendUrl()` follows. `OPENCODE_PATH` is deliberately not trimmed: a path can
- * contain a space.
- * @param {string} label the name the operator used, for the note (`BIND_HOST`, `config.json BIND_HOST`, …)
- * @param {string} value the configured value
- * @returns {string} the trimmed value (empty when the value was blank, so the caller's default applies)
- */
-export function normalizeBindHost(label, value) {
-    const raw = value === undefined || value === null ? '' : String(value);
-    const trimmed = raw.trim();
-    if (trimmed && trimmed !== raw) {
-        logger.warn(`[Config] ${label}='${loggableConfigValue(raw)}' has surrounding whitespace; using '${loggableConfigValue(trimmed)}'`);
-    }
-    return trimmed;
-}
-
-// True for the addresses whose traffic never leaves the host: `localhost`, the IPv4 loopback block, `::1` and the IPv6
-// forms a URL parser produces for them (`[::1]` arrives without brackets from `new URL().hostname`).
-const isLoopbackHost = (host) => {
-    const value = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
-    if (!value) return false;
-    if (value === 'localhost' || value === '::1' || value === '0:0:0:0:0:0:0:1') return true;
-    if (value === '::ffff:127.0.0.1') return true;
-    return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(value);
-};
-
-export function normalizeBackendUrl(raw) {
-    let url = String(raw || '').trim();
-    const notes = [];
-    if (url === '') return { url: 'http://127.0.0.1:4097', notes };
-    if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)) {
-        notes.push(`OPENCODE_SERVER_URL='${maskBackendUrl(url)}' has no scheme, assuming http://`);
-        url = `http://${url}`;
-    }
-    const stripped = url.replace(/\/+$/, '');
-    if (stripped !== url) {
-        notes.push(`OPENCODE_SERVER_URL had a trailing slash, using '${maskBackendUrl(stripped)}'`);
-        url = stripped;
-    }
-    return { url, notes };
-}
-
-// Reads an integer limit through the documented precedence (environment, then config.json, then the default). A value
-// that cannot be used must not look like it took effect: an operator who raises OPENCODE_PROXY_MAX_CONCURRENCY (a
-// throughput knob) and sees no change has no way to tell a typo from a clamp, so every adjustment is kept as a note
-// for the startup summary.
-function readLimit(name, { min, max, fallback }, fileValue) {
-    const fromEnv = process.env[name];
-    const raw = (fromEnv === undefined || String(fromEnv).trim() === '') ? fileValue : fromEnv;
-    if (raw === undefined || raw === null || String(raw).trim() === '') return { value: fallback, note: null };
-    const parsed = Number(raw);
-    if (!Number.isFinite(parsed)) {
-        return { value: fallback, note: `${name}='${loggableConfigValue(raw)}' is not a number, using ${fallback}` };
-    }
-    const floored = Math.floor(parsed);
-    if (floored < min) return { value: min, note: `${name}=${floored} is below the minimum ${min}, using ${min}` };
-    if (floored > max) return { value: max, note: `${name}=${floored} is above the maximum ${max}, using ${max}` };
-    return { value: floored, note: null };
-}
 
 // How many chat completions may run at the same time. 1 (the default) preserves the historical behaviour of
 // serializing every completions request; raise it to let independent OpenCode sessions run in parallel.
@@ -795,97 +310,6 @@ let BACKEND_HEALTH_AUTHORIZATIONS = [];
 // accepts that credential, and the printed `server password …` line is never the source of truth.
 let BACKEND_SERVER_PASSWORD_VALUE = null;
 
-/**
- * Split a configured backend URL into the URL the SDK is given and the header that carries its credentials.
- *
- * `http://user:secret@host:4097` - a proxy in front of the backend - was documented as supported but could not work:
- * every SDK call goes through Node's `fetch`, which refuses a URL with credentials ("Request cannot be constructed
- * from a URL that includes credentials: …"), so every completion answered `502` and the runtime's message carried the
- * secret into that response body and into the error log. The userinfo is therefore removed from the URL (which is
- * what the masking in `maskBackendUrl()` already assumed the gateway was doing) and sent as a Basic `Authorization`
- * header instead, which is what such a proxy reads.
- * @param {string} serverUrl normalised backend URL
- * @returns {{url: string, authorization: string|null}}
- */
-export function resolveBackendAuth(serverUrl) {
-    const raw = String(serverUrl);
-    let parsed;
-    try {
-        parsed = new URL(raw);
-    } catch {
-        // Not a URL the gateway can parse: leave it exactly as configured and let the caller report the failure
-        return { url: raw, authorization: null };
-    }
-    if (!parsed.username && !parsed.password) return { url: raw, authorization: null };
-    let user = parsed.username;
-    let password = parsed.password;
-    try {
-        user = decodeURIComponent(user);
-        password = decodeURIComponent(password);
-    } catch {
-        // Keep the percent-encoded form when it is not valid encoding (the credential is still well defined)
-    }
-    const scheme = `${parsed.protocol}//`;
-    const authority = raw.slice(scheme.length).split(/[/?#]/)[0];
-    const withoutUserInfo = `${scheme}${authority.slice(authority.lastIndexOf('@') + 1)}${raw.slice(scheme.length + authority.length)}`;
-    const authorization = `Basic ${Buffer.from(`${user}:${password}`, 'utf8').toString('base64')}`;
-    // The credential this process holds is masked by value wherever text leaves it, because
-    // `maskQuotedCredentials()` needs 16 characters to tell a token from prose and this one can be 8.
-    registerSensitiveValue(authorization.slice(authorization.indexOf(' ') + 1));
-    registerSensitiveValue(`${user}:${password}`);
-    return { url: withoutUserInfo, authorization };
-}
-
-// The username an OpenCode 2.x server expects its password under. The server issues a password and authenticates
-// `Authorization: Basic base64("opencode:<password>")`; a bare token, `Bearer`, or the password alone as the username
-// are all refused with `401 {"_tag":"UnauthorizedError"}`. One constant, so the spawned child and every call cannot
-// disagree about it.
-const BACKEND_AUTH_USERNAME = 'opencode';
-
-/**
- * Build the Basic credential an OpenCode 2.x server accepts.
- * @param {string} password the server password
- * @returns {string} the value for an `Authorization` header
- */
-export function backendAuthorizationHeader(password) {
-    return `Basic ${Buffer.from(`${BACKEND_AUTH_USERNAME}:${password}`, 'utf8').toString('base64')}`;
-}
-
-/**
- * Resolve the OpenCode 2.x server password.
- *
- * A v2 server authenticates every `/api/*` route, so the gateway cannot drive one without its password. Two sources:
- *
- * - `OPENCODE_SERVER_PASSWORD` (env, or `config.json`) pins it. When the gateway spawns the child it passes the same
- *   value through `OPENCODE_SERVER_PASSWORD` in the child's environment, which is what the server itself reads - the
- *   printed `server password …` line is only emitted when the variable is absent, so pinning it avoids scraping the
- *   child's output for a secret.
- * - When nothing is configured, a random password is generated for this process. An *external* server then cannot be
- *   authenticated against (the operator must configure its password), but a spawned child always matches, because the
- *   child is handed the generated value.
- *
- * @param {object} options
- * @param {string} [options.configured] value from the environment or `config.json`
- * @param {boolean} [options.generate] whether a missing value may be generated (a spawned child can be matched)
- * @returns {{password: string, generated: boolean}}
- */
-export function resolveBackendPassword(options = {}) {
-    const configured = options.configured;
-    if (typeof configured === 'string' && configured.trim() !== '') {
-        const password = configured.trim();
-        registerSensitiveValue(password);
-        return { password, generated: false };
-    }
-    if (options.generate === false) {
-        return { password: '', generated: false };
-    }
-    // 32 bytes of entropy, base64url-encoded: a token that survives being pasted into a URL, a unit file or a
-    // container env without quoting. Long enough that a guessed value is not the interesting attack.
-    const password = randomBytes(32).toString('base64url');
-    registerSensitiveValue(password);
-    return { password, generated: true };
-}
-
 // How long one health probe may take, start to finish. The deadline has to cover the phases `req.setTimeout()` does not:
 // that timer only starts once a socket is *assigned and connected*, so `dns.lookup()` and the TCP handshake were
 // unbounded. `ensureBackend()` runs this probe on the completion path (with the completion slot already taken) and in
@@ -1036,243 +460,11 @@ async function checkHealth(serverUrl, authorizations = BACKEND_HEALTH_AUTHORIZAT
     throw lastError || new Error('Backend health probe failed');
 }
 
-// How long a successful health probe is trusted before the next one (0 disables the cache). Resolved again by
-// startProxy() from the merged configuration, so a value in config.json is honoured and not silently ignored - the
-// README documents every tuning key as env > config.json > default.
-// A value that cannot be used is reported by the caller (startProxy logs it): silently running with the default is the
-// failure mode readLimit() was written to end for the queue knobs - an operator who typo'd the request budget had
-// nothing to notice while the gateway kept using 300000 ms.
-const readMilliseconds = (name, fallback, fileValue) => {
-    const fromEnv = process.env[name];
-    const raw = (fromEnv === undefined || String(fromEnv).trim() === '') ? fileValue : fromEnv;
-    if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
-    const parsed = Number(raw);
-    if (!Number.isFinite(parsed) || parsed < 0) return fallback;
-    return Math.min(Math.floor(parsed), MAX_TIMER_MS);
-};
-
-/**
- * The completion budget (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`), resolved through the documented precedence:
- * an explicit embedder option, then the environment, then `config.json`, then the default.
- *
- * A blank environment value counts as **unset**, the rule every other key follows (`envOrFile()` in `src/config.js`,
- * `readLimit()` and `readMilliseconds()` here): `??` treats `''` as a value, so a unit file's
- * `Environment=OPENCODE_PROXY_REQUEST_TIMEOUT_MS=`, a Helm value rendered empty or a shell that exports unconditionally
- * ended the chain at the empty string and the gateway ran the default while the value in `config.json` was never read -
- * silently, because the "unusable value" warning is skipped for a blank one too. A value that is present and unusable
- * is still named in `note`, so the operator sees what was used.
- * @param {object} options options handed to `startProxy()` (an explicit `REQUEST_TIMEOUT_MS` wins)
- * @param {object} env environment to read, injectable so the precedence can be tested without mutating `process.env`
- * @returns {{ value: number, note: string | null }} the budget in milliseconds and a `[Config]` note, if any
- */
-export function resolveRequestTimeoutMs(options = {}, env = process.env) {
-    const fromEnv = env?.OPENCODE_PROXY_REQUEST_TIMEOUT_MS;
-    const fromFile = options.OPENCODE_PROXY_REQUEST_TIMEOUT_MS;
-    const fileIsUsable = fromFile !== undefined && fromFile !== null && String(fromFile).trim() !== '';
-    // Environment first, but only when it actually carries a value
-    const requested = (fromEnv === undefined || String(fromEnv).trim() === '')
-        ? (fileIsUsable ? fromFile : undefined)
-        : fromEnv;
-    const embedder = options.REQUEST_TIMEOUT_MS;
-    const embedderIsUsable = embedder !== undefined && embedder !== null && String(embedder).trim() !== '';
-    const chosen = embedderIsUsable ? embedder : requested;
-    const parsed = Number(chosen);
-    if (Number.isFinite(parsed) && parsed > 0) {
-        const floored = Math.floor(parsed);
-        if (floored <= MAX_TIMER_MS) return { value: floored, note: null };
-        // Longer than a timer can wait: clamp instead of arming a timer that fires after 1 ms
-        return {
-            value: MAX_TIMER_MS,
-            note: `OPENCODE_PROXY_REQUEST_TIMEOUT_MS=${floored} is above the maximum ${MAX_TIMER_MS} (the largest timer), using ${MAX_TIMER_MS}`
-        };
-    }
-    const blank = chosen === undefined || chosen === null || String(chosen).trim() === '';
-    if (blank) return { value: DEFAULT_REQUEST_TIMEOUT_MS, note: null };
-    return {
-        value: DEFAULT_REQUEST_TIMEOUT_MS,
-        note: `OPENCODE_PROXY_REQUEST_TIMEOUT_MS='${loggableConfigValue(String(chosen).trim())}' is not a positive number, using ${DEFAULT_REQUEST_TIMEOUT_MS}`
-    };
-}
-
-// True when a configured millisecond value is present but unusable (so startProxy can name it and the value it used)
-const isUnusableMilliseconds = (value) => {
-    if (value === undefined || value === null || String(value).trim() === '') return false;
-    const parsed = Number(value);
-    return !Number.isFinite(parsed) || parsed < 0;
-};
-
 let BACKEND_HEALTH_CACHE_MS = readMilliseconds('OPENCODE_PROXY_HEALTH_CACHE_MS', 2000);
 
 // After a failed start attempt (missing binary, backend never became healthy) requests fail fast for this long
 // instead of repeating a multi-minute startup wait on every single request
 let BACKEND_START_RETRY_COOLDOWN_MS = readMilliseconds('OPENCODE_PROXY_START_RETRY_MS', 15000);
-
-// A wedged backend - one that still answers /health but never answers /session - used to hang the request handler
-// forever: node's fetch has no default timeout, so the SDK promise never settled, the client waited with no answer and
-// the queue slot was never released (at the default concurrency of 1 that stops the whole gateway). Every SDK call
-// now carries a deadline, and an expired one is reported as a gateway timeout.
-const backendDeadline = (timeoutMs) => ({ signal: AbortSignal.timeout(timeoutMs) });
-// Metadata calls (the model list, the tool list) are cheap round trips, so their budget is capped well below the
-// request budget: a client listing models should get the static fallback quickly instead of waiting for a whole
-// completion to time out.
-const METADATA_TIMEOUT_CAP_MS = 10000;
-const isTimeoutError = (error) => error?.name === 'TimeoutError' || error?.name === 'AbortError' ||
-    error?.code === 'ETIMEDOUT' ||
-    // The 2.x client rethrows an expired deadline as its own transport failure, carrying the message only:
-    // `ClientError("Transport: The operation was aborted due to timeout")`. That is this gateway's deadline, not an
-    // upstream refusal, and reporting it as `500 server_error` told the client the gateway had a bug.
-    (typeof error?.message === 'string' && /aborted due to timeout/i.test(error.message));
-
-const isConnectionError = (error) => {
-    const message = String(error?.message || '');
-    return message.includes('fetch failed') ||
-        message.includes('ECONNREFUSED') ||
-        message.includes('socket hang up') ||
-        error?.cause?.code === 'ECONNREFUSED';
-};
-
-/**
- * The chain of causes behind an error, outermost first.
- *
- * The 1.x SDK handed back a resolved error tuple whose `cause` was Node's own `fetch` error, one level down. The 2.x
- * client *throws* instead, and it wraps: `ClientError("Transport: fetch failed")` → `TypeError("fetch failed")` →
- * `Error(code: ECONNREFUSED)`. Reading only `error.cause.code` therefore found nothing, so a refused backend was
- * reported as a generic unreachable error and the one retry the gateway does (a refused connection proves the request
- * never arrived) never ran.
- *
- * Bounded, because a cause chain is not guaranteed to be a tree: a library that sets `cause` to itself, or two errors
- * that point at each other, would otherwise loop forever on a path that only has to report a failure.
- * @param {unknown} error the thrown value
- * @returns {unknown[]} the outermost error followed by each cause
- */
-function errorCauseChain(error) {
-    const chain = [];
-    let current = error;
-    // Bounded by depth and by a visited set: the depth alone stops a self-referencing cause, the set stops a longer
-    // cycle (A causes B causes A) that the depth would only reach more slowly.
-    const seen = new Set();
-    while (current !== null && current !== undefined && chain.length < 8) {
-        if (typeof current !== 'object' && typeof current !== 'string') break;
-        if (seen.has(current)) break;
-        seen.add(current);
-        chain.push(current);
-        current = current.cause;
-    }
-    return chain;
-}
-
-/**
- * The status the OpenCode 2.x client's own error classes stand for.
- *
- * A 2.x call rejects with a typed error (`SessionNotFoundError`, `UnauthorizedError`, …) that carries a `_tag` and a
- * message but **no HTTP status**: the generated client turns the response into a domain error and drops the number.
- * Every upstream sentence this gateway reports names a status, and `session.delete` classifies 404/410 as "already
- * gone", so the tag is mapped back onto the status the server sent. An unknown tag maps to nothing, which leaves the
- * caller's own wording in place rather than inventing a status.
- */
-const V2_ERROR_TAG_STATUS = {
-    UnauthorizedError: 401,
-    LocationNotFoundError: 404,
-    // The tag a 404 on `POST /api/session` actually carries. `LocationNotFoundError` above is a different route's
-    // error and never fires here, so without this the "a 1.x CLI has no /api route" case - the one warning worth
-    // printing - answered a bare `500` instead of `502 (status 404)`.
-    NotFoundError: 404,
-    SessionNotFoundError: 404,
-    SessionArchivedError: 410,
-    InvalidRequestError: 400,
-    InvalidPayloadError: 400,
-    ConflictError: 409,
-    ServiceUnavailableError: 503
-};
-
-/**
- * The HTTP status behind a thrown backend error, or `null`.
- * @param {unknown} error the thrown value
- * @returns {number|null}
- */
-function upstreamErrorStatus(error) {
-    for (const link of errorCauseChain(error)) {
-        const tag = link?._tag;
-        if (typeof tag === 'string' && V2_ERROR_TAG_STATUS[tag] !== undefined) return V2_ERROR_TAG_STATUS[tag];
-        // A status on any link of the chain is the real answer: a wrapper that does carry `response.status` (a proxy,
-        // a Node `fetch` failure with a response) is more precise than a tag guess.
-        const status = link?.response?.status ?? link?.status ?? link?.statusCode;
-        if (typeof status === 'number') return status;
-    }
-    return null;
-}
-
-// Describes a failed backend call: the status and the reason the backend gave.
-//
-// Two shapes, one helper. The 1.x SDK resolved a non-2xx answer with `{error, response}` and never threw, so the
-// tuple was read here. The 2.x client throws a typed error (`_tag`, `message`, no status) or a `ClientError`
-// wrapping Node's `fetch` failure, so the thrown value is read the same way - a call site that only understood the
-// tuple reported a refused backend as "no reason" and an invalid request as a bare 500.
-//
-// The body the SDK hands back is used as-is (`{error:{message}}`, `{message}` or a plain string), so taking the
-// first object would print "[object Object]" in a client-facing message.
-const upstreamFailureReason = (res) => {
-    // A call site that caught a rejection and stored it as `{error}` (the poll loop does) is unwrapped here, so the
-    // status on the real error is read instead of being lost behind the wrapper object.
-    const thrown = res instanceof Error
-        ? res
-        : (res?.error instanceof Error ? res.error : null);
-    const status = upstreamErrorStatus(thrown || res);
-    // The body a backend error carries, in every shape the 2.x client and the 1.x one produce: a plain string, an
-    // object with `message`, one with a nested `error`, or the `{error:{message}}` / `{message}` envelopes.
-    const bodyMessage = (value) => {
-        if (typeof value === 'string') return value;
-        if (!value || typeof value !== 'object') return '';
-        return value.data?.message
-            ?? value.message
-            ?? (typeof value.error === 'string' ? value.error : value.error?.message)
-            ?? '';
-    };
-    // A 2.x `ClientError` for a status the generated client has no typed error for carries an **empty** message and
-    // hangs the response body off `.error`, so reading only `message` reported a failing poll as "failed while
-    // polling the answer: Error" - the reason the backend actually gave was one property further in. When there is a
-    // body, it wins: for those statuses the message is nothing but the status echoed back (`UnexpectedStatus: 502`),
-    // and a reason is what the reader is looking for.
-    const raw = thrown
-        ? (bodyMessage(thrown.error) || (typeof thrown.message === 'string' ? thrown.message : ''))
-        : bodyMessage(res?.error);
-    // A thrown call carries the runtime's own wording (`fetch failed` for a dead or refused backend), which names
-    // no cause at all; the same phrase a client would read from the top-level handler is used here.
-    const text = clientFacingText(raw);
-    const reason = text && isConnectionError(thrown || { message: raw })
-        ? `the backend is not reachable (${text})`
-        : text;
-    return {
-        status,
-        reason: typeof reason === 'string' && reason ? `: ${reason}` : ''
-    };
-};
-
-// A connection that was *refused* proves nothing reached the backend; `fetch failed` / `socket hang up` do not - the
-// request may have been accepted and only the answer lost. The distinction matters for the one call the gateway retries
-// (`session.create`): retrying a request that may have created a session leaves that first session on the backend with
-// no id in this process, so neither `cleanupSession()` nor the shutdown drain can ever delete it.
-const isConnectionRefused = (error) => {
-    if (String(error?.message || '').includes('ECONNREFUSED')) return true;
-    const cause = error?.cause;
-    if (cause?.code === 'ECONNREFUSED') return true;
-    // Node's `fetch` wraps the per-address failures (`127.0.0.1:4097`, `::1:4097`) in an AggregateError
-    if (Array.isArray(cause?.errors) && cause.errors.some((inner) => inner?.code === 'ECONNREFUSED')) return true;
-    // The 2.x client adds a wrapper of its own above Node's error, so the code sits one level deeper than 1.x put it.
-    // Walking the chain (bounded, cycle-safe) covers both without guessing a fixed depth.
-    for (const link of errorCauseChain(error)) {
-        if (link?.code === 'ECONNREFUSED') return true;
-        if (Array.isArray(link?.errors) && link.errors.some((inner) => inner?.code === 'ECONNREFUSED')) return true;
-    }
-    return false;
-};
-
-// A backend that could not be reached, or could not be started, is an upstream failure and not a bug in the gateway:
-// the sentences below ("the CLI is missing", "it exited during startup", "the port is taken", "a start is still
-// running") described a cause the *operator* must fix, and they were answered as `500 server_error` with no `code`,
-// which is what this gateway says about its own defect. The tag is what the handler's catch maps to `502`; it travels
-// on the error instead of matching the message text, so a future sentence cannot silently fall back to `500`.
-const backendUnavailable = (message) => Object.assign(new Error(message), { backendUnavailable: true });
 
 // Jail directories this process created. Another gateway (a second instance, or one in a container sharing /tmp)
 // may be using the same parent directory, so the exit hook must never delete a directory it does not own.
@@ -1588,7 +780,7 @@ function createApp(config) {
         // The id goes into the response header, so it belongs in the log line that reports the same request: a client
         // report quotes the id, and without it here there was nothing to search for it by (`AGENTS.md`: the response id
         // is the one the request log line ends with)
-        logger.warn(`[Proxy] Rejected malformed request: ${error?.code || 'parse error'} [${reqId}]`);
+        logger.warn(`[Proxy] Rejected malformed request: ${code || 'parse error'} [${reqId}]`);
         const body = JSON.stringify({ error: { message: reason, type: 'invalid_request_error', ...(code ? { code } : {}) } });
         if (socket.writable) {
             socket.write(
@@ -1727,6 +919,16 @@ function createApp(config) {
     // resolveApiKey() guarantees a non-empty key, so authentication can never be switched off.
     const apiKeyToken = resolveApiKey(API_KEY);
     const apiKeyTokenBuffer = Buffer.from(apiKeyToken);
+    // Constant-time comparison, built once for the whole app: the length checks are required because
+    // timingSafeEqual throws on a size mismatch, and they have to compare bytes - a token with non-ASCII
+    // characters can match in string length while differing in byte length, which used to throw and turn a wrong
+    // key into a 500 instead of a 401. It lives here rather than in the auth hook because that hook runs on every
+    // request, and `/health` and the 404 path never compare anything at all.
+    const matchesToken = (provided) => {
+        if (typeof provided !== 'string' || provided.length !== apiKeyToken.length) return false;
+        const providedBuffer = Buffer.from(provided);
+        return providedBuffer.length === apiKeyTokenBuffer.length && timingSafeEqual(providedBuffer, apiKeyTokenBuffer);
+    };
     const AUTH_SCHEME_RE = /^Bearer[ \t]+/i;
     // Pulls the token out of an `Authorization` value; returns '' when the value does not carry one
     const authorizationToken = (value) => {
@@ -1900,17 +1102,8 @@ function createApp(config) {
         // Constant-time comparison. The length checks are required because timingSafeEqual throws on a size
         // mismatch, and they have to compare bytes: a token with non-ASCII characters can match in string length
         // while differing in byte length, which used to throw and turn a wrong key into a 500 instead of a 401.
-        const matchesToken = (provided) => {
-            if (typeof provided !== 'string' || provided.length !== apiKeyToken.length) return false;
-            const providedBuffer = Buffer.from(provided);
-            return providedBuffer.length === apiKeyTokenBuffer.length && timingSafeEqual(providedBuffer, apiKeyTokenBuffer);
-        };
-
-        // `Authorization: Bearer <key>` is the contract; the scheme is case-insensitive per RFC 7235, and a client
-        // that sends `bearer <key>`, `BEARER <key>` or `Bearer   <key>` (extra whitespace) is not wrong. `X-Api-Key`
-        // is accepted as an alias because the preflight above advertises it and clients configured with an api-key
-        // header send it. Presence decides, not a parsed token: an `Authorization` header that is present always
-        // wins, so a wrong one - or one a proxy injected with another scheme - is never overridden by the alias.
+        // Defined once, outside the hook: the closure and its two captured values were rebuilt on every request,
+        // including `/health` and the 404 path where no comparison happens at all.
         const hasAuthorization = Object.prototype.hasOwnProperty.call(request.headers, 'authorization');
         const hasApiKeyHeader = Object.prototype.hasOwnProperty.call(request.headers, 'x-api-key');
         const presented = hasAuthorization
@@ -2452,7 +1645,6 @@ function createApp(config) {
         }
     }
 
-
     /**
      * The one line a model listing that did not answer gets, whichever shape the failure arrived in.
      *
@@ -2835,6 +2027,27 @@ function createApp(config) {
         // A bounded list: a part whose text is rewritten (SHRINK) starts a new entry, and a backend that rewrites on
         // every event must not grow this per completion.
         const MAX_PART_SNAPSHOTS = 4;
+        // The same bound for the *number of parts*: `partKey()` builds its key out of backend-controlled text, so a
+        // backend that varies it on every event grew `partTexts` for as long as the answer streamed, and the map is
+        // only read for keys it already holds. Dropping the oldest key is safe because a part that has not been seen
+        // again is over: the answer is append-only and the totals below are keyed by the same string, so a part
+        // dropped here simply loses its snapshot bookkeeping and is re-based if it reappears.
+        const MAX_PART_KEYS = 64;
+        const partKeyOrder = [];
+        const notePartKey = (key) => {
+            if (partTexts.size > MAX_PART_KEYS) {
+                const oldest = partKeyOrder.shift();
+                if (oldest !== undefined && oldest !== key) partTexts.delete(oldest);
+                else {
+                    // The order list is empty or already points at this key: drop the first key the map itself reports,
+                    // which is insertion order, so the bound is honoured either way.
+                    const first = partTexts.keys().next();
+                    if (!first.done && first.value !== key) partTexts.delete(first.value);
+                }
+            }
+            partKeyOrder.push(key);
+            if (partKeyOrder.length > MAX_PART_KEYS) partKeyOrder.shift();
+        };
         // The increment for a part snapshot, and the bookkeeping that keeps its base current. `snapshotDelta()` returns
         // the whole text when the new snapshot is not an extension of the base - the rewrite case, and also the first
         // update of a *different* id-less part of the same type - so that answer is what selects the base: an existing
@@ -2842,7 +2055,14 @@ function createApp(config) {
         const recordPartSnapshot = (key, text) => {
             const snapshots = partTexts.get(key);
             if (!snapshots) {
-                if (text) partTexts.set(key, [text]);
+                // The first text for this part: no earlier snapshot, so the whole text is the increment. Without a
+                // key on the map, every part of this completion accumulated one permanent entry here - the map is
+                // per completion and the key is built from backend-controlled text, so a backend that varies it grew
+                // the map without bound for as long as the answer streamed.
+                if (text) {
+                    partTexts.set(key, [text]);
+                    notePartKey(key);
+                }
                 return text;
             }
             for (let i = snapshots.length - 1; i >= 0; i -= 1) {
@@ -3311,9 +2531,11 @@ function createApp(config) {
                     // keep the historical non-streaming default: a typo answered `200 application/json` to a client
                     // parsing SSE, which is the failure the string spellings exist to prevent, and the same class the
                     // other body fields are refused for. It is refused by name now; absent, blank or `null` still means
-                    // "not streaming".
+                    // "not streaming" - a **blank string** included, which is what `parseBoolean()` reports as
+                    // unreadable: `stream: ""` is the shape a form field or an unset template variable produces, and it
+                    // answered `400` here while the sentence above promised blank was accepted.
                     const readableFlag = (value) =>
-                        value === undefined || value === null || parseBoolean(value, undefined) !== undefined;
+                        value === undefined || value === null || value === '' || parseBoolean(value, undefined) !== undefined;
                     if (!readableFlag(stream)) {
                         return reply.code(400).send({
                             error: {
@@ -3627,18 +2849,22 @@ function createApp(config) {
                             failure instanceof Error ? failure : undefined
                         );
                     };
+                    // The 2.x server takes the model on the session, not on the prompt: `session.create({model})`.
+                    // `{providerID, id}` is the 2.x `Model.Ref` shape (a 1.x `modelID` field is not read).
+                    // Built **once** because it is sent twice: the retry below is the same call, and a duplicated
+                    // literal is what dropped the ruleset from it. Both call sites read the same object, so
+                    // `DISABLE_TOOLS` cannot be enforced on the first attempt and skipped by the second.
+                    const sessionCreateArgs = {
+                        title: `chat ${new Date().toISOString()}`,
+                        model: { providerID: pID, id: mID },
+                        ...(permissionRules ? { permissions: permissionRules } : {})
+                    };
                     try {
                         // What is left of the request budget, not a fresh one: with a full budget here a
                         // completion that had waited in the queue was granted a second create deadline and could
                         // answer past the timeout it had already advertised (measured: 3.66 s for a 2 s budget,
                         // 1.67 s of it spent queued).
-                        // The 2.x server takes the model on the session, not on the prompt: `session.create({model})`.
-                        // `{providerID, id}` is the 2.x `Model.Ref` shape (a 1.x `modelID` field is not read).
-                        sessionRes = await client.session.create({
-                            title: `chat ${new Date().toISOString()}`,
-                            model: { providerID: pID, id: mID },
-                            ...(permissionRules ? { permissions: permissionRules } : {})
-                        }, backendDeadline(remainingBudget()));
+                        sessionRes = await client.session.create(sessionCreateArgs, backendDeadline(remainingBudget()));
                     } catch (createError) {
                         // A backend that died between the cached "healthy" answer and this call fails here with a
                         // connection error. ensureBackend() trusted a probe from up to OPENCODE_PROXY_HEALTH_CACHE_MS
@@ -3674,10 +2900,13 @@ function createApp(config) {
                             // request actually hit, not the start error an internal retry produced
                             throw createError;
                         }
-                        sessionRes = await client.session.create({
-                            title: `chat ${new Date().toISOString()}`,
-                            model: { providerID: pID, id: mID }
-                        }, backendDeadline(remainingBudget()));
+                        // The same call as above, `sessionCreateArgs` included: this retry is what a *refused* connection
+                        // takes, which is the ordinary "the backend just restarted" case. It used to repeat the object
+                        // literal without `permissions`, so that completion ran on a session with the server's default
+                        // permissions - `shell`, `edit`, `write` and `patch` allowed again - while the prompt still carried
+                        // TOOL_GUARD_MESSAGE, and DISABLE_TOOLS was enforced only by a sentence asking the model not to
+                        // use tools. The client could not tell: the answer looked normal either way.
+                        sessionRes = await client.session.create(sessionCreateArgs, backendDeadline(remainingBudget()));
                     }
                     // A 2.x server answers 200 with `{"data":{…}}`; the id is read from the envelope. A 1.x server
                     // answered it at the top level, so reading only one shape is what makes this fail loudly instead of
@@ -4135,7 +3364,13 @@ function createApp(config) {
                                     // about the same payload in size and in masking.
                                     message: clientFacingText(error.data?.message || error.message) || 'OpenCode provider error',
                                     type: 'server_error',
-                                    code: error.name || 'OpenCodeError'
+                                    // The same three stable values the outer handler maps to (see below), not
+                                    // `error.name`: this catch runs for a provider that answered before the first frame,
+                                    // so it is the same "the provider failed" case the outer path reports as
+                                    // `ProviderError`. Leaking `error.name` put an internal exception class in a public
+                                    // body - and a plain `Error` put the literal string `Error` in a field documented as
+                                    // taking one of three values.
+                                    code: 'ProviderError'
                                 }
                             });
                             release();
@@ -4188,12 +3423,17 @@ function createApp(config) {
                     });
                     // A rejection that is not an `Error` is not masked by `safeClone()` on its way to the line, so the
                     // value goes through the masking helper here: this is the same handler that needs
-                    // `handlerFailureMessage()` to read a sentence out of whatever threw.
-                    logger.debug('[Proxy] Error details', {
-                        reqId,
-                        sessionId,
-                        error: error instanceof Error ? loggableError(error) : maskDetail(error)
-                    });
+                    // `handlerFailureMessage()` to read a sentence out of whatever threw. Guarded, because both
+                    // `loggableError()` and `maskDetail()` build a bounded copy of the error - the `cause` chain and
+                    // the own properties - and at the default `info` level that copy was thrown away: this is the
+                    // first statement of every failed completion, before the queue slot is released.
+                    if (logger.isEnabled('debug')) {
+                        logger.debug('[Proxy] Error details', {
+                            reqId,
+                            sessionId,
+                            error: error instanceof Error ? loggableError(error) : maskDetail(error)
+                        });
+                    }
 
                     // A dead/unreachable backend must not stay cached as healthy: drop the timestamp so the next
                     // request performs a real probe (and restarts the backend if needed)
@@ -4822,7 +4062,7 @@ async function ensureBackend(config, options = {}) {
             // ran whatever followed it as a second shell line.
             let spawnTarget = opencodeBin;
             if (useShell) {
-                if (/["$`\u0000-\u001f\u007f]/.test(opencodeBin)) {
+                if (isShellUnsafePath(opencodeBin)) {
                     throw new Error(`OPENCODE_PATH cannot be passed through a shell: ${loggableConfigValue(opencodeBin)}`);
                 }
                 spawnTarget = `"${opencodeBin}"`;
@@ -5120,7 +4360,7 @@ export function startProxy(options) {
             if (deletedThisRound === 0) {
                 // Nothing was deleted: the backend refuses (or is gone). Retrying the same calls until the budget runs
                 // out cannot turn a refusal into a success, so the remaining ids are reported once instead.
-                failed = ids.length;
+                failed = Math.max(0, ids.length - deletedThisRound);
                 break;
             }
         }

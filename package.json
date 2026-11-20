@@ -1,6 +1,6 @@
 {
   "name": "free-opencode-api",
-  "version": "3.0.0",
+  "version": "5.0.0",
   "description": "Free OpenCode API — an OpenAI-compatible API gateway for the OpenCode CLI that exposes the free models OpenCode serves (stable alias: opencode/big-pickle) to any standard OpenAI client.",
   "main": "index.js",
   "type": "module",

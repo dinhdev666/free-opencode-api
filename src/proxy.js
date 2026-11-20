@@ -1271,7 +1271,12 @@ function createApp(config) {
                 const providerID = typeof m.providerID === 'string' && m.providerID !== '' ? m.providerID : 'opencode';
                 models.push({
                     id: `${providerID}/${m.id}`,
-                    name: m.name || m.id,
+                    // The one field copied without a type check: a non-string `name` (a number, an object) reached the
+                    // warm-cache body verbatim, while the cold path coerced it through the response schema - so the same
+                    // listing answered with a string `name` or with a raw number depending only on cache warmth, and the
+                    // warm answer broke the documented `{id,name,object,owned_by}` shape. Every sibling field is guarded
+                    // above; the name falls back to the id the same way a missing one always has.
+                    name: typeof m.name === 'string' && m.name !== '' ? m.name : m.id,
                     object: 'model',
                     owned_by: providerID
                 });
@@ -1299,10 +1304,16 @@ function createApp(config) {
             // Every other upstream payload that reaches a log line or a response goes through the masking helpers:
             // this line quoted `error.message` (the documented symptom of a credential-bearing backend URL) and the
             // raw `error.response` body, so a proxy in front of the backend could have put a secret in `docker logs`.
+            // `extractUpstreamError()` rather than `error.status` / `error.response`: the 2.x client throws, so both
+            // were `undefined` and the line read `{"error":"","body":null}` for every failure the `logger.warn` above
+            // had just described correctly.
+            const upstream = extractUpstreamError(error);
             logger.error('[Proxy] Model Fetch Error:', {
-                error: clientFacingText(error.message),
-                status: error.status,
-                body: maskDetail(error.response?.data ?? error.responseBody ?? null)
+                error: clientFacingText(error.message) ||
+                    clientFacingText(error?.error?.message) ||
+                    handlerFailureMessage(error),
+                status: upstream.status,
+                body: upstream.bodySummary === null ? null : maskDetail(clientFacingText(upstream.bodySummary))
             });
             // Same item shape as a provider-served model, and not cached: the next request probes the backend again
             return serveFallback();
@@ -2019,10 +2030,18 @@ function createApp(config) {
         // key is the backend's part id when it sends one; an id-less part is keyed by its type, and one answer can
         // carry several id-less parts of the same type, so a key holds the snapshots of every part it stands for and the
         // increment is taken against the one the new text continues.
+        //
+        // A snapshot is a one-field object rather than a bare string so the delta path can keep a **reference** to the
+        // entry it extended (`partTotals`) and update it in place: a delta already *is* the increment, so re-diffing
+        // the whole answer to rediscover which entry to update cost O(answer) per delta (measured 217 ms for 2 000
+        // deltas of a 1 MB answer, on the thread that streams it). The object is per part, never per delta.
         const partTexts = new Map();
         // The running total each part's deltas add up to, so a delta can seed the snapshot base the closing
         // `session.*.ended` event is diffed against. Without it that event carried the part's whole text with nothing
         // to compare it to, and the answer was appended a second time (measured: sent three times in total).
+        // `{ total, slot }`: `slot` is the snapshot entry `total` came from, or null when the entry is gone (rewritten
+        // by a closing event, or dropped by the bound), in which case the next delta goes back through
+        // `recordPartSnapshot()`.
         const partTotals = new Map();
         // A bounded list: a part whose text is rewritten (SHRINK) starts a new entry, and a backend that rewrites on
         // every event must not grow this per completion.
@@ -2035,14 +2054,22 @@ function createApp(config) {
         const MAX_PART_KEYS = 64;
         const partKeyOrder = [];
         const notePartKey = (key) => {
+            // Both maps are keyed by this string, so both are bounded here: `partTotals` used to grow one permanent
+            // entry per delta for a backend that varies the part id (`assistantMessageID` is backend-controlled text),
+            // 200 000 deltas measured 200 000 entries and +44.6 MB of heap against a `partTexts` stuck at 64.
             if (partTexts.size > MAX_PART_KEYS) {
                 const oldest = partKeyOrder.shift();
-                if (oldest !== undefined && oldest !== key) partTexts.delete(oldest);
-                else {
+                if (oldest !== undefined && oldest !== key) {
+                    partTexts.delete(oldest);
+                    partTotals.delete(oldest);
+                } else {
                     // The order list is empty or already points at this key: drop the first key the map itself reports,
                     // which is insertion order, so the bound is honoured either way.
                     const first = partTexts.keys().next();
-                    if (!first.done && first.value !== key) partTexts.delete(first.value);
+                    if (!first.done && first.value !== key) {
+                        partTexts.delete(first.value);
+                        partTotals.delete(first.value);
+                    }
                 }
             }
             partKeyOrder.push(key);
@@ -2060,26 +2087,38 @@ function createApp(config) {
                 // per completion and the key is built from backend-controlled text, so a backend that varies it grew
                 // the map without bound for as long as the answer streamed.
                 if (text) {
-                    partTexts.set(key, [text]);
+                    partTexts.set(key, [{ text }]);
                     notePartKey(key);
                 }
                 return text;
             }
             for (let i = snapshots.length - 1; i >= 0; i -= 1) {
-                const increment = snapshotDelta(snapshots[i], text);
+                const increment = snapshotDelta(snapshots[i].text, text);
                 if (increment !== text) {
                     // The part continues this snapshot: same base, new snapshot (an empty text drops a base that can
                     // no longer be continued, so `''` stays a fresh start rather than a prefix of everything)
-                    if (text) snapshots[i] = text;
+                    if (text) snapshots[i].text = text;
                     else snapshots.splice(i, 1);
                     return increment;
                 }
             }
             if (text) {
-                snapshots.push(text);
+                snapshots.push({ text });
                 if (snapshots.length > MAX_PART_SNAPSHOTS) snapshots.shift();
             }
             return text;
+        };
+        // Whether `slot` is still the entry some key's snapshot list holds. A rewritten part (`SHRINK`) or the
+        // snapshot bound can drop the entry a running total came from; writing to a detached object would leave the
+        // list stale and the closing event would append the part a second time. Four identity comparisons, no string
+        // work, so this stays cheaper than the diff it replaces.
+        const isLiveSnapshot = (key, slot) => {
+            const snapshots = partTexts.get(key);
+            if (!snapshots || !slot) return false;
+            for (let i = 0; i < snapshots.length; i += 1) {
+                if (snapshots[i] === slot) return true;
+            }
+            return false;
         };
         let firstDeltaAt = null;
         let firstDeltaTimer = null;
@@ -2195,8 +2234,29 @@ function createApp(config) {
                             if (!delta) continue;
                             receivedDelta = true;
                             const snapshotKey = `${isReasoning ? 'r' : 't'}${partKey}`;
-                            const running = (partTotals.get(snapshotKey) || '') + delta;
-                            partTotals.set(snapshotKey, running);
+                            const held = partTotals.get(snapshotKey);
+                            const running = (held ? held.total : '') + delta;
+                            if (held && held.slot && held.slot.text === held.total && isLiveSnapshot(snapshotKey, held.slot)) {
+                                // The entry this key's deltas have been extending is still live and still holds the base
+                                // `running` was built from: the delta *is* the increment, so it is written straight in.
+                                // `recordPartSnapshot()` re-diffed the whole answer to rediscover that entry, and
+                                // `snapshotDelta()` flattens `base + delta` to slice it - O(answer) per delta, measured
+                                // 217 ms for 2 000 deltas of a 1 MB answer on the thread that streams it.
+                                held.slot.text = running;
+                                held.total = running;
+                            } else {
+                                // First delta for this part, or its base was rewritten by a closing event or dropped by
+                                // the snapshot bound: take the diff once, then remember the entry it landed on.
+                                recordPartSnapshot(snapshotKey, running);
+                                const snapshots = partTexts.get(snapshotKey);
+                                let slot = null;
+                                if (snapshots) {
+                                    for (let i = 0; i < snapshots.length; i += 1) {
+                                        if (snapshots[i].text === running) { slot = snapshots[i]; break; }
+                                    }
+                                }
+                                partTotals.set(snapshotKey, { total: running, slot });
+                            }
                             // The returned increment is deliberately ignored: the delta is already the increment, and it
                             // is what the timers and `deltaChars` below count. Recording it keeps the base current so the
                             // closing event diffs to nothing.
@@ -2401,6 +2461,11 @@ function createApp(config) {
                 // Assigned by the streaming path; the error path uses it to drop the backend event subscription
                 // instead of leaving it open until its own deadline (up to the whole request budget)
                 let abortStream = null;
+                // Disarms the SSE keep-alive timer. Declared out here because the catch below has to call it: the normal
+                // end of the streaming block clears the timer, but every throw above jumps straight to that catch, so the
+                // timer survived for up to one 5 s tick after the stream was already answered. A no-op until the
+                // streaming branch arms it.
+                let stopKeepAlive = () => {};
 
                 try {
                     reqId = request.gatewayLog?.reqId || null;
@@ -3040,14 +3105,15 @@ function createApp(config) {
                         let clientGone = false;
                         let collectorHandle = null;
                         let keepAliveTimer = null;
-                        const stopKeepAlive = () => {
+                        const stopStreamKeepAlive = () => {
                             if (keepAliveTimer) {
                                 clearInterval(keepAliveTimer);
                                 keepAliveTimer = null;
                             }
                         };
+                        stopKeepAlive = stopStreamKeepAlive;
                         const noteClientGone = () => {
-                            stopKeepAlive();
+                            stopStreamKeepAlive();
                             // No `writableEnded` short-circuit: when someone else already ended the response (the
                             // request timeout answered in-band) the socket is still open, and leaving the flag false
                             // let the task write into an ended stream, where the drain never comes and the slot was
@@ -3176,7 +3242,7 @@ function createApp(config) {
                         // with the frames already written or as the 502 envelope when none were. Serving the text it
                         // managed to write under `finish_reason: "stop"` is a successful answer to every client.
                         if (collected && collected.error) {
-                            throw new ProviderError(describeProviderFailure(collected.error));
+                            throw new ProviderError(describeProviderFailure(collected.error), upstreamErrorStatus(collected.error), collected.error);
                         }
 
                         // One place that turns a polled assistant message into deltas. `appendOnly` trims the part that
@@ -3205,7 +3271,7 @@ function createApp(config) {
                             if (error && !content && !reasoning) {
                                 // The prompt succeeded but the provider reported an error and no text: terminate the
                                 // stream with an error frame instead of streaming the message back as model output
-                                throw new ProviderError(describeProviderFailure(error));
+                                throw new ProviderError(describeProviderFailure(error), upstreamErrorStatus(error), error);
                             }
                             const emitPolledKind = async (text, kind, isReasoning) => {
                                 if (!text) return;
@@ -3244,14 +3310,17 @@ function createApp(config) {
                             // A polled message that carries a provider error is a failure even when it also carries
                             // text: the text was emitted above, so the client gets what there was and then the error
                             // frame, instead of a "stop" that reads as a complete answer.
-                            if (error) throw new ProviderError(describeProviderFailure(error));
+                            if (error) throw new ProviderError(describeProviderFailure(error), upstreamErrorStatus(error), error);
                         };
 
                         let polled = false;
                         if (collected && collected.__error) {
                             logDebug('SSE collect error, falling back to polling', {
                                 sessionId,
-                                error: collected.__error?.message
+                                // Through the same bounder as every sibling line: a plain string detail is not masked by
+                                // `safeClone()` (only an `Error.message` is), so an upstream sentence quoting a
+                                // credential-bearing URL reached the log verbatim and unbounded.
+                                error: clientFacingText(collected.__error?.message)
                             });
                             polled = true;
                             // Text may already be on the wire: the poll then only contributes the part the client does
@@ -3409,7 +3478,12 @@ function createApp(config) {
                 } catch (error) {
                     // Upstream (opencode serve) call chain failed: always emitted at error level with status code and
                     // error-body summary; the full error object goes to debug level
+                    // The keep-alive timer is disarmed here too: the normal end of the streaming block clears it, but
+                    // every throw above jumped straight to this catch, so the timer survived for up to one 5 s tick
+                    // after the stream was already answered (it self-cleared on the next tick via `writableEnded`,
+                    // which is why this showed up as a pending timer rather than a leak). Idempotent.
                     if (abortStream) abortStream();
+                    stopKeepAlive();
                     const upstream = extractUpstreamError(error);
                     logger.error('[Proxy] API Error (upstream call failed)', {
                         reqId,
@@ -4039,11 +4113,26 @@ async function ensureBackend(config, options = {}) {
             }
 
             let port = '4097';
+            let portParsed = false;
             try {
-                port = new URL(OPENCODE_SERVER_URL).port || '4097';
+                port = new URL(OPENCODE_SERVER_URL).port;
+                portParsed = true;
             } catch (e) {
                 logger.warn(`[Proxy] Could not parse OPENCODE_SERVER_URL '${maskBackendUrl(OPENCODE_SERVER_URL)}', assuming port 4097`);
             }
+            // A URL with no port and a child that can only listen on one: the child was started on 4097 while every
+            // readiness probe used the configured URL verbatim (port 80 for `http://127.0.0.1`), so all 60 probes
+            // failed, every completion answered `502 backend_unreachable` after ~114 s of backoff, a cooldown was set
+            // and the child - which was listening, just not where anything looked - was left holding 4097 until the
+            // next attempt killed it. Refuse before `spawn()`: no child, no cooldown, and a sentence that names the
+            // port the gateway would have chosen.
+            if (portParsed && port === '') {
+                throw backendUnavailable(
+                    'OPENCODE_SERVER_URL must name the backend port (http://127.0.0.1:4097): ' +
+                    'a URL without one points at port 80, while opencode serve can only be started on a numbered port'
+                );
+            }
+            if (!port) port = '4097';
             const resolved = resolveOpencodePath(OPENCODE_PATH);
             const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;
             if (resolved.path) {

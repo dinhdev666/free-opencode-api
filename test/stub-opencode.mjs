@@ -125,6 +125,9 @@ let providerCalls = 0;
 // 2.x has no tool-list route, so this stays 0 and proves the gateway does not reach for one
 let toolIdCalls = 0;
 let messagePolls = 0;
+// How many readiness probes (`GET /api/info`) the stub has seen. `/health` must never touch the backend, so a suite
+// that reads this around a burst of `/health` requests can prove it instead of trusting the handler.
+let infoCalls = 0;
 let promptedSessions = 0;
 let lastSystemPrompt = '';
 let lastPromptText = '';
@@ -165,6 +168,16 @@ const modelInfo = (id, name, overrides = {}) => ({
     time: { released: '2025-01-01T00:00:00.000Z' },
     ...overrides
 });
+// A provider that publishes a model name that is not a string (a number, an object). The gateway must still answer
+// with the documented `{id,name,object,owned_by}` shape on both the warm and the cold path: the warm cache sends the
+// entry it built verbatim, so an unvalidated `name` reached the client as a number, while the cold path coerced the
+// same entry through the response schema - one listing, two shapes, decided only by cache warmth.
+const ODD_MODEL_NAMES = process.env.STUB_ODD_MODEL_NAMES === '1';
+const ODD_MODELS = [
+    modelInfo('odd-name', 7),
+    modelInfo('odd-object', { label: 'Odd' }),
+    modelInfo('odd-empty', '')
+];
 const MODELS = [
     modelInfo('big-pickle', 'Big Pickle'),
     modelInfo('kimi-k2.5-free', 'Kimi K2.5 Free', { capabilities: { tools: false, reasoning: true, streaming: true } }),
@@ -392,6 +405,7 @@ const server = http.createServer(async (req, res) => {
     // The readiness probe: a 1.x backend answers /health with JSON and has no /api/* route at all, so this is the
     // route that tells the two apart (and it must answer JSON, not the web UI's HTML)
     if (req.method === 'GET' && path === '/api/info') {
+        infoCalls += 1;
         return sendJson(res, 200, {
             version: VERSION,
             pid: process.pid,
@@ -410,7 +424,7 @@ const server = http.createServer(async (req, res) => {
         }
         // The first call is an empty catalogue; later ones carry a single entry with no usable fields, so both shapes
         // of "the provider reported nothing" end at the gateway's fallback model
-        return sendJson(res, 200, { data: EMPTY_PROVIDERS ? (providerCalls === 1 ? [] : [{}]) : MODELS });
+        return sendJson(res, 200, { data: EMPTY_PROVIDERS ? (providerCalls === 1 ? [] : [{}]) : (ODD_MODEL_NAMES ? ODD_MODELS : MODELS) });
     }
 
     // The provider list. The 2.x gateway reads the catalogue from /api/model, so nothing calls this any more; it stays
@@ -503,6 +517,7 @@ const server = http.createServer(async (req, res) => {
             deleted: deletedSessions,
             prompts: promptedSessions,
             providerCalls,
+            infoCalls,
             toolIdCalls,
             messagePolls,
             lastSystemPrompt,

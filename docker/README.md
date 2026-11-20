@@ -203,7 +203,7 @@ docker run -d --restart=always --network common-all --name free-opencode-api -p 
   container killed mid-write cannot leave a truncated `config.json` behind (which made every later start exit with
   "is not valid JSON" until a human deleted it).
 - The first-boot line in `docker logs` shows the generated settings with the **API key masked** (`sk-a***(22 chars)`,
-  nothing at all up to 16 characters — the same rule the in-process logger uses) and a credential in
+  nothing but its length up to 16 characters — the same rule the in-process logger uses) and a credential in
   `OPENCODE_SERVER_URL` masked the same way (`http://***@host:4097`, `?token=***`):
   the file it writes is `0600`, owned by the container user (`node`, uid 1000), and holds the real key, but container
   logs are usually collected and shipped, so the key must never be printed. The startup `[Security]` warning still
@@ -342,12 +342,14 @@ The image is published by `.github/workflows/docker-publish.yml`. Pushing a vers
 
 ```bash
 # package.json version and the tag must match; the workflow fails otherwise
-git tag v1.0.1
-git push origin v1.0.1
+git tag v3.0.0
+git push origin v3.0.0
 ```
 
 The publish job itself is guarded by `if: startsWith(github.ref, 'refs/tags/v')`, so a run started from a branch (a
-manual dispatch) stops before it logs in to the registry: only a tag can move `latest`.
+manual dispatch) stops before it logs in to the registry: only a tag can move `latest`. Two further gates refuse the tag
+outright: the tagged commit must already be on `main`, and every check run on it must have concluded `success`,
+`skipped` or `neutral`. A tag on a commit CI never ran is refused, so a broken build cannot be published by tagging it.
 
 Every published image carries a **provenance attestation** and an **SBOM** (`provenance: true`, `sbom: true` on
 `docker/build-push-action`): `docker buildx imagetools inspect <image>` shows the build's inputs, and a scanner can read

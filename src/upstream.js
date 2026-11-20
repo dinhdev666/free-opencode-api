@@ -9,6 +9,24 @@
 import { clientFacingText } from './errors.js';
 
 /**
+ * Whether the backend answered this call, rather than the transport failing before it could.
+ *
+ * `@opencode/client` builds a thrown error for an HTTP answer as
+ * `Object.assign(new Error(body.message), body)` and then sets `error.name = body._tag` when the body carries one, so
+ * **every field of a backend error body becomes a property of the thrown value**. The classifiers below therefore
+ * cannot tell "node could not connect" from "the backend answered 400 with `{"_tag":"TimeoutError"}`" by reading
+ * `name` or `code` - and `isConnectionRefused()` is the gate for the only retry the gateway performs
+ * (`session.create` after a backend restart), the one whose duplicate `session.create` can leave a session nobody can
+ * delete. Two things prove an answer: a `_tag` (the field OpenCode's error envelope carries, and the one
+ * `V2_ERROR_TAG_STATUS` exists for) and a status (a body that repeats it, or the `ClientError` the client throws for a
+ * status it has no typed error for, which keeps it at `cause.status`). A body that spoofs only `name` or `code`, with
+ * neither of those, is not detectable from the thrown value and is the documented limit of this guard.
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+const answeredByBackend = (error) => error?._tag !== undefined || typeof upstreamErrorStatus(error) === 'number';
+
+/**
  * Whether an error is this gateway's own deadline expiring, rather than an upstream refusal.
  *
  * A wedged backend - one that still answers `/health` but never answers `/session` - used to hang the request handler
@@ -17,12 +35,13 @@ import { clientFacingText } from './errors.js';
  * @param {unknown} error
  * @returns {boolean}
  */
-export const isTimeoutError = (error) => error?.name === 'TimeoutError' || error?.name === 'AbortError' ||
+export const isTimeoutError = (error) => !answeredByBackend(error) &&
+    (error?.name === 'TimeoutError' || error?.name === 'AbortError' ||
     error?.code === 'ETIMEDOUT' ||
     // The 2.x client rethrows an expired deadline as its own transport failure, carrying the message only:
     // `ClientError("Transport: The operation was aborted due to timeout")`. That is this gateway's deadline, not an
     // upstream refusal, and reporting it as `500 server_error` told the client the gateway had a bug.
-    (typeof error?.message === 'string' && /aborted due to timeout/i.test(error.message));
+    (typeof error?.message === 'string' && /aborted due to timeout/i.test(error.message)));
 
 /**
  * Whether an error is a transport failure of any kind (as opposed to the backend answering with a refusal).
@@ -30,6 +49,7 @@ export const isTimeoutError = (error) => error?.name === 'TimeoutError' || error
  * @returns {boolean}
  */
 export const isConnectionError = (error) => {
+    if (answeredByBackend(error)) return false;
     const message = String(error?.message || '');
     return message.includes('fetch failed') ||
         message.includes('ECONNREFUSED') ||
@@ -48,6 +68,8 @@ export const isConnectionError = (error) => {
  * @returns {boolean}
  */
 export function isConnectionRefused(error) {
+    // An error the backend answered with is never a refused connection, however its body is spelled.
+    if (answeredByBackend(error)) return false;
     if (String(error?.message || '').includes('ECONNREFUSED')) return true;
     const cause = error?.cause;
     if (cause?.code === 'ECONNREFUSED') return true;
@@ -124,7 +146,12 @@ const V2_ERROR_TAG_STATUS = {
 export function upstreamErrorStatus(error) {
     for (const link of errorCauseChain(error)) {
         const tag = link?._tag;
-        if (typeof tag === 'string' && V2_ERROR_TAG_STATUS[tag] !== undefined) return V2_ERROR_TAG_STATUS[tag];
+        // `Object.hasOwn`, not a truthiness test: the map is a plain object literal, so `_tag` of `constructor`,
+        // `toString` or `__proto__` read an inherited member and returned a function or an object as the "status",
+        // which `upstreamFailureReason()` then interpolated into a client-facing 502 and a log line. `_tag` is
+        // backend-controlled (`declared()` copies the body onto the thrown error), so that was reachable from a
+        // single error payload.
+        if (typeof tag === 'string' && Object.hasOwn(V2_ERROR_TAG_STATUS, tag)) return V2_ERROR_TAG_STATUS[tag];
         // A status on any link of the chain is the real answer: a wrapper that does carry `response.status` (a proxy,
         // a Node `fetch` failure with a response) is more precise than a tag guess.
         const status = link?.response?.status ?? link?.status ?? link?.statusCode;

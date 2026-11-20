@@ -59,10 +59,6 @@ COPY --chown=node:node package.json pnpm-lock.yaml ./
 # --frozen-lockfile guarantees the image is built from the committed lockfile
 RUN pnpm install --frozen-lockfile --prod
 
-# Copy the rest of the source (the build context is the repository root). --chown avoids a second full copy of the tree
-# in a following `RUN chown -R`, which is what the image used to carry.
-COPY --chown=node:node . .
-
 # Install the opencode CLI inside the image (the gateway detects and launches the opencode backend on startup)
 # Approach: the official npm package @opencode/cli, which installs the `opencode` executable into the npm global bin
 #           directory, i.e. /usr/local/bin/opencode
@@ -72,15 +68,24 @@ COPY --chown=node:node . .
 # gateway speaks. A 1.x release has no `/api` routes at all, so every completion in such an image failed with a 502
 # naming a backend that would not start. Override to try another 2.x release:
 #   docker build --build-arg OPENCODE_VERSION=2.3.2
+# This step runs **before** the source is copied in, and that order is the point: it was after `COPY . .`, so every
+# change to any file in the repository invalidated this layer and re-downloaded the CLI (~100 MB, and a full `npm
+# install -g` of it) even though nothing about the CLI had changed. Docker can only reuse a layer while its own
+# instruction and the layers before it are unchanged, and a source file is not an input to this step.
 ARG OPENCODE_VERSION=2.3.2
 RUN npm install -g "@opencode/cli@${OPENCODE_VERSION}" \
     && npm cache clean --force
 # Alternative (if the npm package installation has problems, use the official install script):
 # RUN curl -fsSL https://opencode.ai/install | bash
 
+# Copy the rest of the source (the build context is the repository root). --chown avoids a second full copy of the tree
+# in a following `RUN chown -R`, which is what the image used to carry.
+COPY --chown=node:node . .
+
 # Entry script: on first boot generates /app/config.json from `docker run -e` environment variables
 # (supports PORT/API_KEY/BIND_HOST/OPENCODE_PATH/OPENCODE_SERVER_URL/OPENCODE_BIND_HOST, plus DISABLE_TOOLS and
-# USE_ISOLATED_HOME under either their bare or their OPENCODE_-prefixed name)
+# USE_ISOLATED_HOME under either their bare or their OPENCODE_-prefixed name; OPENCODE_SERVER_PASSWORD is passed
+# through to the spawned backend and never written into config.json)
 # This file lives in docker/ inside the repository, so the COPY below picks it up from the build context
 # --chmod sets the executable bit in the layer itself: a separate `RUN chmod +x` cost another layer for one mode bit
 COPY --chown=node:node --chmod=0755 docker/docker-entrypoint.sh /app/docker-entrypoint.sh

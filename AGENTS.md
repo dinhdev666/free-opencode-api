@@ -85,7 +85,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `src/socket.js` | `closeSocketAfterFlush()`: `end()` then a 250 ms `destroy()` fallback, for the paths that answer outside Fastify's reply lifecycle (`clientErrorHandler`, `badUrlHandler`, a hijacked stream). `destroy()` alone discards buffered writes, so a client under backpressure got a reset instead of its envelope. |
 | `src/api-key.js` | The built-in key `sk-dummy-123` and `resolveApiKey()` (a blank or missing `API_KEY` falls back to it). Never add a "disable auth" switch. |
 | `src/backend-auth.js` | The `Authorization` header for the **backend**: `backendAuthorizationHeader()` (Basic, user `opencode`), `resolveBackendAuth()` (splits userinfo out of a credential-bearing `OPENCODE_SERVER_URL` and registers it as sensitive) and `resolveBackendPassword()` (an explicit password, or a generated one — there is no variable that switches generation off: `options.generate === false` suppresses it for a caller that needs to match a spawned child, and no production caller passes it). |
-| `src/env.js` | Resolving the two configured environment values: `resolveOpencodePath()` (memoised per requested value for a minute; PATH, then the package/version-manager install locations) and `normalizeBackendUrl()` / `normalizeBindHost()` (trim, add a missing scheme, drop a trailing slash — each with a `[Config]` note naming the value that was corrected), plus `isLoopbackHost()`. |
+| `src/env.js` | Resolving the two configured environment values: `resolveOpencodePath()` (memoised per requested value for a minute; PATH, then the package/version-manager install locations — a candidate that exists but is not a regular file, a directory being the realistic case, is skipped rather than handed to `spawn()`, which fails with `EACCES`/`EISDIR` on every start) and `normalizeBackendUrl()` / `normalizeBindHost()` (trim, add a missing scheme, drop a trailing slash — each with a `[Config]` note naming the value that was corrected, and `normalizeBackendUrl()` also notes that a URL without an explicit port resolves to the scheme default), plus `isLoopbackHost()`. |
 | `src/options.js` | `parseBoolean()` and `readFlag()`, the **single** boolean parser for `index.js`, `startProxy()` and request bodies. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off" in the container); do not add a third. |
 | `src/settings.js` | The tuning keys' readers: `readLimit()`, `readMilliseconds()`, `resolveRequestTimeoutMs()`, `isUnusableMilliseconds()`, `backendDeadline()`, and the named defaults they quote (`DEFAULT_REQUEST_TIMEOUT_MS`, `MAX_TIMER_MS`, `METADATA_TIMEOUT_CAP_MS`). The resolved values are held by their consumers in `src/proxy.js`. |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. A BOM is tolerated. |
@@ -113,7 +113,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 450 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway (476 contract assertions on Linux, 464 on Windows)
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -133,7 +133,8 @@ Releases come from tags, not from a laptop: bump `version` in `package.json`, th
 `pnpm test` covers the HTTP contract against the stub in `test/stub-opencode.mjs` (the `/api/*` info, model, session,
 message and SSE routes, plus a test-only `GET /__sessions` reporting created/deleted/live counts, `lastSystemPrompt`,
 `lastPromptText`, `lastPermissionRules`, `sessionCreatePermissions` (the ruleset of **every** create, in order, so a
-call that never produced a session is still counted), `messagePolls` and `toolIdCalls`). Behaviour is selected by markers in the prompt text - `SLOW`
+call that never produced a session is still counted), `messagePolls`, `toolIdCalls` and `infoCalls` (the readiness probes
+that reached `GET /api/info`, so a burst of `/health` requests can be asserted not to touch the backend)). Behaviour is selected by markers in the prompt text - `SLOW`
 (an answer slow enough to abort mid-stream), `STALL` (silence after two deltas), `TOOLTAG` (a tool-call block cut inside
 both of its tags), `FAIL` (a provider error with no content), `ENDONLY` (a finish event carrying only `time.completed`),
 `GROW` (an answer still being written when the prompt returns), `SUICIDE` (the stub SIGKILLs itself after accepting the
@@ -168,7 +169,9 @@ slow `POST /api/session`, so a completion that waited for a queue slot can be gr
 `STUB_DROP_CREATE=1` (the session is created and the connection dropped before the answer),
 `STUB_REJECT_DELETES=1` (a `500` for `DELETE /session/:id`, so the session stays), `STUB_HANG_DELETES=1` (a delete that is
 never answered), `STUB_FAIL_TOOL_IDS=1` (a `500` for the 1.x `GET /experimental/tool/ids`; **accepted as a no-op**, because 2.x has
-no tool-list route and the gateway builds no override map), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
+no tool-list route and the gateway builds no override map), `STUB_ODD_MODEL_NAMES=1` (three provider entries whose
+`name` is a number, an object and an empty string, so a warm cache can be asserted to answer byte-identically to a
+cold one), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
 unreadable provider payload), `STUB_FAIL_EVENTS=1`, `STUB_FAIL_PROVIDERS=1` and `STUB_BIG_ERROR_BODY=1` (a 1 MB error
 body, for the summary bound). Extend it and `test/smoke.mjs` when you add behaviour worth protecting. Session-cleanup
 assertions go through `sessionsAfterCleanup()`: the gateway answers the client *before* deleting the session (its own
@@ -346,7 +349,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   (`type: "queue_full"`, the wait queue is full, with `Retry-After: 1` so an OpenAI SDK backs off instead of failing
   the request) or `type: "server_error"` with `code: "gateway_shutting_down"` (also with `Retry-After: 1`, when
   `SIGINT`/`SIGTERM` arrived and the request is not one of the responses being finished), `504` (timeout), `500`
-  (anything else). A backend the gateway cannot start (a missing CLI, a 1.x release, a taken port, a start cooldown) is
+  (anything else). A backend the gateway cannot start (a missing CLI, a 1.x release, a taken port, a start cooldown, or
+  an `OPENCODE_SERVER_URL` naming **no port** - the child can only listen on a numbered one, so the gateway probed the
+  URL as written, port 80/443, while the child held 4097: every completion answered 502 after the whole startup budget
+  and the child was left behind. It is refused before the spawn, with a sentence naming the port) is
   the same `502 backend_unreachable` as a backend that died mid-request: the tagged `backendUnavailable()` error is
   what tells the two paths apart, and the message names the start failure. Every error body carries a
   `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name, and its message is
@@ -532,7 +538,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `SENSITIVE_HEADER_PATTERN`, built from the exported `SENSITIVE_NAME_ALTERNATIVES` (`auth`, `authorization`,
   `authentication`, `api-key`/`apikey`, `token`, `secret`, `cookie`, `session`, `passw`, `key`, `code`, `sig`,
   `signature`, `credential`, `bearer`, `password`/`passwd`/`pwd` as whole name segments — a bare `passw` was a
-  prefix and matched nothing else) rather than a fixed denylist: `x-goog-api-key`,
+  prefix and matched nothing else, and `access[-_]?token`, `auth[-_]?token`, `refresh[-_]?token`, `client[-_]?secret`,
+  `secret[-_]?key` and `session[-_]?id` match the **concatenated** spellings too, because the client chooses the header
+  name and `X-Access-Token`/`Client-Secret`/`Session-Id` are ordinary ones) rather than a fixed denylist: `x-goog-api-key`,
   `x-auth-token` or `openai-api-key` is a credential too, and the client decides that name. **URLs are masked too**
   (`maskUrlQuery()` before `loggableUrl()` truncates): `?api_key=…`, `?token=…` and `?Authorization=…` are a
   documented OpenAI-compatible client convention, and so are Google's `?key=…`, an OAuth `?code=…` and an Azure SAS
@@ -724,7 +732,13 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   the backend sends **without an id** is keyed by its type, and one answer can carry several parts of the same type: a
   key therefore holds a bounded list of snapshots (`MAX_PART_SNAPSHOTS`, 4) and the increment is taken against the
   snapshot the new text actually continues, so two id-less `text` parts are delivered once each instead of being
-  diffed against one another (`MULTIPARTNOID`).
+  diffed against one another (`MULTIPARTNOID`). Both maps are bounded by the same key count (`MAX_PART_KEYS`, 64):
+  `partTotals` was not, and a backend that varies the part id grew it one permanent entry per delta (200 000 deltas
+  measured 200 000 entries and +44.6 MB of heap, against a `partTexts` stuck at 64). A delta that extends the snapshot
+  its key is already holding is written into that snapshot directly - the delta *is* the increment, and re-diffing the
+  whole answer to rediscover which entry to update cost O(answer) per delta (measured 217 ms for 2 000 deltas of a
+  1 MB answer, on the thread that streams it); the entry is only re-found through `recordPartSnapshot()` when a closing
+  event rewrote it or the snapshot bound dropped it.
 - **A finished message ends the stream, whatever the finish reason.** The collector settles on any non-empty
   `finish` (or `time.completed`), not just `finish === "stop"`: requiring the literal word left answers from
   providers that report `tool-calls`, `end` or only `time.completed` waiting for the 8 s idle timeout.

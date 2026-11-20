@@ -115,6 +115,17 @@ function findExecutableInDirs(dirs, names) {
 const RESOLVE_CACHE_TTL_MS = 60 * 1000;
 let resolveCache = null;
 
+// A configured path has to name a file, not merely something that exists. `statSync` follows a symlink, which is the
+// normal shape for an install into a version manager's tree (`lstat` would reject it), and a throw (unreadable, raced
+// away) is "not a usable path" rather than a crash on the startup path.
+function isFile(candidate) {
+    try {
+        return fs.statSync(candidate).isFile();
+    } catch (e) {
+        return false;
+    }
+}
+
 /**
  * Resolves `OPENCODE_PATH` to the binary `spawnBackend()` will run (PATH, PATHEXT candidates, npm prefixes).
  *
@@ -147,9 +158,14 @@ function searchOpencodePath(input) {
     if (input) {
         const looksLikePath = path.isAbsolute(input) || input.includes('/') || input.includes('\\');
         if (looksLikePath) {
-            if (fs.existsSync(input)) return { path: input, source: 'config' };
+            // A *file*, not merely something that exists: a configured directory (`OPENCODE_PATH=/opt/opencode`)
+            // passed `existsSync()` and was reported at startup as the resolved binary, so the failure surfaced one
+            // layer later as `spawn /opt/opencode EACCES` inside a `502 backend_unreachable` - about a path the
+            // operator had just been told was correct. `findExecutableInDirs()` has always required a regular file
+            // for the PATH search; the configured branch is the one that did not.
+            if (isFile(input)) return { path: input, source: 'config' };
             const resolved = path.resolve(process.cwd(), input);
-            if (fs.existsSync(resolved)) return { path: resolved, source: 'config' };
+            if (isFile(resolved)) return { path: resolved, source: 'config' };
             // A configured path that does not exist is almost always a typo or a moved installation. Say so: the
             // PATH search below would otherwise hide it behind a binary the operator did not choose
             logger.warn(`[Proxy] OPENCODE_PATH '${loggableConfigValue(input)}' does not exist; using the OpenCode found on PATH instead`);
@@ -280,6 +296,16 @@ export function normalizeBackendUrl(raw) {
     if (stripped !== url) {
         notes.push(`OPENCODE_SERVER_URL had a trailing slash, using '${maskBackendUrl(stripped)}'`);
         url = stripped;
+    }
+    // No port: the gateway starts `opencode serve` on 4097 while every probe uses this URL verbatim, so a port-less
+    // value is a backend that can never answer (see `spawnBackend()`, which refuses to spawn one). Said at startup,
+    // where the operator reads the summary, rather than only in the 502 of the first completion.
+    try {
+        if (new URL(url).port === '') {
+            notes.push(`OPENCODE_SERVER_URL='${maskBackendUrl(url)}' names no port: the backend is started on 4097 but this URL is probed as-is (port 80), so completions cannot succeed`);
+        }
+    } catch (e) {
+        // Unparseable: `spawnBackend()` reports it and falls back to port 4097
     }
     return { url, notes };
 }

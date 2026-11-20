@@ -81,6 +81,10 @@ if [ ! -f "$CONFIG" ]; then
         // Mode 0600 because the file carries the API key.
         const tmp = "/app/.config.json.tmp";
         fs.writeFileSync(tmp, JSON.stringify(cfg, null, 4), { mode: 0o600 });
+        // `mode` only applies when the file is created: a leftover .config.json.tmp from an interrupted boot keeps the
+        // mode it was created with, and the rename then installed *that* over a config.json carrying the API key.
+        // chmodSync is unconditional and cheap, so the mode of the file the key lands in never depends on a leftover.
+        fs.chmodSync(tmp, 0o600);
         fs.renameSync(tmp, "/app/config.json");
         // The generated config holds the API key, and this line ends up in `docker logs` (collected and shipped as
         // often as not): print where the key came from, never the key itself. Same rule as maskSecret() in

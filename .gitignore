@@ -15,3 +15,24 @@ config.*.json
 !config.json.example
 *.pem
 *.key
+# The same credential class `.dockerignore` keeps out of the image, ignored here so `git add -A` cannot commit it in
+# the first place: package-manager and git credential files (`.npmrc` is where a registry token lives), an SSH private
+# key and a PKCS#12/keystore bundle.
+.npmrc
+.pnpmrc
+.yarnrc
+.yarnrc.yml
+.netrc
+_netrc
+.git-credentials
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*.p12
+*.pfx
+*.keystore
+*.jks
+# Editor and IDE state: not a credential, but it is machine-local and never belongs in a commit
+.vscode
+.idea

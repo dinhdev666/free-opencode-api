@@ -373,9 +373,9 @@ try {
             // (`SHUTDOWN_TEARDOWN_BUDGET_MS`) so the SIGTERM/SIGKILL escalation always runs, and a hard exit shorter
             // than that preempted it - the gateway left while a child that ignores SIGTERM still held the backend port.
             // The watchdog above adds its own 6 s before this timer starts.
-            const hardExit = setTimeout(() => process.exit(exitCode), 10000);
+            const hardExit = setTimeout(() => process.exit(exitCode | crashExitCode), 10000);
             hardExit.unref();
-            stopBackend().then(() => process.exit(exitCode));
+            stopBackend().then(() => process.exit(exitCode | crashExitCode));
         };
 
         const watchdog = setTimeout(
@@ -397,6 +397,12 @@ try {
     };
 
     process.on('SIGINT', () => shutdown('SIGINT'));
+    // A crash keeps its exit status even when a signal already started the shutdown: `shutdown()` returns
+    // immediately for a second caller, so an uncaught exception raised between SIGINT and the forced exit used to
+    // leave with the *signal's* status 0 - the one thing the `exitCode` argument exists to prevent. The bit is sticky
+    // and `finish()` ORs it in, so whichever exit path wins (server close, teardown watchdog) still reports a crash.
+    let crashExitCode = 0;
+
     process.on('SIGTERM', () => shutdown('SIGTERM'));
 
     // A single failed request must not take the gateway down silently: a stray rejection is logged with its stack and
@@ -406,7 +412,9 @@ try {
     });
     process.on('uncaughtException', (err) => {
         logger.error('[Fatal] Uncaught exception:', loggableError(err));
-        // Status 1: the state is unknown, so this is a crash and every supervisor should see one
+        // Status 1: the state is unknown, so this is a crash and every supervisor should see one. Recorded even when
+        // a shutdown is already running, because `shutdown()` returns early for a second caller.
+        crashExitCode = 1;
         shutdown('uncaughtException', 1);
     });
 } catch (error) {

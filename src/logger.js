@@ -189,8 +189,19 @@ const SENSITIVE_HEADER_NAMES = new Set([
 // went out in clear. The full words are listed next to it, and a segment separator (`_`, `-`) is what makes
 // `db_password` match.
 export const SENSITIVE_NAME_ALTERNATIVES = 'auth|token|secret|cookie|session|passw|password|passwd|pwd|key|code|sig|signature|credential|bearer';
+// Node lower-cases every incoming header name before `request.headers` is built, so `X-AccessToken` reaches
+// `maskHeaders()` as `accesstoken` and `credentialNameKey()` has no case boundary to split: the segment anchors below
+// then match nothing, because `accesstoken` is one word that no alternative spells. The camel-case split that fixed
+// the JavaScript spellings (`accessToken`) therefore never runs for a real header, and the concatenated compounds -
+// the shape every non-browser client uses for its own metadata - were dumped in clear at debug level. `[-_]?` keeps
+// both spellings: `x-access-token` already matched through the `token` segment, `x-accesstoken` did not.
+// Only the compounds are added here and `SENSITIVE_NAME_ALTERNATIVES` is left alone, because that string is also the
+// query-name list: a query is not lower-cased and not split, so `?accessToken=` is still one name there. A compound
+// that is not a credential (`monkey`, `keyboard`, `tokenizer`) still matches nothing: every alternative is anchored by
+// a separator or by a word boundary on both sides.
 const SENSITIVE_HEADER_PATTERN = new RegExp(
-    `(^|[-_])(${SENSITIVE_NAME_ALTERNATIVES})([-_]|$)|authorization|authentication|api[-_]?key`,
+    `(^|[-_])(${SENSITIVE_NAME_ALTERNATIVES})([-_]|$)|authorization|authentication|api[-_]?key` +
+        `|access[-_]?token|auth[-_]?token|refresh[-_]?token|client[-_]?secret|secret[-_]?key|session[-_]?id`,
     'i'
 );
 
@@ -317,8 +328,16 @@ export function maskUrlCredentials(text) {
     // does too unless the leading word is a URI scheme the login and address forms use.
     // The name class cannot cross a separator, `:`, `=` or a quote: `KEY=user:pass@host` is a note naming the value, and
     // starting at the `=` keeps the key readable while the credential goes.
+    // The secret run is bounded (`{0,256}`) for the same reason the scheme run above is: `[^…]*` had to reach the `@`
+    // to succeed, so a target with one `@` early and no other retried the scan from every `=`, `:`, quote and space
+    // after it - `/v1/@x==a:=a:=a:…` measured 1.2 ms at 3 KiB, 16.9 ms at 12 KiB and 126 ms at 32 KiB, quadratic, on
+    // the request-summary line that is built before the auth check (the debug body dump hits the same rule with every
+    // string it masks, at 32 KiB each). The scheme-qualified rule above masks a real `scheme://user:pass@` credential
+    // of any length, so this rule only ever sees the scheme-less form a hand-written sentence or `normalizeBackendUrl()`
+    // produces, where 256 characters is far beyond any credential: measured 31.1 ms -> 2.3 ms at 16 KiB, byte-identical
+    // output on every credential-bearing shape.
     return withScheme.replace(
-        /(^|[\s="'(<])([^\s/?#@"'()<>=:]+):([^\s/?#@]*)@(?=[^\s/?#@]+)/g,
+        /(^|[\s="'(<])([^\s/?#@"'()<>=:]+):([^\s/?#@]{0,256})@(?=[^\s/?#@]+)/g,
         (match, boundary, user, secret, offset, whole) => {
             const afterAt = whole.slice(offset + match.length);
             const looksLikeAuthority = /^[^\s/?#@]+(?::\d+|[/?#])/.test(afterAt);

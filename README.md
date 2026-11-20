@@ -628,8 +628,8 @@ A container image with the OpenCode CLI preinstalled is published for `linux/amd
 [docker/README.md](docker/README.md) for image tags, environment variables, and port exposure.
 
 ```bash
-docker pull dinhdev666/free-opencode-api:3.0.0
-docker run -d --restart=always -p 8083:8083 -e API_KEY=sk-your-key dinhdev666/free-opencode-api:3.0.0
+docker pull dinhdev666/free-opencode-api:latest
+docker run -d --restart=always -p 8083:8083 -e API_KEY=sk-your-key dinhdev666/free-opencode-api:latest
 ```
 
 Docker Hub selects the matching architecture automatically. The image runs as the unprivileged `node` user
@@ -655,8 +655,8 @@ branch protection rules.
 Publishing a release is therefore just a tag:
 
 ```bash
-git tag v3.0.0        # must match "version" in package.json
-git push origin v3.0.0
+git tag vX.Y.Z        # must match "version" in package.json
+git push origin vX.Y.Z
 ```
 
 ---

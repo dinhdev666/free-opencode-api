@@ -2100,7 +2100,31 @@ function createApp(config) {
         // again is over: the answer is append-only and the totals below are keyed by the same string, so a part
         // dropped here simply loses its snapshot bookkeeping and is re-based if it reappears.
         const MAX_PART_KEYS = 64;
+        // The `partTexts`/`partTotals` key for each part, built the first time the part is seen instead of once per
+        // delta: it is a template over the backend-controlled `assistantMessageID` and the part ordinal, and the same
+        // string was rebuilt for every delta of every part (about 16 ns/delta of the streaming loop). Two slots per
+        // part, because a text part and a reasoning part of the same assistant message can share an ordinal - the
+        // snapshot keys differ by their first character, and this map is keyed by `partKey` alone.
+        const partKeysByKind = new Map();
+        const partKeyOrderForCache = [];
         const partKeyOrder = [];
+        // The `partTexts`/`partTotals` key for one part, built once per part (see `partKeysByKind`). Bounded by the
+        // same MAX_PART_KEYS rule as the maps themselves: a part that has not been seen for a long answer is dropped
+        // and simply rebuilt if it reappears.
+        const partSnapshotKey = (partKey, isReasoning) => {
+            let byKind = partKeysByKind.get(partKey);
+            if (!byKind) {
+                if (partKeysByKind.size >= MAX_PART_KEYS) {
+                    partKeysByKind.delete(partKeyOrderForCache.shift());
+                }
+                byKind = {};
+                partKeysByKind.set(partKey, byKind);
+                partKeyOrderForCache.push(partKey);
+            }
+            const kind = isReasoning ? 'r' : 't';
+            if (byKind[kind] === undefined) byKind[kind] = kind + partKey;
+            return byKind[kind];
+        };
         const notePartKey = (key) => {
             // Both maps are keyed by this string, so both are bounded here: `partTotals` used to grow one permanent
             // entry per delta for a backend that varies the part id (`assistantMessageID` is backend-controlled text),
@@ -2281,7 +2305,7 @@ function createApp(config) {
                             const delta = typeof data.delta === 'string' ? data.delta : '';
                             if (!delta) continue;
                             receivedDelta = true;
-                            const snapshotKey = `${isReasoning ? 'r' : 't'}${partKey}`;
+                            let snapshotKey = partSnapshotKey(partKey, isReasoning);
                             const held = partTotals.get(snapshotKey);
                             const running = (held ? held.total : '') + delta;
                             if (held && held.slot && held.slot.text === held.total && isLiveSnapshot(snapshotKey, held.slot)) {

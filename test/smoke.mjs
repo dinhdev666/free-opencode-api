@@ -351,9 +351,15 @@ async function run() {
     // cap raised in code left the table promising the old one, and a reader raising it from the table change alone
     // would find the gateway still enforcing the old value. Both sides are read as text, so a change to either has to
     // agree with the other.
-    const proxySource = fs.readFileSync(path.join(ROOT, 'src', 'proxy.js'), 'utf8');
+    // The resolvers and the named defaults they quote live in `src/settings.js` (the tuning keys' own module), the
+    // callers that hold the resolved values in `src/proxy.js`: both are read, so the table is compared against the code
+    // that decides, wherever that code sits.
+    const proxySource = ['src/proxy.js', 'src/settings.js']
+        .map((file) => fs.readFileSync(path.join(ROOT, ...file.split('/')), 'utf8'))
+        .join('\n');
     const numericConstants = new Map(
-        [...proxySource.matchAll(/^const (DEFAULT_[A-Z0-9_]+) = (\d+);$/gm)].map((match) => [match[1], Number(match[2])])
+        [...proxySource.matchAll(/^(?:export )?const (DEFAULT_[A-Z0-9_]+) = (\d+);$/gm)]
+            .map((match) => [match[1], Number(match[2])])
     );
     const resolveDefault = (token) => (/^\d+$/.test(token) ? Number(token) : numericConstants.get(token));
     const tuningDefaults = new Map();

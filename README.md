@@ -661,8 +661,18 @@ git push origin v3.0.0
 ├── index.js                  # Entry point: merges config and starts the gateway
 ├── src/
 │   ├── proxy.js              # Fastify app, OpenAI routes, OpenCode backend management
+│   ├── text.js               # Request ids, log-safe truncation and masking of values
+│   ├── errors.js             # Client-facing sentences for a failed upstream call
+│   ├── upstream.js           # Classifies what the backend threw (tag, status, cause chain)
+│   ├── socket.js             # end() then destroy() fallback for a raw socket close
+│   ├── api-key.js            # The built-in API key and resolveApiKey()
+│   ├── backend-auth.js       # Basic Authorization header for the backend
+│   ├── env.js                # OPENCODE_PATH lookup, backend URL and bind host normalisation
+│   ├── options.js            # parseBoolean()/readFlag(), the single boolean parser
+│   ├── settings.js           # Tuning-key readers and their defaults
 │   ├── config.js             # Reads config.json (a missing file is fine, an unusable one stops the gateway)
-│   └── logger.js             # Zero-dependency leveled logger with secret masking
+│   ├── logger.js             # Zero-dependency leveled logger with secret masking
+│   └── polyfills.js          # Node 20 shims (Promise.withResolvers)
 ├── config.json.example       # Sample configuration
 ├── package.json              # Scripts, dependencies, packageManager pin (pnpm)
 ├── pnpm-lock.yaml            # Locked dependency tree (pnpm)

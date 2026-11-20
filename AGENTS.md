@@ -23,7 +23,8 @@ These are product decisions, not implementation details. Do not "improve" them w
    configured with an api-key header send it) — a present `Authorization` header always decides, so a wrong one is never
    rescued by the alias. Presence decides, not the parsed token: a proxy injecting `Authorization: Basic …` or a bare
    `Bearer` sends a header the gateway could not read, and testing the parsed token let the alias rescue it. A blank or
-   missing `API_KEY` falls back to the built-in default `sk-dummy-123` (`resolveApiKey()` in `src/proxy.js`). Never add a
+   missing `API_KEY` falls back to the built-in default `sk-dummy-123` (`resolveApiKey()` in `src/api-key.js`, re-exported
+   from `src/proxy.js`). Never add a
    "disable auth" switch, never treat an empty key as "no auth". The bearer is compared in **bytes** (`timingSafeEqual`
    on two `Buffer`s of equal length): a non-ASCII key matches in string length but not in byte length, and comparing
    strings threw a `RangeError` for a wrong key. The refusal names the cause the reader can act on -
@@ -76,7 +77,16 @@ These are product decisions, not implementation details. Do not "improve" them w
 | Path | Responsibility |
 | --- | --- |
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved queue limits, via `getQueueLimits()`), calls `startProxy()` and awaits its `ready` promise (a listen failure is reported and exits there, not inside the proxy), wires `SIGINT`/`SIGTERM` shutdown. |
-| `src/proxy.js` | Everything else: Fastify app, hooks (request id/logging, CORS, auth), `/v1/models`, `/v1/chat/completions`, `/health`, error/404 envelopes, completion queue, SSE collection, polling, backend lifecycle (`ensureBackend`, spawn, health probe against `/api/info`), and the `@opencode/client` calls every completion is built from (`session.create` / `prompt` / `message.list` / `remove`, `model.list`, `event.subscribe`). |
+| `src/proxy.js` | The Fastify app: hooks (request id/logging, CORS, auth), the routes `/`, `/v1/models`, `/v1/models/:modelId`, `/v1/chat/completions`, `/health`, error/404 envelopes, the completion queue, SSE collection, polling, the backend lifecycle (`ensureBackend`, spawn, health probe against `/api/info`), and the `@opencode/client` calls every completion is built from (`session.create` / `prompt` / `message.list` / `remove`, `model.list`, `event.subscribe`). It is also the **public surface**: the entry point, the smoke suite and an embedder import `startProxy()`, `beginShutdown()`, `getQueueLimits()`, `resolveApiKey()` and the helper names from here, so a helper that moved into its own module is re-exported here rather than moved for its callers. |
+| `src/text.js` | Text and value handling shared by the request path: request/completion ids (`requestId()`, `generatedRequestId()`, `newCompletionId()`), the log-safety bounders (`echoedValue()`, `loggableModelId()`, `loggableConfigValue()`, `loggableUpstreamText()`, `loggableUrl()`, `urlPath()`), `jsonTypeName()` and `timeoutMessage()`. Every bounder **bounds, then masks** and marks a cut value with an ellipsis plus a `…[truncated N chars]` counter, so two log lines never disagree about how much was dropped. |
+| `src/errors.js` | The sentences an upstream throw turns into: `clientFacingText()` (masked, URL/credential-safe, cut at 512) for a 5xx body and `handlerFailureMessage()` for the route handler's own catch. |
+| `src/upstream.js` | Classifying what the backend threw: `isTimeoutError()`, `isConnectionError()`, `isConnectionRefused()` (walks the `cause` chain, because `fetch` nests `ECONNREFUSED`), `errorCauseChain()`, `upstreamErrorStatus()` over `V2_ERROR_TAG_STATUS`, `upstreamFailureReason()` and the tagged `backendUnavailable()`. |
+| `src/socket.js` | `closeSocketAfterFlush()`: `end()` then a 250 ms `destroy()` fallback, for the paths that answer outside Fastify's reply lifecycle (`clientErrorHandler`, `badUrlHandler`, a hijacked stream). `destroy()` alone discards buffered writes, so a client under backpressure got a reset instead of its envelope. |
+| `src/api-key.js` | The built-in key `sk-dummy-123` and `resolveApiKey()` (a blank or missing `API_KEY` falls back to it). Never add a "disable auth" switch. |
+| `src/backend-auth.js` | The `Authorization` header for the **backend**: `backendAuthorizationHeader()` (Basic, user `opencode`), `resolveBackendAuth()` (splits userinfo out of a credential-bearing `OPENCODE_SERVER_URL` and registers it as sensitive) and `resolveBackendPassword()` (an explicit password, or a generated one unless `OPENCODE_GENERATE_PASSWORD=false`). |
+| `src/env.js` | Resolving the two configured environment values: `resolveOpencodePath()` (memoised per requested value for a minute; PATH, then the package/version-manager install locations) and `normalizeBackendUrl()` / `normalizeBindHost()` (trim, add a missing scheme, drop a trailing slash — each with a `[Config]` note naming the value that was corrected), plus `isLoopbackHost()`. |
+| `src/options.js` | `parseBoolean()` and `readFlag()`, the **single** boolean parser for `index.js`, `startProxy()` and request bodies. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off" in the container); do not add a third. |
+| `src/settings.js` | The tuning keys' readers: `readLimit()`, `readMilliseconds()`, `resolveRequestTimeoutMs()`, `isUnusableMilliseconds()`, `backendDeadline()`, and the named defaults they quote (`DEFAULT_REQUEST_TIMEOUT_MS`, `MAX_TIMER_MS`, `METADATA_TIMEOUT_CAP_MS`). The resolved values are held by their consumers in `src/proxy.js`. |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. A BOM is tolerated. |
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses) for debug logging. |
 | `src/polyfills.js` | Node 20 shims, imported for its side effect first thing in `src/proxy.js`: `Promise.withResolvers()` is Node 22+, and `@opencode/client`'s SSE subscription calls it unconditionally, so without it every stream silently fell back to polling (one delta per answer). A no-op on a runtime that has the API. |
@@ -456,7 +466,7 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   notes, the container's first-boot config dump and `/health` verbatim — and `/health` needs no key, so that published
   the secret to every caller and to `docker logs`. `maskBackendUrl()` in `src/logger.js` masks
   the userinfo and any credential query value and leaves scheme/host/path readable, which is what they are read for. The entrypoint **imports** the helper for its own first-boot dump and log line (`node --input-type=module -e … /app/src/logger.js`), so the container cannot drift from the module - its earlier hand-written copy matched neither `#`-separated pairs nor the length rule - and masks everything as `***` if that import fails; the stored `config.json` keeps the real value.
-  The same applies to **text**: `resolveBackendAuth()` (`src/proxy.js`) splits the userinfo out of the value the SDK is
+  The same applies to **text**: `resolveBackendAuth()` (`src/backend-auth.js`) splits the userinfo out of the value the SDK is
   given and `maskUrlCredentials()` masks a `scheme://user:pass@` inside any sentence. Its scheme run is bounded
   (`\w[\w+.-]{0,31}`): an unbounded one rescanned every position of a whitespace-free token containing `://` and no
   `@`, which is O(n²) — 8 ms at 2 000 characters, 1.85 s at 32 000 — on the serving thread, reachable through a debug
@@ -559,10 +569,11 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   exception — denying either of them hung prompt requests with the free zen models. The set lives in constants
   (`TOOL_DENY_ACTIONS`, `TOOLS_ALLOWED_WHEN_DISABLED`) and the rules go out only when the switch is on; the prompt
   text still carries `TOOL_GUARD_MESSAGE`, because a permission rule refuses a call the model may still attempt.
-- **Boolean options go through `parseBoolean()`** (exported from `src/proxy.js`), the single parser used by
+- **Boolean options go through `parseBoolean()`** (in `src/options.js`, re-exported from `src/proxy.js`), the single
+  parser used by
   `index.js` and `startProxy()`. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off"
   in the container); do not add a third. A value that is present but cannot be read is **named with the
-  value actually used** (`readFlag()` in `src/proxy.js`, used by `index.js` for `DISABLE_TOOLS`,
+  value actually used** (`readFlag()` in `src/options.js`, used by `index.js` for `DISABLE_TOOLS`,
   `USE_ISOLATED_HOME` and `DEBUG`): `[Config] DISABLE_TOOLS='maybe' is not a boolean (use true/false, yes/no, on/off
   or 1/0), using false`. A silent fallback is the failure the numeric tuning keys were fixed for, and
   a `DISABLE_TOOLS` typo leaves `<function_calls>` markup in the answer while the operator believes it
@@ -620,9 +631,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS='0' is not a positive number, using 300000`, `… HEALTH_CACHE_MS='abc' is not a
   number, using 2000`): a silent fallback left the operator convinced a value was in force while the gateway ran the
   default.
-  The completion budget has one resolution point, `resolveRequestTimeoutMs(options, env)` (exported from
-  `src/proxy.js`): it applies the same precedence and returns the value **and** the note to print, so an entry point, an
-  embedder and the smoke suite cannot disagree. A blank environment value falls through to `config.json` like every
+  The completion budget has one resolution point, `resolveRequestTimeoutMs(options, env)` (in `src/settings.js`,
+  re-exported from `src/proxy.js`): it applies the same precedence and returns the value **and** the note to print, so
+  an entry point, an embedder and the smoke suite cannot disagree. A blank environment value falls through to
+  `config.json` like every
   other key (`??` ended the chain at `''`, so `Environment=OPENCODE_PROXY_REQUEST_TIMEOUT_MS=` in a unit file silently
   replaced the file's value with the 300000 ms default, and the "unusable value" note was skipped for a blank one).
   A timeout above `MAX_TIMER_MS` (`2 ** 31 - 1`, the largest delay `setTimeout` accepts) is clamped to it with a note: a

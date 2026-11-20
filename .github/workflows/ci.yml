@@ -295,10 +295,12 @@ jobs:
           echo "OPENCODE_BIND_HOST in the generated config -> $bind"
           test "$bind" = "127.0.0.1"
 
-      # The image bundles the CLI that the gateway drives: prove the bundled `opencode serve` still exposes the 1.x
-      # session API. A 2.x release serves the web UI instead - it answers /health with HTML (so a readiness probe
-      # passes) and 405 for POST /session (so every completion fails), and no other step here would notice: this is
-      # what a `latest` CLI install shipped. Needs no provider credentials, only the local backend.
+      # The image bundles the CLI that the gateway drives: prove the bundled `opencode serve` still exposes the 2.x
+      # session API the gateway calls (`POST /api/session`). A 1.x release answers 404 there - it has no `/api` route at
+      # all - and no other step here would notice, because a 1.x server also answers `/health` with HTML, so a plain
+      # readiness probe passes on it. This is what a `latest` CLI install that moved backwards would ship.
+      # The server password is pinned through the environment so the request can authenticate: 2.x answers 401 without
+      # it, and the gateway reads the same variable (`OPENCODE_SERVER_PASSWORD`) for the child it spawns.
       # It runs in its own container rather than through `docker exec`: a detached exec keeps the CLI's output out of
       # `docker logs`, so a failure reported only "fetch failed" with nothing to read, and sharing the gateway
       # container's HOME means sharing its backend state for no reason.
@@ -309,18 +311,18 @@ jobs:
       # static model, so a 10 s curl timeout raced it and failed with exit 28 on a container that was about to answer.
       - name: Bundled CLI exposes the session API
         run: |
-          docker run -d --name cli-session-check -p 4599:4599 --entrypoint opencode \
-            free-opencode-api:ci serve --port 4599 --hostname 0.0.0.0
+          docker run -d --name cli-session-check -p 4599:4599 -e OPENCODE_SERVER_PASSWORD=ci-check-password \
+            --entrypoint opencode free-opencode-api:ci serve --port 4599 --hostname 0.0.0.0
           for attempt in $(seq 1 60); do
-            if body=$(curl -fsS --max-time 3 --connect-timeout 1 -X POST -H 'content-type: application/json' \
-                -d '{}' http://127.0.0.1:4599/session 2>/dev/null); then
+            if body=$(curl -fsS --max-time 3 --connect-timeout 1 -u opencode:ci-check-password -X POST \
+                -H 'content-type: application/json' -d '{}' http://127.0.0.1:4599/api/session 2>/dev/null); then
               echo "bundled opencode created a session: $body"
               echo "$body" | grep -q '"id"'
               exit 0
             fi
             sleep 1
           done
-          echo "the bundled opencode CLI did not answer POST /session"
+          echo "the bundled opencode CLI did not answer POST /api/session"
           docker ps -a --filter name=cli-session-check
           docker logs cli-session-check || true
           exit 1

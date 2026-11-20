@@ -51,6 +51,13 @@ const REJECT_PERMISSIONS = process.env.STUB_REJECT_PERMISSIONS === '1';
 const DROP_CREATE = process.env.STUB_DROP_CREATE === '1';
 // A backend that wedges on this session creation (1-based) and never answers
 const HANG_CREATE_AFTER = Number(process.env.STUB_HANG_CREATE_AFTER || 0);
+// A backend whose socket dies for the first `n` session creations, before a session is made: what a backend that
+// accepted `POST /api/session` and then died looks like from the client's side. This is **not** the case the gateway
+// retries (`isConnectionRefused()` needs a refused *connection*, and dropping an accepted socket is `ECONNRESET`), so
+// it pins the other half of that rule: no second create, and the orphan it would leave behind never appears.
+// A genuine refusal is not reproducible against a live stub: the retry re-probes `/api/info` before its second call,
+// so the port would have to be closed for the create and open again microseconds later.
+const RESET_CREATE_TIMES = Number(process.env.STUB_RESET_CREATE_TIMES || 0);
 // A backend that takes a while to answer POST /api/session, so a completion that waited for a queue slot can be
 // granted a fresh request budget for a call that was already answered
 const CREATE_DELAY_MS = Number(process.env.STUB_CREATE_DELAY_MS || 0);
@@ -78,8 +85,12 @@ const REJECT_DELETES = process.env.STUB_REJECT_DELETES === '1';
 // Accept a DELETE and never answer it
 const HANG_DELETES = process.env.STUB_HANG_DELETES === '1';
 
-export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub.';
-export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
+// The stub's answer is a **constant**, not a variable: the suite carries its own copy of both sentences and asserts the
+// gateway relays them verbatim (30-odd checks), so an override here would fail all of them while looking like a
+// regression in the gateway. `STUB_ANSWER` / `STUB_REASONING` existed and were documented nowhere; change the sentence
+// here and in `test/smoke.mjs` together instead.
+export const ANSWER = 'Hello from the smoke test stub.';
+export const REASONING = 'Thinking about the request.';
 // An answer long enough that splitting it produces many more deltas than a sentence would (the idle timer is re-armed
 // on every one of them). Kept in step with MANY_DELTAS_ANSWER in test/smoke.mjs.
 export const MANY_DELTAS_ANSWER = Array.from({ length: 60 }, (_, index) => `part${index}`).join(' ');
@@ -120,6 +131,11 @@ let lastPromptText = '';
 // The permission ruleset of the most recent POST /api/session: 2.x replaced the 1.x per-tool override map with a
 // ruleset handed to session create, so this is where a test reads what the gateway actually sent
 let lastPermissionRules = null;
+// The `permissions` of every successful `POST /api/session`, in order. A gateway that retries a refused connection has
+// to send the ruleset on the retry too, and that is only visible by looking past the first entry.
+const sessionCreatePermissions = [];
+// How many `POST /api/session` calls the stub has seen, so a refusal can be limited to the first few
+let createCalls = 0;
 const eventClients = new Set();
 let eventSeq = 0;
 
@@ -452,11 +468,23 @@ const server = http.createServer(async (req, res) => {
             body = {};
         }
         // The whole ruleset is kept as it arrived: 2.x replaced the 1.x per-tool override map with a permission
-        // ruleset on session create, and this is what a test reads to prove which tools the gateway denied
+        // ruleset on session create, and this is what a test reads to prove which tools the gateway denied.
+        // Recorded for **every** call, refused ones included: a call that never produced a session is still a call the
+        // gateway made, and "how many creates did it attempt" is what the no-retry rule is asserted on.
         lastPermissionRules = body.permissions ?? null;
+        sessionCreatePermissions.push(body.permissions ?? null);
+        createCalls += 1;
+        if (createCalls <= RESET_CREATE_TIMES) {
+            // The connection is dropped before the session exists, so the id never reaches the gateway: what a backend
+            // that accepted the call and then died looks like. `fetch` reports `ECONNRESET`/`socket hang up`, which is
+            // deliberately *not* the refused-connection case the gateway retries - retrying it is what orphaned a session.
+            return req.socket.destroy();
+        }
         if (HANG_CREATE_AFTER > 0 && sessionSeq >= HANG_CREATE_AFTER) return;
         if (CREATE_DELAY_MS) await sleep(CREATE_DELAY_MS);
         sessionSeq += 1;
+        // Every created session's ruleset, not just the last one: "which tools did each session deny" has to be
+        // provable per session, and one global `lastPermissionRules` is overwritten by whichever call finished last.
         const session = { id: `ses_${sessionSeq}`, time: { created: Date.now() }, title: 'smoke test', permissionRules: lastPermissionRules, messages: [], messageId: null, promptText: '' };
         sessions.set(session.id, session);
         // Accepted, **then** the connection goes away without an answer: what a backend that dies between accepting the
@@ -479,7 +507,8 @@ const server = http.createServer(async (req, res) => {
             messagePolls,
             lastSystemPrompt,
             lastPromptText,
-            lastPermissionRules
+            lastPermissionRules,
+            sessionCreatePermissions
         });
     }
 

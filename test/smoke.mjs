@@ -84,6 +84,11 @@ async function sessionsAfterCleanup(url, timeoutMs = 5000) {
     }
 }
 
+// `MODELS_CACHE_TTL_MS` in `src/proxy.js`: the age at which a cached model listing is refreshed. Duplicated here as a
+// number rather than imported, because the point of the check is the *documented* bound - a test that read the value
+// out of the module would follow a change to it instead of noticing.
+const MODELS_CACHE_TTL_MS_FOR_TEST = 5000;
+
 async function waitForOk(url, timeoutMs = 20000, headers = undefined) {
     const deadline = Date.now() + timeoutMs;
     let lastError = null;
@@ -1033,6 +1038,31 @@ async function run() {
     const cachedCalls = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
     check('a repeated listing is served from the cache', cachedCalls === burstAfter,
         `provider calls: ${cachedCalls - burstAfter} extra`);
+
+    // An **expired** entry is not a miss: the listing is served from the cache for up to `MODELS_STALE_MS` while the
+    // refresh runs behind the response, so the request that crosses the 5 s TTL does not pay a provider round trip -
+    // measured 5.0-5.3 ms against 0.6 ms warm on a loopback stub, and one network RTT against a real backend. Awaiting
+    // the refresh was the bug; serving stale without ever refreshing would be the opposite one, so both halves are
+    // asserted: the body is the cached one and exactly one refresh reaches the provider.
+    const staleBefore = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
+    await sleep(MODELS_CACHE_TTL_MS_FOR_TEST + 200);
+    const staleStarted = Date.now();
+    const staleListing = await request('/v1/models');
+    const staleMs = Date.now() - staleStarted;
+    check('a listing served past its TTL is the cached body, answered without waiting for the refresh',
+        staleListing.response.status === 200 && staleListing.text === cachedSecond.text && staleMs < 1500,
+        `status ${staleListing.response.status}, ${staleMs} ms`);
+    const staleAfter = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
+    check('the stale listing triggers exactly one background refresh',
+        staleAfter - staleBefore === 1, `provider calls: ${staleAfter - staleBefore}`);
+    // ...and the refresh rate-limits itself: past the TTL but inside the same refresh window a failing provider must not
+    // be asked once per request, which is the round trip the stale path would otherwise reintroduce on the backend.
+    const staleSecondBefore = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
+    await request('/v1/models');
+    await request('/v1/models');
+    const staleSecondAfter = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
+    check('a second stale listing does not start a second refresh',
+        staleSecondAfter - staleSecondBefore === 0, `provider calls: ${staleSecondAfter - staleSecondBefore}`);
 
     // A model id is looked up in both shapes: the slash escaped and the slash as a path separator
     const encodedModel = await request('/v1/models/opencode%2Fkimi-k2.5-free');
@@ -2298,10 +2328,48 @@ async function run() {
         sniffRejection.response.status === 401 &&
         sniffRejection.response.headers.get('x-content-type-options') === 'nosniff',
         `${sniffRejection.response.status} ${sniffRejection.response.headers.get('x-content-type-options')}`);
+    // The other two paths the CORS set is written on are asserted with the parser-level checks below, which is where
+    // the raw reply is captured: `clientErrorHandler` answers a request the HTTP *parser* refused (no hook runs) and
+    // `badUrlHandler` answers one the *router* could not decode.
+    const sniffBadUrl = await request('/v1/models/%E0%A4%A');
+    check('a URL the router cannot decode forbids content sniffing',
+        sniffBadUrl.response.headers.get('x-content-type-options') === 'nosniff',
+        `${sniffBadUrl.response.status} ${sniffBadUrl.response.headers.get('x-content-type-options')}`);
+    // A hijacked stream leaves Fastify's reply lifecycle, so the frames go out through the raw socket: the stream is the
+    // one response that has to set the header itself.
+    const sniffStream = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: { messages: [{ role: 'user', content: 'hi' }], stream: true },
+        stream: true
+    });
+    check('a hijacked SSE stream forbids content sniffing',
+        sniffStream.response.headers.get('x-content-type-options') === 'nosniff',
+        `${sniffStream.response.status} ${sniffStream.response.headers.get('x-content-type-options')}`);
     const injected = await request('/health', { headers: { 'X-Request-Id': 'bad id with spaces' } });
     const injectedId = injected.response.headers.get('x-request-id') || '';
     check('an unusable client trace id is replaced by a generated one',
         injectedId.startsWith('gw-'), injectedId);
+    // The accepted shape is `[A-Za-z0-9._:-]{1,64}` and it is a **contract**: the value is copied into a header and a
+    // log line, so a widening to `{1,1024}` or a dropped `:` passes every other assertion in the suite. One accepted
+    // token and one rejected value only proved the two endpoints of a table. A value `fetch` refuses to send at all
+    // (a newline, which its own header validation rejects) cannot reach the gateway, so it is not a case here.
+    const traceIdCases = [
+        ['tr-1', true], ['a.b_c:d-1', true], ['A'.repeat(64), true],
+        ['B'.repeat(65), false], ['has space', false], ['semi;colon', false],
+        ['quote"mark', false], ['back\\slash', false], ['tab\there', false], ['paren(thesis)', false]
+    ];
+    const traceIdResults = [];
+    for (const [value, accepted] of traceIdCases) {
+        const echoed = await request('/health', { headers: { 'X-Request-Id': value } });
+        const id = echoed.response.headers.get('x-request-id') || '';
+        traceIdResults.push({
+            value: JSON.stringify(value),
+            ok: accepted ? id === value : id.startsWith('gw-')
+        });
+    }
+    check('a client trace id is echoed only in the documented shape',
+        traceIdResults.every((r) => r.ok),
+        JSON.stringify(traceIdResults.filter((r) => !r.ok)));
 
     // --- session lifecycle -------------------------------------------------------------------------------
     // One session is created and must be deleted per completion; a leak would grow the backend without bound
@@ -2332,10 +2400,15 @@ async function run() {
     // The summary is where an operator copies the backend value from, so it must show the value the gateway uses and
     // not the raw one: it printed `http://host:port/` while a note two lines later said the slash was stripped, and a
     // trailing space was printed verbatim. The correction now comes first, and the summary contradicts nothing.
+    // The logger sends `warn`/`error` to stderr and `info`/`debug` to stdout, so `slashOutput` is two pipes merged by
+    // the scheduler and **cannot** prove that one line precedes the other: asserting `note < summary` on it failed on
+    // one port pair and passed on another with no code change. What is contractual is that both lines exist and that
+    // the summary prints the corrected value; the ordering is a property of `index.js`'s call sequence, not of an
+    // interleaving of two pipes.
     const slashSummaryIndex = slashOutput.indexOf(`  - Backend: ${STUB_URL}`);
     const slashNoteIndex = slashOutput.indexOf('OPENCODE_SERVER_URL had a trailing slash');
-    check('the startup summary prints the normalised backend URL, below its correction',
-        slashSummaryIndex !== -1 && slashNoteIndex !== -1 && slashNoteIndex < slashSummaryIndex,
+    check('the startup summary reports the correction and the normalised backend URL',
+        slashSummaryIndex !== -1 && slashNoteIndex !== -1,
         JSON.stringify(slashOutput.split('\n').filter((line) => /Backend:|trailing slash/.test(line))).slice(0, 240));
     check('the startup summary never prints a backend URL with a trailing slash',
         !/  - Backend: \S*\/\s*$/m.test(slashOutput),
@@ -3807,6 +3880,81 @@ async function run() {
     stop(dropStub);
     await waitForExit(dropStub);
 
+    // --- a dropped session creation is not retried --------------------------------------------------------------
+    // `session.create` is retried once, and **only** for a refused connection (`isConnectionRefused()`: `ECONNREFUSED`,
+    // also through the `AggregateError` Node's `fetch` builds). A socket that is destroyed after the request arrived is
+    // `ECONNRESET`/`socket hang up` - a backend that accepted the call and then died - and retrying it is what created a
+    // second session while the first one kept existing with no id in this process, so neither `cleanupSession()` nor the
+    // shutdown drain could ever delete it. The stub drops the first creation at the transport and records every call, so
+    // the rule is asserted on both halves: one attempt, and no session left behind.
+    const createResetStubPort = GATEWAY_PORT + 92;
+    const createResetStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(createResetStubPort), STUB_RESET_CREATE_TIMES: '1' }
+    });
+    children.push(createResetStub);
+    createResetStub.stdout.on('data', () => {});
+    createResetStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${createResetStubPort}/health`);
+    const createResetGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(createResetStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${createResetStubPort}`,
+            DISABLE_TOOLS: 'true',
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(createResetGateway);
+    createResetGateway.stdout.on('data', () => {});
+    createResetGateway.stderr.on('data', () => {});
+    const createResetUrl = `http://127.0.0.1:${createResetStubPort + 1}`;
+    await waitForOk(`${createResetUrl}/health`);
+    const createReset = await fetch(`${createResetUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi after a dropped connection' }] }),
+        signal: AbortSignal.timeout(25000)
+    }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => null) }))
+        .catch((error) => ({ status: 0, json: { error: error.message } }));
+    check('a session creation whose socket is dropped is an unreachable backend, not a retry',
+        createReset.status === 502 && createReset.json?.error?.code === 'backend_unreachable',
+        `status ${createReset.status} ${JSON.stringify(createReset.json)?.slice(0, 160)}`);
+    const createResetStats = await fetch(`http://127.0.0.1:${createResetStubPort}/__sessions`)
+        .then((r) => r.json()).catch(() => null);
+    const createAttempts = Array.isArray(createResetStats?.sessionCreatePermissions)
+        ? createResetStats.sessionCreatePermissions
+        : [];
+    // One attempt is the whole rule: a second create would be a second session, and the id of the first was never
+    // received, so nothing in this process could delete either of them.
+    check('a dropped session creation is attempted exactly once',
+        createAttempts.length === 1 && createResetStats?.created === 0 && createResetStats?.live === 0,
+        `attempts ${createAttempts.length}, created ${createResetStats?.created}, live ${createResetStats?.live}`);
+    const createDenied = new Set(
+        (Array.isArray(createAttempts[0]) ? createAttempts[0] : [])
+            .filter((rule) => rule?.effect === 'deny')
+            .map((rule) => rule?.action)
+    );
+    check('the attempt a dropped connection made still carried the DISABLE_TOOLS ruleset',
+        ['shell', 'write', 'edit'].every((action) => createDenied.has(action)),
+        `denied ${JSON.stringify([...createDenied]).slice(0, 200)}`);
+    // The retry is the *same* call, and the shape that regressed was a second hand-written argument object: the retry
+    // repeated the literal and dropped `permissions`, which is invisible in every answer the client receives. It cannot
+    // be reached end to end - the retry re-probes `/api/info` before its second call, so the port would have to be
+    // closed for the create and open again microseconds later - so the invariant is asserted where it now lives: one
+    // object, read by both call sites. Two literals with the same shape is exactly what drifted.
+    const createSource = fs.readFileSync(path.join(ROOT, 'src', 'proxy.js'), 'utf8');
+    const createCallArgs = [...createSource.matchAll(/client\.session\.create\(\s*([^,)]*)/g)].map((m) => m[1].trim());
+    check('every session.create call site sends the same prebuilt arguments',
+        createCallArgs.length === 2 && createCallArgs.every((arg) => arg === 'sessionCreateArgs'),
+        JSON.stringify(createCallArgs));
+    stopGateway(createResetGateway);
+    await waitForExit(createResetGateway);
+    stop(createResetStub);
+    await waitForExit(createResetStub);
+
     // --- a backend error body larger than the summary --------------------------------------------------
     // The 500 characters the gateway keeps as a log summary used to come from `JSON.stringify(body).slice(0, 500)`:
     // the whole backend payload was serialised first, so a proxy answering with a megabyte of JSON paid a megabyte
@@ -4387,6 +4535,9 @@ async function run() {
     // with nothing after the colon.
     check('a backend that keeps failing the poll is an upstream error',
         failPolled.status === 502 && failPolled.json?.error?.type === 'server_error' &&
+        // The poll gives up as a `ProviderError`, so this asserts the value a client branches on: the same `code` the
+        // non-streaming provider failures above carry, which is what lets a client tell them from `backend_unreachable`.
+        failPolled.json?.error?.code === 'ProviderError' &&
         /transient poll failure/.test(String(failPolled.json?.error?.message)),
         `status ${failPolled.status} ${JSON.stringify(failPolled.json)?.slice(0, 160)}`);
     check('the failed poll gives up well before the request timeout', failPollMs < 7000, `${failPollMs}ms`);
@@ -4850,6 +5001,10 @@ async function run() {
     check('a parser-level rejection still carries CORS and a request id',
         /access-control-allow-origin: \*/i.test(rawHeaderBlock) && /x-request-id: gw-/i.test(rawHeaderBlock),
         rawHeaderBlock.slice(0, 240));
+    // ...and `nosniff` on that same path, which is where a browser would otherwise re-read the envelope as HTML
+    check('a parser-level rejection forbids content sniffing',
+        /x-content-type-options: nosniff/i.test(rawHeaderBlock),
+        rawHeaderBlock.slice(0, 240));
     // ...and the envelope has to arrive whole: the handler wrote it and called socket.destroy() on the next line, which
     // discards buffered writes, so under backpressure the client saw a reset instead of the error it was promised
     const declaredLength = Number((/content-length: (\d+)/i.exec(rawHeaderBlock) || [])[1]);
@@ -5142,6 +5297,72 @@ async function run() {
     }
     stop(refuseStub);
     await waitForExit(refuseStub);
+
+    // --- a delete the backend never answers ------------------------------------------------------------
+    // `STUB_HANG_DELETES` has been implemented in the stub since the drain was written, and nothing exercised it: a
+    // delete that neither resolves nor rejects is the shape that proves the drain is *bounded*. A drain that waited on
+    // the SDK call with no deadline of its own would hang the shutdown signal handler forever, and the gateway would
+    // never exit - the one failure mode no other delete check can show, because every other stub answers.
+    const hangDeleteStubPort = GATEWAY_PORT + 93;
+    const hangDeleteStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(hangDeleteStubPort), STUB_HANG_DELETES: '1' }
+    });
+    children.push(hangDeleteStub);
+    hangDeleteStub.stdout.on('data', () => {});
+    hangDeleteStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${hangDeleteStubPort}/health`);
+    const hangDeleteGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(hangDeleteStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${hangDeleteStubPort}`,
+            LOG_LEVEL: 'warn'
+        }
+    });
+    children.push(hangDeleteGateway);
+    let hangDeleteOut = '';
+    hangDeleteGateway.stdout.on('data', (chunk) => { hangDeleteOut += chunk; });
+    hangDeleteGateway.stderr.on('data', (chunk) => { hangDeleteOut += chunk; });
+    await waitForOk(`http://127.0.0.1:${hangDeleteStubPort + 1}/health`);
+    // `HOLD` keeps the completion in flight past the moment shutdown starts, so the session is created and still live
+    // when the drain runs - which is what makes the drain attempt a delete at all.
+    const hangDeleteCompletion = fetch(`http://127.0.0.1:${hangDeleteStubPort + 1}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'STALL while shutting down' }] })
+    }).then(() => null).catch(() => null);
+    await sleep(400);
+    let hangDeleteExit = 'timeout';
+    if (process.platform === 'win32') {
+        // `stopGateway()` sends SIGINT, which Windows does not deliver to a child process, so the shutdown path this
+        // check is about is never entered here. Stop the tree so the port is free for the next block.
+        stop(hangDeleteGateway);
+        await waitForExit(hangDeleteGateway);
+        await hangDeleteCompletion;
+        stop(hangDeleteStub);
+        await waitForExit(hangDeleteStub);
+        skip('a delete the backend never answers does not hang the shutdown',
+            'SIGINT is not delivered to a child process on Windows');
+    } else {
+    hangDeleteExit = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 20000);
+        hangDeleteGateway.once('exit', (code) => {
+            clearTimeout(timer);
+            resolve(code);
+        });
+        stopGateway(hangDeleteGateway);
+    });
+    await hangDeleteCompletion;
+    // The budget is `SHUTDOWN_SESSION_TIMEOUT_MS` (3 s) plus the teardown budget: the assertion is that the process
+    // exited at all, and inside a bound an operator would accept, not that it waited forever on the socket.
+    check('a delete the backend never answers does not hang the shutdown',
+        hangDeleteExit === 0, `exit ${hangDeleteExit}, ${hangDeleteOut.slice(-200)}`);
+    stop(hangDeleteStub);
+    await waitForExit(hangDeleteStub);
+    }
 
     // --- a tuning value that cannot be used is named, not silently replaced -------------------------------
     // These three keys fell back to their default without a word, so an operator who typo'd the request budget ran a

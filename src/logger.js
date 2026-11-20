@@ -188,20 +188,26 @@ const SENSITIVE_HEADER_NAMES = new Set([
 // ever matched a name spelled exactly `passw`, and the ordinary spellings (`?password=…`, an `x-db-password` header)
 // went out in clear. The full words are listed next to it, and a segment separator (`_`, `-`) is what makes
 // `db_password` match.
-export const SENSITIVE_NAME_ALTERNATIVES = 'auth|token|secret|cookie|session|passw|password|passwd|pwd|key|code|sig|signature|credential|bearer';
+export const SENSITIVE_NAME_ALTERNATIVES = 'auth|token|secret|cookie|session|passw|password|passwd|pwd|pass|key|code|sig|signature|credential|bearer|jwt|assertion|saml|ticket|mfa|pat';
 // Node lower-cases every incoming header name before `request.headers` is built, so `X-AccessToken` reaches
 // `maskHeaders()` as `accesstoken` and `credentialNameKey()` has no case boundary to split: the segment anchors below
 // then match nothing, because `accesstoken` is one word that no alternative spells. The camel-case split that fixed
 // the JavaScript spellings (`accessToken`) therefore never runs for a real header, and the concatenated compounds -
 // the shape every non-browser client uses for its own metadata - were dumped in clear at debug level. `[-_]?` keeps
 // both spellings: `x-access-token` already matched through the `token` segment, `x-accesstoken` did not.
-// Only the compounds are added here and `SENSITIVE_NAME_ALTERNATIVES` is left alone, because that string is also the
-// query-name list: a query is not lower-cased and not split, so `?accessToken=` is still one name there. A compound
-// that is not a credential (`monkey`, `keyboard`, `tokenizer`) still matches nothing: every alternative is anchored by
-// a separator or by a word boundary on both sides.
+// Only the compounds are added here and `SENSITIVE_NAME_ALTERNATIVES` is left alone for the header pattern, because
+// that string is also the query-name list: a query is not lower-cased and not split, so `?accessToken=` is still one
+// name there. A compound that is not a credential (`monkey`, `keyboard`, `tokenizer`) still matches nothing: every
+// alternative is anchored by a separator or by a word boundary on both sides. The Cloudflare Access and SAML
+// assertions are header names a proxy in front of the backend can inject, and `Cf-Access-Jwt-Assertion` is one word
+// after the camel-case split that no alternative spelled, so it is listed as a compound alongside the others.
+// Note: query names *are* checked through `credentialNameKey()` → `isSensitiveHeader()` in `maskUrlQuery()`, so
+// `?accessToken=` is masked too - the comment above is about why the *alternatives* string is not widened, not about
+// what is checked.
 const SENSITIVE_HEADER_PATTERN = new RegExp(
     `(^|[-_])(${SENSITIVE_NAME_ALTERNATIVES})([-_]|$)|authorization|authentication|api[-_]?key` +
-        `|access[-_]?token|auth[-_]?token|refresh[-_]?token|client[-_]?secret|secret[-_]?key|session[-_]?id`,
+        `|access[-_]?token|auth[-_]?token|refresh[-_]?token|client[-_]?secret|secret[-_]?key|session[-_]?id` +
+        `|cf[-_]?access[-_]?jwt[-_]?assertion|x[-_]?saml[-_]?assertion|saml[-_]?response|x[-_]?cas[-_]?ticket`,
     'i'
 );
 
@@ -432,6 +438,14 @@ export function maskUrlsInText(text) {
         .join('');
 }
 
+// A value that did not come from this process can carry control characters - a newline in an upstream error payload,
+// a tab in a provider sentence - and every `loggable*` helper in `src/text.js` replaces them, so a value put into a log
+// *message* (not a detail object, which escapes them through `JSON.stringify`) could start a second record the gateway
+// never wrote. `maskFreeText()` is the single chain every outbound sentence passes through, so it is the one place that
+// has to apply the same rule. The regex is duplicated here rather than imported from `src/text.js` because that module
+// already imports from this one, and a shared constant would close the cycle into an import error at load time.
+const MASK_CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
+
 /**
  * Free text that is about to leave the process - a client-facing 5xx sentence, an error log line, a stack, a string
  * inside a debug dump - masked and bounded in one place.
@@ -454,7 +468,8 @@ export function maskFreeText(value, maxChars = MAX_UPSTREAM_TEXT_CHARS) {
     // characters left into the retained window - and the final truncation below still applies unchanged.
     const window = Number.isFinite(maxChars) && maxChars > 0 ? maxChars * MASK_TEXT_WINDOW_FACTOR : 0;
     const bounded = window && text.length > window ? text.slice(0, window) : text;
-    const masked = redactRegisteredValues(maskQuotedCredentials(maskUrlsInText(bounded)));
+    const masked = redactRegisteredValues(maskQuotedCredentials(maskUrlsInText(bounded)))
+        .replace(MASK_CONTROL_CHARS_RE, '?');
     if (!Number.isFinite(maxChars) || masked.length <= maxChars) return masked;
     return `${masked.slice(0, maxChars)}…[truncated ${text.length - maxChars} chars]`;
 }

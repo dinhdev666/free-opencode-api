@@ -25,9 +25,14 @@ These are product decisions, not implementation details. Do not "improve" them w
    `Bearer` sends a header the gateway could not read, and testing the parsed token let the alias rescue it. A blank or
    missing `API_KEY` falls back to the built-in default `sk-dummy-123` (`resolveApiKey()` in `src/api-key.js`, re-exported
    from `src/proxy.js`). Never add a
-   "disable auth" switch, never treat an empty key as "no auth". The bearer is compared in **bytes** (`timingSafeEqual`
-   on two `Buffer`s of equal length): a non-ASCII key matches in string length but not in byte length, and comparing
-   strings threw a `RangeError` for a wrong key. The refusal names the cause the reader can act on -
+   "disable auth" switch, never treat an empty key as "no auth". The bearer is compared as **fixed-size digests**
+   (`timingSafeEqual` over two 32-byte HMAC-SHA256 results, keyed with the configured key over a fixed non-secret
+   pepper): comparing the keys themselves needed a length guard first, and `timingSafeEqual` is only constant-time once
+   both lengths are known to be equal, so a wrong length answered measurably faster than a right length with wrong
+   bytes - enough, averaged over many requests, to learn how long the configured key is. The digests are always the
+   same size, so nothing about the key's length enters the comparison. Bytes are still compared rather than strings: a
+   non-ASCII key matches in string length but not in byte length, and comparing strings threw a `RangeError` for a
+   wrong key. The refusal names the cause the reader can act on -
    no key sent, a wrong `Authorization` (a proxy-injected `Basic …` included) or `X-Api-Key` header - and
    never the value; `Unauthorized` alone named none of them.
 2. **The default key stays visible and warned about.** `index.js` logs a `[Security]` warning when the built-in key is
@@ -87,11 +92,18 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `src/backend-auth.js` | The `Authorization` header for the **backend**: `backendAuthorizationHeader()` (Basic, user `opencode`), `resolveBackendAuth()` (splits userinfo out of a credential-bearing `OPENCODE_SERVER_URL` and registers it as sensitive) and `resolveBackendPassword()` (an explicit password, or a generated one — there is no variable that switches generation off: `options.generate === false` suppresses it for a caller that needs to match a spawned child, and no production caller passes it). |
 | `src/env.js` | Resolving the two configured environment values: `resolveOpencodePath()` (memoised per requested value for a minute; PATH, then the package/version-manager install locations — a candidate that exists but is not a regular file, a directory being the realistic case, is skipped rather than handed to `spawn()`, which fails with `EACCES`/`EISDIR` on every start) and `normalizeBackendUrl()` / `normalizeBindHost()` (trim, add a missing scheme, drop a trailing slash — each with a `[Config]` note naming the value that was corrected, and `normalizeBackendUrl()` also notes that a URL without an explicit port resolves to the scheme default), plus `isLoopbackHost()`, and `isUsableBindHost()` - the check `OPENCODE_BIND_HOST` gets before it becomes an
   argument of the child: the child may be started through a shell, so a value outside `[A-Za-z0-9.\-:\[\]%]` falls
-  back to loopback with a `[Config]` note instead of being concatenated into a command line. |
+  back to loopback with a `[Config]` note instead of being concatenated into a command line.
+  `isShellUnsafePath()` is the same rule for `OPENCODE_PATH`, and it is **platform-aware**: the characters that break
+  out of a quoted run are `"`, `$`, a backtick and the control characters everywhere, but on Windows `cmd.exe` also
+  expands `%VAR%`, treats `^` as its escape and `!` under delayed expansion, and lets a **trailing backslash** escape
+  the closing quote - a path in `C:\Program Files\…\` is the ordinary spelling there, so refusing it outright would
+  reject a valid install, while accepting it on Linux would hand a shell a command line it does not control. |
 | `src/options.js` | `parseBoolean()` and `readFlag()`, the **single** boolean parser for `index.js`, `startProxy()` and request bodies. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off" in the container); do not add a third. |
-| `src/settings.js` | The tuning keys' readers: `readLimit()`, `readMilliseconds()`, `resolveRequestTimeoutMs()`, `isUnusableMilliseconds()`, `backendDeadline()`, and the named defaults they quote (`DEFAULT_REQUEST_TIMEOUT_MS`, `MAX_TIMER_MS`, `METADATA_TIMEOUT_CAP_MS`). The resolved values are held by their consumers in `src/proxy.js`. |
-| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. A BOM is tolerated. |
-| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses) for debug logging. |
+| `src/settings.js` | The tuning keys' readers: `readLimit()`, `readMilliseconds()` (returns `{value, note}`, with the precedence inside it so the note names the value that actually took effect), `resolveRequestTimeoutMs()`, `backendDeadline()`, and the named defaults they quote (`DEFAULT_REQUEST_TIMEOUT_MS`, `MAX_TIMER_MS`, `METADATA_TIMEOUT_CAP_MS`). The resolved values are held by their consumers in `src/proxy.js`. |
+| `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. The file is opened **once** with `O_NOFOLLOW` (when the platform has it) and `O_NONBLOCK`, then described with `fstat()` on that descriptor: a `config.json` that is a **symbolic link** or a **FIFO** is refused by name, because following it would read a target the operator did not configure and a FIFO would block the startup on a writer that never comes. A BOM is tolerated. |
+| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses), and `maskFreeText()` (control characters - newline, tab, DEL - replaced
+*before* the mask chain runs, so a secret cannot be split across a line break into a shape no pattern matches) for debug
+logging. |
 | `src/polyfills.js` | Node 20 shims, imported for its side effect first thing in `src/proxy.js`: `Promise.withResolvers()` is Node 22+, and `@opencode/client`'s SSE subscription calls it unconditionally, so without it every stream silently fell back to polling (one delta per answer). A no-op on a runtime that has the API. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README (`docker/README.md`, kept under 25 000 characters). |
@@ -105,7 +117,8 @@ These are product decisions, not implementation details. Do not "improve" them w
 
 Request flow (short version): `index.js` → Fastify hooks → auth → route handler → queue (`lock()`) → validate and
 normalise messages → `ensureBackend()` → `client.session.create({model, permissions})` → `client.session.prompt()`
-with `client.event.subscribe()` alongside it (streaming) or `client.message.list({order:'asc'})` polling
+with `client.event.subscribe({types, signal})` alongside it (streaming) or
+`client.message.list({type:'assistant', order:'desc', limit:1})` polling
 (non-streaming) → OpenAI response → `client.session.remove()` session cleanup.
 
 ## Commands
@@ -115,7 +128,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway (500 contract assertions on Linux; fewer on Windows, where the POSIX-only checks are skipped)
+pnpm test                        # smoke suite: stub backend + gateway (522 contract assertions on Linux; fewer on Windows, where the POSIX-only checks are skipped)
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -135,7 +148,10 @@ Releases come from tags, not from a laptop: bump `version` in `package.json`, th
 `pnpm test` covers the HTTP contract against the stub in `test/stub-opencode.mjs` (the `/api/*` info, model, session,
 message and SSE routes, plus a test-only `GET /__sessions` reporting created/deleted/live counts, `lastSystemPrompt`,
 `lastPromptText`, `lastPermissionRules`, `sessionCreatePermissions` (the ruleset of **every** create, in order, so a
-call that never produced a session is still counted), `messagePolls`, `toolIdCalls` and `infoCalls` (the readiness probes
+call that never produced a session is still counted), `messagePolls`, `toolIdCalls`,
+`eventSubscriptionQueries` (the query of every backend event subscription, so "the collector subscribed" is asserted from the
+request that was actually made rather than from the source alone), `largestSessionMessages` (the most messages any one
+session ever held, so a poll assertion cannot pass against a one-message session) and `infoCalls` (the readiness probes
 that reached `GET /api/info`, so a burst of `/health` requests can be asserted not to touch the backend)). Behaviour is selected by markers in the prompt text - `SLOW`
 (an answer slow enough to abort mid-stream), `STALL` (silence after two deltas), `TOOLTAG` (a tool-call block cut inside
 both of its tags), `FAIL` (a provider error with no content), `ENDONLY` (a finish event carrying only `time.completed`),
@@ -161,7 +177,9 @@ that never closes, dropped while the text after it is kept - the two shapes the 
 scan must agree on), `BADPART` (a text part whose `text` is a number, next to a normal part), `REASONONLY`
 (a message carrying reasoning and no text that is never marked finished), `LEAKYFAIL` (a provider error quoting a
 credential-bearing URL behind a long message) and `MANYDELTAS` (a 470-character answer split into ~180 deltas, for the
-idle timer that is re-armed on every one) - and by the variables `STUB_FAIL_SESSION=1` (a 404 for
+idle timer that is re-armed on every one), `MANYMESSAGES` (a session that already holds dozens of finished messages, so the
+newest-message poll is provably not answering from the oldest one) and `BIGANSWER` (a ~17 M character answer, past
+`MAX_ANSWER_CHARS`, so the cap is exercised against a real stream) - and by the variables `STUB_FAIL_SESSION=1` (a 404 for
 `POST /api/session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 400 whose message quotes a
 credential-bearing URL), `STUB_ECHO_AUTH=1` (a 401 quoting the header it refused), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every creation after the n-th goes
@@ -170,6 +188,9 @@ made, which is the `ECONNRESET`/`socket hang up` half of the retry rule and is a
 `STUB_CREATE_DELAY_MS=<n>` (a
 slow `POST /api/session`, so a completion that waited for a queue slot can be granted a fresh request budget),
 `STUB_DROP_CREATE=1` (the session is created and the connection dropped before the answer),
+`STUB_PARTIAL_CREATE=1` (a `200` whose body stops mid-JSON and whose socket is destroyed 10 ms later, so the
+creation answer is *truncated* rather than refused - the shape a client that read a `status` and no envelope produces;
+the attempt is still counted, because a call that produced no session is still a call),
 `STUB_REJECT_DELETES=1` (a `500` for `DELETE /session/:id`, so the session stays), `STUB_HANG_DELETES=1` (a delete that is
 never answered), `STUB_FAIL_TOOL_IDS=1` (a `500` for the 1.x `GET /experimental/tool/ids`; **accepted as a no-op**, because 2.x has
 no tool-list route and the gateway builds no override map), `STUB_ODD_MODEL_NAMES=1` (three provider entries whose
@@ -358,7 +379,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   started, and `upstream_error` as the fallback for a 502 that is neither — a shape no current path produces, kept so a
   future one cannot answer a 502 with no `code` at all), `503`
   (`type: "queue_full"`, the wait queue is full, with `Retry-After: 1` so an OpenAI SDK backs off instead of failing
-  the request) or `type: "server_error"` with `code: "gateway_shutting_down"` (also with `Retry-After: 1`, when
+  the request; the `onRequest` hook answers it **before the body parser runs** when the queue is already full, so a
+  burst that will certainly be refused does not pay for parsing, normalising and prompt-building its body first, and
+  the sentence is one shared `queueFullMessage()` - the `OPENCODE_PROXY_MAX_QUEUE=0` spelling of "waiting is disabled"
+  included - so the two paths cannot describe the same refusal differently) or `type: "server_error"` with `code: "gateway_shutting_down"` (also with `Retry-After: 1`, when
   `SIGINT`/`SIGTERM` arrived and the request is not one of the responses being finished), `504` (timeout), `500`
   (anything else). A backend the gateway cannot start (a missing CLI, a 1.x release, a taken port, a start cooldown, or
   an `OPENCODE_SERVER_URL` naming **no port** - the child can only listen on a numbered one, so the gateway probed the
@@ -396,8 +420,15 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   prompt look like a slow answer - no assistant message was created, so the gateway polled until its budget ran out and reported `504`. A streaming request keeps streaming only when deltas already reached the client.
 - **A 2.x prompt does not return the answer.** `POST /api/session/{id}/prompt` answers with the *user inbox item* it
   just enqueued, so `completedPromptMessage()` returns `null` for every 2.x answer and the answer is read from the
-  event stream (streaming) or by polling `GET /api/session/{id}/message?order=asc` (non-streaming; the list is newest
-  first otherwise, and `cursor` cannot be combined with `order`). The 1.x shape — a finished message inside the prompt
+  event stream (streaming) or by polling `GET /api/session/{id}/message?type=assistant&order=desc&limit=1`
+  (non-streaming: `order=desc` returns the **newest** message first, so `limit: 1` is the message just produced, and
+  `type: 'assistant'` leaves the user message that prompted it out of the answer). The previous query asked for
+  `order=asc` with no `type`, so the answer was message `[0]` of an ascending page - a **stale** step in any session
+  with more than the page size, and the user's own message when the page held one - and `cursor` cannot be combined
+  with `order`, so there was no second page to fetch. `type` and `limit` are passed by the pinned 2.x client
+  verbatim; the scan over what comes back still walks forward, so a backend that ignores `order` is read oldest-first
+  rather than having the newest message chosen by position from the wrong end.
+  The 1.x shape — a finished message inside the prompt
   response, with `info`/`parts` nested — is still recognised on purpose, so a translating proxy or a release that
   starts answering that way again keeps the round trip it saves. A message that is still being written has no `finish`
   and keeps the poll loop either way, so a partial answer is never served.
@@ -415,7 +446,13 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `_tag` (`SessionNotFoundError`, `UnauthorizedError`, `InvalidRequestError`, `ConflictError`, …) but **no HTTP
   status**, so `upstreamErrorStatus()` maps the tags in `V2_ERROR_TAG_STATUS` back onto the status the server sent
   (`SessionNotFoundError`/`NotFoundError` 404, `SessionArchivedError` 410, `UnauthorizedError` 401,
-  `InvalidRequestError` 400, `ConflictError` 409, `ServiceUnavailableError` 503). `NotFoundError` is the tag a
+  `InvalidRequestError` 400, `ConflictError` 409, `ServiceUnavailableError` 503,
+  `MessageNotFoundError` 404, `ForbiddenError` 403, `UnsupportedModelError` 400, `SessionBusyError` 409,
+  `ProviderRequestError` 502). The last five name the status the server already sent, so a client that reads the code
+  sees the real one instead of the generic tag default; without them a `403` reached the client as `502`. An
+  **explicit** status on the error wins over the tag (`link?.response?.status ?? link?.status ?? link?.statusCode`,
+  read first): `ProviderError` carries 502 in the table, but a translating proxy that answers it with `429` must keep
+  its `429`, or the retry-after a client needs is replaced by "the provider is down". `NotFoundError` is the tag a
   **404 on `POST /api/session`** carries; the older `LocationNotFoundError` in the same map is a different route's
   error, so without `NotFoundError` the "this looks like a 1.x CLI" case answered a bare `500` and never reached the
   warning that names the fix. A refused connection surfaces as
@@ -472,6 +509,12 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - Every response carries `X-Content-Type-Options: nosniff` (`NO_SNIFF`, `createApp()`) on the same three paths as the
   CORS set (`onRequest` hijacked streams included, `clientErrorHandler`, `badUrlHandler`): it writes only JSON
   and SSE, which a browser must not re-read as something else.
+- **Responses are not cacheable by default.** The `onRequest` hook sets `Cache-Control: no-store` on the raw response
+  for every request, and the SSE path narrows it to `no-cache` when it hijacks the stream (a revalidated stream is the
+  right answer for a long-lived response; a stored one is not). The gateway writes no `ETag`, `Last-Modified` or
+  `Vary`, so without this a shared cache was free to key a completion on the URL alone - and every completion POSTs to
+  the same `/v1/chat/completions`, so the only thing separating two users' answers was that nothing had told the cache
+  not to reuse them. `no-store` is the header OpenAI's own API sends.
 - CORS headers are set on the raw response for every request, including hijacked streams:
   `Access-Control-Allow-Origin: *`, `Allow-Methods: GET, POST, OPTIONS`, `Allow-Headers: Content-Type,
   Authorization, X-Api-Key, X-Request-Id, X-Requested-With`, `Max-Age: 600`, `Expose-Headers: X-Request-Id`. The
@@ -561,10 +604,15 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   characters — because `docker logs` is collected (`maskHeaders`/`maskSecret`). Header **names** are matched against
   `SENSITIVE_HEADER_PATTERN`, built from the exported `SENSITIVE_NAME_ALTERNATIVES` (`auth`, `authorization`,
   `authentication`, `api-key`/`apikey`, `token`, `secret`, `cookie`, `session`, `passw`, `key`, `code`, `sig`,
-  `signature`, `credential`, `bearer`, `password`/`passwd`/`pwd` as whole name segments — a bare `passw` was a
+  `signature`, `credential`, `bearer`, `jwt`, `assertion`, `saml`, `ticket`, `mfa`, `pat`,
+  `password`/`passwd`/`pwd` as whole name segments — a bare `passw` was a
   prefix and matched nothing else, and `access[-_]?token`, `auth[-_]?token`, `refresh[-_]?token`, `client[-_]?secret`,
   `secret[-_]?key` and `session[-_]?id` match the **concatenated** spellings too, because the client chooses the header
-  name and `X-Access-Token`/`Client-Secret`/`Session-Id` are ordinary ones) rather than a fixed denylist: `x-goog-api-key`,
+  name and `X-Access-Token`/`Client-Secret`/`Session-Id` are ordinary ones. The federated-login headers are matched by
+  name as well, not only by their credential-shaped values: `Cf-Access-Jwt-Assertion`, `X-SAML-Assertion`,
+  `SAMLResponse` and `X-Cas-Ticket` are each one bearer credential under a name no OpenAI client sends, so a denylist
+  built from OpenAI's vocabulary alone passed them through verbatim. `jwt` and `assertion` are the same argument as
+  segments) rather than a fixed denylist: `x-goog-api-key`,
   `x-auth-token` or `openai-api-key` is a credential too, and the client decides that name. **URLs are masked too**
   (`maskUrlQuery()` before `loggableUrl()` truncates): `?api_key=…`, `?token=…` and `?Authorization=…` are a
   documented OpenAI-compatible client convention, and so are Google's `?key=…`, an OAuth `?code=…` and an Azure SAS
@@ -668,7 +716,18 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `BIND_HOST` and `OPENCODE_BIND_HOST` are trimmed the same way (`normalizeBindHost()`, with a `[Config]` note): a
   trailing space reached `listen()` as part of the address. A bind address that is **not loopback** is warned about
   where it matters: `OPENCODE_SERVER_URL` over plain `http://` says its credential travels in clear text, and a
-  non-loopback backend URL with a spawned child says the child cannot satisfy it (the child listens on `OPENCODE_BIND_HOST`).
+  non-loopback backend URL with a spawned child **refuses the start** instead: a child started here binds a local
+  port, which can never make `http://otherhost:4097` answer, so the old warn-then-spawn spent 60 probe/backoff rounds
+  (at least 112 s of sleeping) before answering 502, set the 15 s start cooldown and kept the useless child alive.
+  `ensureBackend()` throws `backendUnavailable()` before the spawn - the same shape as the no-port refusal below -
+  and the sentence names both fixes (run `opencode serve` on that host, or point the URL at 127.0.0.1).
+- **The gateway does not rate-limit, and that is a deployment note rather than a gap.** It bounds *concurrency*
+  (`OPENCODE_PROXY_MAX_CONCURRENCY`), the *wait queue* (`OPENCODE_PROXY_MAX_QUEUE`, a full one answering `503` with
+  `Retry-After: 1`) and the *body* (`OPENCODE_PROXY_MAX_BODY_MB`). A **request rate** per client is deliberately
+  absent: the only identity the gateway has is one shared API key and it keeps no cross-process counter, so an
+  in-process per-address cap would be a weaker copy of what a reverse proxy already does correctly (`nginx limit_req`,
+  a load-balancer policy), would reset on every restart and would not survive two instances. `README.md` says so in
+  its Performance section, which is the fix: an operator reaches for the proxy, not for a half-measure here.
 - **Every tuning key follows the same precedence.** `OPENCODE_PROXY_MAX_CONCURRENCY`, `OPENCODE_PROXY_MAX_QUEUE`,
   `OPENCODE_PROXY_MAX_BODY_MB`, `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_HEALTH_CACHE_MS` and
   `OPENCODE_PROXY_START_RETRY_MS` are read through `readLimit()` / `readMilliseconds()`, which take the `config.json`
@@ -772,7 +831,14 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - **Every backend call carries a deadline.** `client.session.create`, `client.message.list`,
   `client.session.remove`, `client.session.prompt`, `client.model.list` and `client.event.subscribe` are all called
   with an `AbortSignal` (`backendDeadline()`), and an expired one answers `504` ("did not answer within …ms") instead
-  of `500`. The health probe is bounded too, and by a deadline armed **before** the request exists
+  of `500`. `event.subscribe()` takes **one** argument object in the pinned 2.x client - `{types, signal}` - and the
+  `types` list (`COLLECTOR_EVENT_TYPES`, the nine event names the collector actually handles) is what keeps the
+  multiplexed stream from delivering every unrelated session's traffic to a completion that only reads its own. The
+  generated two-argument signature is a trap: the pinned client replaces that route with a **shared multiplexer**
+  (`raw.event.subscribe(undefined, { signal, onActivity })`) that filters `options.types` **in-process** and then fans
+  one connection out to its subscribers, so a second positional argument is dropped and no `types` ever reaches the
+  backend - the suite therefore asserts the source passes one options object carrying `types`, and asserts the
+  *subscription happened* from the stub's recorded query, because a wire assertion would be unsatisfiable. The health probe is bounded too, and by a deadline armed **before** the request exists
   (`HEALTH_PROBE_TIMEOUT_MS`, 2 s, `checkHealth()`): `request.setTimeout()` starts its clock only once a socket is
   assigned, so DNS and the TCP handshake were unbounded - and this probe runs on the completion path with the slot
   already taken, so a backend host that drops SYNs (a firewall, a wrong port on a black-holed address) suspended the
@@ -907,7 +973,11 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   - and `mkdirSync(recursive)` succeeds on it, which would leave that account owning the parent of the backend's
   working directory (and of its `HOME`). The parent is trusted only when it is a directory this process owns (uid match;
   no comparison on Windows), a symlink or a foreign directory is warned about and replaced by a private
-  `opencode-proxy-jail-XXXXXX` (`mkdtempSync`, `0700`), and only the directories this process created are removed. Under `USE_ISOLATED_HOME` the child's
+  `opencode-proxy-jail-XXXXXX` (`mkdtempSync`, `0700`), and only the directories this process created are removed. That
+  private parent is **remembered** for the rest of the process (`privateJailParent`): re-running the check per spawn
+  would replace a parent that may already hold a live child's jail, and the reuse is only accepted while `lstatSync`
+  still shows a real directory this uid owns - a removed or replaced one falls back to a fresh `mkdtempSync()`, and
+  `cleanupTempDirs()` forgets it along with the rest. Under `USE_ISOLATED_HOME` the child's
   `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`, `TMPDIR`, `TMP` and `TEMP` all point inside
   that jail: the CLI resolves them before `HOME`, so an inherited value (a desktop session, a systemd unit, an image)
   sent the "isolated" run straight back to the real user's store, config and cache.

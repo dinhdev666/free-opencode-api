@@ -39,8 +39,8 @@ export function parseBoolean(value, fallback = undefined) {
         // The longest accepted spelling is five characters, so a value over 64 characters is rejected before it is
         // trimmed or lowercased: a request body is bounded by `OPENCODE_PROXY_MAX_BODY_MB`, and `{"stream": "aaaa…"}`
         // (50 MiB) was copied and lowercased twice per completion - 10 ms per call on the single serving thread, ~100 MB
-        // of garbage - to answer a question the length already answers. `readableFlag()` in the handler calls this once
-        // to validate and once to read, so the cost was paid twice per field.
+        // of garbage - to answer a question the length already answers. The handler parses each field **once** now and
+        // derives both its validation answer and its value from that one call.
         const trimmed = value.length > 64 ? '' : value.trim();
         if (!trimmed) return fallback;
         const normalized = trimmed.toLowerCase();

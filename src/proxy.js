@@ -1271,7 +1271,12 @@ function createApp(config) {
                 const providerID = typeof m.providerID === 'string' && m.providerID !== '' ? m.providerID : 'opencode';
                 models.push({
                     id: `${providerID}/${m.id}`,
-                    name: m.name || m.id,
+                    // The one field copied without a type check: a non-string `name` (a number, an object) reached the
+                    // warm-cache body verbatim, while the cold path coerced it through the response schema - so the same
+                    // listing answered with a string `name` or with a raw number depending only on cache warmth, and the
+                    // warm answer broke the documented `{id,name,object,owned_by}` shape. Every sibling field is guarded
+                    // above; the name falls back to the id the same way a missing one always has.
+                    name: typeof m.name === 'string' && m.name !== '' ? m.name : m.id,
                     object: 'model',
                     owned_by: providerID
                 });
@@ -1299,10 +1304,16 @@ function createApp(config) {
             // Every other upstream payload that reaches a log line or a response goes through the masking helpers:
             // this line quoted `error.message` (the documented symptom of a credential-bearing backend URL) and the
             // raw `error.response` body, so a proxy in front of the backend could have put a secret in `docker logs`.
+            // `extractUpstreamError()` rather than `error.status` / `error.response`: the 2.x client throws, so both
+            // were `undefined` and the line read `{"error":"","body":null}` for every failure the `logger.warn` above
+            // had just described correctly.
+            const upstream = extractUpstreamError(error);
             logger.error('[Proxy] Model Fetch Error:', {
-                error: clientFacingText(error.message),
-                status: error.status,
-                body: maskDetail(error.response?.data ?? error.responseBody ?? null)
+                error: clientFacingText(error.message) ||
+                    clientFacingText(error?.error?.message) ||
+                    handlerFailureMessage(error),
+                status: upstream.status,
+                body: upstream.bodySummary === null ? null : maskDetail(clientFacingText(upstream.bodySummary))
             });
             // Same item shape as a provider-served model, and not cached: the next request probes the backend again
             return serveFallback();
@@ -3231,7 +3242,7 @@ function createApp(config) {
                         // with the frames already written or as the 502 envelope when none were. Serving the text it
                         // managed to write under `finish_reason: "stop"` is a successful answer to every client.
                         if (collected && collected.error) {
-                            throw new ProviderError(describeProviderFailure(collected.error));
+                            throw new ProviderError(describeProviderFailure(collected.error), upstreamErrorStatus(collected.error), collected.error);
                         }
 
                         // One place that turns a polled assistant message into deltas. `appendOnly` trims the part that
@@ -3260,7 +3271,7 @@ function createApp(config) {
                             if (error && !content && !reasoning) {
                                 // The prompt succeeded but the provider reported an error and no text: terminate the
                                 // stream with an error frame instead of streaming the message back as model output
-                                throw new ProviderError(describeProviderFailure(error));
+                                throw new ProviderError(describeProviderFailure(error), upstreamErrorStatus(error), error);
                             }
                             const emitPolledKind = async (text, kind, isReasoning) => {
                                 if (!text) return;
@@ -3299,14 +3310,17 @@ function createApp(config) {
                             // A polled message that carries a provider error is a failure even when it also carries
                             // text: the text was emitted above, so the client gets what there was and then the error
                             // frame, instead of a "stop" that reads as a complete answer.
-                            if (error) throw new ProviderError(describeProviderFailure(error));
+                            if (error) throw new ProviderError(describeProviderFailure(error), upstreamErrorStatus(error), error);
                         };
 
                         let polled = false;
                         if (collected && collected.__error) {
                             logDebug('SSE collect error, falling back to polling', {
                                 sessionId,
-                                error: collected.__error?.message
+                                // Through the same bounder as every sibling line: a plain string detail is not masked by
+                                // `safeClone()` (only an `Error.message` is), so an upstream sentence quoting a
+                                // credential-bearing URL reached the log verbatim and unbounded.
+                                error: clientFacingText(collected.__error?.message)
                             });
                             polled = true;
                             // Text may already be on the wire: the poll then only contributes the part the client does

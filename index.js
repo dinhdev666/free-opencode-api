@@ -29,6 +29,10 @@ const defaultConfig = {
     OPENCODE_SERVER_URL: 'http://127.0.0.1:4097',
     OPENCODE_BIND_HOST: '127.0.0.1',
     OPENCODE_PATH: 'opencode',
+    // The OpenCode 2.x server authenticates every API route with its own password. Left blank on purpose: the gateway
+    // generates one per process and hands it to the child it spawns, so a self-hosted backend needs no configuration.
+    // Set it only to drive an *external* 2.x server, and set the same value there.
+    OPENCODE_SERVER_PASSWORD: '',
     BIND_HOST: '127.0.0.1',
     DISABLE_TOOLS: false,
     USE_ISOLATED_HOME: false
@@ -103,6 +107,9 @@ const finalConfig = {
     OPENCODE_BIND_HOST: normalizeBindHost('OPENCODE_BIND_HOST', envOrFile(process.env, 'OPENCODE_BIND_HOST', fileConfig.OPENCODE_BIND_HOST))
         || defaultConfig.OPENCODE_BIND_HOST,
     OPENCODE_PATH: envOrFile(process.env, 'OPENCODE_PATH', fileConfig.OPENCODE_PATH) ?? defaultConfig.OPENCODE_PATH,
+    // The 2.x backend's own password. Blank means "generate one per process", which a spawned child is handed.
+    OPENCODE_SERVER_PASSWORD: envOrFile(process.env, 'OPENCODE_SERVER_PASSWORD', fileConfig.OPENCODE_SERVER_PASSWORD)
+        ?? defaultConfig.OPENCODE_SERVER_PASSWORD,
     // `OPENCODE_PROXY_BIND_HOST` is documented as an alias, and it is the only one that used to be dead: startProxy()
     // reads it only when no BIND_HOST is passed, and this line always passed one, so setting it changed nothing while
     // the README advertised it.
@@ -182,7 +189,7 @@ const apiKeyFromFile = String(process.env.API_KEY ?? '').trim() === '' &&
 // Which tools are on is the other half, and it used to be named only for a *custom* key: the built-in key is public and
 // reachable from any origin, and it handed out the same shell and file-write capability in silence. `DISABLE_TOOLS=true`
 // turns the execution tools off; the two read-only tools the backend cannot run a prompt without (`read` and `glob`, see
-// `warmToolOverrides()` in `src/proxy.js`) stay on, so the line says "tools" and points at the README rather than
+// `toolPermissionRules()` in `src/proxy.js`) stay on, so the line says "tools" and points at the README rather than
 // promising a backend that cannot read anything.
 if (!finalConfig.DISABLE_TOOLS) {
     const capability = 'the OpenCode backend runs model-directed tools (shell commands, file writes) as the same user as ' +
@@ -242,10 +249,11 @@ logger.info(`  - Wait queue: ${queueLimits.queue} waiting completion(s) before 5
 // printed every note twice.
 
 // Reads the CLI version beside the running server. The major version decides whether the API this gateway drives
-// exists at all: a 2.x `opencode serve` is the web UI, answers /health with HTML and rejects POST /session, so every
-// completion fails with a 502 whose message names only the status. Saying it at startup puts the cause in front of the
-// operator before the first request instead. A probe that cannot answer (no binary, a wrapper that never returns) is
-// reported the same way it always was - as a warning, never as a reason not to serve.
+// exists at all: the gateway speaks the **2.x** API (`/api/...`, authenticated with the server's own password), and a
+// 1.x `opencode serve` has no `/api` routes at all, so every completion fails with a 502 whose message names only the
+// status. Saying it at startup puts the cause in front of the operator before the first request instead. A probe that
+// cannot answer (no binary, a wrapper that never returns) is reported the same way it always was - as a warning, never
+// as a reason not to serve.
 function probeOpencodeVersion(binPath) {
     return new Promise((resolve) => {
         // The version probe is still a child of this gateway: it gets the same scrubbed environment the backend
@@ -278,8 +286,8 @@ function probeOpencodeVersion(binPath) {
 function reportOpencodeVersion(result) {
     if (result.error) {
         logger.warn(`[Warning] Cannot verify OpenCode installation: ${loggableConfigValue(finalConfig.OPENCODE_PATH)}`);
-        logger.warn('[Warning] Please ensure OpenCode is installed (a 1.x release is required):');
-        logger.warn('  Windows: npm install -g "opencode-ai@1"');
+        logger.warn('[Warning] Please ensure OpenCode is installed (a 2.x release is required):');
+        logger.warn('  Windows: npm install -g @opencode/cli');
         logger.warn('  Linux/macOS: curl -fsSL https://opencode.ai/install | bash  (then check `opencode --version`)');
         logger.warn('[Warning] Or specify the full path in config.json:');
         logger.warn('  { "OPENCODE_PATH": "C:\\\\Users\\\\YourName\\\\AppData\\\\Roaming\\\\npm\\\\opencode.cmd" }');
@@ -288,10 +296,13 @@ function reportOpencodeVersion(result) {
     const version = result.version;
     if (!version) return;
     logger.info(`  - OpenCode CLI version: ${version}`);
-    if (Number(version.split('.')[0]) >= 2) {
+    // The supported major version is the one whose API this gateway drives. A 1.x release is now the mismatch, and the
+    // message names the fix rather than only the symptom: every `/api/*` call answers 404, so the readiness probe never
+    // passes and each completion reports a backend that would not start.
+    if (Number(version.split('.')[0]) < 2) {
         logger.warn(
-            `[Warning] OpenCode CLI ${version} is a 2.x release: its \`serve\` is the web UI, not the session API this gateway drives, ` +
-            'so every completion will fail with 502 "rejected session creation". Install a 1.x release (npm install -g "opencode-ai@1") ' +
+            `[Warning] OpenCode CLI ${version} is a 1.x release: its \`serve\` predates the \`/api\` routes this gateway drives, ` +
+            'so every completion will fail with 502 "backend_unreachable". Install a 2.x release (npm install -g @opencode/cli) ' +
             'or point OPENCODE_PATH at one.'
         );
     }

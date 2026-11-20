@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import { spawn } from 'child_process';
-import { createOpencodeClient } from '@opencode-ai/sdk';
+import { OpenCode } from '@opencode/client';
 import http from 'http';
 import https from 'https';
 import fs from 'fs';
@@ -51,6 +51,10 @@ const DEFAULT_POLL_INTERVAL_MS = 500;
 const POLL_BACKOFF_MS = [25, 50, 100, 200];
 // How many polls in a row may fail before a completion is reported as an upstream error
 const MAX_POLL_FAILURES = 5;
+// How many messages one poll asks for. A completion is one session with one prompt, so a small page covers it; the
+// 2.x list answers newest-first by default and this bound keeps a session that somehow accumulated history from
+// pushing the whole transcript across the wire on every poll.
+const DEFAULT_POLLED_MESSAGE_LIMIT = 50;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
 // A stream that has written nothing for this long gets a comment line, so a proxy or client does not drop the
@@ -777,12 +781,16 @@ let gatewayShuttingDown = false;
 const healthAgent = new http.Agent({ keepAlive: true, maxSockets: 4 });
 const healthAgentSecure = new https.Agent({ keepAlive: true, maxSockets: 4 });
 
-// Credentials lifted out of OPENCODE_SERVER_URL by resolveBackendAuth(); the probe sends them the same way the SDK
-// does, otherwise a backend behind a credential-requiring proxy answers the probe with 401 and the gateway concludes
-// its backend is gone (and tries to start a local one).
-let BACKEND_AUTHORIZATION = null;
-// Reads the backend tool list once, set by createApp() (it closes over the SDK client) and called after the warmup
-let warmToolOverrides = null;
+// The credentials the readiness probe tries, in order. An OpenCode 2.x server authenticates `GET /api/info` with its
+// own password, so the header built from the resolved server password comes first; a proxy sitting *in front of* the
+// backend may instead authenticate the credential `OPENCODE_SERVER_URL` carries (`http://user:secret@host`), which is
+// the second. One header can only carry one of them, so the probe tries the next only when the previous was refused -
+// a refused connection or an HTML answer is not retried with the other credential.
+let BACKEND_HEALTH_AUTHORIZATIONS = [];
+// The OpenCode 2.x server password this process resolved (configured or generated). `spawnBackend()` passes it to the
+// child as `OPENCODE_SERVER_PASSWORD`, which is the same variable the server itself reads - so a spawned child always
+// accepts that credential, and the printed `server password …` line is never the source of truth.
+let BACKEND_SERVER_PASSWORD_VALUE = null;
 
 /**
  * Split a configured backend URL into the URL the SDK is given and the header that carries its credentials.
@@ -825,6 +833,56 @@ export function resolveBackendAuth(serverUrl) {
     return { url: withoutUserInfo, authorization };
 }
 
+// The username an OpenCode 2.x server expects its password under. The server issues a password and authenticates
+// `Authorization: Basic base64("opencode:<password>")`; a bare token, `Bearer`, or the password alone as the username
+// are all refused with `401 {"_tag":"UnauthorizedError"}`. One constant, so the spawned child and every call cannot
+// disagree about it.
+const BACKEND_AUTH_USERNAME = 'opencode';
+
+/**
+ * Build the Basic credential an OpenCode 2.x server accepts.
+ * @param {string} password the server password
+ * @returns {string} the value for an `Authorization` header
+ */
+export function backendAuthorizationHeader(password) {
+    return `Basic ${Buffer.from(`${BACKEND_AUTH_USERNAME}:${password}`, 'utf8').toString('base64')}`;
+}
+
+/**
+ * Resolve the OpenCode 2.x server password.
+ *
+ * A v2 server authenticates every `/api/*` route, so the gateway cannot drive one without its password. Two sources:
+ *
+ * - `OPENCODE_SERVER_PASSWORD` (env, or `config.json`) pins it. When the gateway spawns the child it passes the same
+ *   value through `OPENCODE_SERVER_PASSWORD` in the child's environment, which is what the server itself reads - the
+ *   printed `server password …` line is only emitted when the variable is absent, so pinning it avoids scraping the
+ *   child's output for a secret.
+ * - When nothing is configured, a random password is generated for this process. An *external* server then cannot be
+ *   authenticated against (the operator must configure its password), but a spawned child always matches, because the
+ *   child is handed the generated value.
+ *
+ * @param {object} options
+ * @param {string} [options.configured] value from the environment or `config.json`
+ * @param {boolean} [options.generate] whether a missing value may be generated (a spawned child can be matched)
+ * @returns {{password: string, generated: boolean}}
+ */
+export function resolveBackendPassword(options = {}) {
+    const configured = options.configured;
+    if (typeof configured === 'string' && configured.trim() !== '') {
+        const password = configured.trim();
+        registerSensitiveValue(password);
+        return { password, generated: false };
+    }
+    if (options.generate === false) {
+        return { password: '', generated: false };
+    }
+    // 32 bytes of entropy, base64url-encoded: a token that survives being pasted into a URL, a unit file or a
+    // container env without quoting. Long enough that a guessed value is not the interesting attack.
+    const password = randomBytes(32).toString('base64url');
+    registerSensitiveValue(password);
+    return { password, generated: true };
+}
+
 // How long one health probe may take, start to finish. The deadline has to cover the phases `req.setTimeout()` does not:
 // that timer only starts once a socket is *assigned and connected*, so `dns.lookup()` and the TCP handshake were
 // unbounded. `ensureBackend()` runs this probe on the completion path (with the completion slot already taken) and in
@@ -833,11 +891,53 @@ export function resolveBackendAuth(serverUrl) {
 // on Linux) while every other backend call in this file carries a deadline. The probe is not a completion: a couple of
 // seconds is the whole budget it gets.
 const HEALTH_PROBE_TIMEOUT_MS = 2000;
+// The route the readiness probe asks. `GET /api/info` answers `{"version":…}` for an authenticated v2 server, and a
+// web UI, a proxy error page or a 1.x server answers it with something else - which is exactly what must be told apart
+// from a usable backend.
+const HEALTH_PROBE_PATH = '/api/info';
+// How much of the probe's body is read to classify it. A JSON document starts with `{` or `[`, so a page of HTML is
+// identified from its first bytes; the bound keeps a large body from being buffered on the completion path.
+const HEALTH_PROBE_BODY_SAMPLE_CHARS = 64;
+/**
+ * Whether a health payload is a JSON document rather than a web page.
+ *
+ * The check is deliberately about the *shape* and not about a version field: the OpenCode 2.x server answers
+ * `{"version":"2.x.y",…}`, and a proxy that returns its own JSON error with `200` is still a backend the gateway
+ * cannot drive - but it is not this function's job to tell those apart, only to stop `text/html` from passing.
+ * @param {string} text the sampled head of the response body
+ * @returns {boolean}
+ */
+function isJsonHealthBody(text) {
+    const trimmed = String(text).replace(/^\uFEFF/, '').trimStart();
+    if (!trimmed) return false;
+    const first = trimmed[0];
+    return first === '{' || first === '[';
+}
 
 /**
  * Robust Health Check Helper
+ *
+ * The OpenCode 2.x server has no JSON health route: `GET /health` serves the web UI with `200 text/html`, so the
+ * original "any 200 is healthy" rule accepted a backend that answers every API call with `401`/`404` - the readiness
+ * probe passed, the child was considered up, and every completion failed. The probe therefore asks an API route
+ * (`GET /api/info`) and additionally requires a JSON body: an HTML page, a proxy's error page or a 2.x web UI can no
+ * longer pass as a usable backend.
  */
-function checkHealth(serverUrl, authorization = BACKEND_AUTHORIZATION) {
+/**
+ * One readiness probe against one credential.
+ *
+ * Two things have to be true before a backend counts as ready, and both were learned the hard way on 2.x:
+ *
+ * - the **status** must be 200. The probe used to classify the first bytes of the body and settle there, so the `401`
+ *   a 2.x server answers an unauthenticated `GET /api/info` with (`{"_tag":"UnauthorizedError"}`, JSON) passed as a
+ *   healthy backend: the spawn loop reported "backend ready", and every completion then failed on its own credential.
+ * - the body must be **JSON**. There is no JSON health route any more: `/health` and `/` serve the web UI with
+ *   `200 text/html`, so "any 200 is healthy" accepted a web UI - or a proxy's error page - as a drivable backend.
+ * @param {string} serverUrl
+ * @param {string|null} authorization value for the `Authorization` header, or null to send none
+ * @returns {Promise<true>} resolves when the backend answered 200 with a JSON document
+ */
+function probeBackendOnce(serverUrl, authorization) {
     const secure = String(serverUrl).startsWith('https://');
     const transport = secure ? https : http;
     return new Promise((resolve, reject) => {
@@ -858,12 +958,41 @@ function checkHealth(serverUrl, authorization = BACKEND_AUTHORIZATION) {
             } catch (e) { }
         };
         const options = { agent: secure ? healthAgentSecure : healthAgent };
-        if (authorization) options.headers = { authorization };
-        const req = transport.get(`${serverUrl}/health`, options, (res) => {
-            // Drain the body so the socket goes back to the keep-alive pool
-            res.resume();
-            if (res.statusCode === 200) finish(null);
-            else finish(new Error(`Status ${res.statusCode}`));
+        if (authorization) options.headers = { authorization, accept: 'application/json' };
+        const req = transport.get(`${serverUrl}${HEALTH_PROBE_PATH}`, options, (res) => {
+            // Only the first bytes are needed to tell JSON from a web page, but the body is drained either way so the
+            // socket goes back to the keep-alive pool instead of being torn down per probe.
+            let head = '';
+            let sampled = false;
+            const settle = (error) => {
+                if (sampled) return;
+                sampled = true;
+                // A refusal still has a body, and leaving it unread would take the socket out of the keep-alive pool
+                res.resume();
+                finish(error);
+            };
+            res.setEncoding('utf8');
+            res.on('data', (chunk) => {
+                if (sampled) return;
+                // Status first: a 401/404 body is JSON too, and reading the shape without the status called every
+                // refused probe healthy.
+                if (res.statusCode !== 200) {
+                    settle(new Error(`Status ${res.statusCode}`));
+                    return;
+                }
+                head += chunk;
+                if (head.length < HEALTH_PROBE_BODY_SAMPLE_CHARS) return;
+                settle(isJsonHealthBody(head) ? null : new Error('Backend answered with a non-JSON health payload'));
+            });
+            res.on('end', () => {
+                if (sampled) return;
+                sampled = true;
+                if (res.statusCode !== 200) {
+                    finish(new Error(`Status ${res.statusCode}`));
+                    return;
+                }
+                finish(isJsonHealthBody(head) ? null : new Error('Backend answered with a non-JSON health payload'));
+            });
         });
         // Armed before the socket exists, so it covers DNS and connect as well as the response; unref'd so a probe in
         // flight never keeps the process alive on its own
@@ -872,6 +1001,36 @@ function checkHealth(serverUrl, authorization = BACKEND_AUTHORIZATION) {
         req.on('error', (e) => finish(e));
         req.setTimeout(HEALTH_PROBE_TIMEOUT_MS, () => abandon(new Error('Timeout')));
     });
+}
+
+/**
+ * Is the OpenCode backend answering as a usable 2.x API?
+ *
+ * Each candidate credential is tried until one is accepted. A **refusal** (`401`, the credential a proxy in front wants
+ * or the server's own password) is the only thing that moves on to the next one: a connection that was refused, a
+ * timeout or an HTML answer means the backend is not there to be authenticated against, so trying the other header
+ * would only double the wait on every request that concludes the backend is gone.
+ * @param {string} serverUrl
+ * @param {string[]} [authorizations] credentials to try, in order
+ * @returns {Promise<true>}
+ */
+async function checkHealth(serverUrl, authorizations = BACKEND_HEALTH_AUTHORIZATIONS) {
+    const candidates = [];
+    for (const value of (Array.isArray(authorizations) ? authorizations : [authorizations])) {
+        if (typeof value === 'string' && value !== '' && !candidates.includes(value)) candidates.push(value);
+    }
+    const attempts = candidates.length > 0 ? candidates : [null];
+    let lastError = null;
+    for (const authorization of attempts) {
+        try {
+            return await probeBackendOnce(serverUrl, authorization);
+        } catch (error) {
+            lastError = error;
+            // Only a refusal is worth another credential
+            if (!/Status 401/.test(String(error && error.message))) break;
+        }
+    }
+    throw lastError || new Error('Backend health probe failed');
 }
 
 // How long a successful health probe is trusted before the next one (0 disables the cache). Resolved again by
@@ -955,7 +1114,11 @@ const backendDeadline = (timeoutMs) => ({ signal: AbortSignal.timeout(timeoutMs)
 // completion to time out.
 const METADATA_TIMEOUT_CAP_MS = 10000;
 const isTimeoutError = (error) => error?.name === 'TimeoutError' || error?.name === 'AbortError' ||
-    error?.code === 'ETIMEDOUT';
+    error?.code === 'ETIMEDOUT' ||
+    // The 2.x client rethrows an expired deadline as its own transport failure, carrying the message only:
+    // `ClientError("Transport: The operation was aborted due to timeout")`. That is this gateway's deadline, not an
+    // upstream refusal, and reporting it as `500 server_error` told the client the gateway had a bug.
+    (typeof error?.message === 'string' && /aborted due to timeout/i.test(error.message));
 
 const isConnectionError = (error) => {
     const message = String(error?.message || '');
@@ -964,6 +1127,77 @@ const isConnectionError = (error) => {
         message.includes('socket hang up') ||
         error?.cause?.code === 'ECONNREFUSED';
 };
+
+/**
+ * The chain of causes behind an error, outermost first.
+ *
+ * The 1.x SDK handed back a resolved error tuple whose `cause` was Node's own `fetch` error, one level down. The 2.x
+ * client *throws* instead, and it wraps: `ClientError("Transport: fetch failed")` → `TypeError("fetch failed")` →
+ * `Error(code: ECONNREFUSED)`. Reading only `error.cause.code` therefore found nothing, so a refused backend was
+ * reported as a generic unreachable error and the one retry the gateway does (a refused connection proves the request
+ * never arrived) never ran.
+ *
+ * Bounded, because a cause chain is not guaranteed to be a tree: a library that sets `cause` to itself, or two errors
+ * that point at each other, would otherwise loop forever on a path that only has to report a failure.
+ * @param {unknown} error the thrown value
+ * @returns {unknown[]} the outermost error followed by each cause
+ */
+function errorCauseChain(error) {
+    const chain = [];
+    let current = error;
+    // Bounded by depth and by a visited set: the depth alone stops a self-referencing cause, the set stops a longer
+    // cycle (A causes B causes A) that the depth would only reach more slowly.
+    const seen = new Set();
+    while (current !== null && current !== undefined && chain.length < 8) {
+        if (typeof current !== 'object' && typeof current !== 'string') break;
+        if (seen.has(current)) break;
+        seen.add(current);
+        chain.push(current);
+        current = current.cause;
+    }
+    return chain;
+}
+
+/**
+ * The status the OpenCode 2.x client's own error classes stand for.
+ *
+ * A 2.x call rejects with a typed error (`SessionNotFoundError`, `UnauthorizedError`, …) that carries a `_tag` and a
+ * message but **no HTTP status**: the generated client turns the response into a domain error and drops the number.
+ * Every upstream sentence this gateway reports names a status, and `session.delete` classifies 404/410 as "already
+ * gone", so the tag is mapped back onto the status the server sent. An unknown tag maps to nothing, which leaves the
+ * caller's own wording in place rather than inventing a status.
+ */
+const V2_ERROR_TAG_STATUS = {
+    UnauthorizedError: 401,
+    LocationNotFoundError: 404,
+    // The tag a 404 on `POST /api/session` actually carries. `LocationNotFoundError` above is a different route's
+    // error and never fires here, so without this the "a 1.x CLI has no /api route" case - the one warning worth
+    // printing - answered a bare `500` instead of `502 (status 404)`.
+    NotFoundError: 404,
+    SessionNotFoundError: 404,
+    SessionArchivedError: 410,
+    InvalidRequestError: 400,
+    InvalidPayloadError: 400,
+    ConflictError: 409,
+    ServiceUnavailableError: 503
+};
+
+/**
+ * The HTTP status behind a thrown backend error, or `null`.
+ * @param {unknown} error the thrown value
+ * @returns {number|null}
+ */
+function upstreamErrorStatus(error) {
+    for (const link of errorCauseChain(error)) {
+        const tag = link?._tag;
+        if (typeof tag === 'string' && V2_ERROR_TAG_STATUS[tag] !== undefined) return V2_ERROR_TAG_STATUS[tag];
+        // A status on any link of the chain is the real answer: a wrapper that does carry `response.status` (a proxy,
+        // a Node `fetch` failure with a response) is more precise than a tag guess.
+        const status = link?.response?.status ?? link?.status ?? link?.statusCode;
+        if (typeof status === 'number') return status;
+    }
+    return null;
+}
 
 // A connection that was *refused* proves nothing reached the backend; `fetch failed` / `socket hang up` do not - the
 // request may have been accepted and only the answer lost. The distinction matters for the one call the gateway retries
@@ -974,7 +1208,14 @@ const isConnectionRefused = (error) => {
     const cause = error?.cause;
     if (cause?.code === 'ECONNREFUSED') return true;
     // Node's `fetch` wraps the per-address failures (`127.0.0.1:4097`, `::1:4097`) in an AggregateError
-    return Array.isArray(cause?.errors) && cause.errors.some((inner) => inner?.code === 'ECONNREFUSED');
+    if (Array.isArray(cause?.errors) && cause.errors.some((inner) => inner?.code === 'ECONNREFUSED')) return true;
+    // The 2.x client adds a wrapper of its own above Node's error, so the code sits one level deeper than 1.x put it.
+    // Walking the chain (bounded, cycle-safe) covers both without guessing a fixed depth.
+    for (const link of errorCauseChain(error)) {
+        if (link?.code === 'ECONNREFUSED') return true;
+        if (Array.isArray(link?.errors) && link.errors.some((inner) => inner?.code === 'ECONNREFUSED')) return true;
+    }
+    return false;
 };
 
 // A backend that could not be reached, or could not be started, is an upstream failure and not a bug in the gateway:
@@ -1114,13 +1355,33 @@ process.on('exit', cleanupTempDirs);
 // gracefully. Registering an exit-on-signal handler here would run first and cut that shutdown short.
 
 /**
- * Best-effort extraction of the status code and error-body summary from an upstream (opencode serve) call error.
- * The SDK error shape may change between versions; common fields are supported:
- * response.{status,data} / status / statusCode / responseBody / data / body
+ * Best-effort extraction of the status code and error-body summary from an upstream (opencode serve) call failure.
+ *
+ * Two shapes reach here. The 1.x SDK resolved with `{error, response}` on a non-2xx answer, so `response.{status,data}`
+ * was the whole story. The 2.x client throws instead: a typed error carrying `_tag` and a message (`SessionNotFoundError`,
+ * `UnauthorizedError`, `InvalidRequestError`, …) and no status, or a `ClientError` wrapping Node's `fetch` failure.
+ * `upstreamErrorStatus()` maps the tag back onto the status the server sent, so the sentence a client reads still names
+ * one.
+ * @param {unknown} error the resolved tuple or the thrown value
+ * @returns {{status: number|null, bodySummary: string|null}}
  */
 function extractUpstreamError(error) {
-    const status = error?.response?.status ?? error?.status ?? error?.statusCode ?? null;
-    const body = error?.response?.data ?? error?.responseBody ?? error?.data ?? error?.body ?? null;
+    const chain = errorCauseChain(error);
+    // `error.error` is where the 2.x client hangs the response body of a status it has no typed error for: those arrive
+    // as a bare `Error` whose own message is empty (`UnexpectedStatus: 500`), so without this a megabyte of backend
+    // payload was logged as `bodySummary: null` - the summary bound existed and was never applied. The chain is walked
+    // for it too, because the gateway's own `ProviderError` wraps the failure it was built from.
+    let body = error?.response?.data ?? error?.responseBody ?? error?.data ?? error?.body
+        ?? error?.error
+        ?? chain.map((link) => link?.data ?? link?.body ?? link?.error).find((value) => value !== undefined) ?? null;
+    // A **typed** 2.x error (`_tag`, the statuses the client declares) carries the backend's answer as its own message
+    // and has no separate body. A short one is already printed in full by the `message` field, so it is summarised only
+    // when it is long enough for the bound to matter - that megabyte is exactly what the bound exists for.
+    if (body === null && typeof error?._tag === 'string' && typeof error?.message === 'string'
+        && error.message.length > 200) {
+        body = error.message;
+    }
+    const status = upstreamErrorStatus(error);
     // Bounded *before* it is serialised. This used to be `JSON.stringify(body).slice(0, 500)`, which built the whole
     // string - a proxy in front of the backend answering a megabyte of JSON paid a full serialisation and a megabyte
     // string on the completion's error path - to keep 500 characters of it. The summary is a log line either way.
@@ -1238,7 +1499,7 @@ const CHAT_COMPLETION_SCHEMA = {
  */
 function createApp(config) {
     // DEBUG no longer controls output directly (startProxy maps it onto the debug log level), so it is not destructured here
-    const { API_KEY, OPENCODE_SERVER_URL, REQUEST_TIMEOUT_MS, DISABLE_TOOLS } = config;
+    const { API_KEY, OPENCODE_SERVER_URL, OPENCODE_SERVER_PASSWORD, REQUEST_TIMEOUT_MS, DISABLE_TOOLS } = config;
 
     // A request line or header the HTTP parser rejects never reaches the onRequest hook (hooks run after routing), so
     // it used to be answered by Fastify's own handler with `{"error":"Bad Request","message":"Client Error",
@@ -1368,11 +1629,32 @@ function createApp(config) {
     // Basic Authorization header instead - for the SDK, which merges `config.headers` into every request, and for the
     // health probe, which the backend (or the proxy) would otherwise refuse with 401 and look like a missing backend.
     const backendAuth = resolveBackendAuth(OPENCODE_SERVER_URL);
-    BACKEND_AUTHORIZATION = backendAuth.authorization;
+    // An OpenCode 2.x server authenticates every `/api/*` route with its own password. It is either configured (and
+    // handed to a spawned child verbatim) or generated here, which the child is then given - so the two always agree.
+    const backendPassword = resolveBackendPassword({ configured: OPENCODE_SERVER_PASSWORD });
+    BACKEND_SERVER_PASSWORD_VALUE = backendPassword.password;
+    if (backendPassword.generated) {
+        logger.info('[Config] OPENCODE_SERVER_PASSWORD is not set: generated a server password for this process');
+    }
+    // A URL credential (a proxy in front of the backend) and the server's own password are two different secrets for two
+    // different hops. The server's password is what every v2 API call needs, so it is the header the SDK sends; a URL
+    // credential is tried by the readiness probe as well, because a proxy in front authenticates its own hop.
+    // The probe therefore carries both, server password first: it is the one `GET /api/info` itself answers to.
+    const backendSdkAuthorization = backendPassword.password
+        ? backendAuthorizationHeader(backendPassword.password)
+        : backendAuth.authorization;
+    BACKEND_HEALTH_AUTHORIZATIONS = [];
+    const addProbeCredential = (value) => {
+        if (typeof value === 'string' && value !== '' && !BACKEND_HEALTH_AUTHORIZATIONS.includes(value)) {
+            BACKEND_HEALTH_AUTHORIZATIONS.push(value);
+        }
+    };
+    addProbeCredential(backendSdkAuthorization);
+    addProbeCredential(backendAuth.authorization);
     // A credential sent over plain `http://` to a host that is not this machine travels in cleartext: readable by every
     // hop between here and there, which is the one thing the masking elsewhere cannot help with. Loopback is fine (the
     // bytes never leave the host), a remote host is worth a line.
-    if (backendAuth.authorization) {
+    if (backendSdkAuthorization) {
         let backendHost = null;
         try {
             backendHost = new URL(backendAuth.url).hostname;
@@ -1387,9 +1669,9 @@ function createApp(config) {
             );
         }
     }
-    const client = createOpencodeClient({
+    const client = OpenCode.make({
         baseUrl: backendAuth.url,
-        ...(backendAuth.authorization ? { headers: { authorization: backendAuth.authorization } } : {})
+        ...(backendSdkAuthorization ? { headers: { Authorization: backendSdkAuthorization } } : {})
     });
 
     // Precomputed once: comparing against a ready-made buffer avoids rebuilding the token on every request.
@@ -1648,7 +1930,6 @@ function createApp(config) {
         return STATIC_FALLBACK_MODELS;
     };
     const MODELS_TIMEOUT_MS = Math.min(REQUEST_TIMEOUT_MS, METADATA_TIMEOUT_CAP_MS);
-    const TOOL_IDS_TIMEOUT_MS = MODELS_TIMEOUT_MS;
     let modelsCache = null;
     let modelsCacheAt = 0;
     // The listing is serialised once per cache fill instead of once per request: `/v1/models` is the hot read route (a
@@ -1708,45 +1989,54 @@ function createApp(config) {
 
     const fetchModels = async () => {
         try {
-            const providersRes = await client.config.providers(backendDeadline(MODELS_TIMEOUT_MS));
-            // The SDK resolves a rejected call with `{ error, response }` instead of throwing, so reading `.data` alone
-            // made a refused provider call ("upstream answered 500", "the backend is gone") report itself as "the
-            // backend reported no models" - the one SDK call in the gateway whose error tuple was never inspected.
-            if (providersRes && providersRes.error) {
-                const { status, reason } = upstreamFailureReason(providersRes);
-                logger.warn(
-                    `[Proxy] The backend rejected the provider listing${status ? ` (status ${status})` : ''}${reason}, using the static fallback`
-                );
+            // The 2.x server publishes one flat model list (`GET /api/model` → `{"data":[ModelInfo]}`) instead of a
+            // provider list whose entries carry a `models` map. Each entry already names its provider (`providerID`) and
+            // itself (`id`), which is what the OpenAI-facing `provider/model` id is built from.
+            // The request options are the client's **second** argument (`model.list(input?, requestOptions?)`), where 1.x
+            // merged them into the same object: passing the deadline as the input left the call with none at all, and a
+            // silent backend held a model listing for as long as the client's own socket timeout allowed (measured 15 s
+            // against a 2 s budget) instead of answering from the static fallback.
+            const modelsRes = await client.model.list(undefined, backendDeadline(MODELS_TIMEOUT_MS));
+            // The 2.x client **throws** on a rejected call, so the usual shape reaches the `catch` below; this guard is
+            // for a client that resolves `{ error, response }` instead (a translating proxy, a future release). Both
+            // paths report through `modelListingRejected()` so a refused call cannot describe itself as an empty one -
+            // reading `.data` alone made "the upstream answered 500" and "the backend is gone" read as "the backend
+            // reported no models", which sent the operator after a backend that was answering perfectly.
+            if (modelsRes && modelsRes.error) {
+                modelListingRejected(modelsRes);
                 return serveFallback();
             }
-            const providersRaw = providersRes.data?.providers || [];
-            const models = [];
-            const list = Array.isArray(providersRaw)
-                ? providersRaw
-                : Object.entries(providersRaw).map(([id, info]) => ({ ...info, id }));
+            const modelsRaw = modelsRes?.data;
+            const list = Array.isArray(modelsRaw)
+                ? modelsRaw
+                : (modelsRaw && Array.isArray(modelsRaw.data) ? modelsRaw.data : []);
             if (list.length === 0) {
-                // A backend whose provider payload the gateway cannot read (a changed shape, a version that reports
+                // A backend whose model payload the gateway cannot read (a changed shape, a version that reports
                 // nothing) answered 200 with no models. Serving `{"data":[]}` is as useless to a client as an error -
                 // clients show no models at all - so an empty list takes the same fallback path and is not cached.
                 logger.warn('[Proxy] The backend reported no models, using the static fallback');
                 return serveFallback();
             }
 
-            list.forEach((p) => {
-                if (p.models) {
-                    Object.entries(p.models).forEach(([mId, mData]) => {
-                        models.push({
-                            id: `${p.id}/${mId}`,
-                            name: mData.name || mId,
-                            object: 'model',
-                            owned_by: p.id
-                        });
-                    });
-                }
+            const models = [];
+            list.forEach((m) => {
+                if (!m || typeof m.id !== 'string' || m.id === '') return;
+                // A model the server itself disabled or retired cannot answer a completion, so offering it only earns
+                // the client an upstream error. Both fields are optional: an entry that reports neither stays listed,
+                // which is how a server that publishes no such flag keeps every model.
+                if (m.enabled === false) return;
+                if (typeof m.status === 'string' && m.status !== '' && m.status !== 'active') return;
+                const providerID = typeof m.providerID === 'string' && m.providerID !== '' ? m.providerID : 'opencode';
+                models.push({
+                    id: `${providerID}/${m.id}`,
+                    name: m.name || m.id,
+                    object: 'model',
+                    owned_by: providerID
+                });
             });
             if (models.length === 0) {
-                // Providers the gateway cannot read a model out of (no `models` map, an empty one, a changed shape)
-                // answer 200 with nothing to choose from: that takes the same fallback path as an empty provider
+                // Models the gateway cannot read a name out of (an empty list, a changed shape, every entry disabled)
+                // answer 200 with nothing to choose from: that takes the same fallback path as an empty model
                 // list, and - unlike a real listing - is not cached.
                 logger.warn('[Proxy] The backend reported no models, using the static fallback');
                 return serveFallback();
@@ -1761,6 +2051,9 @@ function createApp(config) {
             modelsCacheAt = Date.now();
             return models;
         } catch (error) {
+            // A rejected listing is an upstream failure, not a gateway defect: name the status and the reason the same
+            // way the resolved-tuple branch above does, so the sentence an operator greps for is one sentence.
+            modelListingRejected(error);
             // Every other upstream payload that reaches a log line or a response goes through the masking helpers:
             // this line quoted `error.message` (the documented symptom of a credential-bearing backend URL) and the
             // raw `error.response` body, so a proxy in front of the backend could have put a secret in `docker logs`.
@@ -1893,8 +2186,10 @@ function createApp(config) {
 
     /**
      * The text a part's snapshot added since the snapshot already seen.
-     * opencode >= 1.19 sends no delta: `part.text` is the part's current full text, so the increment is that text
-     * minus the previous snapshot of the same part. Two details matter. The snapshot is tracked **per part**: it used
+     * A `session.text.ended` / `session.reasoning.ended` event carries the part's **whole** text, so the increment is
+     * that text minus the previous snapshot of the same part. In 2.x the deltas already delivered the text, which is
+     * why the delta path feeds its running total here: the closing event then diffs to nothing instead of appending
+     * the answer a second time. Two further details matter. The snapshot is tracked **per part**: it used
      * to be diffed against the accumulated answer of the whole message, so a message with more than one text part (a
      * model that writes, calls a tool, then keeps writing) never matched and every event re-sent its part in full.
      * And the append is checked by length plus a bounded head/tail comparison instead of comparing the whole prefix,
@@ -2013,124 +2308,66 @@ function createApp(config) {
         return filter;
     };
 
-    const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
-    // A failed lookup must not be retried on every request: without this a broken /tool/ids endpoint adds one failed
-    // round trip to every completion
-    const TOOL_IDS_FAILURE_TTL_MS = 60 * 1000;
-    let cachedToolOverrides = null;
-    // How many switches the cached map carries. The handler needs "is this map empty?" once per completion, and
-    // `Object.keys(...).length` built an array of every tool id to answer it (552 ns and a 60-element array per
-    // completion, while `for…in` is no cheaper: V8 enumerates either way). The count is known right here.
-    let cachedToolOverrideCount = 0;
-    // When the map was last loaded successfully (its age), and when the list was last asked for (the failure backoff)
-    let cachedToolAt = 0;
-    let cachedToolAttemptAt = 0;
-    let cachedToolError = false;
-    // The refresh in flight, so a cold cache shares one round trip instead of one per waiting completion
-    let toolIdsInFlight = null;
+    // `DISABLE_TOOLS` on a 2.x server.
+    //
+    // The 1.x mechanism was a per-tool override map: the gateway enumerated the backend's tool ids
+    // (`GET /experimental/tool/ids`), set each one to `false` and posted the map as `tools` on the prompt. None of that
+    // exists in 2.x: every `/api/tool/*` route answers 404, and the prompt body has no `tools` field.
+    //
+    // What 2.x does have is a per-session permission ruleset (`Permission.Rule[]`, each `{action, resource, effect}`),
+    // accepted by `session.create({permissions})` and enforced by the server: a denied action is refused before the
+    // tool runs, rather than being a suggestion in the prompt. Every action the default agent can use is denied here,
+    // so no tool can run and the answer is produced from the model alone.
+    //
+    // Two read-only tools stay allowed, for the reason the 1.x map also kept them: with a free zen model, denying
+    // `read` or `glob` made the prompt request hang forever instead of answering.
+    const TOOLS_ALLOWED_WHEN_DISABLED = ['read', 'glob'];
+    // Every action a 2.x agent's ruleset names. `edit`, `shell`, `webfetch`, `websearch` and `skill` are the ones that
+    // can change something or reach the network; the rest are their neighbours in the built-in agents' rulesets. A
+    // server that adds an action is still covered by the trailing `*` rule below.
+    const TOOL_DENY_ACTIONS = [
+        'edit', 'shell', 'write', 'grep', 'webfetch', 'websearch', 'subagent',
+        'external_directory', 'question', 'skill', 'task', 'todowrite', 'todoread',
+        'lsp', 'browser', 'patch', 'multiedit', 'invalid'
+    ];
 
-    // Reads the map and stores it. Throws on failure; the callers decide what that means.
-    const loadToolOverrides = async () => {
-        const idsRes = await client.tool.ids(backendDeadline(TOOL_IDS_TIMEOUT_MS));
-        // The SDK resolves on a non-2xx answer instead of throwing: an error tuple carries no data, so it used to
-        // be read as "the backend has no tools" and cached as a *success* - DISABLE_TOOLS then sent no tool
-        // switches at all for the whole cache window, leaving every tool enabled.
-        if (idsRes && idsRes.error) {
-            const { status } = upstreamFailureReason(idsRes);
-            throw new Error(`tool list rejected${status ? ` (status ${status})` : ''}`);
-        }
-        const ids = Array.isArray(idsRes?.data)
-            ? idsRes.data
-            : Array.isArray(idsRes)
-                ? idsRes
-                : [];
-        const overrides = {};
-        ids.forEach((id) => {
-            /* With opencode>=1.19 + a free zen model, disabling either read or glob makes the prompt request hang forever, so these two read-only tools stay enabled while all other tools remain disabled */
-            // `setOwnProperty()` for the same reason the masking helpers use it: the id is backend-supplied (an MCP
-            // server names its own tools), and `overrides['__proto__'] = false` runs the prototype setter as a
-            // silent no-op - that tool stayed enabled while DISABLE_TOOLS was on, the failure this switch exists to
-            // prevent.
-            setOwnProperty(overrides, id, ["read","glob"].includes(String(id).toLowerCase()));
-        });
-        cachedToolOverrides = overrides;
-        cachedToolOverrideCount = ids.length;
-        cachedToolAt = Date.now();
-        cachedToolAttemptAt = cachedToolAt;
-        cachedToolError = false;
-        logDebug('Tool overrides loaded', { count: ids.length });
-        return overrides;
+    /**
+     * The permission ruleset that disables tools on a 2.x session, or `undefined` when tools are enabled.
+     *
+     * Built fresh per session rather than cached: a ruleset is a handful of small objects, the completion that needs it
+     * already creates a session, and the 1.x cache existed only because the tool list cost a backend round trip - which
+     * is exactly what this no longer does.
+     * @returns {Array<{action: string, resource: string, effect: string}>|undefined}
+     */
+    const toolPermissionRules = () => {
+        if (!DISABLE_TOOLS) return undefined;
+        const deny = (action) => ({ action, resource: '*', effect: 'deny' });
+        // The named actions come first so the ruleset reads as what it denies, then `*` catches an action this list
+        // does not know about (a server that grows one), and the read-only pair is re-stated last as the single
+        // exception. A 2.x server evaluates the rules in order and the last match for an action is not necessarily the
+        // winner, so the allow pair is the only rule that mentions those two actions at all.
+        return [
+            ...TOOL_DENY_ACTIONS.map(deny),
+            deny('*'),
+            ...TOOLS_ALLOWED_WHEN_DISABLED.map((action) => ({ action, resource: '*', effect: 'allow' }))
+        ];
     };
 
-    // Records a failed refresh. The last known-good map is kept, because an absent `tools` field is not "no tools":
-    // the gateway sends an override map, and omitting it leaves the backend's own defaults, i.e. every tool enabled.
-    // Discarding the map on a transient failure therefore turned one bad round trip into an open switch.
-    const noteToolOverrideFailure = (error) => {
-        const firstOfWindow = !cachedToolError;
-        cachedToolAttemptAt = Date.now();
-        cachedToolError = true;
-        if (!firstOfWindow) return;
-        // Masked and bounded like every other upstream sentence: a thrown `fetch`/SDK error quotes the URL it
-        // failed on, and a log line is collected (`docker logs`) as often as not
-        const sentence = clientFacingText(error?.message);
-        if (cachedToolOverrides) {
-            logger.warn('[Proxy] Could not refresh the backend tool list; the last known map is still in force', {
-                error: sentence
-            });
-        } else {
-            logger.warn(
-                '[Proxy] DISABLE_TOOLS is on but the backend tool list could not be read, so the backend defaults ' +
-                'apply and every tool stays enabled until it succeeds',
-                { error: sentence }
-            );
-        }
-    };
+    // Kept for the debug line and for callers that ask "is anything disabled?" without building the ruleset.
+    const toolsDisabled = () => DISABLE_TOOLS;
 
-    const refreshToolOverrides = () => {
-        if (toolIdsInFlight) return toolIdsInFlight;
-        toolIdsInFlight = loadToolOverrides()
-            .catch((e) => {
-                noteToolOverrideFailure(e);
-                return null;
-            })
-            .finally(() => {
-                toolIdsInFlight = null;
-            });
-        return toolIdsInFlight;
-    };
-
-    const getToolOverrides = async () => {
-        if (!DISABLE_TOOLS) return null;
-        const now = Date.now();
-        if (cachedToolOverrides && now - cachedToolAt < TOOL_IDS_CACHE_MS) return cachedToolOverrides;
-        if (cachedToolOverrides) {
-            // Stale-while-revalidate, the rule `/v1/models` follows: the map in hand is served and refreshed behind the
-            // request instead of putting a backend round trip in front of the 1-in-N completion that crossed the TTL.
-            // Tools change rarely, so a five-minute-old map is strictly better than the all-enabled default.
-            if (now - cachedToolAttemptAt >= (cachedToolError ? TOOL_IDS_FAILURE_TTL_MS : 0)) {
-                void refreshToolOverrides();
-            }
-            return cachedToolOverrides;
-        }
-        // Cold cache: wait for the map (or for the refresh already in flight), unless the last attempt just failed
-        if (cachedToolError && now - cachedToolAttemptAt < TOOL_IDS_FAILURE_TTL_MS) return null;
-        await refreshToolOverrides();
-        return cachedToolOverrides;
-    };
-
-    // The switch map is a cheap metadata call, so the first completion should not pay for it (nor race a refresh).
-    // startProxy() calls this after the backend answered its warmup probe; the closure lives here because it needs the
-    // SDK client this app was built with.
-    warmToolOverrides = () => { getToolOverrides().catch(() => { }); };
-
-    async function promptWithTimeout(promptParams, timeoutMs) {        let timer = null;
+    async function promptWithTimeout(promptParams, timeoutMs) {
+        let timer = null;
         const timeoutPromise = new Promise((_, reject) => {
             timer = setTimeout(() => reject(new Error(timeoutMessage(timeoutMs))), timeoutMs);
         });
         // The promise that loses a race keeps running. A rejection that arrives after the timeout - a backend that
         // dies, or the aborted fetch from the deadline below - used to reach nothing and become an unhandled
         // rejection, which ends the process by default: one slow completion could take the whole gateway down.
-        const promptPromise = client.session.prompt({ ...promptParams, ...backendDeadline(timeoutMs) });
+        // The 2.x client takes the flat input object (`{sessionID, text, …}`) and the request options as a *second*
+        // argument, where 1.x merged the deadline into the same object. Merging it here would have sent `signal` as
+        // part of the prompt payload and left the call with no deadline at all.
+        const promptPromise = client.session.prompt(promptParams, backendDeadline(timeoutMs));
         promptPromise.catch(() => { });
         try {
             return await Promise.race([promptPromise, timeoutPromise]);
@@ -2152,32 +2389,80 @@ function createApp(config) {
     // raise it so the stream can be terminated with an in-band error frame, exactly like any other post-header
     // failure: the alternative is a successful-looking stream whose only "answer" is an error message.
     class ProviderError extends Error {
-        constructor(message, status) {
-            super(message);
+        /**
+         * @param {string} message the sentence the client and the log line show
+         * @param {number} [status] the upstream status, when one could be read
+         * @param {unknown} [cause] the failure this one was built from. A 2.x `ClientError` carries the backend's answer
+         *   on `.error`, and a wrapper that dropped it left the error log with `bodySummary: null` - the summary bound
+         *   existed and was never applied. `extractUpstreamError()` walks the `cause` chain for exactly this.
+         */
+        constructor(message, status, cause) {
+            super(message, cause === undefined ? undefined : { cause });
             this.name = 'ProviderError';
             if (status !== undefined) this.status = status;
         }
     }
 
-    // Describes a failed SDK call: the status and the reason the backend gave. The SDK hands back the parsed body
-    // as-is (`{error:{message}}`, `{message}` or a plain string), so taking the first object would print
-    // "[object Object]" in a client-facing message.
+    // Describes a failed backend call: the status and the reason the backend gave.
+    //
+    // Two shapes, one helper. The 1.x SDK resolved a non-2xx answer with `{error, response}` and never threw, so the
+    // tuple was read here. The 2.x client throws a typed error (`_tag`, `message`, no status) or a `ClientError`
+    // wrapping Node's `fetch` failure, so the thrown value is read the same way - a call site that only understood the
+    // tuple reported a refused backend as "no reason" and an invalid request as a bare 500.
+    //
+    // The body the SDK hands back is used as-is (`{error:{message}}`, `{message}` or a plain string), so taking the
+    // first object would print "[object Object]" in a client-facing message.
     const upstreamFailureReason = (res) => {
-        const status = res?.response?.status;
-        const raw = res?.error;
-        const candidate = typeof raw === 'string'
-            ? raw
-            : (raw?.data?.message ?? raw?.message ?? (typeof raw?.error === 'string' ? raw.error : raw?.error?.message));
+        // A call site that caught a rejection and stored it as `{error}` (the poll loop does) is unwrapped here, so the
+        // status on the real error is read instead of being lost behind the wrapper object.
+        const thrown = res instanceof Error
+            ? res
+            : (res?.error instanceof Error ? res.error : null);
+        const status = upstreamErrorStatus(thrown || res);
+        // The body a backend error carries, in every shape the 2.x client and the 1.x one produce: a plain string, an
+        // object with `message`, one with a nested `error`, or the `{error:{message}}` / `{message}` envelopes.
+        const bodyMessage = (value) => {
+            if (typeof value === 'string') return value;
+            if (!value || typeof value !== 'object') return '';
+            return value.data?.message
+                ?? value.message
+                ?? (typeof value.error === 'string' ? value.error : value.error?.message)
+                ?? '';
+        };
+        // A 2.x `ClientError` for a status the generated client has no typed error for carries an **empty** message and
+        // hangs the response body off `.error`, so reading only `message` reported a failing poll as "failed while
+        // polling the answer: Error" - the reason the backend actually gave was one property further in. When there is a
+        // body, it wins: for those statuses the message is nothing but the status echoed back (`UnexpectedStatus: 502`),
+        // and a reason is what the reader is looking for.
+        const raw = thrown
+            ? (bodyMessage(thrown.error) || (typeof thrown.message === 'string' ? thrown.message : ''))
+            : bodyMessage(res?.error);
         // A thrown call carries the runtime's own wording (`fetch failed` for a dead or refused backend), which names
         // no cause at all; the same phrase a client would read from the top-level handler is used here.
-        const text = clientFacingText(candidate);
-        const reason = text && isConnectionError({ message: candidate })
+        const text = clientFacingText(raw);
+        const reason = text && isConnectionError(thrown || { message: raw })
             ? `the backend is not reachable (${text})`
             : text;
         return {
             status,
             reason: typeof reason === 'string' && reason ? `: ${reason}` : ''
         };
+    };
+
+    /**
+     * The one line a model listing that did not answer gets, whichever shape the failure arrived in.
+     *
+     * The 2.x client throws, the 1.x one resolved `{error, response}`, and a translating proxy may do either, so both
+     * call sites would otherwise word the same event differently - and the wording is what an operator greps for when a
+     * client shows only `big-pickle`. The reason goes through `upstreamFailureReason()`, so a credential-bearing
+     * sentence is masked and an unreachable backend says so instead of quoting `fetch failed` on its own.
+     * @param {unknown} failure a thrown error or a resolved `{error}` wrapper
+     */
+    const modelListingRejected = (failure) => {
+        const { status, reason } = upstreamFailureReason(failure);
+        logger.warn(
+            `[Proxy] The backend rejected the model listing${status ? ` (status ${status})` : ''}${reason}, using the static fallback`
+        );
     };
 
     // What actually arrived, for a debug line: the top-level type and a few keys tell an envelope change (a "data" or
@@ -2227,14 +2512,37 @@ function createApp(config) {
     /**
      * The assistant message `client.session.prompt` already returned, when the provider is done writing it.
      *
-     * The backend answers `POST /session/:id/message` with the message it produced, so a finished message *is* the
-     * answer: asking for it again with `GET /session/:id/message` was one backend round trip per completion (plus up
-     * to a poll interval when the message was not yet marked finished) spent on data the gateway already held. A
-     * message that is still being written carries no `finish`, and that case keeps using the poll loop.
+     * **A 2.x prompt does not return one.** `POST /api/session/{id}/prompt` answers with the *user inbox item* it just
+     * enqueued (`{data:{id,type:'user',…}}`); the assistant's answer is written afterwards and is read through the event
+     * stream or by polling `GET /api/session/{id}/message`. So the fast path 1.x allowed - serving the finished message
+     * the prompt response already carried instead of spending a poll - has nothing to read here and returns `null` for
+     * every 2.x answer, which is the correct outcome rather than a missing optimisation.
+     *
+     * The 1.x shape is still recognised on purpose. A deployment that fronts the gateway with something translating the
+     * two APIs, or a 2.x release that starts answering with the finished message again, then keeps the round trip it
+     * saves instead of silently losing it. A message that is still being written carries no `finish`, and that case
+     * keeps using the poll loop either way.
      */
     const completedPromptMessage = (result) => {
-        const message = result?.data;
-        const info = message?.info;
+        // The 2.x client unwraps the response envelope once, so the payload arrives as the message itself, while the 1.x
+        // one handed back the enveloped form. Both are accepted rather than betting the fast path on one SDK's
+        // unwrapping: reading only `result.data` recognised nothing the 2.x client returns.
+        const candidates = [];
+        if (result && typeof result === 'object') {
+            candidates.push(result);
+            if (result.data && typeof result.data === 'object') candidates.push(result.data);
+        }
+        let message = null;
+        let info = null;
+        for (const candidate of candidates) {
+            // 1.x: `{info:{…},parts:[…]}`. A 2.x prompt answers with the user inbox item, which is neither.
+            const found = candidate.info || (candidate.type === 'assistant' ? candidate : null);
+            if (found) {
+                message = candidate;
+                info = found;
+                break;
+            }
+        }
         if (!info) return null;
         // opencode reports the end of a message either with a finish reason or with a completion stamp only
         if (!info.finish && !info.time?.completed) return null;
@@ -2243,8 +2551,9 @@ function createApp(config) {
         // Serving this step here reintroduced that truncation on the fast path: the client got the model's preamble for
         // a request that went on to run a tool and answer. It is an intermediate step, so the poll loop handles it.
         if (String(info.finish || '').toLowerCase() === 'tool-calls') return null;
-        const parts = Array.isArray(message.parts) ? message.parts : [];
-        const { content, reasoning } = extractFromParts(parts);
+        // 2.x carries the answer as `content:[{type:'text'|'reasoning',text}]`; 1.x as `parts:[…]`.
+        const fragments = Array.isArray(message.parts) ? message.parts : message.content;
+        const { content, reasoning } = extractFromParts(fragments);
         const error = info.error || null;
         // Nothing to serve and no failure to report: the staged message is not the answer, poll for it
         if (!content && !reasoning && !error) return null;
@@ -2254,19 +2563,59 @@ function createApp(config) {
     /**
      * Turns a rejected `client.session.prompt` into the same upstream failure the other backend calls report.
      *
-     * The SDK does not throw on a non-2xx answer: it resolves with `{ error, response }`. Ignoring that tuple made a
-     * prompt the backend rejected (expired credentials, a rate limit, an unknown model, an incompatible version) look
-     * like a slow answer - no assistant message was ever created, so polling could only run out the whole request
-     * budget and answer 504 while holding the queue slot for minutes.
+     * The 2.x client **throws** on a non-2xx answer (`InvalidRequestError`, `UnauthorizedError`, a `ClientError`
+     * wrapping `fetch` for an unreachable backend) instead of resolving with the `{ error, response }` tuple 1.x used,
+     * so the rejection now reaches the handler's own catch; this guard covers the tuple form as well, because a proxy
+     * that translates the API - or a future client that resolves it - would otherwise make a prompt the backend
+     * rejected (expired credentials, a rate limit, an unknown model) look like a slow answer: no assistant message was
+     * ever created, so polling could only run out the whole request budget and answer 504 while holding the slot.
      */
     const throwIfPromptRejected = (result, hasAnswer) => {
         if (!result || !result.error || hasAnswer) return;
-        const { status, reason } = upstreamFailureReason(result);
-        throw new ProviderError(
+        throw promptRejected(result);
+    };
+
+    /**
+     * The upstream failure a rejected `client.session.prompt` becomes, whichever way the rejection arrived.
+     *
+     * The 2.x client throws, and a status it has no typed error for arrives as `ClientError("UnexpectedStatus: 500")`
+     * with the number only on `cause.status` and the response body dropped. That is still the backend refusing the
+     * prompt, so it is named the same way as a resolved `{error}` tuple: without this, the refusal reached the
+     * handler's own catch and was answered `500 server_error` - the gateway blaming itself for the backend's answer.
+     * @param {unknown} failure the thrown error or the resolved `{error}` wrapper
+     * @returns {ProviderError}
+     */
+    const promptRejected = (failure) => {
+        const { status, reason } = upstreamFailureReason(failure);
+        const thrown = failure instanceof Error ? failure : (failure?.error instanceof Error ? failure.error : undefined);
+        return new ProviderError(
             `OpenCode backend rejected the prompt${status ? ` (status ${status})` : ''}${reason}`,
-            status
+            status,
+            thrown
         );
     };
+
+    /**
+     * `client.session.prompt`, with a thrown rejection turned into the upstream failure it is.
+     *
+     * The 2.x client throws on every non-2xx answer, so the prompt's own catch never sees a rejected prompt - and the
+     * handler's catch answered it as `500 server_error`, which tells a client the gateway has a bug. A status the
+     * generated client has no typed error for arrives as `ClientError("UnexpectedStatus: 500")` (the number only on
+     * `cause.status`, the body dropped), so the presence of a status is what marks a refusal; a transport failure (the
+     * backend died, the deadline expired) keeps its own wording, which names a cause the client can act on.
+     * @param {object} promptParams the flat 2.x prompt input
+     * @param {number} timeoutMs the budget for this call
+     */
+    async function promptCall(promptParams, timeoutMs) {
+        try {
+            return await promptWithTimeout(promptParams, timeoutMs);
+        } catch (error) {
+            if (!isTimeoutError(error) && typeof upstreamErrorStatus(error) === 'number') {
+                throw promptRejected(error);
+            }
+            throw error;
+        }
+    }
 
     async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS, shouldAbort = null, options = {}) {
         const pollStart = Date.now();
@@ -2312,14 +2661,23 @@ function createApp(config) {
                 // Each poll gets the budget that is left, not a fresh copy of it: a poll started just before the
                 // deadline used to run for another full budget, so a wedged backend kept a completion alive for
                 // about twice the advertised timeout (beyond the queue timer, which then answered a generic 500).
-                messagesRes = await client.session.messages({
-                    path: { id: sessionId },
-                    ...backendDeadline(Math.max(1, timeoutMs - (Date.now() - startedAt)))
-                });
+                //
+                // The 2.x list is `client.message.list()` - a *top-level* namespace, not `session.message` (which only
+                // carries `get`) - and is **newest first** unless `order: 'asc'` is asked for. The caller scans for the
+                // newest assistant message and treats the tail as the answer, so the order is pinned here rather than
+                // left to the server's default.
+                messagesRes = await client.message.list({
+                    sessionID: sessionId,
+                    order: 'asc',
+                    limit: DEFAULT_POLLED_MESSAGE_LIMIT
+                }, backendDeadline(Math.max(1, timeoutMs - (Date.now() - startedAt))));
             } catch (error) {
                 // The deadline is the caller's budget, not a failed poll: it still surfaces as a timeout
                 if (isTimeoutError(error)) throw error;
-                messagesRes = { error: error?.message || String(error) };
+                // The error itself, not a flattened `{error: message}`: an undeclared status arrives as a bare `Error`
+                // whose message is empty and whose `.error` holds the response body, so flattening it to the message
+                // lost both the reason and anything `upstreamErrorStatus()` could read.
+                messagesRes = error;
             }
             const messages = Array.isArray(messagesRes?.data)
                 ? messagesRes.data
@@ -2358,18 +2716,32 @@ function createApp(config) {
                 // `finish: "tool-calls"`, and the real answer is written after it. Walking further back to find a
                 // message that was already finished returned that earlier step as the answer (and the streaming
                 // recovery appended it to what the client had), under `finish_reason: "stop"`.
+                //
+                // A 2.x message is flat - `{id, type:'assistant', content:[…], finish, time, error}` - where 1.x nested
+                // the same fields under `info` with the fragments in `parts`. Both are read here: the poll must not
+                // silently see "no assistant message" (and poll to its budget) because the envelope moved.
                 let newest = null;
+                let newestIsV2 = false;
                 for (let i = messages.length - 1; i >= 0; i -= 1) {
-                    if (messages[i]?.info?.role === 'assistant') {
-                        newest = messages[i];
+                    const message = messages[i];
+                    if (message?.info?.role === 'assistant') {
+                        newest = message;
+                        break;
+                    }
+                    if (message?.type === 'assistant') {
+                        newest = message;
+                        newestIsV2 = true;
                         break;
                     }
                 }
                 if (newest) {
-                    const info = newest.info;
-                    const { content, reasoning } = extractFromParts(newest.parts || []);
-                    const error = info?.error || null;
-                    const done = Boolean(info.finish || info.time?.completed || error);
+                    const info = newestIsV2 ? newest : newest.info;
+                    const { content, reasoning } = extractFromParts(
+                        Array.isArray(newest.parts) ? newest.parts : newest.content
+                    );
+                    // A 2.x message carries its own error object; a 1.x one nests it under `info`.
+                    const error = (newestIsV2 ? newest.error : info?.error) || null;
+                    const done = Boolean(info?.finish || info?.time?.completed || error);
                     let stableFor = 0;
                     // `content || reasoning` keeps the guard the single-field version had: an empty poll is a normal
                     // "not written yet" answer, never a finished one, so it may only restart the window.
@@ -2425,13 +2797,18 @@ function createApp(config) {
      */
     async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs) {
         const controller = new AbortController();
-        const eventStreamResult = await client.event.subscribe({ signal: controller.signal });
-        const eventStream = eventStreamResult?.stream;
-        // A rejected subscription resolves with an error tuple instead of throwing (the SDK never throws on a non-2xx
-        // answer), so there is no stream to read: without this check the failure surfaced as "Cannot read properties
-        // of undefined" and lost the upstream status that says what actually went wrong.
-        if (!eventStream) {
-            const { status, reason } = upstreamFailureReason(eventStreamResult);
+        // The 2.x client returns the event iterator directly (`client.event.subscribe(input?, {signal})`), where 1.x
+        // resolved with `{stream}` and never threw. A subscription the server refuses therefore arrives as a rejected
+        // promise; the failure is reported with its status, exactly as the missing 1.x stream was.
+        let eventStream;
+        let eventStreamError = null;
+        try {
+            eventStream = await client.event.subscribe(undefined, { signal: controller.signal });
+        } catch (error) {
+            eventStreamError = error;
+        }
+        if (!eventStream || typeof eventStream[Symbol.asyncIterator] !== 'function') {
+            const { status, reason } = upstreamFailureReason({ error: eventStreamError });
             throw new ProviderError(
                 `OpenCode backend rejected the event subscription${status ? ` (status ${status})` : ''}${reason}`,
                 status
@@ -2447,6 +2824,10 @@ function createApp(config) {
         // carry several id-less parts of the same type, so a key holds the snapshots of every part it stands for and the
         // increment is taken against the one the new text continues.
         const partTexts = new Map();
+        // The running total each part's deltas add up to, so a delta can seed the snapshot base the closing
+        // `session.*.ended` event is diffed against. Without it that event carried the part's whole text with nothing
+        // to compare it to, and the answer was appended a second time (measured: sent three times in total).
+        const partTotals = new Map();
         // A bounded list: a part whose text is rewritten (SHRINK) starts a new entry, and a backend that rewrites on
         // every event must not grow this per completion.
         const MAX_PART_SNAPSHOTS = 4;
@@ -2560,78 +2941,142 @@ function createApp(config) {
             (async () => {
                 try {
                     for await (const event of eventStream) {
-                        // Not every event carries properties; reading one that does not would throw here and abort a
-                        // subscription that is still perfectly usable
-                        const props = event?.properties;
-                        if (!props) continue;
-                        if (event.type === 'message.part.updated' && ((props.part && props.part.sessionID) || props.sessionID) === sessionId) {
-                            const { part } = props;
-                            // An event that only names the session (no part payload) carries nothing to add: reading
-                            // part.type here would throw and abort a subscription that is still usable
-                            if (!part) continue;
-                            /* opencode>=1.19 events carry no delta field: part.text is that part's current full text, so the increment is its previous snapshot diffed away (snapshotDelta) */
-                            let delta = typeof props.delta === 'string' ? props.delta : '';
-                            // The snapshot is recorded on every event that carries one, not only on the delta-less
-                            // branch: the SDK's own event type allows `delta` and a cumulative `part.text` on the same
-                            // event, and a backend (or a version transition) that sends a delta on the streaming
-                            // updates and the finished part without one had its whole part re-sent - the delta-bearing
-                            // events left this map unset, so the next delta-less event diffed against '' and duplicated
-                            // the answer the client already had.
-                            if ((part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
-                                // The snapshot is recorded on every event that carries one, whether or not the event also
-                                // carries a delta, so the increment of a delta-less event is never taken against a stale
-                                // base; the returned increment is only needed when the event brought no delta of its own.
-                                const increment = recordPartSnapshot(part.id || part.type, part.text);
-                                if (!delta) delta = increment;
+                        // A collector that already settled must not touch the response again. The timers can settle it
+                        // while the iterator still has buffered events, and `settle()` only resolves the promise: the
+                        // loop kept running and handed those events to `onDelta`, so a stream that had fallen back to
+                        // polling wrote the same answer twice (measured: every delta frame duplicated, on a stream that
+                        // was already ended). Aborting the controller is the real stop; this is the guard that makes it
+                        // immediate.
+                        if (finished) break;
+                        // The 2.x stream names the payload `data` and the kind `type` (a dot-separated name such as
+                        // `session.text.delta`), where 1.x sent `message.part.updated` / `message.updated` with the
+                        // payload under `properties`. Not every event carries one, so the read is guarded.
+                        const data = event?.data;
+                        if (!data) continue;
+                        // Every event the collector cares about names its session. A global event (another session, a
+                        // provider refresh) must not move this completion.
+                        if (data.sessionID !== sessionId) continue;
+                        // A part ordinal identifies one text or reasoning part of the assistant message, so the
+                        // cumulative snapshots of two kinds never collide even though both count from zero.
+                        const partKey = `${data.assistantMessageID || ''}:${data.ordinal || 0}`;
+                        if (event.type === 'session.text.delta' || event.type === 'session.reasoning.delta') {
+                            // 2.x sends real increments here, so the delta itself is what the client gets. The running
+                            // total is still fed to `recordPartSnapshot()` on every delta, because `session.text.ended`
+                            // closes the part with its **whole** text: without a base to diff against, that closing event
+                            // looked like a part the gateway had never seen and appended the entire answer a second time
+                            // (measured: a three-word answer arrived three times, once from the deltas and twice more
+                            // from the closing events of the text and reasoning parts).
+                            const isReasoning = event.type === 'session.reasoning.delta';
+                            const delta = typeof data.delta === 'string' ? data.delta : '';
+                            if (!delta) continue;
+                            receivedDelta = true;
+                            const snapshotKey = `${isReasoning ? 'r' : 't'}${partKey}`;
+                            const running = (partTotals.get(snapshotKey) || '') + delta;
+                            partTotals.set(snapshotKey, running);
+                            // The returned increment is deliberately ignored: the delta is already the increment, and it
+                            // is what the timers and `deltaChars` below count. Recording it keeps the base current so the
+                            // closing event diffs to nothing.
+                            recordPartSnapshot(snapshotKey, running);
+                            // Nulled here as well as on the budget path: the timer has fired by the time a delta
+                            // arrives (it is cleared here), so every later delta cleared an already-dead handle
+                            if (firstDeltaTimer) {
+                                clearTimeout(firstDeltaTimer);
+                                firstDeltaTimer = null;
                             }
-                            if (delta) {
-                                receivedDelta = true;
-                                // Nulled here as well as on the budget path: the timer has fired by the time a delta
-                                // arrives (it is cleared here), so every later delta cleared an already-dead handle
-                                if (firstDeltaTimer) {
-                                    clearTimeout(firstDeltaTimer);
-                                    firstDeltaTimer = null;
+                            scheduleIdleTimer();
+                            if (!firstDeltaAt) {
+                                firstDeltaAt = Date.now();
+                                if (logger.isEnabled('debug')) {
+                                    logger.debug('SSE first delta', {
+                                        sessionId,
+                                        ms: firstDeltaAt - startedAt,
+                                        type: isReasoning ? 'reasoning' : 'text'
+                                    });
                                 }
-                                scheduleIdleTimer();
-                                if (!firstDeltaAt) {
-                                    firstDeltaAt = Date.now();
-                                    if (logger.isEnabled('debug')) {
-                                        logger.debug('SSE first delta', {
-                                            sessionId,
-                                            ms: firstDeltaAt - startedAt,
-                                            type: part.type
-                                        });
-                                    }
-                                }
-                                if (part.type === 'reasoning') {
-                                    reasoning += delta;
-                                    if (onDelta) await onDelta(delta, true);
-                                } else {
-                                    content += delta;
-                                    if (onDelta) await onDelta(delta, false);
-                                }
-                                deltaChars += delta.length;
                             }
+                            if (isReasoning) {
+                                reasoning += delta;
+                                if (onDelta) await onDelta(delta, true);
+                            } else {
+                                content += delta;
+                                if (onDelta) await onDelta(delta, false);
+                            }
+                            deltaChars += delta.length;
+                            continue;
                         }
-                        // Any completed assistant message ends the stream: `finish` is not always "stop" (a tool-call
-                        // answer reports "tool-calls", other backends report "end" or only time.completed), and
-                        // requiring the exact word "stop" left such an answer waiting for the 8 s idle timeout
-                        if (event.type === 'message.updated' &&
-                            props.info?.sessionID === sessionId &&
-                            (props.info?.finish || props.info?.time?.completed)) {
+                        if (event.type === 'session.text.ended' || event.type === 'session.reasoning.ended') {
+                            // The closing text of one part. It is a *snapshot*, not an increment, so it goes through the
+                            // same diffing the 1.x cumulative `part.text` did: a server that streamed its deltas gets
+                            // an empty increment here, and one that streamed nothing gets the whole part.
+                            if (typeof data.text !== 'string' || data.text === '') continue;
+                            const isReasoning = event.type === 'session.reasoning.ended';
+                            const delta = recordPartSnapshot(`${isReasoning ? 'r' : 't'}${partKey}`, data.text);
+                            // An empty increment means the deltas already delivered this text: the closing event is
+                            // bookkeeping, and treating it as output is what duplicated the answer.
+                            if (!delta) continue;
+                            receivedDelta = true;
+                            if (firstDeltaTimer) {
+                                clearTimeout(firstDeltaTimer);
+                                firstDeltaTimer = null;
+                            }
+                            scheduleIdleTimer();
+                            if (!firstDeltaAt) firstDeltaAt = Date.now();
+                            if (isReasoning) {
+                                reasoning += delta;
+                                if (onDelta) await onDelta(delta, true);
+                            } else {
+                                content += delta;
+                                if (onDelta) await onDelta(delta, false);
+                            }
+                            deltaChars += delta.length;
+                            continue;
+                        }
+                        // A provider failure: the execution failed outright, or one step did. It arrives on the event
+                        // that ends the answer, so it is carried out with the text already collected rather than
+                        // dropped - a truncated answer reported as `finish_reason: "stop"` is what dropping it produced.
+                        if (event.type === 'session.execution.failed' || event.type === 'session.step.failed') {
+                            if (logger.isEnabled('debug')) {
+                                logger.debug('SSE provider failure', {
+                                    sessionId,
+                                    ms: Date.now() - startedAt,
+                                    deltaChars,
+                                    error: data.error?.name || data.error?.message || null
+                                });
+                            }
+                            settle({ content, reasoning, error: data.error || null });
+                            break;
+                        }
+                        // Any finished step ends the stream: `finish` is not always "stop" (a tool-call answer reports
+                        // "tool-calls", others report "length" or only an unknown finish), and requiring the exact word
+                        // "stop" left such an answer waiting for the idle timeout. A `tool-calls` step is the one
+                        // exception: another step follows it, so ending there served the step that *asked* for the tool
+                        // as the answer.
+                        if (event.type === 'session.step.ended' && data.finish !== 'tool-calls') {
                             if (logger.isEnabled('debug')) {
                                 logger.debug('SSE completed', {
                                     sessionId,
                                     ms: Date.now() - startedAt,
                                     deltaChars,
-                                    error: props.info?.error?.name || null
+                                    finish: data.finish || null
                                 });
                             }
-                            // A provider failure is marked on the same event that ends the message (`error` next to
-                            // `time.completed`). It used to be dropped here, so a completion that failed after two
-                            // deltas ended with `finish_reason: "stop"` and no error frame - the truncated text was
-                            // reported as a successful answer.
-                            settle({ content, reasoning, error: props.info?.error || null });
+                            settle({ content, reasoning, error: null });
+                            break;
+                        }
+                        // The session has nothing left to do, and the turn is over. This is the 2.x replacement for the
+                        // 1.x `message.updated` carrying `time.completed`: a server that reports no step finish (or a
+                        // finish this gateway does not recognise) still ends the answer here instead of running into the
+                        // idle timeout. `session.idle` and `session.execution.succeeded` both mean it.
+                        if (event.type === 'session.idle' || event.type === 'session.execution.succeeded') {
+                            if (logger.isEnabled('debug')) {
+                                logger.debug('SSE completed', {
+                                    sessionId,
+                                    ms: Date.now() - startedAt,
+                                    deltaChars,
+                                    reason: event.type
+                                });
+                            }
+                            settle({ content, reasoning, error: null });
                             break;
                         }
                     }
@@ -2666,14 +3111,25 @@ function createApp(config) {
         return {
             promise: promise.finally(() => controller.abort()),
             /**
-             * Called as soon as the prompt request returns. If this stream has not produced a single delta by
-             * then, the event subscription is not delivering (seen intermittently with opencode >= 1.19), so the
-             * wait is shortened to a small grace period instead of the full first-delta timeout (4 s by default).
-             * Polling then supplies the answer immediately.
+             * Called as soon as the prompt request returns.
+             *
+             * In 1.x this *shortened* the first-delta wait to a small grace period: the prompt response came back with
+             * the finished message, so a stream with no delta by then was not delivering at all and polling could
+             * answer immediately.
+             *
+             * In 2.x the prompt resolves with the **user** inbox item - the turn has been accepted, nothing has been
+             * generated yet - and the first token follows seconds later (measured: 1.7-3.2 s). Collapsing the wait
+             * here therefore discarded a working event stream on every single request: the collector settled with
+             * `noData` before the backend's first lifecycle event existed, and the answer arrived as one polled chunk
+             * at the end. That is a correct body with streaming defeated.
+             *
+             * So the window is re-armed from here instead: the prompt is accepted, and the first token gets a full
+             * `firstDeltaTimeoutMs` from this point. A subscription that is genuinely dead still falls back to
+             * polling, only one window later than it used to.
              */
-            endFirstDeltaWait: (graceMs = 50) => {
+            promptAccepted: () => {
                 if (finished || receivedDelta) return;
-                scheduleFirstDeltaTimer(graceMs);
+                scheduleFirstDeltaTimer(firstDeltaTimeoutMs);
             },
             /**
              * Stop collecting immediately (client disconnected, or the caller no longer needs the answer). The
@@ -3106,6 +3562,10 @@ function createApp(config) {
                         });
                     }
                     const systemWithGuard = applyToolGuard(systemMsg);
+                    // The 2.x permission ruleset that enforces DISABLE_TOOLS, or undefined when tools are enabled. It is
+                    // handed to `session.create()`: the server refuses a denied action itself, rather than the answer
+                    // depending on a sentence in the prompt being obeyed.
+                    const permissionRules = toolPermissionRules();
                     if (!parts.length) {
                         return reply.code(400).send({ error: { message: 'messages must include at least one non-system text message', type: 'invalid_request_error' } });
                     }
@@ -3135,12 +3595,46 @@ function createApp(config) {
 
                     // Create session
                     let sessionRes;
+                    /**
+                     * The upstream failure a refused `client.session.create` becomes.
+                     *
+                     * A 2.x call throws, so this is reached from the catch below as often as from the resolved branch: a
+                     * backend that rejects the POST (a 1.x server, which has no `/api/*` route at all, a proxy in front of
+                     * it, an error body) must be reported as the upstream failure it is - `502` with the status and
+                     * reason - instead of the `500 server_error` that says "this gateway has a bug".
+                     * @param {unknown} failure the thrown error or the resolved value
+                     */
+                    const sessionCreationRejected = (failure) => {
+                        const { status: upstreamStatus, reason } = upstreamFailureReason(failure);
+                        if (upstreamStatus === 404 || upstreamStatus === 405) {
+                            // The one cause worth naming: a 1.x `opencode serve` has no `/api/*` routes at all, so its
+                            // answers here are 404/405 while the gateway's readiness probe (which asks an /api route
+                            // and requires JSON) never passed for one in the first place. A proxy that strips the
+                            // prefix lands here too. A 502 alone does not say that.
+                            logger.warn(
+                                `[Proxy] The backend does not expose the OpenCode 2.x session API (status ${upstreamStatus}). ` +
+                                'The installed `opencode` CLI is probably a 1.x release: install a 2.x version, which is what ' +
+                                '@opencode/client drives.'
+                            );
+                        }
+                        return new ProviderError(
+                            `OpenCode backend rejected session creation${upstreamStatus ? ` (status ${upstreamStatus})` : ''}${reason}`,
+                            upstreamStatus,
+                            failure instanceof Error ? failure : undefined
+                        );
+                    };
                     try {
                         // What is left of the request budget, not a fresh one: with a full budget here a
                         // completion that had waited in the queue was granted a second create deadline and could
                         // answer past the timeout it had already advertised (measured: 3.66 s for a 2 s budget,
                         // 1.67 s of it spent queued).
-                        sessionRes = await client.session.create(backendDeadline(remainingBudget()));
+                        // The 2.x server takes the model on the session, not on the prompt: `session.create({model})`.
+                        // `{providerID, id}` is the 2.x `Model.Ref` shape (a 1.x `modelID` field is not read).
+                        sessionRes = await client.session.create({
+                            title: `chat ${new Date().toISOString()}`,
+                            model: { providerID: pID, id: mID },
+                            ...(permissionRules ? { permissions: permissionRules } : {})
+                        }, backendDeadline(remainingBudget()));
                     } catch (createError) {
                         // A backend that died between the cached "healthy" answer and this call fails here with a
                         // connection error. ensureBackend() trusted a probe from up to OPENCODE_PROXY_HEALTH_CACHE_MS
@@ -3155,7 +3649,15 @@ function createApp(config) {
                         // existing with no id in this process - nothing could delete it (an external backend keeps it,
                         // and its message history, for good). Those requests answer `502 backend_unreachable`, which is
                         // the documented answer for "the backend disappeared mid-request"; the next request recovers.
-                        if (!isConnectionRefused(createError)) throw createError;
+                        if (!isConnectionRefused(createError)) {
+                            // A status on the rejection means the backend *answered* with a failure (a 400/401/404 the
+                            // client typed, or a `ClientError("UnexpectedStatus: 405")` for one it did not). A transport
+                            // failure - the backend died, the deadline expired - keeps its own wording.
+                            if (!isTimeoutError(createError) && typeof upstreamErrorStatus(createError) === 'number') {
+                                throw sessionCreationRejected(createError);
+                            }
+                            throw createError;
+                        }
                         logDebug('Session creation failed on a refused connection, restarting the backend', {
                             error: clientFacingText(createError.message)
                         });
@@ -3168,28 +3670,22 @@ function createApp(config) {
                             // request actually hit, not the start error an internal retry produced
                             throw createError;
                         }
-                        sessionRes = await client.session.create(backendDeadline(remainingBudget()));
+                        sessionRes = await client.session.create({
+                            title: `chat ${new Date().toISOString()}`,
+                            model: { providerID: pID, id: mID }
+                        }, backendDeadline(remainingBudget()));
                     }
-                    sessionId = sessionRes.data?.id;
+                    // A 2.x server answers 200 with `{"data":{…}}`; the id is read from the envelope. A 1.x server
+                    // answered it at the top level, so reading only one shape is what makes this fail loudly instead of
+                    // creating a session whose id nobody can see.
+                    sessionId = sessionRes?.data?.id ?? sessionRes?.id;
                     if (!sessionId) {
-                        // A backend that answers /health but rejects POST /session (a version whose API moved, a proxy
-                        // in front of it, an error body) used to surface as a bare 500 "Failed to create OpenCode
-                        // session": no status, no reason, and it blamed the gateway for an upstream failure.
-                        const { status: upstreamStatus, reason } = upstreamFailureReason(sessionRes);
-                        if (upstreamStatus === 405) {
-                            // The one cause worth naming: `opencode serve` from the 2.x CLI serves the web UI and
-                            // answers /health with HTML, so the gateway's readiness probe passes and every
-                            // completion then fails here. A 502 alone does not say that.
-                            logger.warn(
-                                '[Proxy] The backend does not expose the OpenCode session API (405). ' +
-                                'The installed `opencode` CLI is probably a 2.x release: install a 1.x version, which is what ' +
-                                '@opencode-ai/sdk drives, or upgrade the SDK.'
-                            );
-                        }
-                        throw new ProviderError(
-                            `OpenCode backend rejected session creation${upstreamStatus ? ` (status ${upstreamStatus})` : ''}${reason}`,
-                            upstreamStatus
-                        );
+                        // A backend that answers the readiness probe but rejects POST /api/session (a 1.x server, which
+                        // has no /api prefix at all, a proxy in front of it, an error body) used to surface as a bare
+                        // 500 "Failed to create OpenCode session": no status, no reason, and it blamed the gateway for
+                        // an upstream failure. `sessionCreationRejected()` builds that sentence for the resolved form
+                        // too, so a translating proxy cannot reintroduce the 500.
+                        throw sessionCreationRejected(sessionRes);
                     }
                     trackLiveSession(sessionId);
                     logDebug('Session created', { sessionId });
@@ -3205,9 +3701,12 @@ function createApp(config) {
                         // done dropped the id here, and the session outlived the gateway with nothing left to retry it.
                         let transient = false;
                         try {
-                            const deleteResult = await client.session.delete({ path: { id: sessionId }, ...backendDeadline(SESSION_CLEANUP_TIMEOUT_MS) });
-                            // The SDK resolves on a non-2xx answer as well, so a rejected delete used to be logged as
-                            // "Session deleted" while the session stayed on the backend
+                            // The 2.x delete answers `204` with no body, and a delete for a session that is already gone
+                            // *throws* `SessionNotFoundError` rather than resolving with a tuple - so the status is read
+                            // from the rejection below, not only from a resolved value.
+                            const deleteResult = await client.session.remove({ sessionID: sessionId }, backendDeadline(SESSION_CLEANUP_TIMEOUT_MS));
+                            // A resolved value that still carries an error is a failure too: a rejected delete used to be
+                            // logged as "Session deleted" while the session stayed on the backend.
                             if (deleteResult && deleteResult.error) {
                                 const { status, reason } = upstreamFailureReason(deleteResult);
                                 if (status === 404 || status === 410) {
@@ -3221,10 +3720,17 @@ function createApp(config) {
                                 logDebug('Session deleted', { sessionId });
                             }
                         } catch (e) {
-                            // Thrown or timed out (`SESSION_CLEANUP_TIMEOUT_MS`): the session is still on the backend,
-                            // and this is the only signal that a backend is accumulating them
-                            transient = true;
-                            noteCleanupFailure(sessionId, clientFacingText(e.message));
+                            // The 2.x server answers a second delete with 404 and the client raises
+                            // `SessionNotFoundError` for it: the session is gone, which is what this cleanup was for.
+                            const { status } = upstreamFailureReason(e);
+                            if (status === 404 || status === 410) {
+                                logDebug('Session was already gone', { sessionId, status });
+                            } else {
+                                // Thrown or timed out (`SESSION_CLEANUP_TIMEOUT_MS`): the session is still on the
+                                // backend, and this is the only signal that a backend is accumulating them
+                                transient = true;
+                                noteCleanupFailure(sessionId, clientFacingText(e.message));
+                            }
                         } finally {
                             // Bookkeeping for the shutdown drain, not the cleanup itself: an already-gone session and a
                             // session that was deleted both leave the set; a transient failure stays for the drain.
@@ -3232,23 +3738,19 @@ function createApp(config) {
                         }
                     };
 
+                    // The 2.x prompt takes one `text` string: the conversation parts are already flat text (`USER: …`),
+                    // so joining them is the whole payload. A 1.x `parts` array and its `model`/`system` fields do not
+                    // exist on this route; the model is chosen when the session is created (`session.create({model})`)
+                    // and the system prompt travels inside the text, which is where the tool guard goes.
                     const promptParams = {
-                        path: { id: sessionId },
-                        body: {
-                            model: { providerID: pID, modelID: mID },
-                            system: systemWithGuard,
-                            parts: parts
-                        }
+                        sessionID: sessionId,
+                        text: systemWithGuard
+                            ? `${systemWithGuard}\n\n${parts.map((part) => part.text).join('\n\n')}`
+                            : parts.map((part) => part.text).join('\n\n')
                     };
-                    const toolOverrides = await getToolOverrides();
-                    // The count `getToolOverrides()` cached with the map: enumerating the keys here built the whole tool
-                    // list (and its array) once per completion to answer "is there anything in it?"
-                    if (toolOverrides && cachedToolOverrideCount > 0) {
-                        promptParams.body.tools = toolOverrides;
-                    }
                     if (logger.isEnabled('debug')) {
-                        // Masked like the earlier dump of the same body: `parts[].text` and `system` are client text, and
-                        // a prompt that quotes a credential-bearing URL (a wrapper forwarding its own config) was written
+                        // Masked like the earlier dump of the same body: the prompt text is client text, and a prompt
+                        // that quotes a credential-bearing URL (a wrapper forwarding its own config) was written
                         // to `docker logs` verbatim here while the `Incoming OpenAI request` record masked it.
                         // `debugBounded()` because `maskDetail()`'s copy is bounded and acyclic by construction.
                         logger.debugBounded('Upstream payload (final request body to opencode serve)', {
@@ -3427,14 +3929,15 @@ function createApp(config) {
                             })
                             .catch((err) => ({ __error: err }));
                         const promptStart = Date.now();
-                        const promptResult = await promptWithTimeout(promptParams, remainingBudget());
+                        const promptResult = await promptCall(promptParams, remainingBudget());
                         logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
                         // A prompt the backend rejected is an upstream failure, not a slow answer: waiting for an
                         // assistant message that will never exist held the slot until the whole budget expired.
                         throwIfPromptRejected(promptResult, Boolean(streamedContent || streamedReasoning));
-                        // The prompt has returned: if the stream never delivered a delta, stop waiting for one
+                        // The prompt has returned: the turn is accepted in 2.x, so the first-token window is measured
+                        // from here (see `promptAccepted()`) rather than from the subscription.
                         const collector = await collectDeferred.catch(() => null);
-                        if (collector) collector.endFirstDeltaWait();
+                        if (collector) collector.promptAccepted();
                         const collected = await safeCollect;
                         // The provider failed on the event that ended the message: this must end the stream in-band,
                         // with the frames already written or as the 502 envelope when none were. Serving the text it
@@ -3590,7 +4093,7 @@ function createApp(config) {
                             clientGone = true;
                         });
                         const promptStart = Date.now();
-                        const promptResult = await promptWithTimeout(promptParams, remainingBudget());
+                        const promptResult = await promptCall(promptParams, remainingBudget());
                         logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
                         // A prompt the backend rejected is an upstream failure, not a slow answer: polling would never
                         // find a message and the client got a 504 after the whole request budget.
@@ -4280,6 +4783,16 @@ async function ensureBackend(config, options = {}) {
             // the backend, and the child had no use for it - it *is* the backend (`opencode serve`), it does not
             // connect to one. Passing it on published a credential to a process that runs model-directed tools.
             delete envVars.OPENCODE_SERVER_URL;
+            // A 2.x server authenticates every `/api/*` route with its own password, and it reads that password from this
+            // variable. Pinning it here is what lets the gateway never scrape the child's output: when the variable is
+            // set the server does not print a `server password …` line at all, and the value it uses is the one this
+            // process already sends in `Authorization`. An inherited value would otherwise let a child that was started
+            // with a different password than the gateway holds answer 401 to every call.
+            if (BACKEND_SERVER_PASSWORD_VALUE) {
+                envVars.OPENCODE_SERVER_PASSWORD = BACKEND_SERVER_PASSWORD_VALUE;
+            } else {
+                delete envVars.OPENCODE_SERVER_PASSWORD;
+            }
 
             let port = '4097';
             try {
@@ -4440,6 +4953,13 @@ export function startProxy(options) {
             options.OPENCODE_BIND_HOST || options.openCodeBindHost || process.env.OPENCODE_BIND_HOST
         ) || '127.0.0.1',
         OPENCODE_PATH: options.OPENCODE_PATH || 'opencode',
+        // The OpenCode 2.x server password. A blank value means "generate one per process", which a spawned child is
+        // handed so the two always agree; an external server needs the operator to configure the same value.
+        OPENCODE_SERVER_PASSWORD: (() => {
+            const raw = options.OPENCODE_SERVER_PASSWORD ?? options.openCodeServerPassword
+                ?? process.env.OPENCODE_SERVER_PASSWORD;
+            return (raw === undefined || raw === null || String(raw).trim() === '') ? '' : String(raw).trim();
+        })(),
         BIND_HOST: normalizeBindHost(
             'BIND_HOST',
             options.BIND_HOST || options.bindHost || process.env.OPENCODE_PROXY_BIND_HOST
@@ -4541,9 +5061,9 @@ export function startProxy(options) {
             } catch (error) {
                 logger.error('[Proxy] Backend warmup failed:', loggableError(error));
             }
-            // With tools disabled, read the tool list now rather than on the first completion: the map is a cheap
-            // metadata call, and the first client should not pay for it (nor race the refresh).
-            warmToolOverrides?.();
+            // The 1.x warm-up read the backend's tool list here so the first completion did not pay for it. A 2.x server
+            // has no tool-list route; `DISABLE_TOOLS` is a permission ruleset built per session, so there is nothing to
+            // warm and no round trip to move off the first request.
         });
     // A caller that only holds `{ server, killBackend }` never awaits `ready`; an unobserved rejection would end the
     // process by default (unhandled rejection), which is the behaviour this change removes.
@@ -4572,17 +5092,24 @@ export function startProxy(options) {
             const ids = [...liveSessions];
             let deletedThisRound = 0;
             await Promise.all(ids.map(async (id) => {
-                // The SDK resolves a non-2xx answer with `{ error, response }` instead of rejecting (the rule every
-                // other call in this file follows, and what `cleanupSession()` checks for this same call): testing only
-                // the rejection path counted a refused delete as a deletion, dropped the id from the set and reported
-                // success while the session - with its whole message history - stayed on the backend for good.
-                const result = await client.session.delete({
-                    path: { id },
-                    ...backendDeadline(Math.max(1, Math.min(SHUTDOWN_SESSION_TIMEOUT_MS, deadline - Date.now())))
-                }).catch(() => null);
-                if (result && !result.error) {
+                // A 2.x delete answers `204` with an empty body and rejects with a typed error on failure, so success is
+                // "the call resolved" - testing `result.error` on the resolved value would have counted *every* delete
+                // as a failure (there is no body to carry one), ended the loop on its first round and left every
+                // interrupted session on an external backend for good.
+                try {
+                    await client.session.remove(
+                        { sessionID: id },
+                        backendDeadline(Math.max(1, Math.min(SHUTDOWN_SESSION_TIMEOUT_MS, deadline - Date.now())))
+                    );
                     liveSessions.delete(id);
                     deletedThisRound += 1;
+                } catch (error) {
+                    // A session that is already gone needs no retry either: the 404 that says so is the answer.
+                    const { status } = upstreamFailureReason(error);
+                    if (status === 404 || status === 410) {
+                        liveSessions.delete(id);
+                        deletedThisRound += 1;
+                    }
                 }
             }));
             deleted += deletedThisRound;

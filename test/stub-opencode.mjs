@@ -1,427 +1,474 @@
 #!/usr/bin/env node
 /**
- * Minimal stand-in for `opencode serve`, used by test/smoke.mjs (and therefore by CI).
+ * Minimal stand-in for a 2.x `opencode serve`, used by test/smoke.mjs (and therefore by CI).
  *
- * It implements only the handful of routes the gateway actually calls:
- *   GET    /health
- *   GET    /config/providers
- *   POST   /session
- *   POST   /session/:id/message
- *   GET    /session/:id/message
- *   DELETE /session/:id
- *   GET    /event              (SSE)
+ * It implements only the routes the gateway's generated client drives, in the shapes that client expects:
+ *   GET    /api/info                    the readiness probe (JSON, which is what tells a 1.x backend apart)
+ *   GET    /api/model                   the model catalogue, `{data:[…]}` - flat, one entry per model
+ *   GET    /api/provider                the provider list, `{location, data:[…]}` (the gateway no longer calls it)
+ *   POST   /api/session                 `{data: session}`
+ *   POST   /api/session/:id/prompt      `{data: <user inbox item>}` - 2.x answers with the item it enqueued
+ *   GET    /api/session/:id/message     `{data:[…], cursor}` - newest first unless `order=asc`
+ *   DELETE /api/session/:id             204, and 404 once it is gone
+ *   GET    /api/event                   SSE, one `{"id","type","data"}` frame per event
+ *   GET    /health, GET /               the web UI's HTML (2.x answers a page here, not a health payload)
+ *   GET    /__sessions                  test-only introspection
  *
- * The assistant answer is emitted twice on purpose: incrementally through the event stream (so streaming is
- * exercised) and as a completed message (so the polling fallback would also return the same text).
+ * The answer is published the way 2.x publishes it - `session.text.delta` carries an *increment* and
+ * `session.text.ended` the part's whole text - and stored on the session, so the polling fallback answers the same text.
  */
 import http from 'node:http';
 
 const PORT = Number(process.env.STUB_PORT || 4199);
-// Serve an empty provider list (see the /config/providers handler)
+const HOST = process.env.STUB_HOST || '127.0.0.1';
+const VERSION = '2.3.2';
+const BASE = `http://${HOST}:${PORT}`;
+// Default pause between two scripted steps: a stream that emits everything in one burst cannot exercise the idle
+// timer, the keep-alive or an abort that lands mid-answer, so a small gap is the realistic baseline
+const ANSWER_DELAY_MS = 15;
+// How many pieces the default answer is chopped into: one delta per piece, so the SSE frames and the timers that
+// guard them are exercised the way a real provider exercises them (a sentence is not one frame)
+const DEFAULT_PIECES = 3;
+// The 2.x serve is password-protected on every route; the SDK sends `Basic base64("opencode:<password>")`.
+// `STUB_BASIC_AUTH=user:pass` reproduces that gate with a known credential, so a test can prove the gateway
+// authenticates its backend calls (and that the credential never reaches a client-facing body)
+const BASIC_AUTH_HEADER = process.env.STUB_BASIC_AUTH
+    ? `Basic ${Buffer.from(process.env.STUB_BASIC_AUTH).toString('base64')}`
+    : '';
+// An empty catalogue: the first call answers with no model at all, later calls with one entry that yields nothing
+// usable, so both shapes of "the provider reported nothing" are covered
 const EMPTY_PROVIDERS = process.env.STUB_EMPTY_PROVIDERS === '1';
-// Reject the provider listing with a 500: the SDK resolves that with an error tuple instead of throwing, so a test can
-// prove the gateway inspects it instead of reporting a refused call as "the backend reported no models"
+// A failing catalogue (a proxy in front of the backend, a version whose route moved): the gateway must fall back to
+// its static model instead of reporting an empty provider list
 const FAIL_PROVIDERS = process.env.STUB_FAIL_PROVIDERS === '1';
-// Reject POST /session (an incompatible backend, a proxy in front of it) so a test can prove the gateway reports the
-// upstream status and reason instead of a bare 500
+// A backend that refuses POST /api/session because the gateway's API is not the one it speaks
 const FAIL_SESSION = process.env.STUB_FAIL_SESSION === '1';
-// Accept POST /session (the session is created on the backend) and then drop the connection without answering: what a
-// backend that dies between accepting the call and writing the answer looks like. A gateway that retries it creates a
-// second session and loses the id of the first, so the test reads `/__sessions` to prove only one was created
+// A backend that refuses POST /api/session because it rejected the permission ruleset (a tool switch the server does
+// not know): 400 is a declared status, so the client surfaces it as `InvalidRequestError` with the reason
+const REJECT_PERMISSIONS = process.env.STUB_REJECT_PERMISSIONS === '1';
+// Accept the session and then drop the connection before answering: what a backend that dies between accepting the call
+// and writing the answer looks like. A gateway that retries it creates a second session and loses the id of the first
 const DROP_CREATE = process.env.STUB_DROP_CREATE === '1';
-// Refuse DELETE /session/:id with a 500 and keep the session: the SDK resolves that with an error tuple instead of
-// throwing, so a test can prove the gateway inspects it instead of counting a refused delete as a deletion
-const REJECT_DELETES = process.env.STUB_REJECT_DELETES === '1';
-// Hang on this session creation (1-based) and never answer: a backend that wedges on POST /session, which is
-// what a queued completion used to be granted a second, fresh request budget for
+// A backend that wedges on this session creation (1-based) and never answers
 const HANG_CREATE_AFTER = Number(process.env.STUB_HANG_CREATE_AFTER || 0);
-// Refuse POST /session with a reason that quotes a URL carrying a credential, the way a proxy in front of the backend
-// does when it cannot reach it: the gateway copies that reason into a client-facing 502 body and into its log, so a
-// test can prove both are masked
+// A backend that takes a while to answer POST /api/session, so a completion that waited for a queue slot can be
+// granted a fresh request budget for a call that was already answered
+const CREATE_DELAY_MS = Number(process.env.STUB_CREATE_DELAY_MS || 0);
+// Refuse POST /api/session with a reason that quotes a URL carrying a credential, the way a proxy in front of the
+// backend does when it cannot reach it
 const URL_IN_ERROR = process.env.STUB_URL_IN_ERROR === '1';
-// Refuse POST /session with the authorization header quoted back (a proxy in front of the backend reporting the
-// credential it rejected): the header value is the one the gateway lifted out of OPENCODE_SERVER_URL, so a test can
-// prove the client answer and the log line mask it instead of publishing the credential
+// Refuse POST /api/session with the authorization header quoted back (a proxy reporting the credential it rejected)
 const ECHO_AUTH = process.env.STUB_ECHO_AUTH === '1';
-// Refuse POST /session with a megabyte of JSON in the body (a proxy in front of the backend answering its own error
-// page): the gateway keeps 500 characters of it as a log summary, and used to serialise all of it first
+// Refuse POST /api/session with a megabyte of JSON in the body, for the log summary bound
 const BIG_ERROR_BODY = process.env.STUB_BIG_ERROR_BODY === '1';
-// Reject GET /event with a 500 (a build whose event stream moved, a proxy in front of it) so a test can prove a
-// streaming request still answers from the polling fallback instead of failing
+// Refuse GET /api/event with a 500, so a test can prove a streaming request still answers from the polling fallback
 const FAIL_EVENTS = process.env.STUB_FAIL_EVENTS === '1';
-// Fail the first N polls of a session's messages with a 500 (a transient backend hiccup), or every poll
-// (STUB_ALWAYS_FAIL_MESSAGES=1), so a test can prove the gateway retries a failed poll and gives up in bounded time
+// Fail the first N polls of a session's messages with a 500 (a transient backend hiccup), or every poll, so a test can
+// prove the gateway retries a failed poll and gives up in bounded time
 const FAIL_MESSAGES = Number(process.env.STUB_FAIL_MESSAGES || 0);
 const ALWAYS_FAIL_MESSAGES = process.env.STUB_ALWAYS_FAIL_MESSAGES === '1';
-// Drop the connection on the first N polls, the way a backend that is being restarted does
 const DROP_MESSAGES = Number(process.env.STUB_DROP_MESSAGES || 0);
-// Answer every poll with a 2xx body that is not a message list (an envelope that moved, a proxy in front of the
-// backend), so a test can prove the gateway reports an unreadable payload as such instead of "failed (status 200)"
+// A 2xx whose body is not a message list at all (a proxy in front of the backend answering its own page)
 const UNREADABLE_MESSAGES = process.env.STUB_UNREADABLE_MESSAGES === '1';
-let failedMessagePolls = 0;
-let droppedMessagePolls = 0;
-// Counts GET /session/:id/message calls, so a test can prove the non-streaming fast path needed no poll at all
-let messagePolls = 0;
-// An answer with a tool-call block whose tags are cut in the middle by the delta boundaries (prompt marker TOOLTAG)
+// Accepted for the 1.x suite: 2.x has no tool-list route, so nothing is counted and nothing changes
+const FAIL_TOOL_IDS = process.env.STUB_FAIL_TOOL_IDS === '1';
+void FAIL_TOOL_IDS;
+// Refuse DELETE /api/session/:id with a 500 and keep the session
+const REJECT_DELETES = process.env.STUB_REJECT_DELETES === '1';
+// Accept a DELETE and never answer it
+const HANG_DELETES = process.env.STUB_HANG_DELETES === '1';
+
+export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub.';
+export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
+// An answer long enough that splitting it produces many more deltas than a sentence would (the idle timer is re-armed
+// on every one of them). Kept in step with MANY_DELTAS_ANSWER in test/smoke.mjs.
+export const MANY_DELTAS_ANSWER = Array.from({ length: 60 }, (_, index) => `part${index}`).join(' ');
+export const LAGSTORE_ANSWER = 'The frames carry the whole answer, but the stored message lags behind them by a wide margin.';
+const SHRINK_ANSWER = 'alpha beta gamma';
+const MULTIPART_FIRST = 'alpha beta gamma';
+const MULTIPART_SECOND = 'ALPHA BETA GAMMA';
+const REASON_ONLY_TEXT = 'thinking only';
+const BAD_PART_TEXT = 'Alpha';
 const TOOL_TAG_ANSWER = 'hello <function_calls>secret</function_calls> world';
-// An answer whose last delta ends with a fragment that looks like the start of a tool-call tag but never becomes
-// one (prompt marker TAILTAG): the gateway holds that fragment back, and must still deliver it when the stream ends
 const TAIL_TAG_ANSWER = 'hello world <function_call';
-// An answer made of 64 000 *unclosed* tool-call tags plus one word (prompt marker TOOLSPAM), the input a model that
-// renders its tool attempts as text produces: the gateway must strip them in one pass. A lazy regex restarted a
-// closing-tag search at every opener and spent 8.5 s on this 1 MB answer, stalling everything else in the process.
-const TOOL_SPAM_ANSWER = `${'<function_calls>'.repeat(64000)}done`;
+// A closing tag with no block at all: the filter drops the tag and keeps the text around it (`aaaabbbb`)
+const STRAY_TAG_ANSWER = 'aaaa</function_calls>bbbb';
+// An opening tag that never closes: the tag is dropped and the text after it is kept
+const OPEN_TAIL_ANSWER = 'visible text <function_calls>tail words here';
+const TOOL_ANSWER = 'hello <function_calls>{"name":"shell"}</function_calls> world';
+const TOOL_SPAM_ANSWER = '<function_calls>'.repeat(64000) + 'done';
+const TWO_STEP_EARLIER = 'STEP ONE TEXT';
+const TWO_STEP_FINAL = 'THE FINAL ANSWER';
+// A provider that fails after it has written text (prompt marker FAILMID): the finishing event carries `error` next to
+// `time.completed`, so the answer has to end as a failure, not as `finish_reason: "stop"`
+const FAIL_MID_ANSWER = 'partial answer';
 // A provider error whose own message quotes a credential-bearing URL and 2 KB of trailing text (prompt marker
 // LEAKYFAIL): a provider says exactly this when it rejects a key, and both answer modes have to mask and bound it
 // before the text becomes a client-facing body or log line.
 const LEAKY_ERROR_TEXT = `provider rejected http://alice:s3cr3t-value@127.0.0.1:4097/proxy?token=abc123 and the upstream answered with a very long explanation ${'y'.repeat(2000)}`;
-const HOST = process.env.STUB_HOST || '127.0.0.1';
-// Refuse every route without the Basic credential the gateway is configured with (STUB_BASIC_AUTH=user:pass), the way
-// a proxy in front of the backend does: a gateway that hands the userinfo to the SDK as a URL cannot reach it at all,
-// and one that sends it as a header does. The `/health` probe is covered too - a gateway that authenticates its calls
-// but not its probe reads the backend as missing and starts a second one.
-const BASIC_AUTH = process.env.STUB_BASIC_AUTH || '';
-const BASIC_HEADER = BASIC_AUTH ? `Basic ${Buffer.from(BASIC_AUTH, 'utf8').toString('base64')}` : '';
-
-// The snapshots the SHRINK marker sends: the second one is shorter, so it carries no derivable increment
-const SHRINK_SNAPSHOTS = ['alpha beta gamma', 'alpha beta'];
-const SHRINK_LAST = 'alpha beta';
-// The answer the LAGSTORE marker delivers on the event stream, and how much of it the stored message keeps: a store
-// written behind the broadcast (or a part the backend rewrote shorter) leaves the polled copy *behind* what the client
-// already has, so the recovery poll carries nothing new.
-const LAGSTORE_ANSWER = 'The frames carry the whole answer, but the stored message lags behind them by a wide margin.';
-const LAGSTORE_STORED_CHARS = 13;
-// The two halves of the MULTIPART answer, each sent as its own cumulative snapshots by streamTwoParts()
-const MULTIPART_FIRST = 'alpha beta gamma';
-const MULTIPART_SECOND = 'ALPHA BETA GAMMA';
-// The answer the CUTTOOL and OPENTOOL markers carry, and the two points inside its tool block where the stream stops:
-// the first cuts the opening tag in half, the second the closing one. The stored message is the complete answer, so the
-// recovery poll holds the whole text while the client only has `hello `.
-const TOOL_ANSWER = 'hello <function_calls>secret</function_calls> world';
-const TOOL_OPEN_CUT = 'hello <function_ca';
-const TOOL_CLOSE_CUT = 'hello <function_calls>secret</function_cal';
-// The two-step answer (prompt marker TWOSTEP): the step that asked for a tool, already finished with
-// `finish: "tool-calls"`, and the real answer, which is still being written when the gateway starts polling
-const TWO_STEP_EARLIER = 'STEP ONE TEXT';
-const TWO_STEP_FINAL = 'THE FINAL ANSWER';
-// Answers carrying tool-call markup the streaming filter used to get wrong (prompt markers STRAYTAG and OPENTAIL): a
-// stray closing tag with no block at all, and an opening tag that never closes, whose text must survive
-const STRAY_TAG_ANSWER = 'aaaa</function_calls>bbbb';
-const OPEN_TAIL_ANSWER = 'visible text <function_calls>tail words here';
-// A provider that fails after it has written text (prompt marker FAILMID): the finishing event carries `error` next to
-// `time.completed`, so the answer has to end as a failure, not as `finish_reason: "stop"`
-const FAIL_MID_ANSWER = 'partial answer';
-// The MIXED answer: two increments, each also carrying the part's cumulative text, then a closing update with no delta
-const MIXED_ANSWER = 'Hello world';
-// A text part whose `text` is not a string (a changed backend shape): it is not text and must not be stringified into
-// the answer, while the string part next to it is the answer
-const BAD_PART_TEXT = 'Alpha';
-// The reasoning-only answer: a provider that writes reasoning and no text, and never marks the message finished
-const REASON_ONLY_TEXT = 'thinking only';
-export const ANSWER = process.env.STUB_ANSWER || 'Hello from the smoke test stub.';
-// An answer long enough to be delivered as ~180 deltas (prompt marker MANYDELTAS): the gateway re-arms its idle timer on
-// every delta, and the whole answer still has to arrive in order
-export const MANY_DELTAS_ANSWER = Array.from({ length: 60 }, (_, index) => `part${index}`).join(' ');
-export const REASONING = process.env.STUB_REASONING || 'Thinking about the request.';
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// How long `POST /session` takes to answer (STUB_CREATE_DELAY_MS): a shutdown that lands inside this window used to
-// leave the created session in a set nobody read again
-const CREATE_DELAY_MS = Number(process.env.STUB_CREATE_DELAY_MS || 0) || 0;
 
 const sessions = new Map();
-const eventClients = new Set();
 let sessionSeq = 0;
 let deletedSessions = 0;
-let promptedSessions = 0;
-// Counts /config/providers calls, so a test can prove the gateway collapses a cold-cache burst into one round trip
 let providerCalls = 0;
-// Counts /experimental/tool/ids calls: with tools disabled the gateway builds its per-tool switch map from that list, so
-// a test can prove it asked the backend instead of sending no switches at all
+// 2.x has no tool-list route, so this stays 0 and proves the gateway does not reach for one
 let toolIdCalls = 0;
-// Refuse the tool list with a 500 (a backend whose registry moved, a proxy in front of it). The SDK resolves that with an
-// error tuple, and caching that as "no tools" left every tool enabled for the whole cache window while DISABLE_TOOLS was
-// on; a test proves the completion still answers and the gateway keeps its last known map.
-const FAIL_TOOL_IDS = process.env.STUB_FAIL_TOOL_IDS === '1';
-// Hang on DELETE /session/:id and never answer (a backend that wedges): the gateway's own deadline turns it into a
-// classified cleanup failure instead of a stuck slot
-const HANG_DELETES = process.env.STUB_HANG_DELETES === '1';
-// The system prompt of the most recent prompt body: the gateway folds `system`/`developer` messages into it, so a
-// test can prove they never reach the conversation parts
+let messagePolls = 0;
+let promptedSessions = 0;
 let lastSystemPrompt = '';
-// The conversation text of the most recent prompt body, exactly as the model would read it: a test can prove how a
-// message is labelled (`USER(name): …`) and that a client-supplied value did not reach it raw
 let lastPromptText = '';
+// The permission ruleset of the most recent POST /api/session: 2.x replaced the 1.x per-tool override map with a
+// ruleset handed to session create, so this is where a test reads what the gateway actually sent
+let lastPermissionRules = null;
+const eventClients = new Set();
+let eventSeq = 0;
 
-const sendJson = (res, statusCode, body) => {
-    const payload = JSON.stringify(body);
-    res.writeHead(statusCode, {
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(payload)
-    });
-    res.end(payload);
-};
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const eventId = () => `evt_${++eventSeq}`;
 
-const sendEvent = (payload) => {
-    const frame = `data: ${JSON.stringify(payload)}\n\n`;
-    for (const client of eventClients) {
-        // A subscriber may disconnect mid-answer; writing to it must not take the stub down
-        try {
-            client.write(frame);
-        } catch {
-            eventClients.delete(client);
-        }
+/**
+ * The model catalogue.
+ *
+ * Flat, one entry per model, with the bare model name in `id` and the provider in `providerID`: the gateway builds
+ * `<providerID>/<id>` itself. `big-pickle` is the alias the gateway hardcodes, and the last two entries exist to prove
+ * the gateway skips a model that is disabled or no longer active instead of publishing it.
+ */
+const modelInfo = (id, name, overrides = {}) => ({
+    id,
+    modelID: id,
+    providerID: 'opencode',
+    name,
+    type: 'language',
+    family: 'opencode',
+    capabilities: { tools: true, reasoning: false, streaming: true },
+    variants: {},
+    status: 'active',
+    enabled: true,
+    limit: { context: 128000, output: 8192 },
+    cost: { input: 0, output: 0 },
+    time: { released: '2025-01-01T00:00:00.000Z' },
+    ...overrides
+});
+const MODELS = [
+    modelInfo('big-pickle', 'Big Pickle'),
+    modelInfo('kimi-k2.5-free', 'Kimi K2.5 Free', { capabilities: { tools: false, reasoning: true, streaming: true } }),
+    modelInfo('gpt-5-mini-free', 'GPT-5 Mini Free', { capabilities: { tools: false, reasoning: false, streaming: true } }),
+    modelInfo('some-other-model', 'Some Other Model'),
+    modelInfo('retired-model', 'Retired Model', { status: 'deprecated' }),
+    modelInfo('hidden-model', 'Hidden Model', { enabled: false })
+];
+const PROVIDERS = [
+    {
+        id: 'opencode',
+        name: 'opencode',
+        activation: { source: 'environment' },
+        package: '@opencode/client',
+        compatibility: { version: VERSION }
     }
-};
+];
 
-const partUpdate = (sessionID, part) => ({
-    type: 'message.part.updated',
-    properties: { part: { sessionID, ...part } }
+const sendJson = (res, status, payload, headers = {}) => {
+    res.writeHead(status, { 'content-type': 'application/json', ...headers });
+    res.end(JSON.stringify(payload));
+};
+const sendError = (res, status, tag, message) => sendJson(res, status, { _tag: tag, message });
+const sendEvent = (event) => {
+    const frame = `data: ${JSON.stringify(event)}\n\n`;
+    for (const client of eventClients) client.write(frame);
+};
+const readBody = (req) => new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += chunk; });
+    req.on('end', () => resolve(raw));
+    req.on('error', reject);
 });
 
-const buildAssistantMessage = (sessionID, text, reasoning) => ({
+/**
+ * A 2.x assistant message: flat, with the answer in `content` (`[{type:'text'|'reasoning', text}]`) and no `role`.
+ * `finish` is absent while the message is still being written, which is what keeps the poll loop waiting.
+ */
+const assistantMessage = (sessionID, id, content, options = {}) => {
+    const { finish = null, error = null, completed = true } = options;
+    return {
+        id,
+        sessionID,
+        type: 'assistant',
+        agent: 'build',
+        model: { providerID: 'opencode', id: 'kimi-k2.5-free' },
+        time: { created: Date.now(), ...(completed ? { completed: Date.now() } : {}) },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        content,
+        ...(finish ? { finish } : {}),
+        ...(error ? { error } : {})
+    };
+};
+
+/**
+ * The 1.x prompt-response payload: `{info, parts}`.
+ *
+ * 2.x answers a prompt with the user inbox item, so nothing in the protocol produces this any more - but the gateway
+ * still recognises it on purpose, and the suite asserts the round trip it saves. It travels in the **single** envelope a
+ * 1.x server sent (`{"data":{info,parts}}`), which the 2.x client unwraps to `{info, parts}`: the shape the gateway's
+ * `completedPromptMessage()` has to read. An extra `data` here would test a body no server produces.
+ */
+const legacyMessage = (sessionID, text, reasoning = '', finish = 'stop') => ({
     info: {
         id: `msg_${sessionID}`,
         sessionID,
         role: 'assistant',
-        finish: 'stop',
+        finish,
         time: { created: Date.now(), completed: Date.now() }
     },
     parts: [
-        { type: 'reasoning', text: reasoning },
+        ...(reasoning ? [{ type: 'reasoning', text: reasoning }] : []),
         { type: 'text', text }
     ]
 });
 
-// Part updates that carry a `delta` *and* the part's cumulative text, then one closing update for the same part with no
-// delta at all. The SDK's event type allows both fields on one event, so this is a conforming backend (or a version
-// transition): the closing update must add nothing, because the deltas already carried its text.
-async function streamMixedDeltas(sessionID, pieces, delayMs = 1) {
-    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
-    let text = '';
-    for (const piece of pieces) {
-        text += piece;
-        sendEvent({
-            type: 'message.part.updated',
-            properties: { part: { id: 'prt_mixed', sessionID, type: 'text', text }, delta: piece }
-        });
-        await sleep(delayMs);
-    }
-    sendEvent({ type: 'message.part.updated', properties: { part: { id: 'prt_mixed', sessionID, type: 'text', text } } });
-    await sleep(delayMs);
-    sendEvent({
-        type: 'message.updated',
-        properties: {
-            info: {
-                id: `msg_${sessionID}`,
-                sessionID,
-                role: 'assistant',
-                finish: 'stop',
-                time: { created: Date.now(), completed: Date.now() }
-            }
-        }
-    });
-}
-
-// Emit two deltas and then go silent without ever finishing, so a completion can only end through a timeout.
-async function stallAfterTwoDeltas(sessionID) {
-    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
-    sendEvent(partUpdate(sessionID, { type: 'text', text: 'partial answer that never ends' }));
-    await sleep(10);
-    sendEvent(partUpdate(sessionID, { type: 'text', text: 'partial answer that never ends, still going' }));
-}
-
-// Emit two deltas and then close every event subscriber (a FIN, not a reset) without ever reporting a finish, while the
-// stored message is already complete: what a backend that restarts mid-answer, or a proxy in front of it that drops an
-// idle SSE connection, looks like from the gateway's side.
-async function cutStreamMidAnswer(sessionID, snapshots) {
-    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
-    // `snapshots` are cumulative texts (the shape opencode >= 1.19 sends), not increments
-    for (const snapshot of snapshots) {
-        sendEvent(partUpdate(sessionID, { type: 'text', text: snapshot }));
-        await sleep(10);
-    }
-    for (const client of eventClients) {
-        client.end();
-        eventClients.delete(client);
-    }
-}
-
-// Deltas followed by a finishing event that reports a provider error: a provider that fails after it has written text.
-// `error` sits next to `time.completed` on the same `message.updated`, which is how opencode reports it.
-async function failMidStream(sessionID, pieces) {
-    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
-    let text = '';
-    for (const piece of pieces) {
-        text += piece;
-        sendEvent({ type: 'message.part.updated', properties: { part: { id: 'prt_failmid', sessionID, type: 'text', text } } });
-        await sleep(5);
-    }
-    sendEvent({
-        type: 'message.updated',
-        properties: {
-            info: {
-                id: `msg_${sessionID}`,
-                sessionID,
-                role: 'assistant',
-                error: { name: 'ProviderError', data: { message: 'provider failed mid-answer' } },
-                time: { created: Date.now(), completed: Date.now() }
-            }
-        }
-    });
-}
-
-// One text part whose snapshots are exactly what a backend that rewrote its part sends: the second snapshot is
-// shorter than the first, so there is no increment to derive and the whole text has to be forwarded.
-async function streamSnapshots(sessionID, snapshots, delayMs) {
-    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
-    for (const text of snapshots) {
-        sendEvent({ type: 'message.part.updated', properties: { part: { id: 'prt_text', sessionID, type: 'text', text } } });
-        await sleep(delayMs);
-    }
-    sendEvent({
-        type: 'message.updated',
-        properties: {
-            info: {
-                id: `msg_${sessionID}`,
-                sessionID,
-                role: 'assistant',
-                finish: 'stop',
-                time: { created: Date.now(), completed: Date.now() }
-            }
-        }
-    });
-}
-
-// Two text parts in one message, each sending its own cumulative snapshots, interleaved: what a backend does when the
-// model writes, calls a tool and keeps writing. Each part's text is the part's own full text, never the whole answer.
-// `withIds: false` sends the same two parts without `id`, the shape a backend that does not identify its parts uses:
-// both parts are then of type `text`, so a diff keyed by the type alone mixes them up
-async function streamTwoParts(sessionID, pieces, delayMs, withIds = true) {
-    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
-    let first = '';
-    let second = '';
-    for (const piece of pieces) {
-        first += piece;
-        sendEvent({
-            type: 'message.part.updated',
-            properties: { part: { ...(withIds ? { id: 'prt_first' } : {}), sessionID, type: 'text', text: first } }
-        });
-        await sleep(delayMs);
-        second += piece.toUpperCase();
-        sendEvent({
-            type: 'message.part.updated',
-            properties: { part: { ...(withIds ? { id: 'prt_second' } : {}), sessionID, type: 'text', text: second } }
-        });
-        await sleep(delayMs);
-    }
-    sendEvent({
-        type: 'message.updated',
-        properties: {
-            info: {
-                id: `msg_${sessionID}`,
-                sessionID,
-                role: 'assistant',
-                finish: 'stop',
-                time: { created: Date.now(), completed: Date.now() }
-            }
-        }
-    });
-}
-
-// Wait (briefly) for the gateway to be subscribed before emitting, then replay the answer as incremental updates.
-// `pieces`/`delayMs` let a test ask for a deliberately slow answer (a prompt containing SLOW) so it can abort a
-// stream while the backend is still working.
-async function streamAssistantReply(
+/** The user inbox item a 2.x prompt answers with. */
+const inboxItem = (sessionID, text) => ({
+    id: `inbox_${sessionID}_${promptedSessions}`,
     sessionID,
-    text,
-    reasoning,
-    { pieces = 3, delayMs = 5, chunks = null, finish = 'stop', pauseAfterFirstMs = 0, onSnapshot = null } = {}
-) {
-    const full = text;
-    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
+    type: 'user',
+    time: { created: Date.now() },
+    payload: { text },
+    delivery: 'immediate'
+});
 
-    // opencode interleaves events that have no `properties` at all; the gateway must ignore them instead of
-    // treating the subscription as broken
-    sendEvent({ type: 'server.heartbeat' });
-    sendEvent(partUpdate(sessionID, { type: 'reasoning', text: reasoning }));
-    await sleep(delayMs);
+/** Splits a text field by piece count into roughly equal parts. */
+const chunkText = (text, pieces) => {
+    const count = Math.max(1, Math.min(pieces, text.length || 1));
+    const step = Math.ceil(text.length / count) || 1;
+    const parts = [];
+    for (let i = 0; i < text.length; i += step) parts.push(text.slice(i, i + step));
+    return parts;
+};
 
+/**
+ * 2.x sends one text string, so the system prompt and the labelled conversation arrive joined by a blank line. The
+ * split is that first blank line *if* a role label follows it; `lastSystemPrompt` stays empty otherwise, which is
+ * what the suite reads to prove a system message never reached the model as a `SYSTEM:` part.
+ */
+const splitPromptText = (text) => {
+    // A conversation that opens with a role label has no system prompt, however many turns follow it: the blank line
+    // between two turns is not the join, and reading it as one reported "USER: first turn" as the system prompt
+    if (/^(?:USER|ASSISTANT|SYSTEM|DEVELOPER):/.test(text)) return { system: '', conversation: text };
+    const match = /\n\n(?=(?:USER|ASSISTANT|SYSTEM|DEVELOPER):)/.exec(text);
+    if (!match) return { system: '', conversation: text };
+    return { system: text.slice(0, match.index), conversation: text.slice(match.index + 2) };
+};
 
-    // `chunks` overrides the even split with explicit incremental pieces, so a test can cut the answer in the
-    // middle of a tag; the gateway sees cumulative snapshots either way.
-    let snapshots;
-    if (chunks) {
-        let text = '';
-        snapshots = chunks.map((piece) => {
-            text += piece;
-            return text;
-        });
-    } else {
-        const step = Math.max(1, Math.ceil(full.length / pieces));
-        snapshots = [];
-        for (let end = step; end < full.length; end += step) snapshots.push(full.slice(0, end));
-        snapshots.push(full);
-    }
-    for (const snapshot of snapshots) {
-        sendEvent(partUpdate(sessionID, { type: 'text', text: snapshot }));
-        if (onSnapshot) onSnapshot(snapshot);
-        // A backend that goes quiet for longer than the gateway's idle timeout before it carries on: the stored
-        // message stays partial and unfinished for the whole pause, exactly like a slow provider
-        if (pauseAfterFirstMs && snapshot === snapshots[0]) await sleep(pauseAfterFirstMs);
-        // A message.updated for something the gateway does not care about, with no `info` at all
-        sendEvent({ type: 'message.updated', properties: {} });
-        // A part event that names the session but carries no part: same class of noise the gateway must skip
-        sendEvent({ type: 'message.part.updated', properties: { sessionID } });
-        await sleep(delayMs);
-    }
-    await sleep(delayMs);
-
-    sendEvent({
-        type: 'message.updated',
-        properties: {
-            info: {
-                id: `msg_${sessionID}`,
-                sessionID,
-                role: 'assistant',
-                // A provider may report a finish reason other than "stop" (tool calls, "end", ...)
-                ...(finish === 'completed-only' ? {} : { finish }),
-                time: { created: Date.now(), completed: Date.now() }
-            }
-        }
+/**
+ * Builds the event script for one answer.
+ *
+ * 2.x splits a part's life across events that each carry a different amount of the same text: `session.text.delta`
+ * carries an increment, `session.text.ended` the part's whole text. A gateway that appends both therefore duplicates
+ * the answer, which is why the closing event is diffed against what the deltas added up to.
+ * `onPiece` keeps the stored message in step with the stream for the markers whose store must lag or stop short.
+ */
+const answerSteps = (session, options = {}) => {
+    const {
+        text,
+        reasoning = '',
+        chunks = null,
+        pieces = DEFAULT_PIECES,
+        delayMs = ANSWER_DELAY_MS,
+        ordinal = 0,
+        withId = true,
+        pauseAfterFirstMs = 0,
+        onPiece = null,
+        finish = 'stop',
+        close = true,
+        endPart = true
+    } = options;
+    const envelope = (extra) => ({
+        sessionID: session.id,
+        ...(withId ? { assistantMessageID: session.messageId } : {}),
+        ordinal,
+        ...extra
     });
-}
+    const steps = [{ type: 'session.step.started', data: envelope({}) }];
+    if (reasoning) {
+        steps.push({ type: 'session.reasoning.started', data: envelope({}) });
+        steps.push({ type: 'session.reasoning.delta', data: envelope({ delta: reasoning }) });
+        steps.push({ type: 'session.reasoning.ended', data: envelope({ text: reasoning }) });
+    }
+    steps.push({ type: 'session.text.started', data: envelope({}) });
+    let running = '';
+    const deltas = (chunks || chunkText(text, pieces)).map((part) => {
+        running += part;
+        return { part, snapshot: running };
+    });
+    deltas.forEach((delta, index) => {
+        // A pause before the second delta is silence in the middle of an answer, not a pause before it starts
+        const wait = index === 0 ? 0 : (index === 1 && pauseAfterFirstMs ? pauseAfterFirstMs : delayMs);
+        steps.push({
+            type: 'session.text.delta',
+            data: envelope({ delta: delta.part }),
+            wait,
+            onEmit: onPiece ? () => onPiece(delta.snapshot) : null
+        });
+    });
+    // A stream that is cut mid-answer never closes its part: `endPart: false` leaves the deltas as the last thing the
+    // subscriber sees, which is what makes the gateway fall back to the stored message instead of settling on a part
+    // the backend never finished
+    if (endPart) steps.push({ type: 'session.text.ended', data: envelope({ text }), wait: delayMs });
+    if (close) {
+        steps.push({
+            type: 'session.step.ended',
+            data: envelope({ finish, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }),
+            wait: delayMs
+        });
+    }
+    return steps;
+};
 
-// The prompt body is only needed to decide whether a test asked for a slow answer
-const readBody = async (req) => {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    return Buffer.concat(chunks).toString('utf8');
+/**
+ * Plays a scripted answer on the event stream.
+ *
+ * The wait for a subscriber is bounded: a non-streaming completion never subscribes, and its answer comes from the
+ * stored message instead, so waiting forever would only park the handler.
+ */
+const playSteps = async (steps) => {
+    for (let i = 0; i < 200 && eventClients.size === 0; i += 1) await sleep(5);
+    for (const step of steps) {
+        if (step.wait) await sleep(step.wait);
+        if (step.type === 'stream.end') {
+            for (const client of eventClients) client.end();
+            eventClients.clear();
+            continue;
+        }
+        sendEvent({ id: eventId(), type: step.type, data: step.data });
+        if (step.onEmit) step.onEmit();
+    }
+};
+
+const startSteps = (session, steps) => {
+    playSteps(steps).catch(() => {});
+    void session;
 };
 
 const server = http.createServer(async (req, res) => {
-    // A `Host` header that is not a valid host (a raw client, a test that sets a placeholder) made `new URL` throw
-    // inside an async handler, which Node reports as an unhandled rejection and exits: one harness mistake took the
-    // whole stub down and every later assertion failed for an unrelated reason.
     let url;
     try {
-        url = new URL(req.url, `http://${req.headers.host || HOST}`);
+        url = new URL(req.url || '/', `http://${req.headers.host || `${HOST}:${PORT}`}`);
     } catch {
-        return sendJson(res, 400, { error: 'stub: unreadable request target' });
+        return sendError(res, 400, 'InvalidRequestError', 'a request target is required');
     }
     const path = url.pathname;
 
-    // Test-only: the same gate a credential-requiring proxy puts in front of the backend
-    if (BASIC_HEADER && req.headers.authorization !== BASIC_HEADER) {
-        res.setHeader('www-authenticate', 'Basic realm="stub"');
-        return sendJson(res, 401, { error: { message: 'stub: credentials required' } });
+    // Every route is behind the password in 2.x, including /api/info: the gateway has to send the credential its
+    // backend URL carries to learn whether the backend is there at all
+    if (BASIC_AUTH_HEADER && req.headers.authorization !== BASIC_AUTH_HEADER) {
+        return sendJson(res, 401, { _tag: 'UnauthorizedError', message: 'Authentication required' }, {
+            'www-authenticate': 'Basic realm="opencode"'
+        });
     }
 
-    if (path === '/health') return sendJson(res, 200, { healthy: true });
+    // The 2.x serve answers the web UI here. A probe that expects a JSON health payload is looking at a 1.x backend
+    // (or should be reading /api/info); the suite only needs a 200 to know the process is up.
+    if (req.method === 'GET' && (path === '/' || path === '/health')) {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        return res.end('<!doctype html><html><head><title>opencode</title></head><body><div id="app"></div></body></html>');
+    }
 
-    // Test-only introspection (not part of the OpenCode API): proves the gateway deletes the session it created
-    if (path === '/__sessions') {
+    // The readiness probe: a 1.x backend answers /health with JSON and has no /api/* route at all, so this is the
+    // route that tells the two apart (and it must answer JSON, not the web UI's HTML)
+    if (req.method === 'GET' && path === '/api/info') {
+        return sendJson(res, 200, {
+            version: VERSION,
+            pid: process.pid,
+            hostname: HOST,
+            urls: { api: `${BASE}/api`, ui: BASE },
+            paths: { home: process.env.HOME || process.env.USERPROFILE || '/', config: '' },
+            capabilities: {}
+        });
+    }
+
+    // The model catalogue: flat, one entry per model, behind the same envelope every 2.x collection uses
+    if (req.method === 'GET' && path === '/api/model') {
+        providerCalls += 1;
+        if (FAIL_PROVIDERS) {
+            return sendJson(res, 500, { error: { message: 'model catalogue unavailable' } });
+        }
+        // The first call is an empty catalogue; later ones carry a single entry with no usable fields, so both shapes
+        // of "the provider reported nothing" end at the gateway's fallback model
+        return sendJson(res, 200, { data: EMPTY_PROVIDERS ? (providerCalls === 1 ? [] : [{}]) : MODELS });
+    }
+
+    // The provider list. The 2.x gateway reads the catalogue from /api/model, so nothing calls this any more; it stays
+    // because the route exists on a real server and a translating client may still ask for it
+    if (req.method === 'GET' && path === '/api/provider') {
+        return sendJson(res, 200, { location: `${BASE}/api/provider`, data: PROVIDERS });
+    }
+
+    if (req.method === 'POST' && path === '/api/session') {
+        if (URL_IN_ERROR) {
+            // **400, not 502**: the generated 2.x client declares 400/401/404 for this route and throws a typed
+            // `InvalidRequestError` carrying the body's message. Any other status arrives as a bare `ClientError`
+            // (`UnexpectedStatus: 502`) that keeps only `cause.status` and **discards the body**, so a reason quoted
+            // here could never reach a client or a log line. The sentence still quotes a credential-bearing URL, which
+            // is what proves the masking on that path.
+            return sendError(res, 400, 'InvalidRequestError',
+                'cannot reach http://alice:s3cr3t-value@127.0.0.1:4097/proxy?token=abc123 (connection refused)');
+        }
+        // A proxy in front of the backend reporting the credential it rejected: the gateway copies this sentence into
+        // a client-facing body and into its log, so both have to mask the header it quotes. The value is quoted, which
+        // is the shape the masking helpers recognise as a credential rather than prose
+        if (ECHO_AUTH) {
+            return sendError(res, 401, 'UnauthorizedError',
+                `invalid token: "${req.headers.authorization || '(none)'}" (token=abc123def456)`);
+        }
+        if (BIG_ERROR_BODY) {
+            // **400 and the declared `{_tag, message}` shape**, for the same reason as URL_IN_ERROR: an undeclared status
+            // (500) is reduced to `UnexpectedStatus: 500` and a body that does not decode into the declared error is
+            // kept on `.error` with an empty message - in both cases the megabyte never reaches the gateway, so the
+            // summary bound would be tested against nothing. `message` is the payload: a megabyte of backend text in
+            // the one field the client hands over as the error's message, with a nested `detail` beside it so the
+            // extraction still has to bound a tree rather than copy a string.
+            return sendJson(res, 400, {
+                _tag: 'InvalidRequestError',
+                message: 'x'.repeat(1024 * 1024),
+                detail: { nested: ['y'.repeat(200 * 1024)] }
+            });
+        }
+        // A ruleset the server refuses. 400 is a declared status for this route, so the client surfaces the body as an
+        // `InvalidRequestError` whose message names the reason instead of an opaque status
+        if (REJECT_PERMISSIONS) {
+            return sendError(res, 400, 'InvalidRequestError', 'Invalid permissions ruleset');
+        }
+        // A build whose session API is not there. **404, not 405**: 404 is declared for this route, so the 2.x client
+        // throws a typed error carrying the body's message; 405 is undeclared and arrives as a bare `ClientError` that
+        // discards the body, so the reason would be lost before the gateway could name it. Both statuses mean the same
+        // thing to the gateway (the "probably a 1.x release" warning).
+        if (FAIL_SESSION) {
+            return sendError(res, 404, 'NotFoundError', 'session creation is not supported by this build');
+        }
+        let body = {};
+        try {
+            body = JSON.parse((await readBody(req)) || '{}');
+        } catch {
+            body = {};
+        }
+        // The whole ruleset is kept as it arrived: 2.x replaced the 1.x per-tool override map with a permission
+        // ruleset on session create, and this is what a test reads to prove which tools the gateway denied
+        lastPermissionRules = body.permissions ?? null;
+        if (HANG_CREATE_AFTER > 0 && sessionSeq >= HANG_CREATE_AFTER) return;
+        if (CREATE_DELAY_MS) await sleep(CREATE_DELAY_MS);
+        sessionSeq += 1;
+        const session = { id: `ses_${sessionSeq}`, time: { created: Date.now() }, title: 'smoke test', permissionRules: lastPermissionRules, messages: [], messageId: null, promptText: '' };
+        sessions.set(session.id, session);
+        // Accepted, **then** the connection goes away without an answer: what a backend that dies between accepting the
+        // call and writing the reply looks like. The session is recorded first, because the whole point of the marker is
+        // that the id was lost on the way back - a gateway that retries the call creates a second session and leaves the
+        // first one alive with nobody able to delete it, which is what `/__sessions` is read for. Destroying the socket
+        // before recording it would have made the check pass with `created: 0`.
+        if (DROP_CREATE) return req.socket.destroy();
+        return sendJson(res, 200, { data: session });
+    }
+
+    if (req.method === 'GET' && path === '/__sessions') {
         return sendJson(res, 200, {
             live: sessions.size,
             created: sessionSeq,
@@ -431,518 +478,442 @@ const server = http.createServer(async (req, res) => {
             toolIdCalls,
             messagePolls,
             lastSystemPrompt,
-            lastPromptText
+            lastPromptText,
+            lastPermissionRules
         });
     }
 
-    // The tool list the gateway builds its per-tool switches from when DISABLE_TOOLS is on. An unknown path here would
-    // answer 404 (an error tuple), which is the failure the gateway has to survive rather than cache as "no tools".
-    if (path === '/experimental/tool/ids') {
-        toolIdCalls += 1;
-        if (FAIL_TOOL_IDS) return sendJson(res, 500, { error: { message: 'tool registry unavailable' } });
-        return sendJson(res, 200, ['bash', 'edit', 'write', 'read', 'glob', 'list']);
-    }
-
-    if (path === '/config/providers') {
-        providerCalls += 1;
-        if (FAIL_PROVIDERS) return sendJson(res, 500, { error: { message: 'provider listing unavailable' } });
-        // A backend version whose payload the gateway cannot read answers with nothing to choose from; a listing with
-        // no models at all is as useless to a client as a failed call, so a test can prove the gateway falls back
-        // instead of serving []. The first call reports an empty provider list and every later one a provider whose
-        // model map the gateway cannot read, so one stub covers both shapes of an unreadable answer.
-        if (EMPTY_PROVIDERS) {
-            return sendJson(res, 200, providerCalls === 1 ? { providers: [] } : { providers: [{ id: 'opencode' }] });
-        }
-        return sendJson(res, 200, {
-            providers: [
-                {
-                    id: 'opencode',
-                    // Two models, so a test can tell the provider list apart from the gateway's single-model fallback
-                    models: {
-                        'kimi-k2.5-free': { name: 'Kimi K2.5 Free' },
-                        'gpt-5-mini-free': { name: 'GPT-5 Mini Free' }
-                    }
-                }
-            ]
-        });
-    }
-
-    if (path === '/session' && req.method === 'POST') {
-        // A backend that is slow to answer the creation: the gateway is still waiting for it when its shutdown begins,
-        // which is the window in which a session used to be created after the teardown had already counted the set
-        if (CREATE_DELAY_MS) await sleep(CREATE_DELAY_MS);
-        if (BIG_ERROR_BODY) {
-            return sendJson(res, 502, { error: { message: 'x'.repeat(1000000), detail: { nested: ['y'.repeat(200000)] } } });
-        }
-        if (FAIL_SESSION) return sendJson(res, 405, { error: { message: 'session creation is not supported by this build' } });
-        if (URL_IN_ERROR) {
-            return sendJson(res, 502, {
-                error: { message: 'cannot reach http://alice:s3cr3t-value@127.0.0.1:4097/proxy?token=abc123 (connection refused)' }
-            });
-        }
-        if (ECHO_AUTH) {
-            return sendJson(res, 401, {
-                error: { message: `the proxy refused the credential: Authorization: ${req.headers.authorization || 'none'}` }
-            });
-        }
-        const id = `ses_smoke_${(sessionSeq += 1)}`;
-        if (HANG_CREATE_AFTER && sessionSeq > HANG_CREATE_AFTER) {
-            // Accepted and never answered: the caller has to give up through its own deadline
-            return;
-        }
-        sessions.set(id, { messages: [] });
-        if (DROP_CREATE) {
-            // Accepted, then the connection is dropped: the session exists and the caller never learns its id
-            req.destroy();
-            return;
-        }
-        return sendJson(res, 200, { id });
-    }
-
-    const sessionMatch = path.match(/^\/session\/([^/]+)(\/message)?$/);
-    if (sessionMatch) {
-        const id = sessionMatch[1];
-        const isMessage = Boolean(sessionMatch[2]);
-        const session = sessions.get(id);
-
-        if (!isMessage && req.method === 'DELETE') {
-            if (REJECT_DELETES) return sendJson(res, 500, { error: { message: 'the session store is busy' } });
-            // Accepted and never answered: the gateway's own deadline (not this process) is what ends the cleanup, so a
-            // test can prove a wedged delete is classified as a transient failure instead of holding the slot
-            if (HANG_DELETES) return;
-            if (sessions.delete(id)) deletedSessions += 1;
-            return sendJson(res, 200, {});
-        }
-
-        if (isMessage && req.method === 'POST') {
-            if (!session) return sendJson(res, 404, { error: 'unknown session' });
-            if (session.prompted) return sendJson(res, 200, { info: buildAssistantMessage(id, ANSWER, REASONING).info, parts: [] });
-            try {
-                const parsed = JSON.parse((await readBody(req)) || '{}');
-                session.promptText = (parsed.parts || []).map((part) => part?.text || '').join(' ');
-                lastSystemPrompt = typeof parsed.system === 'string' ? parsed.system : '';
-                lastPromptText = (parsed.parts || []).map((part) => (part?.type === 'text' ? String(part.text || '') : '')).join('\n');
-            } catch {
-                session.promptText = '';
-                lastSystemPrompt = '';
-            }
-            session.prompted = true;
-            promptedSessions += 1;
-            if (session.promptText.includes('REJECTPROMPT')) {
-                // The SDK resolves with { error, response } on a non-2xx answer instead of throwing: a gateway that
-                // ignores that tuple waits for an assistant message that will never exist and answers 504
-                return sendJson(res, 500, { error: { message: 'provider refused the prompt' } });
-            }
-            if (session.promptText.includes('PROMPTTOOLCALLS')) {
-                // The prompt response carries a *finished* step that only asked for a tool (`finish: "tool-calls"`), and
-                // the step that answers it is stored but still being written. Serving the prompt response because it
-                // looked finished handed the client the model's preamble for a request that went on to run a tool and
-                // answer (the poll loop reads the newest message instead).
-                session.messages.push({
-                    info: {
-                        id: `msg_${id}_step`,
-                        sessionID: id,
-                        role: 'assistant',
-                        finish: 'tool-calls',
-                        time: { created: Date.now(), completed: Date.now() }
-                    },
-                    parts: [{ type: 'text', text: TWO_STEP_EARLIER }]
-                });
-                session.messages.push(buildAssistantMessage(id, ANSWER, REASONING));
-                const stepMessage = session.messages[session.messages.length - 2];
-                return sendJson(res, 200, stepMessage);
-            }
-            if (session.promptText.includes('PROMPTDONE')) {
-                // The prompt response already carries the finished message and nothing is stored for polling: an answer
-                // served without a single GET /session/:id/message proves the fast path was used
-                return sendJson(res, 200, buildAssistantMessage(id, ANSWER, REASONING));
-            }
-            if (session.promptText.includes('BADPART')) {
-                // A part carrying a number instead of text, next to a normal one: only the string is answer text
-                return sendJson(res, 200, {
-                    info: {
-                        id: `msg_${id}`,
-                        sessionID: id,
-                        role: 'assistant',
-                        finish: 'stop',
-                        time: { created: Date.now(), completed: Date.now() }
-                    },
-                    parts: [{ type: 'text', text: 42 }, { type: 'text', text: BAD_PART_TEXT }]
-                });
-            }
-            if (session.promptText.includes('REASONONLY')) {
-                // A message that carries reasoning and no text, and is never marked finished: the stall window has to
-                // watch the reasoning too, or the gateways polls until its whole budget and answers 504
-                session.messages.push({
-                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
-                    parts: [{ type: 'reasoning', text: REASON_ONLY_TEXT }]
-                });
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                return;
-            }
-            if (session.promptText.includes('TOOLSPAM')) {
-                // 64 000 unclosed tags: the strip has to walk the answer once, so this answers in milliseconds and used
-                // to spend seconds inside the regular expression before the client saw anything
-                return sendJson(res, 200, buildAssistantMessage(id, TOOL_SPAM_ANSWER, ''));
-            }
-            if (session.promptText.includes('TWOSTEP')) {
-                // A tool-using completion: the step that asked for the tool is already finished, and the answer that
-                // follows it is still being written. `finish: "tool-calls"` is what opencode reports for such a step.
-                session.messages.push({
-                    info: {
-                        id: `msg_${id}_step`,
-                        sessionID: id,
-                        role: 'assistant',
-                        finish: 'tool-calls',
-                        time: { created: Date.now(), completed: Date.now() }
-                    },
-                    parts: [{ type: 'text', text: TWO_STEP_EARLIER }]
-                });
-                const finalMessage = {
-                    info: { id: `msg_${id}_final`, sessionID: id, role: 'assistant' },
-                    parts: [{ type: 'text', text: TWO_STEP_FINAL.slice(0, 5) }]
-                };
-                session.messages.push(finalMessage);
-                sendJson(res, 200, { info: finalMessage.info, parts: [] });
-                setTimeout(() => {
-                    finalMessage.parts[0].text = TWO_STEP_FINAL;
-                    finalMessage.info.finish = 'stop';
-                    finalMessage.info.time = { created: Date.now(), completed: Date.now() };
-                }, 400);
-                return;
-            }
-            if (session.promptText.includes('FAILMID')) {
-                // A provider failure that arrives after the text: the event that ends the message carries the error, so
-                // the truncated answer must not be reported as a completed one
-                session.messages.push({
-                    info: {
-                        id: `msg_${id}`,
-                        sessionID: id,
-                        role: 'assistant',
-                        error: { name: 'ProviderError', data: { message: 'provider failed mid-answer' } },
-                        time: { created: Date.now(), completed: Date.now() }
-                    },
-                    parts: [{ type: 'text', text: FAIL_MID_ANSWER }]
-                });
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                failMidStream(id, ['partial ', 'answer']).catch(() => {});
-                return;
-            }
-            if (session.promptText.includes('STRAYTAG') || session.promptText.includes('OPENTAIL')) {
-                // Tool-call markup the streaming filter has to answer exactly like the non-streaming scan: a stray
-                // closing tag (dropped, text around it kept) and an opening tag that never closes (dropped, the text
-                // after it kept)
-                const stray = session.promptText.includes('STRAYTAG');
-                const text = stray ? STRAY_TAG_ANSWER : OPEN_TAIL_ANSWER;
-                session.messages.push(buildAssistantMessage(id, text, REASONING));
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                streamAssistantReply(id, text, REASONING, {
-                    chunks: stray
-                        ? ['aaaa', '</function_calls>', 'bbbb']
-                        : ['visible text ', '<function_calls>', 'tail words here'],
-                    delayMs: 1
-                }).catch(() => {});
-                return;
-            }
-            if (session.promptText.includes('LEAKYFAIL')) {
-                // The provider error carries a credential-bearing URL and 2 KB of text. Checked before FAIL, whose
-                // marker is a substring of this one.
-                session.messages.push({
-                    info: {
-                        id: `msg_${id}`,
-                        sessionID: id,
-                        role: 'assistant',
-                        error: { name: 'ProviderError', data: { message: LEAKY_ERROR_TEXT } },
-                        time: { created: Date.now(), completed: Date.now() }
-                    },
-                    parts: []
-                });
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                return;
-            }
-            if (session.promptText.includes('FAIL')) {
-                // A provider failure: the assistant message carries an error and no content, so a non-streaming
-                // request must answer 502 and a streaming one must end with an in-band error frame
-                session.messages.push({
-                    info: {
-                        id: `msg_${id}`,
-                        sessionID: id,
-                        role: 'assistant',
-                        error: { name: 'ProviderError', data: { message: 'provider failed' } },
-                        time: { created: Date.now(), completed: Date.now() }
-                    },
-                    parts: []
-                });
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                return;
-            }
-            if (session.promptText.includes('GROW')) {
-                // The answer is still growing when the prompt returns and only marks itself finished later: a poller
-                // that answers with the first poll would truncate it
-                const message = {
-                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
-                    parts: [{ type: 'text', text: ANSWER.slice(0, 12) }]
-                };
-                session.messages.push(message);
-                sendJson(res, 200, { info: message.info, parts: [] });
-                setTimeout(() => {
-                    message.parts[0].text = ANSWER;
-                    message.info.finish = 'stop';
-                    message.info.time = { created: Date.now(), completed: Date.now() };
-                }, 150);
-                return;
-            }
-            if (session.promptText.includes('SLOWFINISH')) {
-                // Written slowly and only finished after 3 s: a non-streaming request is still running well after a
-                // client that disconnected has given up, so a test can prove the slot was freed for real
-                const message = {
-                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
-                    parts: [{ type: 'text', text: ANSWER.slice(0, 12) }]
-                };
-                session.messages.push(message);
-                sendJson(res, 200, { info: message.info, parts: [] });
-                setTimeout(() => {
-                    message.parts[0].text = ANSWER;
-                    message.info.finish = 'stop';
-                    message.info.time = { created: Date.now(), completed: Date.now() };
-                }, 3000);
-                return;
-            }
-            if (session.promptText.includes('HOLD')) {
-                // Finished only after 400 ms: a non-streaming request is still waiting when the gateway starts
-                // shutting down, so a test can prove the backend outlives the responses it is answering
-                const message = {
-                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
-                    parts: [{ type: 'text', text: ANSWER.slice(0, 12) }]
-                };
-                session.messages.push(message);
-                sendJson(res, 200, { info: message.info, parts: [] });
-                setTimeout(() => {
-                    message.parts[0].text = ANSWER;
-                    message.info.finish = 'stop';
-                    message.info.time = { created: Date.now(), completed: Date.now() };
-                }, 400);
-                return;
-            }
-            if (session.promptText.includes('SUICIDE')) {
-                // The backend dies the moment it has accepted the prompt: the poll can never race a completed answer
-                // the way a timed SIGKILL from the test could (a slow runner let the kill land after the gateway had
-                // already accepted a stable partial answer), so "the backend disappears mid request" is deterministic
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                setTimeout(() => process.kill(process.pid, 'SIGKILL'), 25);
-                return;
-            }
-            if (session.promptText.includes('LONGPAUSE')) {
-                // Silent past the gateway's 15 s SSE keep-alive interval, so a stream that never writes the
-                // `: keep-alive` comment is dropped by an idle proxy - and finished just before the idle recovery gives
-                // up on the text it already has (8 s idle + 8 s of polls), which is what ends such a stream around 16 s.
-                // Checked before PAUSE, whose marker it contains.
-                const message = {
-                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
-                    parts: [{ type: 'text', text: '' }]
-                };
-                session.messages.push(message);
-                sendJson(res, 200, { info: message.info, parts: [] });
-                streamAssistantReply(id, ANSWER, REASONING, {
-                    delayMs: 2,
-                    pauseAfterFirstMs: 15600,
-                    onSnapshot: (text) => {
-                        message.parts[0].text = text;
-                    }
-                })
-                    .then(() => {
-                        message.info.finish = 'stop';
-                        message.info.time = { created: Date.now(), completed: Date.now() };
-                    })
-                    .catch(() => {});
-                return;
-            }
-            if (session.promptText.includes('PAUSE')) {
-                // Silenced for longer than the SSE idle timeout and finished only afterwards: the gateway must recover
-                // through polling instead of ending the stream on the text it already had
-                const message = {
-                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant' },
-                    parts: [{ type: 'text', text: '' }]
-                };
-                session.messages.push(message);
-                sendJson(res, 200, { info: message.info, parts: [] });
-                streamAssistantReply(id, ANSWER, REASONING, {
-                    delayMs: 2,
-                    pauseAfterFirstMs: 12500,
-                    onSnapshot: (text) => {
-                        message.parts[0].text = text;
-                    }
-                })
-                    .then(() => {
-                        message.info.finish = 'stop';
-                        message.info.time = { created: Date.now(), completed: Date.now() };
-                    })
-                    .catch(() => {});
-                return;
-            }
-            if (session.promptText.includes('CUTSTREAM')) {
-                // The event stream is closed mid-answer without a finish event, but the stored message is already the
-                // complete answer: the gateway has to recover through polling instead of waiting out its budget and
-                // answering an in-band error. The deltas sent before the cut are prefixes of ANSWER, so a fallback that
-                // re-sends the whole message duplicates the text and one that appends nothing truncates it.
-                session.messages.push(buildAssistantMessage(id, ANSWER, REASONING));
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                const cut = Math.ceil(ANSWER.length / 2);
-                cutStreamMidAnswer(id, [ANSWER.slice(0, Math.ceil(cut / 2)), ANSWER.slice(0, cut)]).catch(() => {});
-                return;
-            }
-            if (session.promptText.includes('LAGSTORE')) {
-                // The stored message is behind the event stream, and the stream is then cut without a finish event, so
-                // the recovery poll reads the short copy. It holds nothing the client does not already have: appending
-                // it repeated the head of the answer (`LAGSTORE_ANSWER` plus its first characters again) under
-                // `finish_reason: "stop"`.
-                session.messages.push(buildAssistantMessage(id, LAGSTORE_ANSWER.slice(0, LAGSTORE_STORED_CHARS), ''));
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                cutStreamMidAnswer(id, [
-                    LAGSTORE_ANSWER.slice(0, Math.ceil(LAGSTORE_ANSWER.length / 2)),
-                    LAGSTORE_ANSWER
-                ]).catch(() => {});
-                return;
-            }
-            if (session.promptText.includes('MULTIPARTNOID')) {
-                // The same interleaved cumulative parts, sent without ids: two parts of the same type must still be
-                // delivered once each instead of being diffed against one another
-                session.messages.push({
-                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } },
-                    parts: [{ type: 'text', text: MULTIPART_FIRST }, { type: 'text', text: MULTIPART_SECOND }]
-                });
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                streamTwoParts(id, ['alpha ', 'beta ', 'gamma '], 1, false).catch(() => {});
-                return;
-            }
-            if (session.promptText.includes('MULTIPART')) {
-                // The same answer as two interleaved cumulative text parts, so a diff taken against the whole message
-                // instead of against the part re-sends each part on every event and the client sees it three times
-                session.messages.push({
-                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } },
-                    parts: [{ type: 'text', text: MULTIPART_FIRST }, { type: 'text', text: MULTIPART_SECOND }]
-                });
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                streamTwoParts(id, ['alpha ', 'beta ', 'gamma '], 1).catch(() => {});
-                return;
-            }
-            if (session.promptText.includes('SHRINK')) {
-                // A part that gets shorter (the backend rewrote what it had written): the snapshot is not an
-                // extension of the previous one, so the collector must forward it instead of swallowing it
-                session.messages.push({
-                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } },
-                    parts: [{ type: 'text', text: SHRINK_LAST }]
-                });
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                streamSnapshots(id, SHRINK_SNAPSHOTS, 1).catch(() => {});
-                return;
-            }
-            if (session.promptText.includes('MIXED')) {
-                // A backend that sends `delta` on the streaming updates and the finished part without one: the part's
-                // snapshot has to be recorded by the delta-bearing events too, or the closing update is diffed against
-                // '' and the client receives the whole answer a second time
-                session.messages.push({
-                    info: { id: `msg_${id}`, sessionID: id, role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } },
-                    parts: [{ type: 'text', text: MIXED_ANSWER }]
-                });
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                streamMixedDeltas(id, ['Hello', ' world']).catch(() => {});
-                return;
-            }
-            if (session.promptText.includes('CUTTOOL') || session.promptText.includes('OPENTOOL')) {
-                // The answer carries a tool-call block and the stream is cut inside it (CUTTOOL: inside the closing
-                // tag, OPENTOOL: inside the opening one), then every event subscriber is closed. The stored message is
-                // the complete answer, so the recovery poll has all of it: the gateway has to strip the block out and
-                // append what the client is missing, whatever the streaming filter was holding when the stream died.
-                session.messages.push(buildAssistantMessage(id, TOOL_ANSWER, REASONING));
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                const cut = session.promptText.includes('OPENTOOL') ? TOOL_OPEN_CUT : TOOL_CLOSE_CUT;
-                if (!TOOL_ANSWER.startsWith(cut)) throw new Error('the cut point is not a prefix of the answer');
-                cutStreamMidAnswer(id, [cut]).catch(() => {});
-                return;
-            }
-            const toolTag = session.promptText.includes('TOOLTAG');
-            const tailTag = session.promptText.includes('TAILTAG');
-            if (session.promptText.includes('STALL')) {
-                // Nothing for polling to find and no finish event: the caller must time out and close the stream
-                session.messages = [];
-                stallAfterTwoDeltas(id).catch(() => {});
-                sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-                return;
-            }
-            const manyDeltas = session.promptText.includes('MANYDELTAS');
-            const answerText = toolTag
-                ? TOOL_TAG_ANSWER
-                : tailTag
-                    ? TAIL_TAG_ANSWER
-                    : manyDeltas
-                        ? MANY_DELTAS_ANSWER
-                        : ANSWER;
-            session.messages.push(buildAssistantMessage(id, answerText, REASONING));
-            sendJson(res, 200, { info: { id: `msg_${id}`, sessionID: id, role: 'assistant' }, parts: [] });
-            // Fire and forget: the gateway collects the answer from /event (or polling). A prompt containing SLOW
-            // is answered over ~2 s so a test can abort mid-stream while the backend is still working.
-            const slow = session.promptText.includes('SLOW');
-            // A provider that ends the message without the literal "stop" (only time.completed is set)
-            const completedOnly = session.promptText.includes('ENDONLY');
-            const options = slow ? { pieces: 10, delayMs: 200 } : {};
-            if (toolTag) {
-                // A tool-call block cut in the middle of both its tags: nothing of it may reach the client
-                options.chunks = ['hello ', '<function_ca', 'lls>secret</function_ca', 'lls> world'];
-                options.delayMs = 1;
-            }
-            if (tailTag) {
-                // The last delta ends inside a tag prefix: the held fragment is not markup and must still be sent
-                options.chunks = ['hello world ', '<function_call'];
-                options.delayMs = 1;
-            }
-            if (completedOnly) options.finish = 'completed-only';
-            if (manyDeltas) {
-                // 200 pieces over a 470-character answer: one SSE delta per ~3 characters, no artificial delay
-                options.pieces = 200;
-                options.delayMs = 0;
-            }
-            streamAssistantReply(id, answerText, REASONING, options).catch(() => {});
-            return;
-        }
-
-        if (isMessage && req.method === 'GET') {
-            messagePolls += 1;
-            // The two failure counters used to be incremented together on every poll, so the "drop the connection"
-            // and "answer 500" knobs counted each other's polls and could not be combined in one test. Each counter now
-            // counts only the polls it actually failed.
-            if (droppedMessagePolls < DROP_MESSAGES) {
-                droppedMessagePolls += 1;
-                req.destroy();
-                return undefined;
-            }
-            if (UNREADABLE_MESSAGES) return sendJson(res, 200, { result: 'unexpected', items: null });
-            if (ALWAYS_FAIL_MESSAGES || failedMessagePolls < FAIL_MESSAGES) {
-                failedMessagePolls += 1;
-                return sendJson(res, 500, { error: { message: 'transient poll failure' } });
-            }
-            return sendJson(res, 200, session ? session.messages : []);
-        }
-    }
-
-    if (path === '/event') {
-        if (FAIL_EVENTS) return sendJson(res, 500, { error: { message: 'event stream unavailable' } });
+    // One event stream for the whole server, as in 2.x: every session publishes to it and the client filters by
+    // `sessionID`. A subscriber that has not appeared when an answer is emitted is simply a non-streaming request.
+    if (req.method === 'GET' && path === '/api/event') {
+        if (FAIL_EVENTS) return sendError(res, 500, 'ServiceUnavailableError', 'event stream unavailable');
         res.writeHead(200, {
             'content-type': 'text/event-stream',
             'cache-control': 'no-cache',
             connection: 'keep-alive'
         });
+        // Some comment line: it is written first so that the connected event is followed by something other than an
+        // event, which is what a client skipping non-data lines has to survive
         res.write(': connected\n\n');
         eventClients.add(res);
         req.on('close', () => eventClients.delete(res));
         return;
     }
 
-    sendJson(res, 404, { error: `stub: unhandled route ${req.method} ${path}` });
+    const promptMatch = /^\/api\/session\/([^/]+)\/prompt$/.exec(path);
+    if (promptMatch && req.method === 'POST') {
+        const session = sessions.get(promptMatch[1]);
+        if (!session) return sendError(res, 404, 'SessionNotFoundError', `unknown session ${promptMatch[1]}`);
+        let body = {};
+        try {
+            body = JSON.parse((await readBody(req)) || '{}');
+        } catch {
+            body = {};
+        }
+        // 2.x has one `text` field: the system prompt and the labelled conversation arrive joined by a blank line
+        const text = typeof body.text === 'string' ? body.text : '';
+        const split = splitPromptText(text);
+        lastSystemPrompt = split.system;
+        lastPromptText = split.conversation;
+        session.promptText = text;
+        promptedSessions += 1;
+
+        if (text.includes('REJECTPROMPT')) {
+            // 400, not 500: 400 is declared for this route, so the 2.x client throws a typed `InvalidRequestError`
+            // carrying the body's message. A 500 is undeclared and arrives as a bare `ClientError`
+            // (`UnexpectedStatus: 500`) that keeps only `cause.status` and drops the body - the gateway would answer
+            // `502` either way, but the reason the backend gave would be gone.
+            return sendError(res, 400, 'InvalidRequestError', 'provider refused the prompt');
+        }
+        // A turn the gateway would otherwise read as a finished message it already holds: the answer is served from
+        // the prompt response and no message is stored, so a poll would find nothing (which is what proves the fast
+        // path was used)
+        if (text.includes('PROMPTDONE')) {
+            return sendJson(res, 200, { data: legacyMessage(session.id, ANSWER, REASONING) });
+        }
+        if (text.includes('PROMPTTOOLCALLS')) {
+            // The prompt response carries a *finished* step that only asked for a tool (`finish: "tool-calls"`) and
+            // the step that answers it is stored. Serving the prompt response handed the client the model's preamble
+            // for a request that went on to run a tool and answer, so the poll loop reads the newest message instead
+            const stepId = `msg_${session.id}_step`;
+            session.messages.push(assistantMessage(session.id, stepId, [{ type: 'text', text: TWO_STEP_EARLIER }], { finish: 'tool-calls' }));
+            const answer = assistantMessage(session.id, `msg_${session.id}_answer`, [{ type: 'text', text: ANSWER }]);
+            session.messages.push(answer);
+            session.messageId = answer.id;
+            return sendJson(res, 200, { data: legacyMessage(session.id, TWO_STEP_EARLIER, '', 'tool-calls') });
+        }
+        if (text.includes('BADPART')) {
+            // A part whose `text` is a number instead of a string, next to a normal one: only the string is answer text
+            session.messages.push(assistantMessage(session.id, `msg_${session.id}`, [
+                { type: 'text', text: 42 },
+                { type: 'text', text: BAD_PART_TEXT }
+            ], { finish: null, completed: false }));
+        } else if (text.includes('REASONONLY')) {
+            // A message that carries reasoning and no text, and is never marked finished: the stall window has to
+            // watch the reasoning too, or the gateway polls until its whole budget and answers 504
+            session.messages.push(assistantMessage(session.id, `msg_${session.id}`, [
+                { type: 'reasoning', text: REASON_ONLY_TEXT }
+            ], { finish: null, completed: false }));
+        } else if (text.includes('TOOLSPAM')) {
+            // A tool-call block repeated until the answer is megabytes wide: a lazy/backtracking markup scan wedges
+            // the only completion slot (plus the EPIPE a closed devNull stdout used to cause)
+            const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: TOOL_SPAM_ANSWER }]);
+            session.messages.push(message);
+            session.messageId = message.id;
+        } else if (text.includes('TWOSTEP')) {
+            // The step that used a tool, then the step that answers. The second is still *being written* when the
+            // prompt returns, so a gateway that reads the first finished message answers with the preamble
+            session.messages.push(assistantMessage(session.id, `msg_${session.id}_step`, [{ type: 'text', text: TWO_STEP_EARLIER }], { finish: 'tool-calls' }));
+            const final = assistantMessage(session.id, `msg_${session.id}_final`, [{ type: 'text', text: TWO_STEP_FINAL.slice(0, 5) }], { finish: null, completed: false });
+            session.messages.push(final);
+            session.messageId = final.id;
+            setTimeout(() => {
+                final.content[0].text = TWO_STEP_FINAL;
+                final.finish = 'stop';
+                final.time.completed = Date.now();
+            }, 400).unref();
+        } else if (text.includes('GROW')) {
+            // The stored answer keeps growing after the prompt returned: polling once serves a truncated answer
+            const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: ANSWER.slice(0, 12) }], { finish: null, completed: false });
+            session.messages.push(message);
+            session.messageId = message.id;
+            setTimeout(() => {
+                message.content[0].text = ANSWER;
+                message.finish = 'stop';
+                message.time.completed = Date.now();
+            }, 150).unref();
+        } else if (text.includes('SLOWFINISH')) {
+            const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: ANSWER.slice(0, 12) }], { finish: null, completed: false });
+            session.messages.push(message);
+            session.messageId = message.id;
+            setTimeout(() => {
+                message.content[0].text = ANSWER;
+                message.finish = 'stop';
+                message.time.completed = Date.now();
+            }, 3000).unref();
+        } else if (text.includes('HOLD')) {
+            // Finishes after 400ms: a completion that stays in flight while the backend is killed
+            const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: ANSWER.slice(0, 12) }], { finish: null, completed: false });
+            session.messages.push(message);
+            session.messageId = message.id;
+            setTimeout(() => {
+                message.content[0].text = ANSWER;
+                message.finish = 'stop';
+                message.time.completed = Date.now();
+            }, 400).unref();
+        } else if (text.includes('SUICIDE')) {
+            // A backend that dies right after accepting the prompt: a request that started before the death must not
+            // be retried, and the next one has to recover (the suite asserts no completion ever returns 502)
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            setTimeout(() => process.kill(process.pid, 'SIGKILL'), 25).unref();
+            return;
+        } else if (text.includes('STALL')) {
+            // Two deltas and then silence forever: the idle timer alone can end this turn, and nothing is stored for
+            // the polling fallback to find
+            const steps = answerSteps(session, { text: ANSWER.slice(0, 16), reasoning: REASONING, close: false, endPart: false });
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        } else if (text.includes('FAIL') || text.includes('LEAKYFAIL') || text.includes('FAILMID')) {
+            // A provider failure: the message is stored with the error and never finished. A streaming request is told
+            // through `session.execution.failed`, which is the only 2.x event that carries one
+            const leaky = text.includes('LEAKYFAIL');
+            const message = leaky ? LEAKY_ERROR_TEXT : 'Provider Error: the model provider returned an error';
+            const partial = text.includes('FAILMID') ? FAIL_MID_ANSWER : null;
+            session.messages.push(assistantMessage(session.id, `msg_${session.id}`, partial
+                ? [{ type: 'text', text: partial }]
+                : [], { finish: null, error: { name: 'ProviderError', data: { message } } }));
+            const steps = partial
+                ? answerSteps(session, { text: partial, pieces: 2, close: false, endPart: false })
+                : [];
+            steps.push({ type: 'session.execution.failed', data: { sessionID: session.id, error: { name: 'ProviderError', data: { message } } } });
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        } else if (text.includes('CUTSTREAM')) {
+            // A stream cut mid-answer: the gateway has to resume from the stored message instead of answering with
+            // what it managed to collect. The store already holds the whole answer; the frames carry only its start
+            const message = assistantMessage(session.id, `msg_${session.id}`, [
+                { type: 'reasoning', text: REASONING },
+                { type: 'text', text: ANSWER }
+            ]);
+            session.messages.push(message);
+            session.messageId = message.id;
+            const cut = Math.floor(ANSWER.length / 2);
+            const steps = answerSteps(session, {
+                text: ANSWER.slice(0, cut),
+                reasoning: REASONING,
+                pieces: 2,
+                close: false,
+                endPart: false
+            });
+            steps.push({ type: 'stream.end' });
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        } else if (text.includes('LAGSTORE')) {
+            // The stream delivers the whole answer while the stored message keeps only its first characters, then the
+            // stream is cut: a recovery poll that trusts the store over the frames answers with those few characters
+            const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: LAGSTORE_ANSWER.slice(0, 13) }]);
+            session.messages.push(message);
+            session.messageId = message.id;
+            const steps = answerSteps(session, { text: LAGSTORE_ANSWER, pieces: 4, close: false, endPart: false });
+            steps.push({ type: 'stream.end' });
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        } else if (text.includes('SHRINK')) {
+            // A part the backend rewrote: the closing event carries less text than the deltas added up to, so a
+            // gateway that appends every snapshot serves "alpha beta gamma" twice
+            const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: 'alpha beta' }]);
+            session.messages.push(message);
+            session.messageId = message.id;
+            const steps = answerSteps(session, { text: SHRINK_ANSWER, close: false, endPart: false });
+            steps.push({ type: 'session.text.ended', data: {
+                sessionID: session.id,
+                assistantMessageID: message.id,
+                ordinal: 0,
+                text: 'alpha beta'
+            } });
+            steps.push({ type: 'session.step.ended', data: { sessionID: session.id, assistantMessageID: message.id, ordinal: 0, finish: 'stop' } });
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        } else if (text.includes('MIXED')) {
+            // The opening events carry both an increment and the part's text so far, the closing one carries neither:
+            // a gateway that appends the whole snapshot on every event ends with "HelloHello worldHello world"
+            const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: 'Hello world' }]);
+            session.messages.push(message);
+            session.messageId = message.id;
+            const envelope = {
+                sessionID: session.id,
+                assistantMessageID: message.id,
+                ordinal: 0
+            };
+            const steps = [
+                { type: 'session.text.started', data: envelope },
+                { type: 'session.text.delta', data: { ...envelope, delta: 'Hello' } },
+                { type: 'session.text.delta', data: { ...envelope, delta: ' world' } },
+                { type: 'session.text.ended', data: { ...envelope, text: 'Hello world' } },
+                { type: 'session.step.ended', data: { ...envelope, finish: 'stop' } }
+            ];
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        } else if (text.includes('CUTTOOL') || text.includes('OPENTOOL')) {
+            // A tool-call answer whose stream is cut inside the closing/opening tag: the filter holds a fragment that
+            // could still become a tag, and the recovery poll has to release it
+            const toolAnswer = text.includes('CUTTOOL') ? TOOL_ANSWER : TOOL_TAG_ANSWER;
+            const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: toolAnswer }]);
+            session.messages.push(message);
+            session.messageId = message.id;
+            // The cut lands *inside* a tag, not merely before one: only a boundary that splits `<function_calls>` or
+            // `</function_calls>` proves the filter holds the fragment back instead of writing half a tag to the client
+            const cut = text.includes('CUTTOOL')
+                ? toolAnswer.indexOf('</function_calls>') + 4
+                : toolAnswer.indexOf('<function_calls>') + 5;
+            const steps = answerSteps(session, { text: toolAnswer.slice(0, cut), pieces: 2, close: false, endPart: false });
+            steps.push({ type: 'stream.end' });
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        } else if (text.includes('LONGPAUSE')) {
+            // Silence longer than the SSE keep-alive interval: the stream carries a `: keep-alive` comment line while
+            // the answer is still coming, and a client that reads every line as an event breaks on the comment
+            const message = assistantMessage(session.id, `msg_${session.id}`, [
+                { type: 'reasoning', text: REASONING },
+                { type: 'text', text: ANSWER }
+            ]);
+            session.messages.push(message);
+            session.messageId = message.id;
+            const steps = answerSteps(session, {
+                text: ANSWER,
+                reasoning: REASONING,
+                pieces: 2,
+                pauseAfterFirstMs: 16000
+            });
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        } else if (text.includes('PAUSE')) {
+            // Silence longer than the idle timeout, in the middle of an answer: the gateway has to tell a slow answer
+            // from a dead turn, and settling on the idle timer would truncate this one. The stored message starts
+            // **empty** and *unfinished* (`time.completed` is only added when the stream ends), so the polling fallback
+            // that runs on the silence has nothing to serve yet: a store that already held the whole answer, or one that
+            // looked finished, let the gateway settle at the idle timeout (measured 8 s for a 13 s pause) and the
+            // "waited for the answer" contract went untested.
+            const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: '' }], { completed: false });
+            session.messages.push(message);
+            session.messageId = message.id;
+            const steps = answerSteps(session, {
+                text: ANSWER,
+                reasoning: REASONING,
+                pieces: 2,
+                pauseAfterFirstMs: 13000,
+                onPiece: (snapshot) => {
+                    message.content = [
+                        ...(REASONING ? [{ type: 'reasoning', text: REASONING }] : []),
+                        { type: 'text', text: snapshot }
+                    ];
+                }
+            });
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            playSteps(steps).then(() => {
+                message.time = { created: message.time.created, completed: Date.now() };
+            }).catch(() => {});
+            return;
+        } else if (text.includes('ENDONLY')) {
+            // The backend closed the part without ever finishing the message: only `time.completed` says the turn is
+            // over, and `session.idle` is the only event left to close it. A gateway that waits for a finish event
+            // times out on a turn that already answered
+            const message = assistantMessage(session.id, `msg_${session.id}`, [
+                { type: 'reasoning', text: REASONING },
+                { type: 'text', text: ANSWER }
+            ], { finish: null });
+            session.messages.push(message);
+            session.messageId = message.id;
+            const steps = answerSteps(session, { text: ANSWER, reasoning: REASONING, close: false });
+            steps.push({ type: 'session.idle', data: { sessionID: session.id } });
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        } else if (text.includes('MULTIPART')) {
+            // One message whose two text parts stream their own cumulative snapshots, interleaved. A gateway that keys
+            // the snapshots by part id alone merges the two parts, and one that appends every snapshot duplicates
+            // each of them. Without the id the parts are told apart by their ordinal alone.
+            const withId = !text.includes('MULTIPARTNOID');
+            // The pieces are built so that the two parts interleave into `alpha ALPHA beta BETA gamma GAMMA` and each
+            // part's own text is exactly what its deltas added up to - a closing event that disagrees with its deltas
+            // is the duplication this marker is about
+            const first = MULTIPART_FIRST.split(' ').map((word) => `${word} `);
+            const second = MULTIPART_SECOND.split(' ').map((word, index, all) => (
+                index === all.length - 1 ? word : `${word} `
+            ));
+            const firstText = first.join('');
+            const secondText = second.join('');
+            const message = assistantMessage(session.id, `msg_${session.id}`, [
+                { type: 'text', text: firstText },
+                { type: 'text', text: secondText }
+            ]);
+            session.messages.push(message);
+            session.messageId = message.id;
+            const envelope = (ordinal) => ({
+                sessionID: session.id,
+                ...(withId ? { assistantMessageID: message.id } : {}),
+                ordinal
+            });
+            const steps = [
+                { type: 'session.step.started', data: envelope(0) },
+                { type: 'session.text.started', data: envelope(0) },
+                { type: 'session.text.started', data: envelope(1) }
+            ];
+            // Interleaved on purpose: each part's deltas arrive between the other part's, so the two snapshots advance
+            // in turn instead of one after the other
+            for (let i = 0; i < Math.max(first.length, second.length); i += 1) {
+                if (i < first.length) steps.push({ type: 'session.text.delta', data: { ...envelope(0), delta: first[i] } });
+                if (i < second.length) steps.push({ type: 'session.text.delta', data: { ...envelope(1), delta: second[i] } });
+            }
+            steps.push({ type: 'session.text.ended', data: { ...envelope(0), text: firstText } });
+            steps.push({ type: 'session.text.ended', data: { ...envelope(1), text: secondText } });
+            steps.push({ type: 'session.step.ended', data: { ...envelope(0), finish: 'stop' } });
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        } else {
+            const answerText = text.includes('TOOLTAG') ? TOOL_TAG_ANSWER
+                : text.includes('TAILTAG') ? TAIL_TAG_ANSWER
+                    : text.includes('STRAYTAG') ? STRAY_TAG_ANSWER
+                        : text.includes('OPENTAIL') ? OPEN_TAIL_ANSWER
+                            // Many deltas need a long answer: the default sentence splits into one delta per character,
+                            // which is not the "an idle timer re-armed on every one" case this marker exists for
+                            : text.includes('MANYDELTAS') ? MANY_DELTAS_ANSWER
+                                : ANSWER;
+            const withReasoning = !text.includes('TOOLTAG') && !text.includes('TAILTAG')
+                && !text.includes('STRAYTAG') && !text.includes('OPENTAIL')
+                // The many-deltas marker is about the delta count, so a reasoning part would only add noise
+                && !text.includes('MANYDELTAS');
+            const message = assistantMessage(session.id, `msg_${session.id}`, [
+                ...(withReasoning ? [{ type: 'reasoning', text: REASONING }] : []),
+                { type: 'text', text: answerText }
+            ]);
+            session.messages.push(message);
+            session.messageId = message.id;
+            let steps;
+            if (text.includes('SLOW')) {
+                steps = answerSteps(session, { text: answerText, reasoning: REASONING, pieces: 10, delayMs: 200 });
+            } else if (text.includes('MANYDELTAS')) {
+                steps = answerSteps(session, { text: answerText, pieces: 200, delayMs: 0 });
+            } else if (text.includes('TOOLTAG')) {
+                // The boundary falls inside both of the closing tag's two halves
+                steps = answerSteps(session, { text: answerText, chunks: ['hello ', '<function_ca', 'lls>secret</function_ca', 'lls> world'], delayMs: 1 });
+            } else if (text.includes('TAILTAG')) {
+                // The final delta ends in a prefix of an opening tag that never completes, so the streaming filter has
+                // to release it at end of stream instead of swallowing it
+                steps = answerSteps(session, { text: answerText, chunks: ['hello world ', '<function_call'], delayMs: 1 });
+            } else {
+                steps = answerSteps(session, { text: answerText, reasoning: REASONING });
+            }
+            sendJson(res, 200, { data: inboxItem(session.id, text) });
+            startSteps(session, steps);
+            return;
+        }
+
+        // The markers above that only store a message (nothing to stream): the poll loop answers them
+        sendJson(res, 200, { data: inboxItem(session.id, text) });
+        return;
+    }
+
+    const messageMatch = /^\/api\/session\/([^/]+)\/message$/.exec(path);
+    if (messageMatch && req.method === 'GET') {
+        messagePolls += 1;
+        // Each counter counts only its own polls: a test that drops N and then fails N others must see exactly N
+        // drops and N failures, so the always-fail switch cannot swallow the drop count
+        if (DROP_MESSAGES > 0 && messagePolls <= DROP_MESSAGES) return req.socket.destroy();
+        if (ALWAYS_FAIL_MESSAGES) return sendJson(res, 500, { error: { message: 'transient poll failure' } });
+        if (FAIL_MESSAGES > 0 && messagePolls <= FAIL_MESSAGES) {
+            return sendJson(res, 500, { error: { message: 'transient poll failure' } });
+        }
+        if (UNREADABLE_MESSAGES) return sendJson(res, 200, { result: 'unexpected', items: null });
+        const session = sessions.get(messageMatch[1]);
+        if (!session) return sendError(res, 404, 'SessionNotFoundError', `unknown session ${messageMatch[1]}`);
+        // 2.x answers newest first, and `order` cannot be combined with `cursor`: a client that passes both is asking
+        // for two orderings at once, so it is refused instead of being answered one of them
+        const order = url.searchParams.get('order');
+        const cursor = url.searchParams.get('cursor');
+        const limit = Number(url.searchParams.get('limit') || 0);
+        const type = url.searchParams.get('type');
+        if (cursor && order) {
+            return sendError(res, 400, 'InvalidRequestError', 'cursor and order cannot be used together');
+        }
+        let items = session.messages.slice();
+        if (order === 'asc') items = items.slice();
+        else items.reverse();
+        if (type) items = items.filter((message) => message.type === type);
+        if (limit > 0) items = items.slice(0, limit);
+        return sendJson(res, 200, { data: items, cursor: { previous: null, next: null } });
+    }
+
+    const sessionMatch = /^\/api\/session\/([^/]+)$/.exec(path);
+    if (sessionMatch && req.method === 'DELETE') {
+        const id = sessionMatch[1];
+        // A session that is already gone is a 404 in 2.x, which is how the gateway recognises "already deleted"
+        if (!sessions.has(id)) return sendError(res, 404, 'SessionNotFoundError', `unknown session ${id}`);
+        if (REJECT_DELETES) return sendError(res, 500, 'ProviderError', 'the session store is busy');
+        // Accepted and never answered: the gateway's own deadline (not this process) is what ends the cleanup, so a
+        // test can prove a wedged delete is classified as a transient failure instead of holding the slot
+        if (HANG_DELETES) return;
+        sessions.delete(id);
+        deletedSessions += 1;
+        // 204: no body at all, not even `{}`. A gateway that reads a body here waits for one that never comes
+        res.writeHead(204);
+        return res.end();
+    }
+
+    sendError(res, 404, 'NotFoundError', `stub: unhandled route ${req.method} ${path}`);
 });
 
 server.listen(PORT, HOST, () => {
-    console.log(`[stub] listening on http://${HOST}:${PORT} (answer: ${JSON.stringify(ANSWER)})`);
+    console.log(`[stub] listening on http://${HOST}:${PORT} (opencode ${VERSION}, answer: ${JSON.stringify(ANSWER)})`);
 });
 
 const shutdown = () => {

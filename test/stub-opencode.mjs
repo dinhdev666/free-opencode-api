@@ -762,22 +762,32 @@ const server = http.createServer(async (req, res) => {
             startSteps(session, steps);
             return;
         } else if (text.includes('LONGPAUSE')) {
-            // Silence longer than the SSE keep-alive interval: the stream carries a `: keep-alive` comment line while
-            // the answer is still coming, and a client that reads every line as an event breaks on the comment
-            const message = assistantMessage(session.id, `msg_${session.id}`, [
-                { type: 'reasoning', text: REASONING },
-                { type: 'text', text: ANSWER }
-            ]);
+            // Silence longer than the SSE keep-alive interval (15 s): the stream carries a `: keep-alive` comment line
+            // while the answer is still coming, and a client that reads every line as an event breaks on the comment.
+            // The store has to stay **empty and unfinished** for the whole pause, exactly as `PAUSE` does: a store that
+            // already held the answer let the idle-timeout recovery poll (8 s) serve it and end the stream at ~8.1 s, so
+            // the 15 s of silence the keep-alive line is written after never arrived and this check could not pass.
+            // The pause clears 15 s by three, not by one: the comment goes out on the first timer tick at or after the
+            // interval, so the stream has to outlive the tick that follows it (the keep-alive tick is one second).
+            const message = assistantMessage(session.id, `msg_${session.id}`, [{ type: 'text', text: '' }], { completed: false });
             session.messages.push(message);
             session.messageId = message.id;
             const steps = answerSteps(session, {
                 text: ANSWER,
                 reasoning: REASONING,
                 pieces: 2,
-                pauseAfterFirstMs: 16000
+                pauseAfterFirstMs: 18000,
+                onPiece: (snapshot) => {
+                    message.content = [
+                        ...(REASONING ? [{ type: 'reasoning', text: REASONING }] : []),
+                        { type: 'text', text: snapshot }
+                    ];
+                }
             });
             sendJson(res, 200, { data: inboxItem(session.id, text) });
-            startSteps(session, steps);
+            playSteps(steps).then(() => {
+                message.time = { created: message.time.created, completed: Date.now() };
+            }).catch(() => {});
             return;
         } else if (text.includes('PAUSE')) {
             // Silence longer than the idle timeout, in the middle of an answer: the gateway has to tell a slow answer

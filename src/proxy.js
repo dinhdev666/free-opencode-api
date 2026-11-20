@@ -79,9 +79,13 @@ const DEFAULT_POLLED_MESSAGE_LIMIT = 50;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
 // A stream that has written nothing for this long gets a comment line, so a proxy or client does not drop the
-// connection while the backend is still thinking. The tick is shorter so the silence stays close to the interval.
+// connection while the backend is still thinking. The tick is much shorter than the interval on purpose: it used to be
+// exactly a third of it, and a tick that lands on the interval loses to the sub-millisecond gap between the timer and
+// the first frame - `Date.now() - lastWriteAt` read 14 999 at the 15 s tick, the comment slipped to the 20 s one, and
+// a stream that fell silent for 16 s (the `LONGPAUSE` marker) ended with no comment at all. A one-second tick puts the
+// line within a second of the documented 15 s and costs one integer comparison per stream per second.
 const SSE_KEEPALIVE_INTERVAL_MS = 15000;
-const SSE_KEEPALIVE_TICK_MS = 5000;
+const SSE_KEEPALIVE_TICK_MS = 1000;
 // How long a streaming write may wait for a client that is not reading before the client is treated as gone. Without
 // a bound, one stalled reader parked the completion in `await drain` forever and held the only completion slot.
 const SSE_CLIENT_WRITE_TIMEOUT_MS = 30000;

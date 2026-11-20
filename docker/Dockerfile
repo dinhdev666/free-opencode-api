@@ -84,8 +84,9 @@ COPY --chown=node:node . .
 
 # Entry script: on first boot generates /app/config.json from `docker run -e` environment variables
 # (supports PORT/API_KEY/BIND_HOST/OPENCODE_PATH/OPENCODE_SERVER_URL/OPENCODE_BIND_HOST, plus DISABLE_TOOLS and
-# USE_ISOLATED_HOME under either their bare or their OPENCODE_-prefixed name; OPENCODE_SERVER_PASSWORD is passed
-# through to the spawned backend and never written into config.json)
+# USE_ISOLATED_HOME under either their bare or their OPENCODE_-prefixed name; OPENCODE_SERVER_PASSWORD is written into
+# that config.json like every other key, and the first-boot log dump masks it with the other secrets - when it is left
+# blank the gateway generates a password for its own process and hands that value to the backend it spawns)
 # This file lives in docker/ inside the repository, so the COPY below picks it up from the build context
 # --chmod sets the executable bit in the layer itself: a separate `RUN chmod +x` cost another layer for one mode bit
 COPY --chown=node:node --chmod=0755 docker/docker-entrypoint.sh /app/docker-entrypoint.sh

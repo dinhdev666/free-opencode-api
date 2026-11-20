@@ -59,19 +59,42 @@ export function readLimit(name, { min, max, fallback }, fileValue) {
  * cooldown, are read through this. Both are resolved again by `startProxy()` from the merged configuration, so a value
  * in `config.json` is honoured and not silently ignored - the README documents every tuning key as
  * env > `config.json` > default.
- * @param {string} name the variable name, for a reader of the source
- * @param {number} fallback used when the value is absent or not a number
+ *
+ * Returns a `{value, note}` pair rather than the bare number, for the reason `readLimit()` does: an unusable value has
+ * to be named, and naming it at the call site meant re-implementing the precedence that this reader is the single copy
+ * of - the warning compared `options.X ?? process.env.X` while the reader prefers the environment, so an invalid
+ * environment variable was dropped without a note and a valid one was reported under the file's spelling.
+ * @param {string} name the variable name, for a reader of the source and for the note
+ * @param {number} fallback used when the value is absent, blank or unusable
  * @param {*} fileValue the value read from `config.json`
- * @returns {number}
+ * @returns {{value: number, note: string|null}} the value in milliseconds and the `[Config]` note, if it had to be adjusted
  */
-export const readMilliseconds = (name, fallback, fileValue) => {
+export function readMilliseconds(name, fallback, fileValue) {
     const fromEnv = process.env[name];
+    // The raw value that was actually used, so a note names the one that took effect rather than the other source.
     const raw = (fromEnv === undefined || String(fromEnv).trim() === '') ? fileValue : fromEnv;
-    if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+    if (raw === undefined || raw === null || String(raw).trim() === '') return { value: fallback, note: null };
+    const shown = loggableConfigValue(String(raw).trim());
     const parsed = Number(raw);
-    if (!Number.isFinite(parsed) || parsed < 0) return fallback;
-    return Math.min(Math.floor(parsed), MAX_TIMER_MS);
-};
+    if (!Number.isFinite(parsed)) {
+        return { value: fallback, note: `${name}='${shown}' is not a number, using ${fallback}` };
+    }
+    // Floored before the sign test, like every other reader: a value below one millisecond is a typo (a budget written
+    // as seconds), and flooring it after the test armed a 0 ms timer that fires after 1 ms - the failure this module
+    // exists to name. Each unusable shape is named for what is wrong with it, because "not a number" sent a reader
+    // looking for a letter in a value whose only sin was the decimal point.
+    const floored = Math.floor(parsed);
+    if (parsed < 0 || floored < 0) {
+        return { value: fallback, note: `${name}='${shown}' is negative, using ${fallback}` };
+    }
+    if (floored === 0) {
+        return {
+            value: fallback,
+            note: `${name}='${shown}' is less than one millisecond, using ${fallback}`
+        };
+    }
+    return { value: Math.min(floored, MAX_TIMER_MS), note: null };
+}
 
 /**
  * The completion budget (`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`), resolved through the documented precedence:
@@ -99,8 +122,12 @@ export function resolveRequestTimeoutMs(options = {}, env = process.env) {
     const embedderIsUsable = embedder !== undefined && embedder !== null && String(embedder).trim() !== '';
     const chosen = embedderIsUsable ? embedder : requested;
     const parsed = Number(chosen);
-    if (Number.isFinite(parsed) && parsed > 0) {
-        const floored = Math.floor(parsed);
+    // Floor before the positivity test, not after: a fractional budget below one millisecond (`0.5` - a value written
+    // as seconds, or a typo) floored to `0` after the test, which armed every deadline at 1 ms and answered every
+    // completion `504` with no `[Config]` note. The test is on the floored value, so a sub-millisecond number takes
+    // the "not a positive number" note and the documented default, like every other unusable value.
+    const floored = Math.floor(parsed);
+    if (Number.isFinite(parsed) && floored > 0) {
         if (floored <= MAX_TIMER_MS) return { value: floored, note: null };
         // Longer than a timer can wait: clamp instead of arming a timer that fires after 1 ms
         return {
@@ -115,17 +142,6 @@ export function resolveRequestTimeoutMs(options = {}, env = process.env) {
         note: `OPENCODE_PROXY_REQUEST_TIMEOUT_MS='${loggableConfigValue(String(chosen).trim())}' is not a positive number, using ${DEFAULT_REQUEST_TIMEOUT_MS}`
     };
 }
-
-/**
- * Whether a configured millisecond value is present but unusable, so the caller can name it and the value it used.
- * @param {*} value the configured value
- * @returns {boolean}
- */
-export const isUnusableMilliseconds = (value) => {
-    if (value === undefined || value === null || String(value).trim() === '') return false;
-    const parsed = Number(value);
-    return !Number.isFinite(parsed) || parsed < 0;
-};
 
 /**
  * A deadline for one SDK call, so no single phase can outlive the request it belongs to.

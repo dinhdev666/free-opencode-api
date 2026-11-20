@@ -192,7 +192,7 @@ docker run -d --restart=always --network common-all --name free-opencode-api -p 
 - A `config.json` that exists but is invalid, or holds a value of the wrong type for a known key (`"API_KEY": true`, an
   object where a string belongs), stops the container with a message naming the key instead of silently running with the
   built-in key or a stringified value (a boolean `API_KEY` would make the literal word `true` the credential). A UTF-8
-  BOM is tolerated; the file must be a regular file of at most 1 MiB.
+  BOM is tolerated; the file must be a regular file of at most 1 MiB (a symbolic link or a FIFO is refused by name).
 - The image's own defaults (used when generating `config.json`) differ from the program defaults for the container:
   `BIND_HOST=0.0.0.0` and `DISABLE_TOOLS=true`. `OPENCODE_BIND_HOST` keeps the program default `127.0.0.1`.
 

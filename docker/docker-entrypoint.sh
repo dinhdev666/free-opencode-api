@@ -8,9 +8,10 @@
 # OPENCODE_SERVER_PASSWORD, and the two boolean flags under both their names. In index.js the first *non-blank* value
 # wins, with the OPENCODE_-prefixed name first (`flagSource()`/`readFlag()`: a blank `OPENCODE_X=` falls through to `X`),
 # so the prefixed spelling wins here too - otherwise the file this script writes and the value the process reads could
-# disagree once the variables are no longer set. A blank OPENCODE_SERVER_PASSWORD is written as one on purpose: the 2.x
-# backend then gets no password from the environment, generates one of its own and prints it, which is what the gateway
-# reads. Pinning a value here is what makes an external or already-running backend accept the gateway's Basic header.
+# disagree once the variables are no longer set. A blank OPENCODE_SERVER_PASSWORD is written as one on purpose: the
+# gateway then resolves a password of its own per process (`resolveBackendPassword()` in src/backend-auth.js) and passes
+# it to the backend it spawns through this same variable - it never reads a password back from the backend's output.
+# Pinning a value here is what makes an external or already-running backend accept the gateway's Basic header.
 # The log level LOG_LEVEL (error/warn/info/debug, case-insensitive) is NOT written into config.json:
 #   the node process reads the environment variable directly, so it takes precedence over the LOG_LEVEL field in
 #   config.json; when unset it defaults to info

@@ -32,7 +32,13 @@ jobs:
       fail-fast: false
       matrix:
         # package.json requires Node >= 20; the matrix covers the oldest supported line, the LTS used by the
-        # official Docker image, and the current release line
+        # official Docker image, and the current release line. The three lines are best-effort with respect to
+        # *transitive* `engines` declarations: cookie@2.0.2, reached via fastify -> light-my-request, declares
+        # node >= 22, which the Node 20 line does not satisfy. That is harmless - pnpm does not enforce a
+        # dependency's `engines` (and this repository has no .npmrc that would turn that on), and fastify core never
+        # touches the cookie path at runtime: only `light-my-request`'s inject() does, which the smoke suite does not
+        # exercise. Node 20 stays a supported runtime on purpose, so the mismatch is recorded here rather than
+        # re-litigated.
         node: ['20', '22', '24']
     steps:
       - name: Checkout

@@ -206,6 +206,13 @@ is where most of the 29 ms goes. A queue slot is freed as soon as the answer is 
 follows does not delay the next completion. Raise `OPENCODE_PROXY_MAX_CONCURRENCY` only if your provider tolerates concurrent
 sessions. Numbers move with machine load; re-measure before drawing conclusions.
 
+**No rate limiter, by design.** The gateway bounds *concurrency* (`OPENCODE_PROXY_MAX_CONCURRENCY`), the *wait queue*
+(`OPENCODE_PROXY_MAX_QUEUE`: a full queue answers `503` with `Retry-After: 1`) and the *body*
+(`OPENCODE_PROXY_MAX_BODY_MB`), and nothing else. A request rate per client is deliberately absent: the only identity
+the gateway has is one shared API key, and it keeps no cross-process counter. If several callers share one instance, put
+a reverse proxy in front of it (`nginx limit_req`, a load-balancer rate policy) - that is where a per-address limit
+belongs, and it survives a restart.
+
 For reference, the Express implementation this gateway replaced measured ~74,000 req/s on `/health` in the same
 harness at the time; the Fastify rewrite answers ~110,000 req/s on the same endpoint today, as the table above says.
 

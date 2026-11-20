@@ -60,7 +60,8 @@ These are product decisions, not implementation details. Do not "improve" them w
    back. The file existed briefly: it was added with the 2.x migration, opened six pull requests (#155-#160: five
    workflow-action pins and the `node:26-bookworm-slim` base image), and was removed again because the automation did
    not fit this repository. Two concrete reasons, so nobody re-litigates them:
-   - a two-dependency project with **exactly pinned** versions (`@opencode/client`, `fastify`) gets little from a weekly
+   - a two-dependency project - one dependency pinned exactly (`@opencode/client`) and one deliberately on a narrow caret
+     (`fastify`, which does not have the generated-surface problem the pin exists for) - gets little from a weekly
      bump, and every bump is a client-compatibility question (invariant 6) that a bot cannot answer;
    - the one bump that mattered was wrong anyway: `node:26-bookworm-slim` fails `docker build` at
      `RUN corepack enable pnpm` (`exit code: 127`), because Corepack was removed in Node 25 - the Dockerfile has to
@@ -83,7 +84,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `src/upstream.js` | Classifying what the backend threw: `isTimeoutError()`, `isConnectionError()`, `isConnectionRefused()` (walks the `cause` chain, because `fetch` nests `ECONNREFUSED`), `errorCauseChain()`, `upstreamErrorStatus()` over `V2_ERROR_TAG_STATUS`, `upstreamFailureReason()` and the tagged `backendUnavailable()`. |
 | `src/socket.js` | `closeSocketAfterFlush()`: `end()` then a 250 ms `destroy()` fallback, for the paths that answer outside Fastify's reply lifecycle (`clientErrorHandler`, `badUrlHandler`, a hijacked stream). `destroy()` alone discards buffered writes, so a client under backpressure got a reset instead of its envelope. |
 | `src/api-key.js` | The built-in key `sk-dummy-123` and `resolveApiKey()` (a blank or missing `API_KEY` falls back to it). Never add a "disable auth" switch. |
-| `src/backend-auth.js` | The `Authorization` header for the **backend**: `backendAuthorizationHeader()` (Basic, user `opencode`), `resolveBackendAuth()` (splits userinfo out of a credential-bearing `OPENCODE_SERVER_URL` and registers it as sensitive) and `resolveBackendPassword()` (an explicit password, or a generated one unless `OPENCODE_GENERATE_PASSWORD=false`). |
+| `src/backend-auth.js` | The `Authorization` header for the **backend**: `backendAuthorizationHeader()` (Basic, user `opencode`), `resolveBackendAuth()` (splits userinfo out of a credential-bearing `OPENCODE_SERVER_URL` and registers it as sensitive) and `resolveBackendPassword()` (an explicit password, or a generated one — there is no variable that switches generation off: `options.generate === false` suppresses it for a caller that needs to match a spawned child, and no production caller passes it). |
 | `src/env.js` | Resolving the two configured environment values: `resolveOpencodePath()` (memoised per requested value for a minute; PATH, then the package/version-manager install locations) and `normalizeBackendUrl()` / `normalizeBindHost()` (trim, add a missing scheme, drop a trailing slash — each with a `[Config]` note naming the value that was corrected), plus `isLoopbackHost()`. |
 | `src/options.js` | `parseBoolean()` and `readFlag()`, the **single** boolean parser for `index.js`, `startProxy()` and request bodies. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off" in the container); do not add a third. |
 | `src/settings.js` | The tuning keys' readers: `readLimit()`, `readMilliseconds()`, `resolveRequestTimeoutMs()`, `isUnusableMilliseconds()`, `backendDeadline()`, and the named defaults they quote (`DEFAULT_REQUEST_TIMEOUT_MS`, `MAX_TIMER_MS`, `METADATA_TIMEOUT_CAP_MS`). The resolved values are held by their consumers in `src/proxy.js`. |
@@ -112,7 +113,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway, 439 contract assertions
+pnpm test                        # smoke suite: stub backend + gateway, 450 contract assertions
 sh -n docker/docker-entrypoint.sh
 ```
 
@@ -131,7 +132,8 @@ Releases come from tags, not from a laptop: bump `version` in `package.json`, th
 
 `pnpm test` covers the HTTP contract against the stub in `test/stub-opencode.mjs` (the `/api/*` info, model, session,
 message and SSE routes, plus a test-only `GET /__sessions` reporting created/deleted/live counts, `lastSystemPrompt`,
-`lastPromptText`, `lastPermissionRules`, `messagePolls` and `toolIdCalls`). Behaviour is selected by markers in the prompt text - `SLOW`
+`lastPromptText`, `lastPermissionRules`, `sessionCreatePermissions` (the ruleset of **every** create, in order, so a
+call that never produced a session is still counted), `messagePolls` and `toolIdCalls`). Behaviour is selected by markers in the prompt text - `SLOW`
 (an answer slow enough to abort mid-stream), `STALL` (silence after two deltas), `TOOLTAG` (a tool-call block cut inside
 both of its tags), `FAIL` (a provider error with no content), `ENDONLY` (a finish event carrying only `time.completed`),
 `GROW` (an answer still being written when the prompt returns), `SUICIDE` (the stub SIGKILLs itself after accepting the
@@ -148,14 +150,22 @@ first characters, then the stream is cut), `MULTIPART` (one message whose two te
 interleaved), `MULTIPARTNOID` (the same without part ids, so both parts are of type `text`), `SHRINK` (a part whose snapshot gets shorter, because the backend rewrote it), `MIXED` (part updates
 carrying both a `delta` and the part's cumulative text, then one closing update with neither),
 `CUTTOOL`/`OPENTOOL` (a tool-call answer whose stream is cut inside the closing/opening tag), `TOOLSPAM` (a tool-call
-block repeated by the answer), `BADPART` (a text part whose `text` is a number, next to a normal part), `REASONONLY`
+block repeated by the answer), `TWOSTEP` (the answer arrives as two steps, the first unfinished), `FAILMID` (a provider
+error after the text has already been written, so both modes have text to keep), `STRAYTAG` (a closing
+`</function_calls>` with no block around it, dropped while its surrounding text is kept), `OPENTAIL` (an opening tag
+that never closes, dropped while the text after it is kept - the two shapes the streaming filter and the whole-answer
+scan must agree on), `BADPART` (a text part whose `text` is a number, next to a normal part), `REASONONLY`
 (a message carrying reasoning and no text that is never marked finished), `LEAKYFAIL` (a provider error quoting a
 credential-bearing URL behind a long message) and `MANYDELTAS` (a 470-character answer split into ~180 deltas, for the
 idle timer that is re-armed on every one) - and by the variables `STUB_FAIL_SESSION=1` (a 404 for
 `POST /api/session`), `STUB_BASIC_AUTH=user:pass` (a `401` gate on every route), `STUB_URL_IN_ERROR=1` (a 400 whose message quotes a
 credential-bearing URL), `STUB_ECHO_AUTH=1` (a 401 quoting the header it refused), `STUB_FAIL_MESSAGES=<n>`, `STUB_UNREADABLE_MESSAGES=1` (a 2xx whose body is not a message
 list), `STUB_DROP_MESSAGES=<n>`, `STUB_ALWAYS_FAIL_MESSAGES=1`, `STUB_HANG_CREATE_AFTER=<n>` (every creation after the n-th goes
-unanswered), `STUB_DROP_CREATE=1` (the session is created and the connection dropped before the answer),
+unanswered), `STUB_RESET_CREATE_TIMES=<n>` (the first n creations have their socket destroyed before a session is
+made, which is the `ECONNRESET`/`socket hang up` half of the retry rule and is asserted as *not* retried),
+`STUB_CREATE_DELAY_MS=<n>` (a
+slow `POST /api/session`, so a completion that waited for a queue slot can be granted a fresh request budget),
+`STUB_DROP_CREATE=1` (the session is created and the connection dropped before the answer),
 `STUB_REJECT_DELETES=1` (a `500` for `DELETE /session/:id`, so the session stays), `STUB_HANG_DELETES=1` (a delete that is
 never answered), `STUB_FAIL_TOOL_IDS=1` (a `500` for the 1.x `GET /experimental/tool/ids`; **accepted as a no-op**, because 2.x has
 no tool-list route and the gateway builds no override map), `STUB_EMPTY_PROVIDERS=1` (both shapes of an
@@ -330,7 +340,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 - Errors → `{"error":{"message":"…","type":"…"}}` with `400` (bad request, `type: "invalid_request_error"`, plus
   Fastify's `code` when it rejected the body), `401` (auth, `type: "invalid_request_error"`,
   `code: "invalid_api_key"`), `404` (unknown route, `type: "not_found"`), `502` (upstream/provider error, with a
-  `code`: `ProviderError`, `backend_unreachable` or `upstream_error`), `503`
+  `code`: `ProviderError` when the provider failed, `backend_unreachable` when the backend could not be reached or
+  started, and `upstream_error` as the fallback for a 502 that is neither — a shape no current path produces, kept so a
+  future one cannot answer a 502 with no `code` at all), `503`
   (`type: "queue_full"`, the wait queue is full, with `Retry-After: 1` so an OpenAI SDK backs off instead of failing
   the request) or `type: "server_error"` with `code: "gateway_shutting_down"` (also with `Retry-After: 1`, when
   `SIGINT`/`SIGTERM` arrived and the request is not one of the responses being finished), `504` (timeout), `500`
@@ -378,7 +390,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   backend. `fetch failed` and `socket hang up` are what a backend that accepted `POST /api/session` and then died looks
   like: retrying those created a second session while the first one kept existing with no id in this process, so
   neither `cleanupSession()` nor the shutdown drain could ever delete it. Those answer `502 backend_unreachable`, the
-  documented answer for "the backend disappeared mid-request", and the next request recovers.
+  documented answer for "the backend disappeared mid-request", and the next request recovers. Both call sites send
+  **one** argument object (`sessionCreateArgs`): the retry repeated the literal by hand and dropped `permissions`, which
+  no answer the client receives can show, so a duplicated literal is what must not come back.
 - **Every 2.x client call throws on failure**, and every call site handles the rejection: `session.create`,
   `session.prompt`, `message.list`, `session.remove`, `model.list` and `event.subscribe`. A thrown error carries a
   `_tag` (`SessionNotFoundError`, `UnauthorizedError`, `InvalidRequestError`, `ConflictError`, …) but **no HTTP

@@ -379,9 +379,10 @@ publishing workflow leaves a Docker Hub token with write scope on the runner: a 
 nobody reviewed running at a version nobody froze. `ci.yml` enforces this — the step "Workflow actions are pinned to
 commit SHAs" fails when any action reference is not a 40-character SHA.
 
-`.github/dependabot.yml` opens weekly pull requests for the three things that go stale on their own: the npm
-dependencies, the GitHub Actions pins below (it rewrites the SHA and its comment), and the `node` base image used by
-`docker/Dockerfile`. Commit subjects follow CONTRIBUTING.md (`deps: …`, `ci: …`, `docker: …`).
+Nothing opens these updates automatically: Dependabot is off for this repository (AGENTS.md), so the npm dependencies,
+the GitHub Actions pins and the `node` base image are all refreshed by hand, as reviewable commits. The npm packages
+move with `pnpm up` (a lockfile-only change is enough), an action pin moves as described below, and the base image
+moves by replacing its tag and digest together.
 
 To update a pin by hand, resolve the commit the tag currently points at (an annotated tag needs one more hop to the commit)
 and replace the SHA plus its comment:

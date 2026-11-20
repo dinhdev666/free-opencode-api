@@ -18,8 +18,8 @@
 # Pinned by digest as well as by tag: every GitHub action in .github/workflows is pinned by SHA and checked in CI, while
 # the base image - the layer everything else is built on - was the one mutable reference left, so two builds of the same
 # commit could differ by a Debian point release or a rebuilt upstream image. The digest is the multi-arch index for
-# `22-bookworm-slim`; Dependabot's docker ecosystem refreshes it (and the tag) when upstream publishes a new one.
-# Refresh by hand with:
+# `22-bookworm-slim`; Dependabot is off for this repository (AGENTS.md), so the tag and the digest are refreshed by
+# hand, together:
 #   docker buildx imagetools inspect node:22-bookworm-slim --format '{{.Manifest.Digest}}'
 FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
 

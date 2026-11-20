@@ -37,11 +37,23 @@ function splitPathEnv() {
  * embedded `"` ends the quoted run and whatever follows is parsed as more commands. That is why the spawn refuses
  * these paths outright instead of quoting them, and the entry point's version probe has to apply the same rule: it
  * builds the same kind of command line, and a probe that ran `x" ; id ; echo "` executed `id`.
+ *
+ * On Windows, `cmd.exe` expands `%VAR%` even inside double quotes, so a `%` in the path is a variable expansion that
+ * can change the command line. `^` and `!` are the escape and delayed-expansion characters respectively. A trailing
+ * backslash is the escape for the closing quote, leaving the string unterminated. All three are refused on `win32`
+ * only, because POSIX shells do not expand `%` or treat `\` specially inside quotes.
  * @param {string} value the program path
  * @returns {boolean} true when the value must not be passed through a shell
  */
 export function isShellUnsafePath(value) {
-    return /["$`\u0000-\u001f\u007f]/.test(String(value));
+    const text = String(value);
+    if (/["$`\u0000-\u001f\u007f]/.test(text)) return true;
+    if (process.platform === 'win32') {
+        // `%VAR%` expansion, `^` escape, `!` delayed expansion, and a trailing backslash (escapes the closing quote).
+        if (/[%^!]/.test(text)) return true;
+        if (text.endsWith('\\')) return true;
+    }
+    return false;
 }
 
 function pushDir(list, dir) {

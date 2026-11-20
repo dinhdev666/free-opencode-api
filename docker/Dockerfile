@@ -64,16 +64,16 @@ RUN pnpm install --frozen-lockfile --prod
 COPY --chown=node:node . .
 
 # Install the opencode CLI inside the image (the gateway detects and launches the opencode backend on startup)
-# Approach: the official npm package opencode-ai, which bundles linux x64/arm64 binaries for both glibc and musl,
-#           and installs the executable into the npm global bin directory, i.e. /usr/local/bin/opencode
+# Approach: the official npm package @opencode/cli, which installs the `opencode` executable into the npm global bin
+#           directory, i.e. /usr/local/bin/opencode
 # (npm is only used here to install this third-party CLI, not for the project's own dependencies)
-# OPENCODE_VERSION pins it for reproducible builds AND for the API the gateway drives: `latest` now resolves to the 2.x
-# line, whose `opencode serve` serves the web UI instead of the 1.x session API (`/session`, `/session/:id/message`),
-# so every completion in a `latest` image failed with "rejected session creation (status 405)". 1.19.5 is the newest
-# 1.x release and matches the bundled `@opencode-ai/sdk`; override to try another one:
-#   docker build --build-arg OPENCODE_VERSION=1.19.5
-ARG OPENCODE_VERSION=1.19.5
-RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" \
+# OPENCODE_VERSION pins it for reproducible builds AND for the API the gateway drives: the 2.x line is the one whose
+# `serve` exposes the `/api/...` session routes and authenticates them with its own server password, which is what this
+# gateway speaks. A 1.x release has no `/api` routes at all, so every completion in such an image failed with a 502
+# naming a backend that would not start. Override to try another 2.x release:
+#   docker build --build-arg OPENCODE_VERSION=2.3.2
+ARG OPENCODE_VERSION=2.3.2
+RUN npm install -g "@opencode/cli@${OPENCODE_VERSION}" \
     && npm cache clean --force
 # Alternative (if the npm package installation has problems, use the official install script):
 # RUN curl -fsSL https://opencode.ai/install | bash
@@ -123,8 +123,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 #   error: upstream (4097) request failures/errors are always logged, with status code and error-body summary
 
 # opencode serve backend port (4097)
-# The backend listens on loopback by default (OPENCODE_BIND_HOST=127.0.0.1, written by the entrypoint), because it has
-# no authentication of its own: publishing it would let any peer reach OpenCode directly and bypass the gateway's key.
+# The backend listens on loopback by default (OPENCODE_BIND_HOST=127.0.0.1, written by the entrypoint). It is not
+# unauthenticated - the 2.x server requires HTTP Basic on every /api/* route and the gateway generates the password and
+# hands it to the child - but it is still not the gateway: publishing it would put the backend API and its web UI
+# outside the gateway's own API key, and the password would travel to every peer that reaches the port.
 # `-e OPENCODE_BIND_HOST=0.0.0.0` plus `-p 4097:4097` is the documented opt-in. The gateway itself always reaches the
 # backend through OPENCODE_SERVER_URL (default http://127.0.0.1:4097) and is unaffected by this variable.
 EXPOSE 4097

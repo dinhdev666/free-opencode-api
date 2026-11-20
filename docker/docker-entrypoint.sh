@@ -5,10 +5,12 @@
 # fallback for settings, not an override: index.js reads environment variables first, so `-e KEY=value` applies on
 # every start even when the file already holds a different value.
 # Supported (written into config.json): PORT API_KEY BIND_HOST OPENCODE_PATH OPENCODE_SERVER_URL OPENCODE_BIND_HOST
-# and the two boolean flags, under both their names. In index.js the first *non-blank* value wins, with the
-# OPENCODE_-prefixed name first (`flagSource()`/`readFlag()`: a blank `OPENCODE_X=` falls through to `X`), so the
-# prefixed spelling wins here too - otherwise the file this script writes and the value the process reads could
-# disagree once the variables are no longer set.
+# OPENCODE_SERVER_PASSWORD, and the two boolean flags under both their names. In index.js the first *non-blank* value
+# wins, with the OPENCODE_-prefixed name first (`flagSource()`/`readFlag()`: a blank `OPENCODE_X=` falls through to `X`),
+# so the prefixed spelling wins here too - otherwise the file this script writes and the value the process reads could
+# disagree once the variables are no longer set. A blank OPENCODE_SERVER_PASSWORD is written as one on purpose: the 2.x
+# backend then gets no password from the environment, generates one of its own and prints it, which is what the gateway
+# reads. Pinning a value here is what makes an external or already-running backend accept the gateway's Basic header.
 # The log level LOG_LEVEL (error/warn/info/debug, case-insensitive) is NOT written into config.json:
 #   the node process reads the environment variable directly, so it takes precedence over the LOG_LEVEL field in
 #   config.json; when unset it defaults to info
@@ -64,9 +66,13 @@ if [ ! -f "$CONFIG" ]; then
             DISABLE_TOOLS: flag(["OPENCODE_DISABLE_TOOLS", "DISABLE_TOOLS"], "true"),
             OPENCODE_PATH: env("OPENCODE_PATH", ""),
             OPENCODE_SERVER_URL: env("OPENCODE_SERVER_URL", "http://127.0.0.1:4097"),
-            // Loopback by default: `opencode serve` has no authentication of its own, so publishing it on every
-            // interface of the container bypasses the gateway that guards it. `-e OPENCODE_BIND_HOST=0.0.0.0` is the
-            // documented opt-in for `-p 4097:4097` (docker/README.md).
+            // The 2.x backend authenticates every API route with its own password. Blank means the gateway generates one
+            // per process and hands it to the child it spawns, which is the right default in a container: there is no
+            // second copy of the secret to manage and none is ever printed.
+            OPENCODE_SERVER_PASSWORD: env("OPENCODE_SERVER_PASSWORD", ""),
+            // Loopback by default: `opencode serve` has no authentication of its own on the socket, so publishing it on
+            // every interface of the container bypasses the gateway that guards it. `-e OPENCODE_BIND_HOST=0.0.0.0` is
+            // the documented opt-in for `-p 4097:4097` (docker/README.md).
             OPENCODE_BIND_HOST: env("OPENCODE_BIND_HOST", "127.0.0.1"),
             USE_ISOLATED_HOME: flag(["OPENCODE_USE_ISOLATED_HOME", "USE_ISOLATED_HOME"], "false")
         };
@@ -83,7 +89,10 @@ if [ ! -f "$CONFIG" ]; then
         // so it goes through maskBackendUrl() for the same reason.
         const shown = Object.assign({}, cfg, {
             API_KEY: maskSecret(cfg.API_KEY),
-            OPENCODE_SERVER_URL: maskBackendUrl(cfg.OPENCODE_SERVER_URL)
+            OPENCODE_SERVER_URL: maskBackendUrl(cfg.OPENCODE_SERVER_URL),
+            // The password of the backend itself is a credential like the other two: this line goes to `docker logs`,
+            // and even a blank value is masked rather than special-cased, so the dump has one rule for every secret.
+            OPENCODE_SERVER_PASSWORD: maskSecret(cfg.OPENCODE_SERVER_PASSWORD)
         });
         console.log("[entrypoint] first boot, config generated from env:", JSON.stringify(shown));
         // Normalised like the shell branch below, and like loggableConfigValue() in src/proxy.js: one log record.

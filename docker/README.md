@@ -4,7 +4,7 @@
 
 Container image of [Free OpenCode API](https://github.com/dinhdev666/free-opencode-api), an OpenAI-compatible gateway for the OpenCode CLI.
 
-The image bundles Node.js 22, the project source, and the OpenCode CLI (npm package `opencode-ai`), so nothing needs to be installed on the host. Project dependencies are installed with **pnpm** (enabled through Corepack and pinned by the `packageManager` field in `package.json`) using the committed `pnpm-lock.yaml`. Point any OpenAI client at the published port and start chatting with the free models your OpenCode installation currently serves: `opencode/big-pickle` is a stable alias that OpenCode routes to whichever model it serves right now (and it is the gateway's default), while the concrete model ids rotate — `GET /v1/models` returns what is live right now.
+The image bundles Node.js 22, the project source, and the OpenCode CLI (npm package `@opencode/cli`, the 2.x line), so nothing needs to be installed on the host. Project dependencies are installed with **pnpm** (enabled through Corepack and pinned by the `packageManager` field in `package.json`) using the committed `pnpm-lock.yaml`. Point any OpenAI client at the published port and start chatting with the free models your OpenCode installation currently serves: `opencode/big-pickle` is a stable alias that OpenCode routes to whichever model it serves right now (and it is the gateway's default), while the concrete model ids rotate — `GET /v1/models` returns what is live right now.
 
 ---
 
@@ -58,9 +58,9 @@ The service is then reachable at `http://<your-ip>:8083`.
 > **Pass `-e API_KEY=…`.** Without it the gateway runs with the built-in key `sk-dummy-123`, which is public: anyone who
 > can reach the port can then drive your OpenCode installation. `--privileged` is **not** needed and is never used
 > here: the image needs no extra capability, and the backend runs model-directed tools, so keep those tools inside the
-> container's default isolation. `DISABLE_TOOLS=true` (the image default) switches every tool that can execute
-> something or write a file off (bash, edit, write, task, webfetch…); the two read-only tools `read` and `glob` stay
-> enabled, because disabling either of them makes the backend hang on opencode ≥ 1.19 (see **Fix 1** below).
+> container's default isolation. `DISABLE_TOOLS=true` (the image default) denies every tool action that can execute
+> something or write a file (`edit`, `shell`, `write`, `grep`, `webfetch`, `task`…); the two read-only ones `read` and
+> `glob` stay allowed, because denying either of them makes the backend hang on a free zen model (see **Fix 1** below).
 
 ---
 
@@ -69,8 +69,8 @@ The service is then reachable at `http://<your-ip>:8083`.
 The image does not run as root. [`docker/Dockerfile`](Dockerfile) ends with `USER node`, so the gateway, the
 `opencode serve` backend it spawns and every tool that backend runs are all the unprivileged `node` user of the
 official Node.js base image — **uid/gid `1000`**. The CLI is still installed as root at build time (`npm install -g
-opencode-ai`), and `/app` is handed to `node:node` because the entrypoint writes `/app/config.json` there on first
-boot.
+"@opencode/cli@${OPENCODE_VERSION}"`, 2.3.2 by default), and `/app` is handed to `node:node` because the entrypoint
+writes `/app/config.json` there on first boot.
 
 What that changes in practice:
 
@@ -166,10 +166,11 @@ working if it is later started without them.
 | `API_KEY` | `sk-dummy-123` | Gateway auth key; mandatory — an empty value falls back to the default key instead of disabling authentication |
 | `BIND_HOST` | `0.0.0.0` | Must listen on `0.0.0.0` inside the container for port mapping to work (the program default is `127.0.0.1`; the entrypoint overrides it) |
 | `DISABLE_TOOLS` (or `OPENCODE_DISABLE_TOOLS`) | `true` | Disables OpenCode tool calls so the model cannot run commands or modify files in the container (`1`, `true`, `yes`, `y`, `on` turn it on; `0`, `false`, `no`, `n`, `off` turn it off). The `OPENCODE_`-prefixed spelling wins when both are set |
-| `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; left as a bare name it is resolved through `PATH` (the npm global install puts it at `/usr/local/bin/opencode`), and the program also probes `~/.opencode/bin` and the npm/pnpm global directories. The CLI version is pinned at build time (`ARG OPENCODE_VERSION`), so the name resolves to the bundled 1.19.5 |
+| `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; left as a bare name it is resolved through `PATH` (the npm global install puts it at `/usr/local/bin/opencode`), and the program also probes `~/.opencode/bin` and the npm/pnpm global directories. The CLI version is pinned at build time (`ARG OPENCODE_VERSION`), so the name resolves to the bundled 2.3.2 |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4097` | Address of the OpenCode backend the gateway launches internally; rarely needs changing (a trailing slash is stripped) |
+| `OPENCODE_SERVER_PASSWORD` | unset (the gateway generates one per process) | Password for the backend's HTTP Basic authentication (username `opencode`), passed to `opencode serve` under the same name — 2.x authenticates every `/api/*` route, so a child with no password would answer `401` to every call. Set it yourself only when `OPENCODE_SERVER_URL` points at a **separate** 2.x server, which has to be given the same value. Never printed: the first-boot dump masks it |
 | `OPENCODE_USE_ISOLATED_HOME` (or `USE_ISOLATED_HOME`) | unset | Runs the backend with a throwaway `HOME` inside the container (the container is already isolated, so this is rarely needed) |
-| `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend (4097). Loopback by default, because the backend has no authentication of its own: publishing it would bypass the gateway's key. Set `0.0.0.0` to serve it outside the container — see [Exposing the 4097 Backend Port](#exposing-the-4097-backend-port) |
+| `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend (4097). Loopback by default: publishing it would put the OpenCode API and its web UI outside the gateway, which is the only thing that checks a key, applies the queue limits and strips tool markup. Set `0.0.0.0` to serve it outside the container — see [Exposing the 4097 Backend Port](#exposing-the-4097-backend-port) |
 | `OPENCODE_PROXY_BIND_HOST` | unset | Alias for `BIND_HOST`, read only when `BIND_HOST` is not set (the program's own default is `127.0.0.1`); environment only — in `config.json` only `BIND_HOST` exists |
 | `OPENCODE_PROXY_DEBUG` | unset | Turns on debug logging **when no explicit `LOG_LEVEL` is set** — an explicit level wins and the switch is then ignored with a `[Config]` warning. This is the **environment** name (in `config.json` the same switch is `DEBUG`, and the environment variable `DEBUG` has no effect); `LOG_LEVEL=debug` is the documented way |
 | `LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug` (case-insensitive; invalid values fall back to `info` with a warning). **Exception: never written into `config.json` — it follows the usual precedence (environment first, then the `LOG_LEVEL` field in `config.json`, then `info`), but the entrypoint does not copy it into the generated file.** See [Logging](#logging) |
@@ -252,8 +253,8 @@ Example `docker logs` output per level:
 
 # debug (additionally logs full request bodies and responses; sensitive headers masked)
 [gateway] 2026-11-06T12:00:05.010Z [DEBUG] Incoming OpenAI request {"reqId":"gw-m1abc2x3","headers":{"authorization":"Bear***(31 chars)","content-type":"application/json"},"body":{"model":"opencode/example-model-a","messages":[...],"stream":true}}
-[gateway] 2026-11-06T12:00:05.032Z [DEBUG] Upstream payload (final request body to opencode serve) {"reqId":"gw-m1abc2x3","sessionId":"ses_...","model":"opencode/example-model-a","payload":{"path":{"id":"ses_..."},"body":{"model":{...},"system":"...","parts":[...],"tools":{...}}}}
-[gateway] 2026-11-06T12:00:05.460Z [DEBUG] SSE stream summary {"reqId":"gw-m1abc2x3","chunks":12,"contentChars":866,"reasoningChars":0,"finishReason":"stop"}
+[gateway] 2026-11-06T12:00:05.032Z [DEBUG] Upstream payload (final request body to opencode serve) {"reqId":"gw-m1abc2x3","sessionId":"ses_...","model":"opencode/example-model-a","payload":{"sessionID":"ses_...","text":"USER: hi"}}
+[gateway] 2026-11-06T12:00:05.460Z [DEBUG] SSE stream summary {"reqId":"gw-m1abc2x3","sessionId":"ses_...","model":"opencode/example-model-a","chunks":12,"contentChars":866,"reasoningChars":0,"finishReason":"stop","clientGone":false}
 [gateway] 2026-11-06T12:00:12.780Z [DEBUG] Upstream response (non-stream full JSON) {"reqId":"gw-n4def5y6","response":{"id":"chatcmpl-...","choices":[{"message":{"content":"..."}}],"finish_reason":"stop"}}
 
 # error (always emitted on upstream failure, with status code and error-body summary)
@@ -297,7 +298,7 @@ Swarm services take `stop_grace_period` in the service definition; Kubernetes us
 
 ## Exposing the 4097 Backend Port
 
-When the gateway (8083) starts it launches the `opencode serve` backend (4097) inside the container. The backend listen address is controlled by `OPENCODE_BIND_HOST` and defaults to `127.0.0.1` — loopback only, unreachable from outside the container. That is deliberate: the backend has **no authentication of its own**, so anything that can reach 4097 can drive the model without the gateway's key.
+When the gateway (8083) starts it launches the `opencode serve` backend (4097) inside the container. The backend listen address is controlled by `OPENCODE_BIND_HOST` and defaults to `127.0.0.1` — loopback only, unreachable from outside the container. That is deliberate: the 2.x backend does authenticate its `/api/*` routes (HTTP Basic, with a password the gateway generates per container and keeps to itself), but publishing 4097 still hands the OpenCode API and its web UI to the network while the gateway's key, queue limits and tool guard stay on the side that is no longer in the path.
 
 To reach 4097 directly from outside, set the address *and* publish the port:
 
@@ -326,11 +327,11 @@ Notes:
 
 ## Known Issues and Compatibility Fixes
 
-Two OpenCode 1.19.5 compatibility issues are fixed directly in [`src/proxy.js`](../src/proxy.js) of the source repository, not patched inside the image. The image builds straight from the repository and the Dockerfile contains no runtime patching step.
+Two OpenCode 2.x behaviour differences are handled in [`src/proxy.js`](../src/proxy.js) of the source repository, not patched inside the image. The image builds straight from the repository and the Dockerfile contains no runtime patching step.
 
-**Fix 1 — tool hang.** With opencode ≥ 1.19 and one of the free zen models the backend serves, `DISABLE_TOOLS=true` (the image default) disables every OpenCode tool, and as soon as either `read` or `glob` is disabled the prompt request hangs forever — the gateway never returns content. The fix keeps the two read-only tools `read` and `glob` enabled while still disabling every other tool (bash/edit/write/task/webfetch/question/grep/skill…). Both are read-only with no write or execution capability, and `stripFunctionCalls` output filtering plus the `TOOL_GUARD_MESSAGE` system prompt act as a second line of defense.
+**Fix 1 — tool hang.** With 2.x and one of the free zen models the backend serves, `DISABLE_TOOLS=true` (the image default) denies every tool action when the session is created, and as soon as either `read` or `glob` is denied the prompt request hangs forever — the gateway never returns content. The fix denies the whole action set first (`edit`, `shell`, `write`, `grep`, `webfetch`, `websearch`, `subagent`, `external_directory`, `question`, `skill`, `task`, `todowrite`, `todoread`, `lsp`, `browser`, `patch`, `multiedit`, `invalid`), then `deny *` so an action a newer server grows is covered too, and re-allows exactly `read` and `glob` **last**. Both are read-only with no write or execution capability, and `stripFunctionCalls` output filtering plus the `TOOL_GUARD_MESSAGE` prompt text act as a second line of defense.
 
-**Fix 2 — streaming SSE compatibility.** In opencode ≥ 1.19, SSE `message.part.updated` events carry no `properties.delta`, and `part.text` holds the part's **current full text**. Reading the increment via `const { part, delta } = event.properties` therefore always yielded `undefined`, so streams carried no content and only a finish chunk; worse, a fast assistant finish delivers `message.updated(finish=stop)` before the 4s first-chunk timer, resolving the collector early with empty content — a path the existing noData/idleTimeout fallbacks never covered (non-streaming responses were unaffected). The fix prefers `properties.delta` when present (older versions) and otherwise derives the increment from the part it came from: `snapshotDelta()` keeps that part's previous `part.text` and returns what the new snapshot appended, using a length check plus a 32-character head and tail window (comparing against the accumulated answer instead re-sent every part of a multi-part message on every event, and the full `startsWith` compare cost O(answer) per event); when nothing has been streamed at all, it polls `pollForAssistantResponse` once for the full reply (filtered through `stripFunctionCalls`), and emits no delta if polling is also empty.
+**Fix 2 — streaming SSE compatibility.** In 2.x the stream names the kind in `type` (dot-separated: `session.text.delta`, `session.reasoning.delta`, `session.text.ended`, `session.step.ended`, …) and the payload in `data`. A `*.delta` event carries a real `delta`, but the closing `session.text.ended` / `session.reasoning.ended` events carry **no `delta` at all** — only the part's whole `text` — so reading the increment from `event.properties.delta` yielded `undefined` on every closing event, and a stream carried no content and only a finish chunk; worse, a fast assistant finish delivers `session.step.ended` (finish=stop) before the 4s first-chunk timer, resolving the collector early with empty content — a path the existing noData/idleTimeout fallbacks never covered (non-streaming responses were unaffected). The fix takes `data.delta` when it is a string and otherwise derives the increment from the part it came from: `snapshotDelta()` keeps that part's previous `text` and returns what the new snapshot appended, using a length check plus a 32-character head and tail window (comparing against the accumulated answer instead re-sent every part of a multi-part message on every event, and the full `startsWith` compare cost O(answer) per event); when nothing has been streamed at all, it polls `pollForAssistantResponse` once for the full reply (filtered through `stripFunctionCalls`), and emits no delta if polling is also empty.
 
 ---
 
@@ -364,11 +365,11 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 ```
 
 The image installs the OpenCode CLI from npm at build time and pins it with `ARG OPENCODE_VERSION`, defaulting to
-`1.19.5` — the newest 1.x release and the line the bundled `@opencode-ai/sdk` drives. Do not build with a 2.x version:
-its `opencode serve` serves the web UI instead of the session API, so the container answers
-`502 … rejected session creation (status 405)` for every completion. Override the pin deliberately with
-`--build-arg OPENCODE_VERSION=<1.x version>`; the version that ended up in a running container is available with
-`docker run --rm <image> opencode --version`.
+`2.3.2` — the release the bundled `@opencode/client` (also 2.3.2) is written against. Do not build with a 1.x version:
+that is a different upstream whose `opencode serve` has no `/api/*` route at all, so the container's readiness probe
+never passes and every completion answers `502 … backend_unreachable`. Override the pin deliberately with
+`--build-arg OPENCODE_VERSION=<2.x version>`, and keep it in step with `@opencode/client` in `package.json`; the
+version that ended up in a running container is available with `docker run --rm <image> opencode --version`.
 
 ### Workflow actions are pinned to commit SHAs
 

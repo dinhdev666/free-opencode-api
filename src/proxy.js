@@ -4099,11 +4099,26 @@ async function ensureBackend(config, options = {}) {
             }
 
             let port = '4097';
+            let portParsed = false;
             try {
-                port = new URL(OPENCODE_SERVER_URL).port || '4097';
+                port = new URL(OPENCODE_SERVER_URL).port;
+                portParsed = true;
             } catch (e) {
                 logger.warn(`[Proxy] Could not parse OPENCODE_SERVER_URL '${maskBackendUrl(OPENCODE_SERVER_URL)}', assuming port 4097`);
             }
+            // A URL with no port and a child that can only listen on one: the child was started on 4097 while every
+            // readiness probe used the configured URL verbatim (port 80 for `http://127.0.0.1`), so all 60 probes
+            // failed, every completion answered `502 backend_unreachable` after ~114 s of backoff, a cooldown was set
+            // and the child - which was listening, just not where anything looked - was left holding 4097 until the
+            // next attempt killed it. Refuse before `spawn()`: no child, no cooldown, and a sentence that names the
+            // port the gateway would have chosen.
+            if (portParsed && port === '') {
+                throw backendUnavailable(
+                    'OPENCODE_SERVER_URL must name the backend port (http://127.0.0.1:4097): ' +
+                    'a URL without one points at port 80, while opencode serve can only be started on a numbered port'
+                );
+            }
+            if (!port) port = '4097';
             const resolved = resolveOpencodePath(OPENCODE_PATH);
             const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;
             if (resolved.path) {

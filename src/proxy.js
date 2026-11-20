@@ -2019,10 +2019,18 @@ function createApp(config) {
         // key is the backend's part id when it sends one; an id-less part is keyed by its type, and one answer can
         // carry several id-less parts of the same type, so a key holds the snapshots of every part it stands for and the
         // increment is taken against the one the new text continues.
+        //
+        // A snapshot is a one-field object rather than a bare string so the delta path can keep a **reference** to the
+        // entry it extended (`partTotals`) and update it in place: a delta already *is* the increment, so re-diffing
+        // the whole answer to rediscover which entry to update cost O(answer) per delta (measured 217 ms for 2 000
+        // deltas of a 1 MB answer, on the thread that streams it). The object is per part, never per delta.
         const partTexts = new Map();
         // The running total each part's deltas add up to, so a delta can seed the snapshot base the closing
         // `session.*.ended` event is diffed against. Without it that event carried the part's whole text with nothing
         // to compare it to, and the answer was appended a second time (measured: sent three times in total).
+        // `{ total, slot }`: `slot` is the snapshot entry `total` came from, or null when the entry is gone (rewritten
+        // by a closing event, or dropped by the bound), in which case the next delta goes back through
+        // `recordPartSnapshot()`.
         const partTotals = new Map();
         // A bounded list: a part whose text is rewritten (SHRINK) starts a new entry, and a backend that rewrites on
         // every event must not grow this per completion.
@@ -2035,14 +2043,22 @@ function createApp(config) {
         const MAX_PART_KEYS = 64;
         const partKeyOrder = [];
         const notePartKey = (key) => {
+            // Both maps are keyed by this string, so both are bounded here: `partTotals` used to grow one permanent
+            // entry per delta for a backend that varies the part id (`assistantMessageID` is backend-controlled text),
+            // 200 000 deltas measured 200 000 entries and +44.6 MB of heap against a `partTexts` stuck at 64.
             if (partTexts.size > MAX_PART_KEYS) {
                 const oldest = partKeyOrder.shift();
-                if (oldest !== undefined && oldest !== key) partTexts.delete(oldest);
-                else {
+                if (oldest !== undefined && oldest !== key) {
+                    partTexts.delete(oldest);
+                    partTotals.delete(oldest);
+                } else {
                     // The order list is empty or already points at this key: drop the first key the map itself reports,
                     // which is insertion order, so the bound is honoured either way.
                     const first = partTexts.keys().next();
-                    if (!first.done && first.value !== key) partTexts.delete(first.value);
+                    if (!first.done && first.value !== key) {
+                        partTexts.delete(first.value);
+                        partTotals.delete(first.value);
+                    }
                 }
             }
             partKeyOrder.push(key);
@@ -2060,26 +2076,38 @@ function createApp(config) {
                 // per completion and the key is built from backend-controlled text, so a backend that varies it grew
                 // the map without bound for as long as the answer streamed.
                 if (text) {
-                    partTexts.set(key, [text]);
+                    partTexts.set(key, [{ text }]);
                     notePartKey(key);
                 }
                 return text;
             }
             for (let i = snapshots.length - 1; i >= 0; i -= 1) {
-                const increment = snapshotDelta(snapshots[i], text);
+                const increment = snapshotDelta(snapshots[i].text, text);
                 if (increment !== text) {
                     // The part continues this snapshot: same base, new snapshot (an empty text drops a base that can
                     // no longer be continued, so `''` stays a fresh start rather than a prefix of everything)
-                    if (text) snapshots[i] = text;
+                    if (text) snapshots[i].text = text;
                     else snapshots.splice(i, 1);
                     return increment;
                 }
             }
             if (text) {
-                snapshots.push(text);
+                snapshots.push({ text });
                 if (snapshots.length > MAX_PART_SNAPSHOTS) snapshots.shift();
             }
             return text;
+        };
+        // Whether `slot` is still the entry some key's snapshot list holds. A rewritten part (`SHRINK`) or the
+        // snapshot bound can drop the entry a running total came from; writing to a detached object would leave the
+        // list stale and the closing event would append the part a second time. Four identity comparisons, no string
+        // work, so this stays cheaper than the diff it replaces.
+        const isLiveSnapshot = (key, slot) => {
+            const snapshots = partTexts.get(key);
+            if (!snapshots || !slot) return false;
+            for (let i = 0; i < snapshots.length; i += 1) {
+                if (snapshots[i] === slot) return true;
+            }
+            return false;
         };
         let firstDeltaAt = null;
         let firstDeltaTimer = null;
@@ -2195,8 +2223,29 @@ function createApp(config) {
                             if (!delta) continue;
                             receivedDelta = true;
                             const snapshotKey = `${isReasoning ? 'r' : 't'}${partKey}`;
-                            const running = (partTotals.get(snapshotKey) || '') + delta;
-                            partTotals.set(snapshotKey, running);
+                            const held = partTotals.get(snapshotKey);
+                            const running = (held ? held.total : '') + delta;
+                            if (held && held.slot && held.slot.text === held.total && isLiveSnapshot(snapshotKey, held.slot)) {
+                                // The entry this key's deltas have been extending is still live and still holds the base
+                                // `running` was built from: the delta *is* the increment, so it is written straight in.
+                                // `recordPartSnapshot()` re-diffed the whole answer to rediscover that entry, and
+                                // `snapshotDelta()` flattens `base + delta` to slice it - O(answer) per delta, measured
+                                // 217 ms for 2 000 deltas of a 1 MB answer on the thread that streams it.
+                                held.slot.text = running;
+                                held.total = running;
+                            } else {
+                                // First delta for this part, or its base was rewritten by a closing event or dropped by
+                                // the snapshot bound: take the diff once, then remember the entry it landed on.
+                                recordPartSnapshot(snapshotKey, running);
+                                const snapshots = partTexts.get(snapshotKey);
+                                let slot = null;
+                                if (snapshots) {
+                                    for (let i = 0; i < snapshots.length; i += 1) {
+                                        if (snapshots[i].text === running) { slot = snapshots[i]; break; }
+                                    }
+                                }
+                                partTotals.set(snapshotKey, { total: running, slot });
+                            }
                             // The returned increment is deliberately ignored: the delta is already the increment, and it
                             // is what the timers and `deltaChars` below count. Recording it keeps the base current so the
                             // closing event diffs to nothing.

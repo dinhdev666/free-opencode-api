@@ -1199,6 +1199,52 @@ function upstreamErrorStatus(error) {
     return null;
 }
 
+// Describes a failed backend call: the status and the reason the backend gave.
+//
+// Two shapes, one helper. The 1.x SDK resolved a non-2xx answer with `{error, response}` and never threw, so the
+// tuple was read here. The 2.x client throws a typed error (`_tag`, `message`, no status) or a `ClientError`
+// wrapping Node's `fetch` failure, so the thrown value is read the same way - a call site that only understood the
+// tuple reported a refused backend as "no reason" and an invalid request as a bare 500.
+//
+// The body the SDK hands back is used as-is (`{error:{message}}`, `{message}` or a plain string), so taking the
+// first object would print "[object Object]" in a client-facing message.
+const upstreamFailureReason = (res) => {
+    // A call site that caught a rejection and stored it as `{error}` (the poll loop does) is unwrapped here, so the
+    // status on the real error is read instead of being lost behind the wrapper object.
+    const thrown = res instanceof Error
+        ? res
+        : (res?.error instanceof Error ? res.error : null);
+    const status = upstreamErrorStatus(thrown || res);
+    // The body a backend error carries, in every shape the 2.x client and the 1.x one produce: a plain string, an
+    // object with `message`, one with a nested `error`, or the `{error:{message}}` / `{message}` envelopes.
+    const bodyMessage = (value) => {
+        if (typeof value === 'string') return value;
+        if (!value || typeof value !== 'object') return '';
+        return value.data?.message
+            ?? value.message
+            ?? (typeof value.error === 'string' ? value.error : value.error?.message)
+            ?? '';
+    };
+    // A 2.x `ClientError` for a status the generated client has no typed error for carries an **empty** message and
+    // hangs the response body off `.error`, so reading only `message` reported a failing poll as "failed while
+    // polling the answer: Error" - the reason the backend actually gave was one property further in. When there is a
+    // body, it wins: for those statuses the message is nothing but the status echoed back (`UnexpectedStatus: 502`),
+    // and a reason is what the reader is looking for.
+    const raw = thrown
+        ? (bodyMessage(thrown.error) || (typeof thrown.message === 'string' ? thrown.message : ''))
+        : bodyMessage(res?.error);
+    // A thrown call carries the runtime's own wording (`fetch failed` for a dead or refused backend), which names
+    // no cause at all; the same phrase a client would read from the top-level handler is used here.
+    const text = clientFacingText(raw);
+    const reason = text && isConnectionError(thrown || { message: raw })
+        ? `the backend is not reachable (${text})`
+        : text;
+    return {
+        status,
+        reason: typeof reason === 'string' && reason ? `: ${reason}` : ''
+    };
+};
+
 // A connection that was *refused* proves nothing reached the backend; `fetch failed` / `socket hang up` do not - the
 // request may have been accepted and only the answer lost. The distinction matters for the one call the gateway retries
 // (`session.create`): retrying a request that may have created a session leaves that first session on the backend with
@@ -2403,51 +2449,6 @@ function createApp(config) {
         }
     }
 
-    // Describes a failed backend call: the status and the reason the backend gave.
-    //
-    // Two shapes, one helper. The 1.x SDK resolved a non-2xx answer with `{error, response}` and never threw, so the
-    // tuple was read here. The 2.x client throws a typed error (`_tag`, `message`, no status) or a `ClientError`
-    // wrapping Node's `fetch` failure, so the thrown value is read the same way - a call site that only understood the
-    // tuple reported a refused backend as "no reason" and an invalid request as a bare 500.
-    //
-    // The body the SDK hands back is used as-is (`{error:{message}}`, `{message}` or a plain string), so taking the
-    // first object would print "[object Object]" in a client-facing message.
-    const upstreamFailureReason = (res) => {
-        // A call site that caught a rejection and stored it as `{error}` (the poll loop does) is unwrapped here, so the
-        // status on the real error is read instead of being lost behind the wrapper object.
-        const thrown = res instanceof Error
-            ? res
-            : (res?.error instanceof Error ? res.error : null);
-        const status = upstreamErrorStatus(thrown || res);
-        // The body a backend error carries, in every shape the 2.x client and the 1.x one produce: a plain string, an
-        // object with `message`, one with a nested `error`, or the `{error:{message}}` / `{message}` envelopes.
-        const bodyMessage = (value) => {
-            if (typeof value === 'string') return value;
-            if (!value || typeof value !== 'object') return '';
-            return value.data?.message
-                ?? value.message
-                ?? (typeof value.error === 'string' ? value.error : value.error?.message)
-                ?? '';
-        };
-        // A 2.x `ClientError` for a status the generated client has no typed error for carries an **empty** message and
-        // hangs the response body off `.error`, so reading only `message` reported a failing poll as "failed while
-        // polling the answer: Error" - the reason the backend actually gave was one property further in. When there is a
-        // body, it wins: for those statuses the message is nothing but the status echoed back (`UnexpectedStatus: 502`),
-        // and a reason is what the reader is looking for.
-        const raw = thrown
-            ? (bodyMessage(thrown.error) || (typeof thrown.message === 'string' ? thrown.message : ''))
-            : bodyMessage(res?.error);
-        // A thrown call carries the runtime's own wording (`fetch failed` for a dead or refused backend), which names
-        // no cause at all; the same phrase a client would read from the top-level handler is used here.
-        const text = clientFacingText(raw);
-        const reason = text && isConnectionError(thrown || { message: raw })
-            ? `the backend is not reachable (${text})`
-            : text;
-        return {
-            status,
-            reason: typeof reason === 'string' && reason ? `: ${reason}` : ''
-        };
-    };
 
     /**
      * The one line a model listing that did not answer gets, whichever shape the failure arrived in.

@@ -55,6 +55,21 @@ These are product decisions, not implementation details. Do not "improve" them w
      error tags are what `src/proxy.js` is written against (see "API contract").
    Adding another dependency requires a clear, stated reason; the project deliberately avoids helper packages
    (routing, CORS, logging, body parsing are in-tree or built in).
+7. **Dependabot stays off.** There is no `.github/dependabot.yml` and no other automated bump bot, and neither comes
+   back. The file existed briefly: it was added with the 2.x migration, opened six pull requests (#155-#160: five
+   workflow-action pins and the `node:26-bookworm-slim` base image), and was removed again because the automation did
+   not fit this repository. Two concrete reasons, so nobody re-litigates them:
+   - a two-dependency project with **exactly pinned** versions (`@opencode/client`, `fastify`) gets little from a weekly
+     bump, and every bump is a client-compatibility question (invariant 6) that a bot cannot answer;
+   - the one bump that mattered was wrong anyway: `node:26-bookworm-slim` fails `docker build` at
+     `RUN corepack enable pnpm` (`exit code: 127`), because Corepack was removed in Node 25 - the Dockerfile has to
+     change first, so "merge the green bump" was never available for it.
+   Dependency updates are a **manual, reviewed change** (`build(deps): …` / `ci: …` / `docker: …`), in the same shape
+   any other commit arrives in. `test/check-commit-messages.mjs` judges every commit and has **no** bot-author
+   exemption: a bump bot's subject (`Bump fastify from …`, scope `dependencies`) is not this repository's convention,
+   and a pull request that cannot satisfy the convention must not be mergeable in the first place.
+   Do not re-add the configuration file, do not enable Dependabot in the repository settings, and do not replace it
+   with Renovate or a workflow scheduled to open bump PRs.
 
 ## Repository map
 

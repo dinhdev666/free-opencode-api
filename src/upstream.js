@@ -32,29 +32,60 @@ const answeredByBackend = (error) => error?._tag !== undefined || typeof upstrea
  * A wedged backend - one that still answers `/health` but never answers `/session` - used to hang the request handler
  * forever: node's fetch has no default timeout, so the SDK promise never settled, the client waited with no answer and
  * the queue slot was never released (at the default concurrency of 1 that stops the whole gateway).
+ *
+ * Detected structurally, by walking the cause chain for a `TimeoutError`/`AbortError` name or an `ETIMEDOUT` code,
+ * rather than by matching a message sentence: the 2.x client wraps an expired deadline as
+ * `ClientError("Transport: The operation was aborted due to timeout")` and a plain abort as
+ * `ClientError("Transport: This operation was aborted")`, and a message regex that knew only the timeout spelling
+ * reported a non-timeout abort as a `500 server_error` with the raw transport sentence.
  * @param {unknown} error
  * @returns {boolean}
  */
-export const isTimeoutError = (error) => !answeredByBackend(error) &&
-    (error?.name === 'TimeoutError' || error?.name === 'AbortError' ||
-    error?.code === 'ETIMEDOUT' ||
-    // The 2.x client rethrows an expired deadline as its own transport failure, carrying the message only:
+export const isTimeoutError = (error) => {
+    if (answeredByBackend(error)) return false;
+    for (const link of errorCauseChain(error)) {
+        // `TimeoutError` is the DOMException name `AbortSignal.timeout()` produces, and `ETIMEDOUT` is Node's own
+        // code. `AbortError` is deliberately *not* matched here: it is also the name of a plain manual abort
+        // (`controller.abort()` with no deadline), which is a transport failure, not a timeout - that case falls
+        // through to `isConnectionError()` and answers 502. The message spelling below is the only thing that tells
+        // an `AbortSignal.timeout()`-driven abort from a manual one, because both carry `AbortError` one level down.
+        if (link?.name === 'TimeoutError') return true;
+        if (link?.code === 'ETIMEDOUT') return true;
+    }
+    // The 2.x client rethrows an expired deadline as its own transport failure carrying only the message:
     // `ClientError("Transport: The operation was aborted due to timeout")`. That is this gateway's deadline, not an
-    // upstream refusal, and reporting it as `500 server_error` told the client the gateway had a bug.
-    (typeof error?.message === 'string' && /aborted due to timeout/i.test(error.message)));
+    // upstream refusal, and reporting it as `500 server_error` told the client the gateway had a bug. A plain abort
+    // (`ClientError("Transport: This operation was aborted")`) does *not* match this and is classified as a
+    // transport failure by `isConnectionError()` instead.
+    return typeof error?.message === 'string' && /aborted due to timeout/i.test(error.message);
+};
 
 /**
  * Whether an error is a transport failure of any kind (as opposed to the backend answering with a refusal).
+ *
+ * The 2.x client wraps every transport throw as `new ClientError("Transport", { cause })`, so the real undici/Node
+ * error sits one or two `cause` levels down. The classifier walks the whole chain and matches either a known transport
+ * `code` or a known message spelling, so a connection that dies mid-body (`UND_ERR_SOCKET` / `"other side closed"` /
+ * `"terminated"`) - which is not `fetch failed`, not `ECONNREFUSED`, and not `socket hang up` - is still reported as
+ * an upstream failure (502), not a gateway bug (500).
  * @param {unknown} error
  * @returns {boolean}
  */
+const TRANSPORT_CODES = new Set([
+    'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN',
+    'EHOSTUNREACH', 'ENETUNREACH', 'ETIMEDOUT',
+    'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+    'UND_ERR_BODY_TIMEOUT', 'UND_ERR_CLOSED'
+]);
+const TRANSPORT_TEXT = /fetch failed|socket hang up|terminated|other side closed|this operation was aborted/i;
 export const isConnectionError = (error) => {
     if (answeredByBackend(error)) return false;
-    const message = String(error?.message || '');
-    return message.includes('fetch failed') ||
-        message.includes('ECONNREFUSED') ||
-        message.includes('socket hang up') ||
-        error?.cause?.code === 'ECONNREFUSED';
+    for (const link of errorCauseChain(error)) {
+        if (typeof link?.code === 'string' && TRANSPORT_CODES.has(link.code)) return true;
+        if (typeof link?.message === 'string' && TRANSPORT_TEXT.test(link.message)) return true;
+    }
+    // The outermost message alone, for a wrapper the chain walk cannot see into (a string, a thrown non-object).
+    return typeof error?.message === 'string' && TRANSPORT_TEXT.test(error.message);
 };
 
 /**
@@ -130,6 +161,17 @@ const V2_ERROR_TAG_STATUS = {
     // error and never fires here, so without this the "a 1.x CLI has no /api route" case - the one warning worth
     // printing - answered a bare `500` instead of `502 (status 404)`.
     NotFoundError: 404,
+    // A refusal the generated client declares but the map used to omit, so the same class of backend refusal was a
+    // correct 502 or a wrong 500 purely on which tag the server chose. Each is reachable through a route that declares
+    // the status: a provider that rejects a model (`UnsupportedModelError`), a session that already exists
+    // (`SessionBusyError`), a message id that no longer resolves (`MessageNotFoundError`), and a 403 from a proxy or
+    // an auth gate in front of the backend (`ForbiddenError`).
+    ForbiddenError: 403,
+    UnsupportedModelError: 400,
+    SessionBusyError: 409,
+    MessageNotFoundError: 404,
+    // A provider-level rejection carries its own `status` when it has one; without this entry it answered a bare 500.
+    ProviderRequestError: 502,
     SessionNotFoundError: 404,
     SessionArchivedError: 410,
     InvalidRequestError: 400,
@@ -145,6 +187,12 @@ const V2_ERROR_TAG_STATUS = {
  */
 export function upstreamErrorStatus(error) {
     for (const link of errorCauseChain(error)) {
+        // A status on any link of the chain is the real answer: a wrapper that does carry `response.status` (a proxy,
+        // a Node `fetch` failure with a response) is more precise than a tag guess, and a `ProviderRequestError`
+        // carries its own `status` (429 for a rate limit, 500 for an overload). It is checked before the tag map so
+        // an explicit status always wins over a tag-derived default.
+        const status = link?.response?.status ?? link?.status ?? link?.statusCode;
+        if (typeof status === 'number') return status;
         const tag = link?._tag;
         // `Object.hasOwn`, not a truthiness test: the map is a plain object literal, so `_tag` of `constructor`,
         // `toString` or `__proto__` read an inherited member and returned a function or an object as the "status",
@@ -152,10 +200,6 @@ export function upstreamErrorStatus(error) {
         // backend-controlled (`declared()` copies the body onto the thrown error), so that was reachable from a
         // single error payload.
         if (typeof tag === 'string' && Object.hasOwn(V2_ERROR_TAG_STATUS, tag)) return V2_ERROR_TAG_STATUS[tag];
-        // A status on any link of the chain is the real answer: a wrapper that does carry `response.status` (a proxy,
-        // a Node `fetch` failure with a response) is more precise than a tag guess.
-        const status = link?.response?.status ?? link?.status ?? link?.statusCode;
-        if (typeof status === 'number') return status;
     }
     return null;
 }

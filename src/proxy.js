@@ -2450,6 +2450,11 @@ function createApp(config) {
                 // Assigned by the streaming path; the error path uses it to drop the backend event subscription
                 // instead of leaving it open until its own deadline (up to the whole request budget)
                 let abortStream = null;
+                // Disarms the SSE keep-alive timer. Declared out here because the catch below has to call it: the normal
+                // end of the streaming block clears the timer, but every throw above jumps straight to that catch, so the
+                // timer survived for up to one 5 s tick after the stream was already answered. A no-op until the
+                // streaming branch arms it.
+                let stopKeepAlive = () => {};
 
                 try {
                     reqId = request.gatewayLog?.reqId || null;
@@ -3089,14 +3094,15 @@ function createApp(config) {
                         let clientGone = false;
                         let collectorHandle = null;
                         let keepAliveTimer = null;
-                        const stopKeepAlive = () => {
+                        const stopStreamKeepAlive = () => {
                             if (keepAliveTimer) {
                                 clearInterval(keepAliveTimer);
                                 keepAliveTimer = null;
                             }
                         };
+                        stopKeepAlive = stopStreamKeepAlive;
                         const noteClientGone = () => {
-                            stopKeepAlive();
+                            stopStreamKeepAlive();
                             // No `writableEnded` short-circuit: when someone else already ended the response (the
                             // request timeout answered in-band) the socket is still open, and leaving the flag false
                             // let the task write into an ended stream, where the drain never comes and the slot was
@@ -3458,7 +3464,12 @@ function createApp(config) {
                 } catch (error) {
                     // Upstream (opencode serve) call chain failed: always emitted at error level with status code and
                     // error-body summary; the full error object goes to debug level
+                    // The keep-alive timer is disarmed here too: the normal end of the streaming block clears it, but
+                    // every throw above jumped straight to this catch, so the timer survived for up to one 5 s tick
+                    // after the stream was already answered (it self-cleared on the next tick via `writableEnded`,
+                    // which is why this showed up as a pending timer rather than a leak). Idempotent.
                     if (abortStream) abortStream();
+                    stopKeepAlive();
                     const upstream = extractUpstreamError(error);
                     logger.error('[Proxy] API Error (upstream call failed)', {
                         reqId,

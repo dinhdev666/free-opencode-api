@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { loggableConfigValue } from './text.js';
 
 // A config.json is a handful of scalars. Reading an arbitrarily large "config" into memory at startup is one
 // misplaced file away from an out-of-memory crash, and a FIFO blocks the read forever, so the file is bounded and has
@@ -77,8 +78,14 @@ function describeType(value) {
     return `a ${typeof value}`;
 }
 
+// The name of the file type a symlink has: one constant, because two places report it - `describeFileType()` for a
+// link that somehow survives the open (a platform without O_NOFOLLOW, or a link to a link), and the ELOOP the
+// O_NOFOLLOW open actually raises on every platform that has the flag.
+const SYMLINK_TYPE = 'a symbolic link';
+
 function describeFileType(stat) {
     if (stat.isDirectory()) return 'a directory';
+    if (stat.isSymbolicLink()) return SYMLINK_TYPE;
     if (stat.isFIFO()) return 'a FIFO';
     if (stat.isSocket()) return 'a socket';
     if (stat.isCharacterDevice()) return 'a character device';
@@ -94,20 +101,58 @@ function describeFileType(stat) {
  * operator wrote, leaving the gateway running with the built-in dummy key instead of theirs.
  */
 export function readConfigFile(configPath) {
+    // O_NOFOLLOW makes a symlink a refusal instead of a read: `config.json -> /etc/shadow` used to be followed, and
+    // the JSON-parse failure below quotes the file's own bytes into the message, so the gateway printed the contents of
+    // whatever the link pointed at. It is absent on Windows (and on any runtime that does not define it), where the
+    // fallback is 0 - plain O_RDONLY - so the flag list stays readable and the behaviour degrades to the previous one
+    // rather than to a startup crash.
+    //
+    // O_NONBLOCK is the other half of the FIFO rule. A stat-then-read pair never opened a FIFO, so it was named
+    // without ever being touched; an O_RDONLY open of a FIFO blocks until a writer appears, which at import time in
+    // index.js is a hang no signal handler can reach. With O_NONBLOCK the open returns immediately, fstatSync sees the
+    // FIFO, and the "not a regular file" refusal below is the answer. It has no effect on a regular file.
+    const openFlags = fs.constants.O_RDONLY
+        | (fs.constants.O_NOFOLLOW === undefined ? 0 : fs.constants.O_NOFOLLOW)
+        | (fs.constants.O_NONBLOCK === undefined ? 0 : fs.constants.O_NONBLOCK);
+
+    let fd;
+    try {
+        fd = fs.openSync(configPath, openFlags);
+    } catch (e) {
+        if (e.code === 'ENOENT') return { config: {}, error: null };
+        // ELOOP is the O_NOFOLLOW open refusing a symlink; EISDIR is the one platform that refuses a directory at
+        // open() instead of handing back a descriptor. Both are the "not a regular file" answer, not a startup crash.
+        if (e.code === 'ELOOP') return { config: {}, error: `must be a regular file, found ${SYMLINK_TYPE}` };
+        if (e.code === 'EISDIR') return { config: {}, error: 'must be a regular file, found a directory' };
+        return { config: {}, error: `cannot be read: ${e.message}` };
+    }
+
     let raw;
     try {
-        // statSync first, so a directory/FIFO/socket is named instead of surfacing as EISDIR or a read that never
-        // returns. A file removed between the stat and the read reports ENOENT from readFileSync below, which is the
-        // same "no config.json" answer as a missing file - not a startup failure.
-        const stat = fs.statSync(configPath);
+        // fstatSync on the descriptor just opened, so the object that is checked is the object that is read - there is
+        // no path left to swap between the two syscalls.
+        const stat = fs.fstatSync(fd);
         if (!stat.isFile()) return { config: {}, error: `must be a regular file, found ${describeFileType(stat)}` };
         if (stat.size > MAX_CONFIG_BYTES) {
             return { config: {}, error: `is ${stat.size} bytes, the maximum is ${MAX_CONFIG_BYTES}` };
         }
-        raw = fs.readFileSync(configPath, 'utf8');
+        // Reading by descriptor is still unbounded - the file can have grown since fstatSync, and nothing about a
+        // descriptor freezes its size - so the text is cut to one character past the limit and the refusal below is
+        // repeated off the string length. The hot path this runs on is a single startup read, so the spare copy is
+        // cheaper than a second stat that could be stale too.
+        raw = fs.readFileSync(fd, 'utf8');
+        if (raw.length > MAX_CONFIG_BYTES) raw = raw.slice(0, MAX_CONFIG_BYTES + 1);
+        if (raw.length > MAX_CONFIG_BYTES) {
+            return { config: {}, error: `is more than ${MAX_CONFIG_BYTES} bytes, the maximum is ${MAX_CONFIG_BYTES}` };
+        }
     } catch (e) {
+        // A file removed after it was opened cannot happen through this descriptor, but ENOENT from the read is still
+        // the same "no config.json" answer as a missing file - not a startup failure.
         if (e.code === 'ENOENT') return { config: {}, error: null };
         return { config: {}, error: `cannot be read: ${e.message}` };
+    } finally {
+        // Every return above leaves through here, so no error path leaks the descriptor.
+        fs.closeSync(fd);
     }
 
     // A UTF-8 BOM is what a Windows editor or PowerShell 5.1 writes: JSON.parse rejects the first character of a file
@@ -118,7 +163,18 @@ export function readConfigFile(configPath) {
     try {
         parsed = JSON.parse(text);
     } catch (e) {
-        return { config: {}, error: `is not valid JSON: ${e.message}` };
+        // V8 embeds a raw source snippet in its `JSON.parse` message (`Unexpected token 's', ..."API_KEY": sk-SECR...`),
+        // so quoting the message verbatim printed the first ~18 characters of the offending line - including the
+        // operator's own key or `OPENCODE_SERVER_PASSWORD` when it was written unquoted - and a snippet carrying a raw
+        // newline split one `[Config]` record into several. The snippet always follows the parser's own clause and is
+        // delimited by a double quote, so everything from the first `"` is dropped; the useful part (the wording and the
+        // position) is kept, and it is bound and control-character cleaned like every other `[Config]` sentence.
+        const snippetAt = String(e.message).indexOf('"');
+        const withoutSnippet = (snippetAt === -1 ? String(e.message) : String(e.message).slice(0, snippetAt))
+            .replace(/,?\s*\.\.\.\s*$/, '')
+            .replace(/,\s*$/, '')
+            .trim();
+        return { config: {}, error: `is not valid JSON: ${loggableConfigValue(withoutSnippet)}` };
     }
 
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {

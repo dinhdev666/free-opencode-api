@@ -140,14 +140,23 @@ const removeTempDir = (dir) => {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* still held by a child */ }
 };
 
+// Wait for a child to actually be gone. Resolving on a timer instead of on `exit` returned while the process was still
+// alive and holding its port, and the next block then failed as "port N is already in use" - a second failure caused by
+// the first one's cleanup. A SIGKILL that does not land is reported here, where the cause is, rather than three checks
+// later as an address in use.
 const waitForExit = (child) => new Promise((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    let killTimer = null;
     const timer = setTimeout(() => {
         child.kill('SIGKILL');
-        resolve();
+        killTimer = setTimeout(() => {
+            console.error(`[smoke] child ${child.pid} is still alive 3 s after SIGKILL`);
+            resolve();
+        }, 3000);
     }, 3000);
     child.once('exit', () => {
         clearTimeout(timer);
+        if (killTimer) clearTimeout(killTimer);
         resolve();
     });
 });
@@ -319,6 +328,16 @@ async function run() {
     // container configured for 8086 probed 8083 and reported itself unhealthy for its whole life. The expression is
     // run here against a stand-in for /app/config.json, so the escaping is checked instead of assumed.
     const dockerfileSource = fs.readFileSync(path.join(ROOT, 'docker', 'Dockerfile'), 'utf8');
+    // The image installs the CLI whose `/api/*` routes the gateway is written against (AGENTS.md invariant 6). The pin
+    // lived in two places - here and `dependencies["@opencode/client"]` - and only one of them was ever checked, so a
+    // bump that touched one file silently shipped an image whose backend the gateway cannot drive (a 1.x `serve` has no
+    // `/api` route at all, and every completion answered 502 naming a backend that would not start).
+    const dockerCliArg = dockerfileSource.match(/^ARG OPENCODE_VERSION=("?)([^"\s]+)\1/m);
+    const clientPin = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
+        .dependencies['@opencode/client'];
+    check('the image installs the CLI version the gateway is written against',
+        Boolean(dockerCliArg) && dockerCliArg[2] === clientPin,
+        `Dockerfile=${dockerCliArg ? dockerCliArg[2] : 'no ARG OPENCODE_VERSION'} client=${clientPin}`);
     const healthcheckMatch = dockerfileSource.match(/CMD port=\$\(node -e '([^']+)'\)/);
     check('the Dockerfile health check carries its port expression',
         Boolean(healthcheckMatch), String(dockerfileSource.match(/HEALTHCHECK[^\n]*/)));
@@ -508,6 +527,33 @@ async function run() {
         maskUrlQuery('/v1/models?password=hunter2&model=x') === '/v1/models?password=***&model=x' &&
         maskUrlQuery('/v1/models?db_password=hunter2') === '/v1/models?db_password=***',
         maskUrlQuery('/v1/models?password=hunter2&model=x'));
+    // The sensitive-header rule is an alternation over name *segments*, so a name that glues two of them together
+    // (`x-access-token`) matched nothing: the token went to `docker logs` in clear while `x-auth-token` was masked.
+    const gluedCredentialNames = [
+        'x-access-token', 'x-access_token', 'x-auth-token', 'x-client-secret', 'x-secret-key',
+        'x-refresh-token', 'x-session-id'
+    ];
+    const gluedMasked = gluedCredentialNames.filter((name) => {
+        const masked = maskHeaders({ [name]: 'hunter2' });
+        return masked[name] !== 'hunter2' && String(masked[name]).includes('***');
+    });
+    check('a credential whose name glues two segments together is masked', gluedMasked.length === gluedCredentialNames.length,
+        `masked ${gluedMasked.length}/${gluedCredentialNames.length}`);
+    // ...and the widened rule must not become a substring match: `compass-word`, `monkey` and `keyboard` all contain
+    // `passw`-adjacent text and none of them is a credential.
+    const nearMissNames = ['compass-word', 'monkey', 'keyboard', 'x-tokenizer'];
+    const nearMissKept = nearMissNames.filter((name) => maskHeaders({ [name]: 'keep-me' })[name] === 'keep-me');
+    check('a name that merely contains credential text is left alone', nearMissKept.length === nearMissNames.length,
+        nearMissNames.filter((name) => !nearMissKept.includes(name)).join(','));
+    // The same rule, spelled as a URL credential inside a sentence: `maskUrlCredentials()` bounds its userinfo run at
+    // 256 characters so a 12 KiB token cannot be scanned quadratically, and the credential must still be masked.
+    const longTokenProbe = `${'u'.repeat(12000)}:p@host`;
+    const longTokenStartedAt = process.hrtime.bigint();
+    const longTokenMasked = maskUrlCredentials(`see https://${longTokenProbe}/x`);
+    const longTokenMs = Number(process.hrtime.bigint() - longTokenStartedAt) / 1e6;
+    check('masking a URL with an over-long credential stays linear and masks it',
+        longTokenMs < 50 && !longTokenMasked.includes('u'.repeat(12000)) && longTokenMasked.includes('***'),
+        `${longTokenMs.toFixed(2)} ms`);
     // A URL reaches this helper straight from a request target, which any caller can make as long as the header block
     // allows. The pair pattern started at the `=` of a pair whose name ran into a second `?` and rescanned from there:
     // 14 011 characters of `?` cost 96 ms of the serving thread, unauthenticated, on every logged line.
@@ -1012,6 +1058,18 @@ async function run() {
     check('GET /health is served as JSON',
         (health.response.headers.get('content-type') || '').includes('application/json'),
         health.response.headers.get('content-type'));
+    // `/health` is the one route that is open without a key, so it is also the one a probe can be pointed at as often as
+    // it likes: if it reached the backend it would be an unauthenticated way to make the gateway talk to the operator's
+    // backend (and to make it wait for one). The stub counts `/api/info` reads - the readiness probe is the only call a
+    // health check could plausibly make - so the burst below proves it makes none.
+    const infoBeforeHealthBurst = (await (await fetch(`${STUB_URL}/__sessions`)).json()).infoCalls;
+    const healthBurst = await Promise.all(Array.from({ length: 10 }, () => fetch(`${BASE}/health`)));
+    await Promise.all(healthBurst.map((response) => response.text()));
+    const infoAfterHealthBurst = (await (await fetch(`${STUB_URL}/__sessions`)).json()).infoCalls;
+    check('a burst of /health probes never reaches the backend',
+        healthBurst.every((response) => response.status === 200) &&
+        infoAfterHealthBurst === infoBeforeHealthBurst,
+        `info calls: ${infoAfterHealthBurst - infoBeforeHealthBurst}`);
 
     // Cold cache under a burst: ten simultaneous listings must cost the backend a single provider round trip, not ten
     const burstBefore = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
@@ -1159,6 +1217,15 @@ async function run() {
         ['content-type', 'authorization', 'x-api-key', 'x-request-id', 'x-requested-with']
             .every((name) => allowHeaders.split(',').map((part) => part.trim()).includes(name)),
         allowHeaders);
+    // The other two fields a browser needs from a preflight: without `Allow-Methods` the request is refused even though
+    // the route exists, and a `Max-Age` of 0 (or none) makes the browser re-ask before every single call.
+    const allowMethods = (preflight.headers.get('access-control-allow-methods') || '').toUpperCase();
+    check('the preflight advertises the methods the gateway serves',
+        ['GET', 'POST', 'OPTIONS'].every((method) => allowMethods.split(',').map((part) => part.trim()).includes(method)),
+        allowMethods);
+    check('the preflight asks for a finite cache lifetime',
+        preflight.headers.get('access-control-max-age') === '600',
+        preflight.headers.get('access-control-max-age'));
 
     // A liveness probe must not have to carry the key, whatever form it takes: the router tolerates a trailing
     // slash, and many probes use HEAD
@@ -3723,6 +3790,59 @@ async function run() {
     check('a start failure carries the same stable code as an unreachable backend',
         unstartableAnswer.json?.error?.code === 'backend_unreachable',
         JSON.stringify(unstartableAnswer.json?.error)?.slice(0, 160));
+    // A start that failed seconds ago is remembered: without the cooldown every completion paid the whole startup
+    // budget (60 probes, measured ~114 s) before answering 502, so one unreachable backend turned every request into a
+    // two-minute wait. The second request must fail immediately and say why.
+    const cooldownStartedAt = Date.now();
+    const cooldownAnswer = await fetch(`http://127.0.0.1:${deadBackendPort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi again' }] }),
+        signal: AbortSignal.timeout(10000)
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }))
+        .catch((error) => ({ status: 0, json: null, error: error.message }));
+    const cooldownMs = Date.now() - cooldownStartedAt;
+    check('a backend that just failed to start is not retried for the whole budget',
+        cooldownAnswer.status === 502 && cooldownMs < 5000,
+        `status ${cooldownAnswer.status} after ${cooldownMs}ms`);
+    check('the cooldown names the start attempt it is waiting out',
+        /last start attempt/i.test(cooldownAnswer.json?.error?.message || ''),
+        (cooldownAnswer.json?.error?.message || cooldownAnswer.error || '').slice(0, 160));
+
+    // A configured URL with no port is a backend that can never answer: the child can only listen on a numbered port, so
+    // the gateway starts it on 4097 while probing the URL as written (port 80). Every probe fails, every completion
+    // answers 502 after the whole budget, and the child is left holding 4097. Refused before the spawn, with a sentence
+    // naming the port.
+    const noPortPort = GATEWAY_PORT + 32;
+    const noPortGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(noPortPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1',
+            OPENCODE_PATH: deadBackendScript,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(noPortGateway);
+    noPortGateway.stdout.on('data', () => {});
+    noPortGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${noPortPort}/health`);
+    const noPortAnswer = await fetch(`http://127.0.0.1:${noPortPort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(15000)
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }))
+        .catch((error) => ({ status: 0, json: null, error: error.message }));
+    const noPortMessage = noPortAnswer.json?.error?.message || noPortAnswer.error || '';
+    check('a backend URL without a port is refused instead of probed as port 80',
+        noPortAnswer.status === 502 && /must name the backend port/.test(noPortMessage),
+        `status ${noPortAnswer.status} ${noPortMessage.slice(0, 160)}`);
+    stopGateway(noPortGateway);
+    await waitForExit(noPortGateway);
+
     stopGateway(deadBackendGateway);
     await waitForExit(deadBackendGateway);
     try { fs.unlinkSync(deadBackendScript); } catch { /* best effort */ }
@@ -3782,6 +3902,58 @@ async function run() {
     }
     try { fs.unlinkSync(fakeBin); } catch { /* best effort */ }
     try { fs.unlinkSync(fakePidFile); } catch { /* best effort */ }
+
+    // --- a model name the backend publishes as something other than a string ---------------------------
+    // `name: m.name || m.id` copied the value unvalidated: a number reached the warm-cache body as a number and an
+    // object as an object, while the cold path coerced the same entry through the response schema. The listing then
+    // answered with two different shapes depending only on cache warmth, and the warm one broke the documented
+    // `{id,name,object,owned_by}` item.
+    const oddStubPort = GATEWAY_PORT + 33;
+    const oddStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(oddStubPort), STUB_ODD_MODEL_NAMES: '1' }
+    });
+    children.push(oddStub);
+    oddStub.stdout.on('data', () => {});
+    oddStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${oddStubPort}/health`);
+    const oddGatewayPort = GATEWAY_PORT + 34;
+    const oddGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(oddGatewayPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${oddStubPort}`,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(oddGateway);
+    oddGateway.stdout.on('data', () => {});
+    oddGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${oddGatewayPort}/health`);
+    const oddListing = await fetch(`http://127.0.0.1:${oddGatewayPort}/v1/models`, {
+        headers: { authorization: `Bearer ${API_KEY}` }
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }));
+    const oddItems = Array.isArray(oddListing.json?.data) ? oddListing.json.data : [];
+    check('a model whose name is not a string is still listed with a string name',
+        oddListing.status === 200 && oddItems.length === 3 &&
+        oddItems.every((model) => typeof model.name === 'string' && model.name !== '') &&
+        oddItems.find((model) => model.id === 'opencode/odd-name')?.name === 'odd-name',
+        JSON.stringify(oddItems.map((model) => [model.id, model.name])).slice(0, 200));
+    // The same listing again, served from the warm cache (the body built when the cache was filled) rather than through
+    // the response schema: the two paths must not disagree.
+    const oddCached = await fetch(`http://127.0.0.1:${oddGatewayPort}/v1/models`, {
+        headers: { authorization: `Bearer ${API_KEY}` }
+    }).then((response) => response.json().catch(() => null));
+    check('the cached listing keeps the same string names',
+        Array.isArray(oddCached?.data) && oddCached.data.length === oddItems.length &&
+        JSON.stringify(oddCached.data) === JSON.stringify(oddItems),
+        JSON.stringify(oddCached?.data ?? null).slice(0, 200));
+    stopGateway(oddGateway);
+    await waitForExit(oddGateway);
+    stop(oddStub);
+    await waitForExit(oddStub);
 
     // --- a backend that rejects session creation --------------------------------------------------------
     // An incompatible backend (a version whose API moved, a proxy in front of it) answers /health but refuses
@@ -5499,8 +5671,13 @@ async function run() {
             blankEnvOut.includes("unknown key 'APIKEY' (did you mean 'API_KEY'?)") &&
             blankEnvOut.includes("unknown key '__proto__'"),
             blankEnvOut.split('\n').filter((line) => line.includes('unknown key')).join(' | ').slice(0, 200));
-        check('an unknown config.json key is never merged into a prototype',
-            ({}).polluted === undefined && fileKeyStatus === 200, `polluted=${({}).polluted}`);
+        // The guard against a prototype being polluted by a config.json key is real, but this process cannot observe
+        // it: `({}).polluted` is this suite's own object, always clean, so the assertion was true whatever the
+        // gateway did. What is observable from here is that a file carrying both keys is still read - the keys it
+        // knows are applied (the file's API key answers) and the ones it does not are reported by the check above.
+        check('a config.json carrying __proto__ does not stop the file being read',
+            fileKeyStatus === 200 && blankEnvOut.includes("unknown key '__proto__'"),
+            `fileKey=${fileKeyStatus}`);
         stopGateway(blankEnvGateway);
         await waitForExit(blankEnvGateway);
     } finally {
@@ -5974,6 +6151,10 @@ if (process.platform !== 'win32') {
     stop(slowCreateStub);
     await waitForExit(slowCreateStub);
     removeTempDir(stubbornDir);
+    // The POSIX-only block ends here: everything below runs on every platform. The brace used to close after the
+    // closed-log-pipe section, so on Windows the two "a closed … pipe" checks were unreachable dead code - and no
+    // `skip()` said so, which the rule at the top of this file forbids.
+}
 
 // --- a closed log reader does not take the gateway down ---------------------------------------------------
 // `node index.js | head -3`, a log shipper that restarts, `docker logs` closing mid-write: the next write emits EPIPE
@@ -6041,7 +6222,6 @@ stopGateway(pipeGateway);
 await waitForExit(pipeGateway);
 stop(pipeStub);
 await waitForExit(pipeStub);
-}
 
 // --- a crash leaves a crash status behind ---------------------------------------------------------------
 // An uncaught exception goes through the graceful shutdown path, which ended in `process.exit(0)`: a supervisor
@@ -6084,7 +6264,11 @@ await waitForExit(pipeStub);
     try { fs.unlinkSync(crashModule); } catch { /* best effort */ }
 }
 
-const TIMEOUT_MS = 120000;
+// The suite's own watchdog. 120 s was below what a healthy run needs on a slow host: the suite starts a dozen
+// processes and several checks wait on real timeouts (a backend that never answers, a delete that hangs, a shutdown
+// drain), so a loaded CI runner hit this ceiling and reported "smoke test exceeded 120000 ms" - a failure about the
+// ceiling rather than about the code. It only has to be shorter than the job's timeout; CI allows 15 minutes.
+const TIMEOUT_MS = 600000;
 
 try {
     await Promise.race([

@@ -20,6 +20,16 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// `package.json` declares `engines.node >= 20`, and that is the only place the requirement was written: a Node 18
+// runtime failed later and elsewhere - a missing `Promise.withResolvers()` (shimmed), then whatever else the platform
+// does not have - so the operator read a stack trace about an API instead of the one sentence that explains it. Said
+// once, by name, before anything is configured; the process then stops rather than serving traffic it cannot serve.
+const [nodeMajor] = String(process.versions.node || '').split('.').map(Number);
+if (Number.isFinite(nodeMajor) && nodeMajor < 20) {
+    logger.error(`[Config] Node ${process.versions.node} is not supported: this package requires Node 20 or newer (engines.node ">=20.0.0")`);
+    process.exit(1);
+}
+
 // Default configuration
 // LOG_LEVEL has no default declared here: when not explicitly configured, undefined is passed through and
 // startProxy supplies the fallback (default info, plus the legacy DEBUG switch interlock)

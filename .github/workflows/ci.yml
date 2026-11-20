@@ -34,6 +34,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # No step in this job talks to the remote (every git call is local), so the token is only ever a liability:
+          # left in .git/config it is readable by anything that runs in the workspace.
+          persist-credentials: false
           # Full history, because the commit-message step below judges a *range*: with the default depth of 1 the fetched
           # base (`github.event.before`, a pull request's base SHA) is a second shallow graft and
           # `git rev-list before..HEAD` answers only the tip - a two-commit push had its first subject checked by nobody.
@@ -80,6 +83,14 @@ jobs:
           # The reference is read wherever `uses:` sits on the line, not only at the start: a flow-style step
           # (`- { name: Checkout, uses: actions/checkout@v4 }`) begins with `{` and used to pass unseen.
           files=$(ls .github/workflows/*.yml .github/workflows/*.yaml .github/workflows/*/*.yml 2>/dev/null || true)
+          # An empty list means the globs matched nothing, and the loop below then checks no file and exits 0: a
+          # workflow directory that moved would have quietly stopped policing pins. `|| true` is still needed above
+          # (a partial match makes `ls` exit non-zero while printing what it found), so the emptiness is what is
+          # asserted here.
+          if [ -z "$files" ]; then
+            echo "no workflow file matched: the pin gate would check nothing"
+            exit 1
+          fi
           for file in $files; do
             [ -f "$file" ] || continue
             # A comment that explains the rule must not be read as a use of an action (`:[[:space:]]*#` is a line
@@ -153,6 +164,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing in this job pushes or fetches: the token would only sit in .git/config
+          persist-credentials: false
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -185,7 +199,7 @@ jobs:
 
       - name: Container health check
         run: |
-          docker run -d --name gateway-ci -p 8083:8083 free-opencode-api:ci
+          docker run -d --name gateway-ci -p 127.0.0.1:8083:8083 free-opencode-api:ci
           for attempt in $(seq 1 30); do
             if curl -fsS --max-time 2 --connect-timeout 1 http://127.0.0.1:8083/health >/dev/null; then
               echo "gateway answered /health after ${attempt}s"
@@ -233,7 +247,7 @@ jobs:
             > "$RUNNER_TEMP/ci-config/config.json"
           chmod 644 "$RUNNER_TEMP/ci-config/config.json"
           # PORT is -e 8084 (the file says 8086) and API_KEY is -e sk-from-env (the file says sk-from-file)
-          docker run -d --name gateway-ci-env -p 8084:8084 \
+          docker run -d --name gateway-ci-env -p 127.0.0.1:8084:8084 \
             -v "$RUNNER_TEMP/ci-config/config.json:/app/config.json:ro" \
             -e PORT=8084 -e API_KEY=sk-from-env free-opencode-api:ci
           healthy=0
@@ -263,7 +277,7 @@ jobs:
       - name: The stored config.json is used when nothing is passed in
         run: |
           docker rm -f gateway-ci-file >/dev/null 2>&1 || true
-          docker run -d --name gateway-ci-file -p 8086:8086 \
+          docker run -d --name gateway-ci-file -p 127.0.0.1:8086:8086 \
             -v "$RUNNER_TEMP/ci-config/config.json:/app/config.json:ro" free-opencode-api:ci
           for attempt in $(seq 1 60); do
             status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' gateway-ci-file)
@@ -285,7 +299,17 @@ jobs:
         run: |
           docker rm -f gateway-ci-fresh >/dev/null 2>&1 || true
           docker run -d --name gateway-ci-fresh free-opencode-api:ci
-          sleep 2
+          # Wait for the entrypoint to write /app/config.json instead of guessing: `sleep 2` is a race against a
+          # container start (image pull-less but still a fresh overlay), and a slow runner answered the `stat` with
+          # "No such file or directory" - a failure about a step that had not run yet.
+          for attempt in $(seq 1 60); do
+            if docker exec gateway-ci-fresh test -f /app/config.json; then
+              echo "config.json written after ${attempt}s"
+              break
+            fi
+            sleep 1
+          done
+          docker exec gateway-ci-fresh test -f /app/config.json
           mode=$(docker exec gateway-ci-fresh stat -c '%a' /app/config.json)
           echo "mode of /app/config.json inside the container -> $mode"
           test "$mode" = "600"
@@ -312,7 +336,7 @@ jobs:
       # static model, so a 10 s curl timeout raced it and failed with exit 28 on a container that was about to answer.
       - name: Bundled CLI exposes the session API
         run: |
-          docker run -d --name cli-session-check -p 4599:4599 -e OPENCODE_SERVER_PASSWORD=ci-check-password \
+          docker run -d --name cli-session-check -p 127.0.0.1:4599:4599 -e OPENCODE_SERVER_PASSWORD=ci-check-password \
             --entrypoint opencode free-opencode-api:ci serve --port 4599 --hostname 0.0.0.0
           for attempt in $(seq 1 60); do
             if body=$(curl -fsS --max-time 3 --connect-timeout 1 -u opencode:ci-check-password -X POST \

@@ -1,3 +1,6 @@
+// First import, ahead of `@opencode/client`: the shim it installs is what the client's SSE subscription needs on
+// Node 20 (see `src/polyfills.js`).
+import './polyfills.js';
 import Fastify from 'fastify';
 import { spawn } from 'child_process';
 import { OpenCode } from '@opencode/client';

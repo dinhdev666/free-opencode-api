@@ -25,7 +25,9 @@ import {
     upstreamErrorStatus, upstreamFailureReason
 } from './upstream.js';
 import { closeSocketAfterFlush } from './socket.js';
-import { normalizeBackendUrl, normalizeBindHost, isLoopbackHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
+import {
+    normalizeBackendUrl, normalizeBindHost, isLoopbackHost, isUsableBindHost, resolveOpencodePath, isShellUnsafePath
+} from './env.js';
 import { DEFAULT_API_KEY, resolveApiKey } from './api-key.js';
 import { backendAuthorizationHeader, resolveBackendAuth, resolveBackendPassword } from './backend-auth.js';
 import {
@@ -39,7 +41,7 @@ import { parseBoolean, readFlag } from './options.js';
 export { DEFAULT_API_KEY, resolveApiKey } from './api-key.js';
 export { backendAuthorizationHeader, resolveBackendAuth, resolveBackendPassword } from './backend-auth.js';
 export { clientFacingText, handlerFailureMessage } from './errors.js';
-export { normalizeBackendUrl, normalizeBindHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
+export { normalizeBackendUrl, normalizeBindHost, isUsableBindHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
 export { parseBoolean, readFlag } from './options.js';
 export { DEFAULT_REQUEST_TIMEOUT_MS, resolveRequestTimeoutMs } from './settings.js';
 export { echoedValue, jsonTypeName, loggableConfigValue, loggableModelId, loggableUpstreamText, loggableUrl,
@@ -4164,8 +4166,16 @@ async function ensureBackend(config, options = {}) {
             };
 
             // Backend listen address: OPENCODE_BIND_HOST (default 127.0.0.1; set to 0.0.0.0 inside Docker so port 4097
-            // can be exposed)
-            const bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
+            // can be exposed). The value is an argument of the child, which `useShell` above may hand to a shell as one
+            // concatenated command line: only a host literal is passed through, and anything else falls back to loopback
+            // with a note naming it - the safe direction, because a value the gateway cannot quote must never widen the
+            // bind the operator asked for. (`0.0.0.0 & curl …` ran the second command as this process's user.)
+            let bindHost = OPENCODE_BIND_HOST || '127.0.0.1';
+            if (!isUsableBindHost(bindHost)) {
+                logger.warn(`[Config] OPENCODE_BIND_HOST='${loggableConfigValue(bindHost)}' is not a usable bind address ` +
+                    '(a host name, an IPv4 address or an IPv6 literal); using 127.0.0.1 instead');
+                bindHost = '127.0.0.1';
+            }
             logger.info(`[Proxy] Starting OpenCode backend: --port ${loggableConfigValue(port)} --hostname ${loggableConfigValue(bindHost)}`);
             state.process = spawn(spawnTarget, ['serve', '--port', port, '--hostname', bindHost], spawnOptions);
 

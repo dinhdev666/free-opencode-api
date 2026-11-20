@@ -885,7 +885,14 @@ function createApp(config) {
         routerOptions: { ignoreTrailingSlash: true, onBadUrl: badUrlHandler },
         trustProxy: false,
         // Replaces Fastify's default handler for requests the HTTP parser rejects (see clientErrorHandler)
-        clientErrorHandler
+        clientErrorHandler,
+        // A request with no `Host` header is rejected by Node's own parser before Fastify sees it, and that answer was
+        // the one rejection that did not look like the others: a bare `400` with no OpenAI envelope, no CORS headers, no
+        // `X-Request-Id` and no log line, while every other parse error got all four. Letting the request reach the
+        // router makes it an ordinary request - `/v1/models` is refused by the auth hook, an unknown path by the 404
+        // envelope, and both are logged like everything else. Node >= 24 honours the option; older runtimes ignore an
+        // unknown `createServer` option, so their behaviour is unchanged.
+        serverFactory: (handler) => http.createServer({ requireHostHeader: false }, handler)
     });
 
     // Fastify parses `application/json` (and `text/plain` as an opaque string the handler reads as JSON), but a body

@@ -56,18 +56,27 @@ jobs:
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
         run: |
-          result=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
-            --jq '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | length')
-          total=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --jq '.total_count')
+          # This job's own check run is on the commit as well, and while it runs it has no conclusion at all - so
+          # counting every non-green run counted this one and failed every tag, including one whose CI was entirely
+          # green. Evidence about the commit has to come from runs that finished, and never from this run.
+          own="$GITHUB_RUN_ID"
+          runs=$(gh api --paginate "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+            --jq '.check_runs[]
+                  | select(.status == "completed")
+                  | select((.html_url // "") | contains("/runs/'"$own"'/") | not)
+                  | [.name, (.conclusion // "")] | @tsv')
+          total=$(printf '%s\n' "$runs" | sed '/^$/d' | wc -l | tr -d ' ')
           if [ "$total" = "0" ]; then
-            echo "commit $SHA has no check runs: let CI run on main before tagging it"
+            echo "commit $SHA has no completed check runs from CI: let CI run on main before tagging it"
             exit 1
           fi
-          if [ "$result" != "0" ]; then
-            echo "$result check run(s) on commit $SHA did not succeed; fix main and tag a green commit"
+          failed=$(printf '%s\n' "$runs" | awk -F'\t' '$2 != "success" && $2 != "skipped" && $2 != "neutral" { print "  " $1 " (" $2 ")" }')
+          if [ -n "$failed" ]; then
+            echo "check run(s) on commit $SHA did not succeed; fix main and tag a green commit:"
+            printf '%s\n' "$failed"
             exit 1
           fi
-          echo "commit $SHA has $total check run(s), all green"
+          echo "commit $SHA has $total completed check run(s), all green"
 
       - name: Verify the tag matches package.json
         run: |

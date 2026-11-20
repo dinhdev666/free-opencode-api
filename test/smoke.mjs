@@ -12,8 +12,8 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import {
-    clientFacingText, handlerFailureMessage, parseBoolean, resolveBackendAuth, resolveJailParent, resolveRequestTimeoutMs,
-    timeoutMessage
+    clientFacingText, handlerFailureMessage, isShellUnsafePath, isUsableBindHost, parseBoolean, resolveBackendAuth,
+    resolveBackendPassword, resolveJailParent, resolveRequestTimeoutMs, timeoutMessage, upstreamErrorStatus
 } from '../src/proxy.js';
 import { readConfigFile, findUnknownKeys, envOrFile, CONFIG_FILE_KEYS } from '../src/config.js';
 import {
@@ -25,6 +25,10 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// This file reads itself for two invariants that live in its own text: the derived ports it must find free before it
+// starts (below) and the session.create call sites it must not let drift apart. Reading a file that is already loaded
+// is cheap and keeps the list from being repeated by hand.
+const suiteSource = fs.readFileSync(path.join(ROOT, 'test', 'smoke.mjs'), 'utf8');
 const STUB_PORT = Number(process.env.SMOKE_STUB_PORT || 4199);
 const GATEWAY_PORT = Number(process.env.SMOKE_PORT || 8199);
 // Kept out of the `GATEWAY_PORT + n` sequence: that one is already dense, and this instance belongs to its own block
@@ -639,6 +643,66 @@ async function run() {
         clientFacingText('a sentence with nothing to mask') === 'a sentence with nothing to mask',
         clientFacingText('a sentence with nothing to mask'));
 
+    // A 2.x client throws a tagged error that carries **no** status, so `upstreamErrorStatus()` is the only thing that
+    // can answer `404` for a `SessionNotFoundError` - it is what makes the session message name the upstream status
+    // and the "a 1.x CLI has no /api route" warning reachable. An unknown tag must stay unmapped rather than invent a
+    // status, and a tag of `constructor`/`toString`/`__proto__` must not read an inherited member of the map: `_tag` is
+    // backend-controlled text.
+    const tagStatuses = [
+        ['SessionNotFoundError', 404], ['NotFoundError', 404], ['LocationNotFoundError', 404],
+        ['SessionArchivedError', 410], ['UnauthorizedError', 401], ['InvalidRequestError', 400],
+        ['InvalidPayloadError', 400], ['ConflictError', 409], ['ServiceUnavailableError', 503]
+    ];
+    const tagResults = tagStatuses.map(([tag, expected]) => [tag, upstreamErrorStatus({ _tag: tag }), expected]);
+    check('every documented 2.x error tag maps back onto the status the server sent',
+        tagResults.every(([, actual, expected]) => actual === expected),
+        JSON.stringify(tagResults.filter(([, actual, expected]) => actual !== expected)));
+    const inheritedTags = ['constructor', 'toString', '__proto__', 'SomethingNew', '', 42];
+    check('an unknown or inherited error tag maps to no status at all',
+        inheritedTags.every((tag) => upstreamErrorStatus({ _tag: tag }) === null),
+        JSON.stringify(inheritedTags.map((tag) => `${String(tag)}=${upstreamErrorStatus({ _tag: tag })}`)));
+    // A wrapper that carries a status of its own is more precise than a tag guess from the error it wraps, which is the
+    // case `errorCauseChain()` exists for: the tag is read first *within one link*, so the status has to come from a
+    // different link of the chain to win.
+    check('a status on the wrapper wins over the tag of the error it wraps',
+        upstreamErrorStatus({ status: 503, cause: { _tag: 'SessionNotFoundError' } }) === 503,
+        String(upstreamErrorStatus({ status: 503, cause: { _tag: 'SessionNotFoundError' } })));
+
+    // `OPENCODE_PATH` and `OPENCODE_BIND_HOST` are arguments of a child that may be started through a shell, which
+    // concatenates them into one command line instead of quoting them. Both guards are pure functions, so they are
+    // asserted here rather than through a spawn that would prove the same thing more slowly.
+    const shellSafePaths = [process.execPath, '/usr/bin/opencode', 'opencode'];
+    check('a program path with no quoting hazard is handed over as it is',
+        shellSafePaths.every((value) => isShellUnsafePath(value) === false),
+        JSON.stringify(shellSafePaths.filter((value) => isShellUnsafePath(value) !== false)));
+    const shellUnsafePaths = ['opencode" ; id ; echo "', 'opencode$(id)', 'opencode`id`', 'opencode\nname'];
+    check('a program path that would break out of its quotes is refused',
+        shellUnsafePaths.every((value) => isShellUnsafePath(value) === true),
+        JSON.stringify(shellUnsafePaths.filter((value) => isShellUnsafePath(value) !== true)));
+    const usableBindHosts = ['127.0.0.1', '0.0.0.0', '::1', '[::]', 'host.example', '10.0.0.5'];
+    check('a bind host that is an address or a name is accepted',
+        usableBindHosts.every((value) => isUsableBindHost(value) === true),
+        JSON.stringify(usableBindHosts.filter((value) => isUsableBindHost(value) !== true)));
+    const unusableBindHosts = ['127.0.0.1; id', '$(id)', '`id`', 'a b', 'host\nname', ''];
+    check('a bind host that would reach the shell as more than an argument is refused',
+        unusableBindHosts.every((value) => isUsableBindHost(value) === false),
+        JSON.stringify(unusableBindHosts.filter((value) => isUsableBindHost(value) !== false)));
+
+    // The backend's own password: generated per process unless one is configured, and `generate: false` is what lets a
+    // caller that has to match a spawned child compute the same value without inventing a second one.
+    const generatedPassword = resolveBackendPassword();
+    const suppressedPassword = resolveBackendPassword({ configured: '', generate: false });
+    const pinnedPassword = resolveBackendPassword({ configured: '  pinned-value  ' });
+    check('a missing backend password is generated for the child, never left blank',
+        generatedPassword.generated === true && generatedPassword.password.length >= 40,
+        `${generatedPassword.generated}, ${generatedPassword.password.length} chars`);
+    check('generate:false suppresses the password instead of inventing one',
+        suppressedPassword.generated === false && suppressedPassword.password === '',
+        JSON.stringify({ generated: suppressedPassword.generated, password: suppressedPassword.password }));
+    check('a configured backend password is trimmed and used as it is',
+        pinnedPassword.generated === false && pinnedPassword.password === 'pinned-value',
+        JSON.stringify({ generated: pinnedPassword.generated, password: pinnedPassword.password }));
+
     // A header name is whatever the client sends, and the match is on the *shape* of the name - so a camelCase
     // spelling (`x-apiKey`, `xAuthToken`) was compared in lower case nowhere and dumped in clear.
     const camelHeaders = maskHeaders({ 'x-apiKey': 'secret-value', 'xAuthToken': 'another-secret', 'content-type': 'application/json' });
@@ -1022,6 +1086,21 @@ async function run() {
 
     await assertPortFree(STUB_PORT, 'stub');
     await assertPortFree(GATEWAY_PORT, 'gateway');
+    // Every other port the suite uses is derived from GATEWAY_PORT, and only the two above were ever checked: a
+    // leftover process on a derived one made a section talk to a foreign server instead of its own gateway, which
+    // surfaced as an unrelated assertion failing far from the port that caused it (a 1 MB backend error answered `200`
+    // by whatever held that port). The offsets are read from this file rather than repeated here, so a section that
+    // derives a new one is covered without editing a list.
+    const derivedOffsets = new Set();
+    for (const match of suiteSource.matchAll(/GATEWAY_PORT \+ (\d+)/g)) derivedOffsets.add(Number(match[1]));
+    // The one derivation that is not a literal offset (`GATEWAY_PORT + 200 + (process.pid % 20)`), expanded to the
+    // twenty ports it can name
+    for (let offset = 200; offset < 220; offset += 1) derivedOffsets.add(offset);
+    for (const offset of [...derivedOffsets].sort((a, b) => a - b)) {
+        await assertPortFree(GATEWAY_PORT + offset, 'derived');
+    }
+    check('every port the suite derives from SMOKE_PORT is free', derivedOffsets.size > 0,
+        `${derivedOffsets.size} derived ports checked`);
 
     const stub = spawn(process.execPath, [path.join(ROOT, 'test', 'stub-opencode.mjs')], {
         cwd: ROOT,
@@ -2047,8 +2126,13 @@ async function run() {
         .filter((chunk) => chunk?.choices?.[0]?.delta?.content)
         .map((chunk) => chunk.choices[0].delta.content)
         .join('');
-    check('a rewritten (shorter) part snapshot is forwarded, not swallowed',
-        shrinkContent.startsWith('alpha beta gamma') && shrinkContent.endsWith('alpha beta'),
+    // The rewrite is a *prefix* of what the deltas already delivered, so there is nothing left to forward: writing it
+    // again appended the answer a second time (`alpha beta gammaalpha beta`, for a backend that rewrote `alpha beta
+    // gamma` to `alpha beta`). A stream cannot take bytes back, so it keeps the longest text it sent - the completion
+    // that answers `alpha beta` without `stream` is the same backend's final word, and the stream simply never saw the
+    // rewrite as a correction it could apply.
+    check('a rewritten (shorter) part snapshot is not re-sent after its deltas',
+        shrinkContent === 'alpha beta gamma',
         JSON.stringify(shrinkContent));
 
     // Part updates that carry a `delta` *and* the part's cumulative text, followed by a closing update with no delta.
@@ -2278,10 +2362,15 @@ async function run() {
             return null;
         }
     })();
+    // The sentence is the provider's own, from the same helper both modes call. It used to be prefixed with the
+    // thrown error's `name` here only, so one failed completion read `ProviderError: Provider Error: …` as a stream
+    // and `Provider Error: …` as JSON - and that prefix is a value the wire chose, which put backend-controlled text
+    // in a public message.
     check('a streaming provider error carries the server_error envelope',
         streamedFailureError?.error?.type === 'server_error' &&
-        /ProviderError/.test(streamedFailureError?.error?.message || ''),
-        streamedFailure.text.slice(0, 160));
+        streamedFailureError?.error?.message === failed.json?.error?.message &&
+        !/^\w*Error:/.test(streamedFailureError?.error?.message || ''),
+        `${streamedFailure.text.slice(0, 160)} / ${failed.text.slice(0, 160)}`);
 
     // A provider error routinely quotes the credential it rejected, and its message has no size of its own. Masking
     // used to be a property of the streaming path only: the non-streaming body copied the provider's text verbatim, and
@@ -4169,7 +4258,8 @@ async function run() {
     const bigErrorLine = bigErrorOutput.split('\n').find((line) => line.includes('[Proxy] API Error')) || '';
     check('a backend error body of 1 MB is summarised, not copied',
         bigErrorAnswer.status === 502 && bigErrorLine.length > 0 && bigErrorLine.length < 1200,
-        `status ${bigErrorAnswer.status}, summary line ${bigErrorLine.length} chars`);
+        `status ${bigErrorAnswer.status}, summary line ${bigErrorLine.length} chars, gateway log ${bigErrorOutput.length} chars, `
+        + `answer ${String(bigErrorAnswer.json?.error?.message || '').slice(0, 120)}`);
     check('the summarised backend body keeps the shape of the payload',
         bigErrorLine.includes('"bodySummary"') && bigErrorLine.includes('…'),
         bigErrorLine.slice(0, 200));

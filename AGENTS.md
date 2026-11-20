@@ -94,7 +94,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses) for debug logging. |
 | `src/polyfills.js` | Node 20 shims, imported for its side effect first thing in `src/proxy.js`: `Promise.withResolvers()` is Node 22+, and `@opencode/client`'s SSE subscription calls it unconditionally, so without it every stream silently fell back to polling (one delta per answer). A no-op on a runtime that has the API. |
 | `config.json.example` | Template for `config.json` (not committed). |
-| `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README. |
+| `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README (`docker/README.md`, kept under 25 000 characters). |
 | `test/stub-opencode.mjs` | Minimal stand-in for `opencode serve` (the `/api/*` routes the client drives: info/health, models, sessions, messages, SSE events) used by the smoke suite. |
 | `test/smoke.mjs` | End-to-end contract checks: boots stub and gateway, asserts status codes, envelopes, SSE frames and clean shutdown. |
 | `test/check-syntax.mjs` | Walks the repository and runs `node --check` on every `.js`/`.mjs` file, so a new file is checked without editing a list. |
@@ -541,6 +541,13 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
 
 ## Working rules for code changes
 
+- **`docker/README.md` stays under 25 000 characters.** It is the container's only user-facing document, so it is read
+  on Docker Hub and in the repository alike; past that size it stops being an overview and becomes a second copy of
+  this file and the main README, which then drift apart. When you add a section, remove or shorten one: the precedence
+  rules and the configuration table are the parts people actually need, while the log examples and the compatibility-fix
+  narratives are the parts that can lose detail. Check with `node -e "console.log(require('fs').readFileSync('docker/README.md','utf8').length)"`
+  before finishing, and keep a real margin below the cap (the rewrite that introduced this rule landed at about 24 200
+  characters, not at 24 999).
 - **Keep the hot path thin.** No new per-request allocations or object rebuilds. Debug-only work must be guarded by
   `logger.isEnabled('debug')`; responses with compiled schemas stay schema-serialised; SSE envelopes stay
   pre-serialised per stream.

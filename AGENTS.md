@@ -133,7 +133,7 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway (522 contract assertions on Linux; fewer on Windows, where the POSIX-only checks are skipped)
+pnpm test                        # smoke suite: stub backend + gateway (533 contract assertions on Linux; fewer on Windows, where the POSIX-only checks are skipped)
 sh -n docker/docker-entrypoint.sh
 ```
 

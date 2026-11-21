@@ -32,18 +32,34 @@ export const clientFacingText = (value) => {
 };
 
 /**
+ * What a `500` says when the handler was rejected with something that carries no message at all. Declared before
+ * `handlerFailureMessage()` reads it, so the sentence cannot be a `ReferenceError` from a `const` read ahead of its
+ * declaration.
+ * @type {string}
+ */
+export const HANDLER_FAILURE_FALLBACK = 'the request handler failed';
+
+/**
  * The sentence a failed completion shows a client and logs, read from whatever the route handler caught.
  *
  * `error.message` is the usual shape, but the handler can also be rejected with something else - a thrown string, an
- * object without a `message`, a library that throws `undefined` - and reading `.message` off that put `undefined` in
- * the body of a `500`. Masked by `clientFacingText()` when there is anything to mask, and otherwise kept exactly as it
- * arrived: an empty message stays empty instead of becoming the word `Error`, which would invent a cause.
+ * object without a `message`, a library that throws `undefined`. `String(error)` named two of those shapes instead of
+ * describing them: `undefined` answered the literal `"undefined"`, `null` answered `"null"` and `{}` answered
+ * `"[object Object]"`, and each was then printed as the cause of a `500` in a client body and in the log line.
+ * Anything that is not a message - including an **empty** one - is therefore described
+ * (`HANDLER_FAILURE_FALLBACK`) rather than stringified: a body whose `message` is `""` sends the reader nowhere, and
+ * an invented `Error` would name a cause that does not exist.
  * @param {*} error whatever was thrown or rejected with
  * @returns {string} the sentence to send and log
  */
 export const handlerFailureMessage = (error) => {
-    const raw = typeof error?.message === 'string' ? error.message : String(error);
-    return clientFacingText(raw) || raw;
+    // A thrown string is a message the author wrote, so it is kept; anything else that is not an object with a string
+    // `message` (`undefined`, `null`, `{ code: 'EPIPE' }`) is described instead of stringified.
+    const raw = typeof error?.message === 'string'
+        ? error.message
+        : (typeof error === 'string' ? error : '');
+    const masked = clientFacingText(raw);
+    return masked || raw || HANDLER_FAILURE_FALLBACK;
 };
 
 /**

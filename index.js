@@ -251,7 +251,12 @@ logger.info(`  - Bind Host for OpenCode backend: ${loggableConfigValue(finalConf
 logger.info(`  - OpenCode Path: ${loggableConfigValue(finalConfig.OPENCODE_PATH)}`);
 logger.info(`  - API Key: ${finalConfig.API_KEY === DEFAULT_API_KEY ? `default (${DEFAULT_API_KEY})` : 'custom'} - authentication always enforced`);
 logger.info(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
-logger.info(`  - Isolated HOME for OpenCode: ${finalConfig.USE_ISOLATED_HOME ? 'Yes' : 'No'}`);
+// The option is not honoured on Windows: `spawnBackend()` runs the child with the real user profile there (the 2.x CLI
+// resolves its storage paths against it, and a fake home broke them), so printing `Yes` for a configured
+// `USE_ISOLATED_HOME=true` reported an isolation that was not in force. The value is still shown, marked as unused.
+logger.info(`  - Isolated HOME for OpenCode: ${finalConfig.USE_ISOLATED_HOME
+    ? (process.platform === 'win32' ? 'Yes (ignored on Windows)' : 'Yes')
+    : 'No'}`);
 logger.info(`  - Log Level (requested): ${loggableConfigValue(finalConfig.LOG_LEVEL || 'info (default)')}`);
 const queueLimits = getQueueLimits(finalConfig);
 logger.info(`  - Concurrency: ${queueLimits.concurrency} completion(s) processed in parallel`);

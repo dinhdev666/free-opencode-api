@@ -110,10 +110,23 @@ if [ ! -f "$CONFIG" ]; then
         // rather than by a list of names, the same rule as isLoopbackHost() in src/proxy.js.
         const usable = (value) => String(value).replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 128);
         const loopback = ["127.0.0.1", "::1", "localhost", ""].includes(String(cfg.BIND_HOST).trim().toLowerCase());
-        if (cfg.API_KEY === "sk-dummy-123" && !loopback) {
-            console.log("[entrypoint] WARNING: API_KEY is the built-in default and BIND_HOST is " + usable(cfg.BIND_HOST)
-                + " (every interface), so anyone who can reach port " + usable(cfg.PORT)
-                + " can use the gateway. Set API_KEY to a private value, and publish the port only on a trusted network.");
+        if (!loopback) {
+            if (cfg.API_KEY === "sk-dummy-123") {
+                console.log("[entrypoint] WARNING: API_KEY is the built-in default and BIND_HOST is " + usable(cfg.BIND_HOST)
+                    + " (every interface), so anyone who can reach port " + usable(cfg.PORT)
+                    + " can use the gateway. Set API_KEY to a private value, and publish the port only on a trusted network.");
+            } else {
+                // A private key closes the built-in-key hole, and it also silenced the only line that said the gateway is
+                // reachable on every interface - which is the default bind of this image, and the half an operator
+                // decides with `-p`. index.js prints nothing for this combination either, so without this a first boot
+                // with a private key said nothing at all about what it published. No apostrophe in this block: it is a
+                // single-quoted shell string, so one would end the Node script mid-comment (dash reported it as
+                // `Syntax error: word unexpected` at this line, which points at the comment, not at the code).
+                console.log("[entrypoint] NOTE: BIND_HOST is " + usable(cfg.BIND_HOST)
+                    + " (every interface), so the gateway is reachable on port " + usable(cfg.PORT)
+                    + " from outside the container; API_KEY is the only thing guarding it, so publish the port only on a"
+                    + " trusted network (or set BIND_HOST=127.0.0.1 and reach it through a proxy).");
+            }
         }
     ' /app/src/logger.js
 else

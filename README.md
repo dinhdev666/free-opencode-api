@@ -91,8 +91,8 @@ completion succeeds — and when one fails:
   up, and every completion failed.
 - **A prompt answers with the user inbox item, not the answer.** `POST /api/session/{id}/prompt` returns the message it
   just enqueued; the assistant's answer is written afterwards and read from the SSE event stream, or by polling
-  `GET /api/session/{id}/message?order=asc`. The message list is **newest first** unless `order=asc` is asked for
-  (`cursor` cannot be combined with `order`), and an assistant message is flat —
+  `GET /api/session/{id}/message?type=assistant&order=desc&limit=1`. The message list is **newest first** unless
+  `order=asc` is asked for (`cursor` cannot be combined with `order`), and an assistant message is flat —
   `{id, type:'assistant', content:[{type:'text'|'reasoning'|'tool', text}], finish, rawFinish, time, cost, tokens, error}`
   — where 1.x nested those fields under `info` and kept the fragments in `parts`.
 - **A delete answers `204` with an empty body**, and a second delete answers
@@ -174,7 +174,10 @@ summary, CORS headers, bearer auth) and no plugin-level middleware chain. Additi
   instead of parking the slot forever, and no single backend call is left without a deadline.
 - **The answer is read where 2.x writes it** — `POST /api/session/{id}/prompt` answers with the *user inbox item* it
   just enqueued, so the assistant's answer is read from the SSE event stream (streaming mode) or by polling
-  `GET /api/session/{id}/message?order=asc` (non-streaming mode) rather than out of the prompt response. A finished
+  `GET /api/session/{id}/message?type=assistant&order=desc&limit=1` (non-streaming mode: the newest assistant message is
+  the one just produced, where `order=asc` with no `type` returned the oldest step of the page — a stale one in any
+  session longer than the page, and the user's own message when the page held one) rather than out of the prompt
+  response. A finished
   message in the prompt response is still served directly when one arrives — the 1.x shape is recognised on purpose, so
   a proxy translating the two APIs keeps the round trip it saves — but a 2.x server never spends a call on an answer it
   already holds, and a message that is still being written keeps the poll loop, so a partial answer is never served.
@@ -336,7 +339,7 @@ while the gateway ran the default you thought you had replaced:
 | `OPENCODE_BIND_HOST` | `127.0.0.1` | Listen address of the OpenCode backend. Keep it on loopback: the 2.x server authenticates its `/api/*` routes with `OPENCODE_SERVER_PASSWORD`, but publishing the port still exposes the backend (and its web UI) outside the gateway, so it bypasses the gateway's key |
 | `OPENCODE_PATH` | `opencode` | Path to the `opencode` executable; auto-detected in common locations when left as a bare name. A path that names a file is resolved against the gateway's working directory before it is used, so `OPENCODE_PATH=./bin/opencode` runs the file you configured rather than whatever of that name `PATH` holds |
 | `DISABLE_TOOLS` | `false` | Disable OpenCode tool calls so models cannot run commands or modify files. On the 2.x server it is a session **permission ruleset** passed at session creation: every action the default agent can use is denied (`edit`, `shell`, `write`, `grep`, `webfetch`, `websearch`, `subagent`, `external_directory`, `question`, `skill`, `task`, `todowrite`, `todoread`, `lsp`, `browser`, `patch`, `multiedit`, `invalid`), then `*` catches an action a newer server grows, and the two read-only tools `read` and `glob` are re-allowed last as the single exception — denying either of them hangs prompt requests with the free zen models. With a custom `API_KEY` and tools enabled, a model-directed tool can read that key from the same host, so startup warns (`[Security]`) and names this switch; `true` is the recommended setting whenever the gateway is exposed. Booleans accept `true`/`false` (JSON) or `1`/`0`, `yes`/`no`, `y`/`n`, `on`/`off` (environment or string); a value none of those match is reported in a `[Config]` warning together with the value actually used (`DISABLE_TOOLS='maybe' is not a boolean …, using false`), for `DISABLE_TOOLS`, `USE_ISOLATED_HOME` and `DEBUG` alike |
-| `USE_ISOLATED_HOME` | `false` | Run the backend with a throwaway `HOME` instead of the real one, so it cannot pick up your machine's OpenCode state. `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`, `TMPDIR`, `TMP` and `TEMP` point inside the same throwaway directory, because the CLI resolves them before `HOME` and an inherited value would otherwise send it back to your real store, config and cache |
+| `USE_ISOLATED_HOME` | `false` | Run the backend with a throwaway `HOME` instead of the real one, so it cannot pick up your machine's OpenCode state. `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`, `TMPDIR`, `TMP` and `TEMP` point inside the same throwaway directory, because the CLI resolves them before `HOME` and an inherited value would otherwise send it back to your real store, config and cache. **Not honoured on Windows**: `spawnBackend()` gives the child the real user profile there, because the 2.x CLI resolves its storage paths against it and a synthetic home breaks them (`[Proxy] Running on Windows, using standard user home directory` in the log, and the startup summary prints `Yes (ignored on Windows)`). The child still gets its own empty working directory and `OPENCODE_PROJECT_DIR` |
 | `DEBUG` | `false` | Switch logging to `debug` **when no explicit `LOG_LEVEL` is set** (an explicit level wins and the switch is ignored with a `[Config]` warning; the environment name for the same switch is `OPENCODE_PROXY_DEBUG`, and `LOG_LEVEL=debug` is the preferred way) |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` (case-insensitive) |
 
@@ -404,7 +407,7 @@ installation right now.
 
 Fields the gateway respects: `messages` (string content, or an array of parts whose `text` is concatenated — see
 [Request bodies](#request-bodies) for the parts that are refused), `model`,
-`stream` (a boolean, or one of `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off` — hand-written clients stringify it, and a
+`stream` (a boolean, or one of `true`/`false`/`1`/`0`/`yes`/`no`/`y`/`n`/`on`/`off` — hand-written clients stringify it, and a
 misread `stream` used to answer JSON to a client that was parsing SSE), `stream_options.include_usage` (adds the
 OpenAI usage chunk — `choices: []` plus a zeroed `usage` block — as the last frame before `data: [DONE]`; the counts
 are zero for the same reason the non-streaming `usage` is) and `messages[].name` as a prompt label. Sampling

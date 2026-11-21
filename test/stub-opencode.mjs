@@ -87,6 +87,8 @@ const FAIL_TOOL_IDS = process.env.STUB_FAIL_TOOL_IDS === '1';
 void FAIL_TOOL_IDS;
 // Refuse DELETE /api/session/:id with a 500 and keep the session
 const REJECT_DELETES = process.env.STUB_REJECT_DELETES === '1';
+// Answer a session that *is* in the store with a 404, the shape a backend whose store was reset produces
+const GONE_DELETES = process.env.STUB_GONE_DELETES === '1';
 // Accept a DELETE and never answer it
 const HANG_DELETES = process.env.STUB_HANG_DELETES === '1';
 
@@ -1021,6 +1023,9 @@ const server = http.createServer(async (req, res) => {
         const id = sessionMatch[1];
         // A session that is already gone is a 404 in 2.x, which is how the gateway recognises "already deleted"
         if (!sessions.has(id)) return sendError(res, 404, 'SessionNotFoundError', `unknown session ${id}`);
+        // A 404 for a session this process still holds is the "the backend lost its store" shape: the cleanup's purpose is
+        // met either way, so the gateway must classify it as already gone rather than retry it for the whole budget.
+        if (GONE_DELETES) return sendError(res, 404, 'SessionNotFoundError', `unknown session ${id}`);
         if (REJECT_DELETES) return sendError(res, 500, 'ProviderError', 'the session store is busy');
         // Accepted and never answered: the gateway's own deadline (not this process) is what ends the cleanup, so a
         // test can prove a wedged delete is classified as a transient failure instead of holding the slot

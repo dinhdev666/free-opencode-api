@@ -43,12 +43,14 @@ function splitPathEnv() {
  * backslash is the escape for the closing quote, leaving the string unterminated. All three are refused on `win32`
  * only, because POSIX shells do not expand `%` or treat `\` specially inside quotes.
  * @param {string} value the program path
+ * @param {string} [platform] the platform whose shell rules apply; defaults to this process's, and exists so the
+ *   `win32`-only rules are asserted from a POSIX runner (CI is Linux-only, so without it that branch ran in no run)
  * @returns {boolean} true when the value must not be passed through a shell
  */
-export function isShellUnsafePath(value) {
+export function isShellUnsafePath(value, platform = process.platform) {
     const text = String(value);
     if (/["$`\u0000-\u001f\u007f]/.test(text)) return true;
-    if (process.platform === 'win32') {
+    if (platform === 'win32') {
         // `%VAR%` expansion, `^` escape, `!` delayed expansion, and a trailing backslash (escapes the closing quote).
         if (/[%^!]/.test(text)) return true;
         if (text.endsWith('\\')) return true;

@@ -93,7 +93,17 @@ export function readMilliseconds(name, fallback, fileValue) {
             note: `${name}='${shown}' is less than one millisecond, using ${fallback}`
         };
     }
-    return { value: Math.min(floored, MAX_TIMER_MS), note: null };
+    // Longer than a timer can wait: clamp, and say so. The clamp is silent in the safe direction (a shorter wait, never
+    // a timer that fires early), but `resolveRequestTimeoutMs()` names its own clamp and this module's contract is that
+    // an unusable value is named - a budget 100x the ceiling otherwise took effect as `MAX_TIMER_MS` with no `[Config]`
+    // line at all, and the operator had no way to tell the value was read.
+    if (floored > MAX_TIMER_MS) {
+        return {
+            value: MAX_TIMER_MS,
+            note: `${name}='${shown}' is above the maximum ${MAX_TIMER_MS} (the largest timer), using ${MAX_TIMER_MS}`
+        };
+    }
+    return { value: floored, note: null };
 }
 
 /**

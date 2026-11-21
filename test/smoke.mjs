@@ -12,15 +12,15 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import {
-    clientFacingText, handlerFailureMessage, isConnectionError, isConnectionRefused, isShellUnsafePath,
-    isTimeoutError, isUsableBindHost, parseBoolean, resolveBackendAuth, resolveBackendPassword, resolveJailParent,
-    resolveRequestTimeoutMs, timeoutMessage, upstreamErrorStatus
+    clientFacingText, handlerFailureMessage, HANDLER_FAILURE_FALLBACK, isConnectionError, isConnectionRefused,
+    isShellUnsafePath, isTimeoutError, isUsableBindHost, parseBoolean, resolveBackendAuth, resolveBackendPassword,
+    resolveJailParent, resolveRequestTimeoutMs, timeoutMessage, upstreamErrorStatus
 } from '../src/proxy.js';
 import { readConfigFile, findUnknownKeys, envOrFile, CONFIG_FILE_KEYS } from '../src/config.js';
 import { readMilliseconds } from '../src/settings.js';
 import {
-    createLogger, loggableError, maskBackendUrl, maskDetail, maskHeaders, maskQuotedCredentials, maskSecret,
-    maskUrlCredentials, maskUrlQuery, registerSensitiveValue, serializeDetail,
+    createLogger, loggableError, maskBackendUrl, maskDetail, maskFreeText, maskHeaders, maskQuotedCredentials,
+    maskSecret, maskUrlCredentials, maskUrlQuery, registerSensitiveValue, serializeDetail,
     MAX_SERIALIZED_LENGTH, SENSITIVE_NAME_ALTERNATIVES
 } from '../src/logger.js';
 import path from 'node:path';
@@ -670,6 +670,43 @@ async function run() {
         maskUrlCredentials('see http://user:s3cr3t@host:4097/x') === 'see http://***@host:4097/x',
         maskUrlCredentials('see http://user:s3cr3t@host:4097/x'));
 
+    // The same two rules, applied to a *sentence* by `maskFreeText()`: that chain is what a 5xx body and an error log
+    // line use, and it called only the URL rules. A pair whose name is not preceded by a query separator - a CLI flag
+    // (`opencode --api-key=…`), a header spelling (`x-api-key=…`) or a quoted `key=value` - was therefore published
+    // verbatim although the vocabulary for it already existed one function away. The free-text chain is also where the
+    // scheme-less `user:pass@host` rule has to run: `maskUrlsInText()` used to return early for a sentence carrying
+    // neither `://` nor `=`, so `connect alice:s3cr3t@proxy failed` kept its credential.
+    const freeTextMaskingCases = [
+        ['opencode --api-key=LEAKME --port 1', 'opencode --api-key=*** --port 1'],
+        ['opencode serve --token=LEAKME', 'opencode serve --token=***'],
+        ['x-api-key=LEAKME', 'x-api-key=***'],
+        ['-password=LEAKME', '-password=***'],
+        ['syntax error near "key=value" in config', 'syntax error near "key=***" in config'],
+        ['the api-key=LEAKME is wrong', 'the api-key=*** is wrong'],
+        ['connect alice:s3cr3t@proxy failed', 'connect ***@proxy failed'],
+        ['cfg #password=LEAKME', 'cfg #password=***'],
+        // Prose that only looks like a pair is left alone: a name that is not a credential, and a colon that is not
+        // userinfo. The chain rewrites a sentence only when it contains a credential *name* followed by `=`.
+        ['GET /v1/chat/completions -> 200 model=gpt-4 stream=false',
+            'GET /v1/chat/completions -> 200 model=gpt-4 stream=false'],
+        ['the model=gpt-4 and the user=bob are fine', 'the model=gpt-4 and the user=bob are fine'],
+        ['the admin: bob@example.com replied', 'the admin: bob@example.com replied'],
+        ['mailto:someone@example.com', 'mailto:someone@example.com']
+    ];
+    const freeTextResults = freeTextMaskingCases.map(([input, expected]) => [input, maskFreeText(input), expected]);
+    check('a credential pair inside a sentence is masked by the free-text chain',
+        freeTextResults.every(([, actual, expected]) => actual === expected),
+        JSON.stringify(freeTextResults.filter(([, actual, expected]) => actual !== expected)));
+    // The residual gap is deliberate and documented in `maskUrlCredentials()`: without a `://` anchor, a secret class
+    // that accepted whitespace would read `the admin: bob@example.com` as userinfo. A scheme-less credential containing
+    // a space is not reachable from anything the gateway composes - `normalizeBackendUrl()` adds the scheme before the
+    // value is quoted into a `[Config]` note, and `maskBackendUrl()` masks the userinfo whatever it holds - so the
+    // limitation is asserted here rather than silently relied on.
+    check('a scheme-less credential with a space stays a documented limitation',
+        maskFreeText('connect alice:pa ss@127.0.0.1:4097 failed') === 'connect alice:pa ss@127.0.0.1:4097 failed'
+        && maskBackendUrl('alice:pa ss@127.0.0.1:4097') === '***@127.0.0.1:4097',
+        maskFreeText('connect alice:pa ss@127.0.0.1:4097 failed'));
+
     // A value that is not a URL at all is still echoed into a response body: the `415` names the `Content-Type` the
     // client sent, and a client that sent `application/json; api_key=SECRET42` read the whole secret back out of the
     // refusal. `echoedValue()` bounds the value *and* masks it, so the pair form of a credential goes the same way as
@@ -1006,6 +1043,22 @@ async function run() {
     check('a program path that would break out of its quotes is refused',
         shellUnsafePaths.every((value) => isShellUnsafePath(value) === true),
         JSON.stringify(shellUnsafePaths.filter((value) => isShellUnsafePath(value) !== true)));
+    // The `win32` rules are a separate set: `cmd.exe` expands `%VAR%` inside double quotes and treats `^`/`!` as
+    // metacharacters, and a trailing `\` escapes the closing quote - none of which a POSIX shell does. The platform is
+    // passed explicitly so these are asserted on every runner: CI is Linux-only, and reading `process.platform` here
+    // would mean the branch no run ever executed.
+    const winOnlyUnsafe = ['C:\\opencode%PATH%.exe', 'C:\\tools^2\\opencode.exe', 'C:\\tools!x!\\opencode.exe',
+        'C:\\Program Files\\opencode\\'];
+    check('a Windows-only quoting hazard is refused by the win32 rules and allowed by the POSIX ones',
+        winOnlyUnsafe.every((value) => isShellUnsafePath(value, 'win32') === true) &&
+        winOnlyUnsafe.every((value) => isShellUnsafePath(value, 'linux') === false),
+        JSON.stringify(winOnlyUnsafe.map((value) =>
+            `${value}=win32:${isShellUnsafePath(value, 'win32')}/linux:${isShellUnsafePath(value, 'linux')}`)));
+    // A path in `C:\Program Files\...` is the ordinary spelling of an install there, so the *interior* backslashes stay
+    // accepted: refusing them would fall back to whatever `PATH` holds on every Windows box that installed it that way.
+    check('an interior backslash is not a trailing one',
+        isShellUnsafePath('C:\\Program Files\\opencode\\opencode.exe', 'win32') === false,
+        String(isShellUnsafePath('C:\\Program Files\\opencode\\opencode.exe', 'win32')));
     const usableBindHosts = ['127.0.0.1', '0.0.0.0', '::1', '[::]', 'host.example', '10.0.0.5'];
     check('a bind host that is an address or a name is accepted',
         usableBindHosts.every((value) => isUsableBindHost(value) === true),
@@ -1052,23 +1105,31 @@ async function run() {
     // is the one an error thrown inside a completion reaches. Its sentence is read by `handlerFailureMessage()`, which
     // has to hold up for whatever a rejection carries: `.message` is the usual shape, but a thrown string, an object
     // without one or a thrown `undefined` all reach the same catch, and reading `.message` off those wrote `undefined`
-    // into the body of a 500. An empty message stays empty rather than becoming the word `Error`, which would invent
-    // a cause the operator then goes looking for.
+    // into the body of a 500. `String(error)` replaced that with the same class of non-sentence: `undefined`,
+    // `null` and `[object Object]` are values, not reasons. Only a message (or a thrown string) is a sentence, and
+    // everything else - an empty message included, which sent the reader nowhere - is described.
     const handlerMessageCases = [
         [new Error('connect ECONNREFUSED http://user:secret@host:4097/session?token=abc'),
             'connect ECONNREFUSED http://***@host:4097/session?token=***'],
         [new Error('the proxy refused: Authorization: Basic b3BzOnMzY3IzdC12YWx1ZQ=='),
             'the proxy refused: Authorization: Basic ***'],
-        [new Error(''), ''],
+        [new Error(''), HANDLER_FAILURE_FALLBACK],
         ['a thrown string, not an Error', 'a thrown string, not an Error'],
-        [{ code: 'EPIPE' }, '[object Object]'],
-        [undefined, 'undefined'],
-        [null, 'null']
+        [{ code: 'EPIPE' }, HANDLER_FAILURE_FALLBACK],
+        [undefined, HANDLER_FAILURE_FALLBACK],
+        [null, HANDLER_FAILURE_FALLBACK]
     ];
     const handlerMessageResults = handlerMessageCases.map(([input, expected]) => [handlerFailureMessage(input), expected]);
     check('the sentence a failed completion carries is read from whatever was thrown, masked',
         handlerMessageResults.every(([actual, expected]) => actual === expected),
         JSON.stringify(handlerMessageResults.filter(([actual, expected]) => actual !== expected)));
+    // The sentence itself is a constant, so the fallback a body carries cannot drift away from the one the log line
+    // prints: both read this export.
+    check('a throw with no message is described rather than stringified',
+        HANDLER_FAILURE_FALLBACK === 'the request handler failed'
+        && handlerFailureMessage(undefined) === HANDLER_FAILURE_FALLBACK
+        && handlerFailureMessage({}) === HANDLER_FAILURE_FALLBACK,
+        HANDLER_FAILURE_FALLBACK);
 
     // The catch reads that sentence in its log line before it builds the body, and reading a `const` ahead of its
     // declaration is a ReferenceError: that one replaces the cause of the 500 with a bug in the catch itself, and an
@@ -2256,6 +2317,32 @@ async function run() {
     check('non-streaming completion finishes with stop',
         completion.json?.choices?.[0]?.finish_reason === 'stop',
         JSON.stringify(completion.json?.choices?.[0]?.finish_reason));
+    // The two fields an OpenAI client reads unconditionally. The message role was never asserted, so a response that
+    // dropped it still passed; `usage` is a zeroed block rather than a missing one because the upstream reports no
+    // token counts, and `usage.total_tokens` on an absent block throws inside the client.
+    check('non-streaming completion names the assistant role',
+        completion.json?.choices?.[0]?.message?.role === 'assistant',
+        JSON.stringify(completion.json?.choices?.[0]?.message?.role));
+    check('non-streaming completion carries a zeroed usage block',
+        completion.json?.usage?.prompt_tokens === 0 && completion.json?.usage?.completion_tokens === 0 &&
+        completion.json?.usage?.total_tokens === 0,
+        JSON.stringify(completion.json?.usage));
+    // `stream_options` only means something to a stream. A client that sets it unconditionally (the OpenAI SDK does when
+    // the caller passes the option) must get the JSON body it asked for, not an SSE frame stream or a 400: the option is
+    // ignored when `stream` is false, which is what the OpenAI API does with it.
+    const jsonWithUsageOption = await request('/v1/chat/completions', {
+        method: 'POST',
+        body: {
+            messages: [{ role: 'user', content: 'hi' }],
+            stream: false,
+            stream_options: { include_usage: true }
+        }
+    });
+    check('stream_options on a non-streaming body is ignored, not refused',
+        jsonWithUsageOption.response.status === 200 && jsonWithUsageOption.json?.object === 'chat.completion'
+        && !jsonWithUsageOption.text.includes('data: [DONE]')
+        && (jsonWithUsageOption.response.headers.get('content-type') || '').includes('application/json'),
+        `${jsonWithUsageOption.response.status} ${jsonWithUsageOption.response.headers.get('content-type')}`);
 
     // --- streaming completion ---------------------------------------------------------------------------
     // The stub records the query of every backend event subscription (`GET /__sessions` → `eventSubscriptionQueries`),
@@ -2276,6 +2363,19 @@ async function run() {
     check('an SSE response is revalidated instead of stored',
         (streamed.response.headers.get('cache-control') || '') === 'no-cache',
         streamed.response.headers.get('cache-control'));
+    // CORS is written on the raw response by the `onRequest` hook, and a hijacked stream leaves Fastify's reply
+    // lifecycle: a browser client that read the JSON path's `Access-Control-Allow-Origin` and then opened a stream got a
+    // response it was not allowed to read, with no error on the wire to explain it. `X-Content-Type-Options` rides the
+    // same three paths for the same reason (a browser must not re-read an SSE body as something else).
+    check('a streaming response carries the CORS and nosniff headers',
+        streamed.response.headers.get('access-control-allow-origin') === '*'
+        && streamed.response.headers.get('x-content-type-options') === 'nosniff'
+        && (streamed.response.headers.get('access-control-allow-headers') || '').includes('X-Api-Key'),
+        JSON.stringify({
+            allowOrigin: streamed.response.headers.get('access-control-allow-origin'),
+            allowHeaders: streamed.response.headers.get('access-control-allow-headers'),
+            nosniff: streamed.response.headers.get('x-content-type-options')
+        }));
 
     const subscriptionsAfter = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
     const priorSubscriptions = Array.isArray(subscriptionsBefore?.eventSubscriptionQueries)
@@ -2823,14 +2923,20 @@ async function run() {
         failed.json?.error?.type === 'server_error' && failed.json?.error?.code === 'ProviderError',
         failed.text.slice(0, 160));
     // A 502 that comes out of the top-level handler used to carry only `type: "server_error"`, so a client could tell
-    // "the backend refused the session" from "the connection died" only by reading the prose
+    // "the backend refused the session" from "the connection died" only by reading the prose. The assertion names the
+    // code of each branch it can reach (`ProviderError` here, `backend_unreachable` where the backend is killed and
+    // where a creation is refused) instead of testing `code !== undefined`, which every object without the field also
+    // satisfies - the check passed for a 502 that carried no code at all. A completion that was *served* is the other
+    // half of the same contract: no error object, not an error object with an undefined code.
     const sessionRefused = await request('/v1/chat/completions', {
         method: 'POST',
         body: { messages: [{ role: 'user', content: 'hi' }], model: 'opencode/big-pickle' }
     });
-    check('every 502 carries a code, not only the provider-error branch',
-        failed.json?.error?.code !== undefined && typeof sessionRefused.json?.error?.code !== 'object',
-        `${failed.json?.error?.code} ${JSON.stringify(sessionRefused.json?.error)?.slice(0, 120)}`);
+    check('a 502 names its branch, and a served completion carries no error object',
+        failed.json?.error?.code === 'ProviderError'
+        && sessionRefused.json?.object === 'chat.completion'
+        && sessionRefused.json?.error === undefined,
+        `${failed.json?.error?.code} / ${sessionRefused.json?.object} / ${JSON.stringify(sessionRefused.json?.error)}`);
     const afterFailure = await sessionsAfterCleanup(STUB_URL);
     check('a failed completion still deletes its session',
         afterFailure && afterFailure.live === 0, JSON.stringify(afterFailure));
@@ -3642,6 +3748,37 @@ async function run() {
         `${new Set(ids).size} distinct ids for ${ids.length} completions`);
     check('completion ids keep the OpenAI prefix', ids.every((id) => typeof id === 'string' && id.startsWith('chatcmpl-')),
         JSON.stringify(ids.slice(0, 3)));
+    // Two streaming completions in flight at once, each with a different answer. Every collector event names its
+    // session, and the collector drops any event whose `data.sessionID` is not the session it created: without that
+    // filter the two streams read each other's deltas and each client is handed a mixture of both answers - a leak from
+    // one conversation into another that no single-stream test can see. The markers give the two answers different
+    // texts, so an interleaved stream cannot pass by producing the right characters in the wrong frames.
+    const [concurrentA, concurrentB] = await Promise.all([
+        fetch(`${idUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ messages: [{ role: 'user', content: 'MANYDELTAS please' }], stream: true })
+        }).then((response) => response.text()),
+        fetch(`${idUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ messages: [{ role: 'user', content: 'STRAYTAG please' }], stream: true })
+        }).then((response) => response.text())
+    ]);
+    const streamedContent = (text) => parseSseFrames(text)
+        .filter((frame) => frame !== '[DONE]')
+        .map((frame) => {
+            try {
+                return JSON.parse(frame);
+            } catch {
+                return null;
+            }
+        })
+        .map((frame) => frame?.choices?.[0]?.delta?.content || '')
+        .join('');
+    check('two concurrent streams each carry only their own answer',
+        streamedContent(concurrentA) === MANY_DELTAS_ANSWER && streamedContent(concurrentB) === 'aaaa</function_calls>bbbb',
+        JSON.stringify({ first: streamedContent(concurrentA).slice(0, 80), second: streamedContent(concurrentB) }));
     stopGateway(idGateway);
     await waitForExit(idGateway);
 
@@ -3723,6 +3860,39 @@ async function run() {
     });
     check('a body under the configured limit is served', withinLimit.status === 200, `status ${withinLimit.status}`);
 
+    // `MAX_BODY_MB` bounds the bytes, not the number of elements: a 20 MiB body of empty message objects is still
+    // 20 000 messages, and one message may carry 20 000 content parts. Both were normalised, prompt-built and stored
+    // per completion (measured 75 MB -> 312 MB RSS for a 20 MiB body, about 12x), which also made the documented
+    // queue bound - `MAX_BODY_MB` x concurrency - wrong by the same factor. Each is a 400 naming the limit and what
+    // arrived, and each request below stays well inside the 1 MiB body limit of this gateway, so the refusal cannot
+    // be the byte cap answering for the count cap.
+    const overMessageLimit = await fetch(`${bodyUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: Array.from({ length: 10001 }, () => ({ role: 'user', content: 'hi' })) })
+    });
+    const overMessageLimitJson = await overMessageLimit.json().catch(() => null);
+    check('a request over the message limit is refused, and names the limit and the count',
+        overMessageLimit.status === 400
+        && overMessageLimitJson?.error?.type === 'invalid_request_error'
+        && overMessageLimitJson?.error?.message === 'messages must not contain more than 10000 entries, found 10001',
+        `${overMessageLimit.status} ${JSON.stringify(overMessageLimitJson?.error?.message)}`);
+    const manyParts = await fetch(`${bodyUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+            messages: [{
+                role: 'user',
+                content: Array.from({ length: 10001 }, (_, index) => ({ type: 'text', text: `part ${index}` }))
+            }]
+        })
+    });
+    const manyPartsJson = await manyParts.json().catch(() => null);
+    check('a message over the content-part limit is refused, and names the position and the count',
+        manyParts.status === 400
+        && manyPartsJson?.error?.message === 'messages[0].content must not contain more than 10000 parts, found 10001',
+        `${manyParts.status} ${JSON.stringify(manyPartsJson?.error?.message)}`);
+
     // The refusal is decided while the client is still uploading. Node ends the socket when a response finishes with
     // the request body unread, and the kernel resets whatever the client is still writing: CI on Node 24 lost the 413
     // here and the suite aborted with "fetch failed". `fetch` cannot express "still uploading", so this uploads over a
@@ -3757,6 +3927,33 @@ async function run() {
     check('an oversized body that is still uploading still gets its 413',
         /^HTTP\/1\.1 413/.test(oversizedUpload.answer) && oversizedUpload.writeError === null,
         `${oversizedUpload.answer.split('\r\n')[0] || 'no answer'}, write error ${oversizedUpload.writeError}`);
+
+    // Node's bare HTTP parser answers an HTTP/1.1 request line with **no `Host` header** with its own `400 Bad Request`
+    // HTML - before any hook runs, so no `type`, no CORS, no `X-Request-Id` and no log line. `serverFactory` passes
+    // `requireHostHeader: false` so the request reaches the hooks and is answered in the OpenAI envelope like any other
+    // refusal. `fetch` always sends a `Host`, so this one has to be written over a raw socket.
+    const noHostAnswer = await new Promise((resolve) => {
+        const socket = net.connect(bodyPort, '127.0.0.1');
+        let answer = '';
+        socket.on('error', () => resolve(answer));
+        socket.on('data', (chunk) => { answer += chunk.toString('latin1'); });
+        socket.on('close', () => resolve(answer));
+        socket.on('connect', () => socket.end('GET /v1/models HTTP/1.1\r\nConnection: close\r\n\r\n'));
+    });
+    const noHostBody = noHostAnswer.slice(noHostAnswer.indexOf('\r\n\r\n') + 4);
+    check('a request with no Host header is answered by the gateway, not by Node',
+        /^HTTP\/1\.1 401/.test(noHostAnswer) && /access-control-allow-origin: \*/i.test(noHostAnswer)
+        && /x-request-id: /i.test(noHostAnswer),
+        `${noHostAnswer.split('\r\n')[0] || 'no answer'} / ${noHostAnswer.split('\r\n\r\n')[0]?.slice(0, 200)}`);
+    check('the Host-less refusal carries the OpenAI envelope',
+        (() => {
+            try {
+                return JSON.parse(noHostBody)?.error?.code === 'invalid_api_key';
+            } catch {
+                return false;
+            }
+        })(),
+        noHostBody.slice(0, 200));
 
     stopGateway(bodyGateway);
     await waitForExit(bodyGateway);
@@ -4608,6 +4805,9 @@ async function run() {
     rejectStub.stdout.on('data', () => {});
     rejectStub.stderr.on('data', () => {});
     await waitForOk(`http://127.0.0.1:${rejectStubPort}/health`);
+    // `LOG_LEVEL: 'warn'` on purpose: the cause this status usually has (a 1.x CLI behind a translating proxy) is named by
+    // a `warn`, so at `error` the operator got the 502 and none of the sentence that explains it.
+    let rejectOutput = '';
     const rejectGateway = spawn(process.execPath, ['index.js'], {
         cwd: ROOT,
         env: {
@@ -4615,12 +4815,12 @@ async function run() {
             PORT: String(rejectStubPort + 1),
             BIND_HOST: '127.0.0.1',
             OPENCODE_SERVER_URL: `http://127.0.0.1:${rejectStubPort}`,
-            LOG_LEVEL: 'error'
+            LOG_LEVEL: 'warn'
         }
     });
     children.push(rejectGateway);
-    rejectGateway.stdout.on('data', () => {});
-    rejectGateway.stderr.on('data', () => {});
+    rejectGateway.stdout.on('data', (chunk) => { rejectOutput += chunk; });
+    rejectGateway.stderr.on('data', (chunk) => { rejectOutput += chunk; });
     const rejectUrl = `http://127.0.0.1:${rejectStubPort + 1}`;
     await waitForOk(`${rejectUrl}/health`);
     const rejected = await fetch(`${rejectUrl}/v1/chat/completions`, {
@@ -4639,6 +4839,12 @@ async function run() {
     check('the rejection names the upstream status and reason',
         /status 404/.test(String(rejected.json?.error?.message)) && /not supported by this build/.test(String(rejected.json?.error?.message)),
         JSON.stringify(rejected.json?.error?.message)?.slice(0, 160));
+    // The status alone does not tell an operator what to do, and the sentence that does is a `warn` - so a gateway run at
+    // `error` (as this one used to be) answered the 502 and printed nothing about the 1.x CLI it most likely means.
+    check('the rejected creation names the 1.x CLI the status usually means',
+        /does not expose the OpenCode 2\.x session API \(status 404\)/.test(rejectOutput) &&
+        /probably a 1\.x release/.test(rejectOutput),
+        (rejectOutput.split('\n').find((line) => /1\.x release/.test(line)) || 'no warning line').trim().slice(0, 200));
     stopGateway(rejectGateway);
     await waitForExit(rejectGateway);
     stop(rejectStub);
@@ -6376,6 +6582,60 @@ async function run() {
     await waitForExit(hangDeleteStub);
     }
 
+    // --- a delete the backend answers with 404 ------------------------------------------------------------
+    // `STUB_GONE_DELETES` answers 404 for a session it still holds, the shape a backend whose store was reset produces.
+    // The cleanup's purpose is met either way, so this is classified as already gone: a `debug` line, no warning, and no
+    // retry - a 404 treated as transient kept the id in `liveSessions` and warned once a minute about a session that no
+    // longer existed anywhere.
+    const goneDeleteStubPort = GATEWAY_PORT + 103;
+    const goneDeleteStub = spawn(process.execPath, ['test/stub-opencode.mjs'], {
+        cwd: ROOT,
+        env: { ...process.env, STUB_PORT: String(goneDeleteStubPort), STUB_GONE_DELETES: '1' }
+    });
+    children.push(goneDeleteStub);
+    goneDeleteStub.stdout.on('data', () => {});
+    goneDeleteStub.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${goneDeleteStubPort}/health`);
+    const goneDeleteGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(goneDeleteStubPort + 1),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: `http://127.0.0.1:${goneDeleteStubPort}`,
+            LOG_LEVEL: 'debug'
+        }
+    });
+    children.push(goneDeleteGateway);
+    let goneDeleteOut = '';
+    goneDeleteGateway.stdout.on('data', (chunk) => { goneDeleteOut += chunk; });
+    goneDeleteGateway.stderr.on('data', (chunk) => { goneDeleteOut += chunk; });
+    await waitForOk(`http://127.0.0.1:${goneDeleteStubPort + 1}/health`);
+    const goneDeleteAnswer = await fetch(`http://127.0.0.1:${goneDeleteStubPort + 1}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(20000)
+    }).then((r) => r.json()).catch((error) => ({ error: error.message }));
+    const goneDeleteSessions = await fetch(`http://127.0.0.1:${goneDeleteStubPort}/__sessions`)
+        .then((r) => r.json()).catch(() => null);
+    // The gateway answers the client before it deletes the session, so the line this asserts is written after the body
+    // is on the wire: sample for it instead of reading one instant that races the cleanup.
+    const goneDeleteDeadline = Date.now() + 5000;
+    while (!/Session was already gone/.test(goneDeleteOut) && Date.now() < goneDeleteDeadline) await sleep(50);
+    check('a delete the backend answers with 404 completes and is treated as already gone',
+        goneDeleteAnswer?.object === 'chat.completion' &&
+        goneDeleteSessions?.created === 1 &&
+        /Session was already gone/.test(goneDeleteOut) &&
+        !/Failed to delete session/.test(goneDeleteOut),
+        `answer ${goneDeleteAnswer?.object ?? JSON.stringify(goneDeleteAnswer).slice(0, 80)}, ` +
+        `${JSON.stringify(goneDeleteSessions)}, ` +
+        `${goneDeleteOut.split('\n').filter((line) => /delete|already gone/.test(line)).join(' | ').slice(0, 200)}`);
+    stopGateway(goneDeleteGateway);
+    await waitForExit(goneDeleteGateway);
+    stop(goneDeleteStub);
+    await waitForExit(goneDeleteStub);
+
     // --- a tuning value that cannot be used is named, not silently replaced -------------------------------
     // These three keys fell back to their default without a word, so an operator who typo'd the request budget ran a
     // gateway with 300000 ms while believing a shorter one was in force. The queue and body knobs already worked this
@@ -7143,5 +7403,16 @@ if (skipped.length) {
     console.log(`\n${skipped.length} check(s) skipped on this platform:`);
     for (const entry of skipped) console.log(` - ${entry.name} (${entry.reason})`);
 }
+// The total is what a reader quotes as evidence that the suite ran, and loop-generated checks contribute no result of
+// their own: a refactor that stops one of those loops from iterating removes dozens of checks without a single failure.
+// A floor is the only assertion that can see that, so the printed number is itself checked.
+const CHECK_COUNT_FLOOR = 500;
+if (results.length < CHECK_COUNT_FLOOR) {
+    console.error(`\nonly ${results.length} checks ran, expected at least ${CHECK_COUNT_FLOOR}:` +
+        ' a generation loop most likely stopped iterating');
+    process.exit(1);
+}
 console.log(`\nAll ${results.length} checks passed.`);
 process.exit(0);
+
+

@@ -85,7 +85,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved queue limits, via `getQueueLimits()`), calls `startProxy()` and awaits its `ready` promise (a listen failure is reported and exits there, not inside the proxy), wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | The Fastify app: hooks (request id/logging, CORS, auth), the routes `/`, `/v1/models`, `/v1/models/:modelId`, `/v1/chat/completions`, `/health`, error/404 envelopes, the completion queue, SSE collection, polling, the backend lifecycle (`ensureBackend`, spawn, health probe against `/api/info`), and the `@opencode/client` calls every completion is built from (`session.create` / `prompt` / `message.list` / `remove`, `model.list`, `event.subscribe`). It is also the **public surface**: the entry point, the smoke suite and an embedder import `startProxy()`, `beginShutdown()`, `getQueueLimits()`, `resolveApiKey()` and the helper names from here, so a helper that moved into its own module is re-exported here rather than moved for its callers. |
 | `src/text.js` | Text and value handling shared by the request path: request/completion ids (`requestId()`, `generatedRequestId()`, `newCompletionId()`), the log-safety bounders (`echoedValue()`, `loggableModelId()`, `loggableConfigValue()`, `loggableUpstreamText()`, `loggableUrl()`, `urlPath()`), `jsonTypeName()` and `timeoutMessage()`. Every bounder **bounds, then masks** and marks a cut value with an ellipsis plus a `…[truncated N chars]` counter, so two log lines never disagree about how much was dropped. Two details of that rule are load-bearing: the bound is applied to the *work* before the mask runs (a masker scans what it is given, and a 16 KiB request target is not made cheaper by needing only 512 of its characters), while the counter is computed from the **original** length - the number of characters the client's value lost, which is what the marker is read for; and the masking window is `16x` the retained length (`MASK_TEXT_WINDOW_FACTOR`, the rule `maskFreeText()` follows), because every masking rule only *shortens* what it matches, so characters past that window can never reach the output. |
-| `src/errors.js` | The sentences an upstream throw turns into: `clientFacingText()` (masked, URL/credential-safe, cut at 512) for a 5xx body and `handlerFailureMessage()` for the route handler's own catch. |
+| `src/errors.js` | The sentences an upstream throw turns into: `clientFacingText()` (masked, URL/credential-safe, cut at 512) for a 5xx body and `handlerFailureMessage()` for the route handler's own catch. A throw that carries no usable text - `undefined`, `null`, a plain object, an `Error` with an empty `message` - produces `HANDLER_FAILURE_FALLBACK` (a sentence naming the handler) rather than the string `"undefined"` or `"[object Object]"`, which is what the client used to read as the cause of its 500. |
 | `src/upstream.js` | Classifying what the backend threw: `isTimeoutError()`, `isConnectionError()`, `isConnectionRefused()` (walks the `cause` chain, because `fetch` nests `ECONNREFUSED`), `errorCauseChain()`, `upstreamErrorStatus()` over `V2_ERROR_TAG_STATUS`, `upstreamFailureReason()` and the tagged `backendUnavailable()`. |
 | `src/socket.js` | `closeSocketAfterFlush()`: `end()` then a 250 ms `destroy()` fallback, for the paths that answer outside Fastify's reply lifecycle (`clientErrorHandler`, `badUrlHandler`, a hijacked stream). `destroy()` alone discards buffered writes, so a client under backpressure got a reset instead of its envelope. |
 | `src/api-key.js` | The built-in key `sk-dummy-123` and `resolveApiKey()` (a blank or missing `API_KEY` falls back to it). Never add a "disable auth" switch. |
@@ -97,9 +97,12 @@ These are product decisions, not implementation details. Do not "improve" them w
   out of a quoted run are `"`, `$`, a backtick and the control characters everywhere, but on Windows `cmd.exe` also
   expands `%VAR%`, treats `^` as its escape and `!` under delayed expansion, and lets a **trailing backslash** escape
   the closing quote - a path in `C:\Program Files\…\` is the ordinary spelling there, so refusing it outright would
-  reject a valid install, while accepting it on Linux would hand a shell a command line it does not control. |
+  reject a valid install, while accepting it on Linux would hand a shell a command line it does not control. Its second
+  argument is the platform whose shell rules apply (defaulting to `process.platform`), so the `win32`-only rules are
+  asserted from any runner: CI is Linux-only, and reading `process.platform` inside the function meant that branch ran
+  in no automated run at all. |
 | `src/options.js` | `parseBoolean()` and `readFlag()`, the **single** boolean parser for `index.js`, `startProxy()` and request bodies. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off" in the container); do not add a third. |
-| `src/settings.js` | The tuning keys' readers: `readLimit()`, `readMilliseconds()` (returns `{value, note}`, with the precedence inside it so the note names the value that actually took effect), `resolveRequestTimeoutMs()`, `backendDeadline()`, and the named defaults they quote (`DEFAULT_REQUEST_TIMEOUT_MS`, `MAX_TIMER_MS`, `METADATA_TIMEOUT_CAP_MS`). The resolved values are held by their consumers in `src/proxy.js`. |
+| `src/settings.js` | The tuning keys' readers: `readLimit()`, `readMilliseconds()` (returns `{value, note}`, with the precedence inside it so the note names the value that actually took effect - including a value **clamped** to `MAX_TIMER_MS`, which used to be shortened in silence while `resolveRequestTimeoutMs()` named its own clamp), `resolveRequestTimeoutMs()`, `backendDeadline()`, and the named defaults they quote (`DEFAULT_REQUEST_TIMEOUT_MS`, `MAX_TIMER_MS`, `METADATA_TIMEOUT_CAP_MS`). The resolved values are held by their consumers in `src/proxy.js`. |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. The file is opened **once** with `O_NOFOLLOW` (when the platform has it) and `O_NONBLOCK`, then described with `fstat()` on that descriptor: a `config.json` that is a **symbolic link** or a **FIFO** is refused by name, because following it would read a target the operator did not configure and a FIFO would block the startup on a writer that never comes. A BOM is tolerated. |
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskCredentialPairs()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses), and `maskFreeText()` (control characters - newline, tab, DEL - replaced
 *before* the mask chain runs, so a secret cannot be split across a line break into a shape no pattern matches) for debug
@@ -112,9 +115,13 @@ second (scheme-less `user:pass@`) rule when the value carries no `://` or the co
 in the host:port that follows it, and its first (scheme-qualified) rule allows whitespace inside the userinfo - a
 passphrase is a real credential, and Node's own "URL that includes credentials" sentence quotes one verbatim. The
 scheme-less rule keeps excluding whitespace on purpose: without a `://` anchor, a class that allowed spaces would match
-from any earlier colon (`the admin: bob@example.com`). `maskCredentialPairs()` masks a bare `name=value` pair whose name
-is a credential, for the values that are not URLs at all (an echoed `Content-Encoding` header, a media type, a
-content-part type). `MASK_TEXT_WINDOW_FACTOR` is exported from here because `src/text.js` bounds by the same rule. |
+from any earlier colon (`the admin: bob@example.com`). `maskCredentialPairs()` masks a `name=value` pair whose name is a
+credential, for the values that are not URLs at all (an echoed `Content-Encoding` header, a media type, a content-part
+type), and it reads a pair wherever the name starts a run: a **prefixed** name (`--api-key=…`, `-token=…` in a wrapper's
+command line) and a **quoted** one (`"key=value"`, the shape a config parser echoes) are both pairs, because the
+free-text chain runs this rule over sentences that carry no `;`, `,` or `&` before the name at all - the separator class
+is what starts a name run, so it also accepts a quote and a flag prefix (written back unchanged; only the value is
+replaced). `MASK_TEXT_WINDOW_FACTOR` is exported from here because `src/text.js` bounds by the same rule. |
 | `src/polyfills.js` | Node 20 shims, imported for its side effect first thing in `src/proxy.js`: `Promise.withResolvers()` is Node 22+, and `@opencode/client`'s SSE subscription calls it unconditionally, so without it every stream silently fell back to polling (one delta per answer). A no-op on a runtime that has the API. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README (`docker/README.md`, kept under 25 000 characters). |
@@ -207,7 +214,9 @@ slow `POST /api/session`, so a completion that waited for a queue slot can be gr
 `STUB_PARTIAL_CREATE=1` (a `200` whose body stops mid-JSON and whose socket is destroyed 10 ms later, so the
 creation answer is *truncated* rather than refused - the shape a client that read a `status` and no envelope produces;
 the attempt is still counted, because a call that produced no session is still a call),
-`STUB_REJECT_DELETES=1` (a `500` for `DELETE /session/:id`, so the session stays), `STUB_HANG_DELETES=1` (a delete that is
+`STUB_REJECT_DELETES=1` (a `500` for `DELETE /session/:id`, so the session stays), `STUB_GONE_DELETES=1` (a `404` for a
+session the stub still holds, the shape a backend that lost its store produces: the cleanup must call that "already
+gone" rather than retrying it), `STUB_HANG_DELETES=1` (a delete that is
 never answered), `STUB_FAIL_TOOL_IDS=1` (a `500` for the 1.x `GET /experimental/tool/ids`; **accepted as a no-op**, because 2.x has
 no tool-list route and the gateway builds no override map), `STUB_ODD_MODEL_NAMES=1` (three provider entries whose
 `name` is a number, an object and an empty string, so a warm cache can be asserted to answer byte-identically to a
@@ -421,8 +430,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `handlerFailureMessage()` - masked, and built *before* the log line that prints it, because a `const` read ahead of
   its declaration is a `ReferenceError` that replaces the cause of the `500` with a bug in the catch itself. The inner
   catch around a failed upstream call reads its `[Proxy] API Error` sentence from the same helper, for the same reason:
-  `error.message` is `undefined` for a throw that is not an `Error`, so the line logged nothing and the client was told
-  `undefined`.
+  `error.message` is `undefined` for a throw that is not an `Error`, so the line logged nothing. A throw with **no
+  usable text** now reads as `HANDLER_FAILURE_FALLBACK` in both places instead of the strings `undefined` and
+  `[object Object]`, which named no cause at all: the client's `500` quoted a JavaScript conversion of the thrown
+  value, and an operator searching the log for that sentence finds nothing to search for.
   A log record prints the sentence *and* the stack behind that error, whose first line is the message: both go
   through `loggableError()` - masked, stack bounded (`MAX_LOGGED_STACK_CHARS`).
   A backend that disappears mid-request is an upstream failure (`502`), not a bug (`500`): the client is told the upstream is gone and the next request
@@ -795,7 +806,13 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   first polls are much shorter than the interval (`POLL_BACKOFF_MS` = 25/50/100/200 ms), and counting polls would have shrunk the
   documented ~1.5 s of silence to ~75 ms and served half-written answers. It
   watches the whole visible answer, `content` **and** `reasoning`, and requires one of them to be non-empty: watching
-  `content` alone left the window at 0 for a reasoning-only message, so such a provider was answered `504`. `extractFromParts()` reads a part's `text` only when it is a string, like the streaming
+  `content` alone left the window at 0 for a reasoning-only message, so such a provider was answered `504`. That watch
+  compares a **bounded fingerprint** of the answer (`answerFingerprint()`, `ANSWER_FINGERPRINT_CHARS` = 64 characters
+  per side), not the answer itself: the loop kept the previous `content` and `reasoning` in full to compare them, so a
+  16 M character answer was copied twice per poll - thousands of polls against a per-request deadline - to answer "did
+  this change?". Collisions are harmless in the direction that matters: a fingerprint that matches skips a
+  rewrite check whose text was identical anyway, and one that differs falls through to the full comparison.
+  `extractFromParts()` reads a part's `text` only when it is a string, like the streaming
   collector and the request parser: concatenating whatever arrived served a numeric part as answer text
   (`parts: [{text: 42}, {text: 'Alpha'}]` answered `"42Alpha"`). The
   first four polls use `min(intervalMs, POLL_BACKOFF_MS[i])`, an answer landing a few tens of milliseconds after

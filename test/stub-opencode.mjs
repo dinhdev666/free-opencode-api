@@ -84,7 +84,6 @@ const DROP_MESSAGES = Number(process.env.STUB_DROP_MESSAGES || 0);
 const UNREADABLE_MESSAGES = process.env.STUB_UNREADABLE_MESSAGES === '1';
 // Accepted for the 1.x suite: 2.x has no tool-list route, so nothing is counted and nothing changes
 const FAIL_TOOL_IDS = process.env.STUB_FAIL_TOOL_IDS === '1';
-void FAIL_TOOL_IDS;
 // Refuse DELETE /api/session/:id with a 500 and keep the session
 const REJECT_DELETES = process.env.STUB_REJECT_DELETES === '1';
 // Answer a session that *is* in the store with a 404, the shape a backend whose store was reset produces
@@ -142,9 +141,14 @@ const sessions = new Map();
 let sessionSeq = 0;
 let deletedSessions = 0;
 let providerCalls = 0;
-// 2.x has no tool-list route, so this stays 0 and proves the gateway does not reach for one
+// How many times the 1.x tool-list route was asked for. 2.x has no such route and the gateway no longer builds a
+// per-tool override map, so the count must stay 0 - and this counter is what makes that assertion falsifiable. It used
+// to be declared and never incremented, so `toolIdCalls === 0` held no matter what the gateway did, and nothing
+// answered the route either: a gateway that started calling `/api/tool/ids` again could not have been caught.
 let toolIdCalls = 0;
 let messagePolls = 0;
+// The `order`/`cursor`/`limit`/`type` of each message poll, newest last (bounded).
+const messagePollQueries = [];
 // How many readiness probes (`GET /api/info`) the stub has seen. `/health` must never touch the backend, so a suite
 // that reads this around a burst of `/health` requests can prove it instead of trusting the handler.
 let infoCalls = 0;
@@ -460,6 +464,15 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { location: `${BASE}/api/provider`, data: PROVIDERS });
     }
 
+    // The 1.x tool-list route. 2.x does not serve it, so the gateway must never ask: counting the request is what turns
+    // "the gateway asks nothing" into an assertion, and the answer mimics the 1.x shape for the same reason the other
+    // accepted no-ops are kept (a release or a translating proxy that starts answering here again keeps its meaning).
+    if (req.method === 'GET' && path === '/api/tool/ids') {
+        toolIdCalls += 1;
+        if (FAIL_TOOL_IDS) return sendError(res, 500, 'InternalServerError', 'tool list unavailable');
+        return sendJson(res, 200, { location: `${BASE}/api/tool/ids`, data: ['bash', 'edit', 'read', 'write'] });
+    }
+
     if (req.method === 'POST' && path === '/api/session') {
         if (URL_IN_ERROR) {
             // **400, not 502**: the generated 2.x client declares 400/401/404 for this route and throws a typed
@@ -558,6 +571,7 @@ const server = http.createServer(async (req, res) => {
             infoCalls,
             toolIdCalls,
             messagePolls,
+            messagePollQueries,
             lastSystemPrompt,
             lastPromptText,
             lastPermissionRules,
@@ -1007,6 +1021,11 @@ const server = http.createServer(async (req, res) => {
         const cursor = url.searchParams.get('cursor');
         const limit = Number(url.searchParams.get('limit') || 0);
         const type = url.searchParams.get('type');
+        // The query each poll actually made, so a test can assert the shape the gateway is written against
+        // (`order=desc&limit=1&type=assistant`) from the request rather than from the source or from a behavioural
+        // proxy. Bounded, because a long poll loop would otherwise grow it for the life of the stub.
+        messagePollQueries.push({ order, cursor, limit, type });
+        if (messagePollQueries.length > 50) messagePollQueries.shift();
         if (cursor && order) {
             return sendError(res, 400, 'InvalidRequestError', 'cursor and order cannot be used together');
         }

@@ -381,6 +381,17 @@ try {
             clearTimeout(watchdog);
             if (warn) logger.warn(message);
             else logger.info(message);
+            // Drop whatever is still connected (a long-lived SSE stream) *here*, not on a fixed 1.5 s timer: this is
+            // the point at which the gateway has waited as long as it is willing to, so a request that was going to
+            // finish has already done so, and one that was not is not served by being reset earlier. The old timer cut
+            // every in-flight completion off 1.5 s after the signal - far below the duration of one - and the teardown
+            // below then spent up to 6 s deleting the sessions of exactly those requests, after the clients that would
+            // have seen the work were gone.
+            try {
+                proxy.server.server?.closeAllConnections?.();
+            } catch (e) {
+                // best effort
+            }
             // The backend is awaited before exiting: SIGTERM used to be followed by process.exit() on the next line, so
             // the SIGKILL escalation inside killBackend() never ran and a backend that ignores SIGTERM outlived the
             // gateway that owns it. A second watchdog bounds the teardown itself.
@@ -399,16 +410,9 @@ try {
         );
         watchdog.unref();
 
-        // Stop accepting new connections; whatever is already being served keeps the backend it depends on
+        // Stop accepting new connections; whatever is already being served keeps the backend it depends on, and the
+        // 6 s watchdog above decides when the gateway stops waiting for it (see `finish()`).
         proxy.server.close(() => finish('[Shutdown] Server closed', false));
-        // Give responses in flight a moment to finish, then drop whatever is still connected (open SSE streams)
-        setTimeout(() => {
-            try {
-                proxy.server.server?.closeAllConnections?.();
-            } catch (e) {
-                // best effort
-            }
-        }, 1500).unref();
     };
 
     process.on('SIGINT', () => shutdown('SIGINT'));

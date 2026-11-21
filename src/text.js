@@ -14,7 +14,7 @@ import { MASK_TEXT_WINDOW_FACTOR, maskCredentialPairs, maskUrlCredentials, maskU
  * is put into a log line, a response body or a prompt line.
  * @type {RegExp}
  */
-export const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
+export const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f]/g;
 
 /**
  * A value cut to `maxLen` characters with its control characters replaced, plus the cut marker when it was cut.

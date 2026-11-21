@@ -67,9 +67,13 @@ export function readLimit(name, { min, max, fallback }, fileValue) {
  * @param {string} name the variable name, for a reader of the source and for the note
  * @param {number} fallback used when the value is absent, blank or unusable
  * @param {*} fileValue the value read from `config.json`
+ * @param {{allowZero?: boolean}} [options] `allowZero` accepts `0` as a value in its own right. It exists for a window
+ *   that is *disabled* by zero (`OPENCODE_PROXY_HEALTH_CACHE_MS=0` is documented as "probe on every request"), where
+ *   rejecting it sent the operator the most trusting default instead of the least: a cache window of zero is a
+ *   meaningful setting, while a timeout of zero is a typo and is still named and replaced.
  * @returns {{value: number, note: string|null}} the value in milliseconds and the `[Config]` note, if it had to be adjusted
  */
-export function readMilliseconds(name, fallback, fileValue) {
+export function readMilliseconds(name, fallback, fileValue, options = {}) {
     const fromEnv = process.env[name];
     // The raw value that was actually used, so a note names the one that took effect rather than the other source.
     const raw = (fromEnv === undefined || String(fromEnv).trim() === '') ? fileValue : fromEnv;
@@ -88,6 +92,8 @@ export function readMilliseconds(name, fallback, fileValue) {
         return { value: fallback, note: `${name}='${shown}' is negative, using ${fallback}` };
     }
     if (floored === 0) {
+        // A window that zero *disables* keeps it: see the `allowZero` note above. No note, because nothing was adjusted.
+        if (options.allowZero) return { value: 0, note: null };
         return {
             value: fallback,
             note: `${name}='${shown}' is less than one millisecond, using ${fallback}`

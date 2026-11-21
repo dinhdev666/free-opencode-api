@@ -183,8 +183,9 @@ gh pr merge 123 --merge --subject "feat(proxy): add the thing (#123)"
 ```
 
 The trailing `(#123)` counts towards the 72 characters, and neither `gh` nor GitHub warns when the result is over the
-limit: `feat(proxy): add the thing that does the other thing (#123)` is a rejected merge subject. A protected `main`
-cannot have the message corrected afterwards, so the red check stays in its history. Judge the exact string first:
+limit: `feat(proxy): add the thing that does the other thing and a bit more (#123)` is a rejected merge subject (74
+characters, measured by the checker below). A protected `main` cannot have the message corrected afterwards, so the red
+check stays in its history. Judge the exact string first:
 
 ```bash
 node test/check-commit-messages.mjs --subject "feat(proxy): add the thing (#123)"

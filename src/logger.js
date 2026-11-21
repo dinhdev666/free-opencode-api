@@ -289,21 +289,63 @@ const decodeQueryName = (name) => {
  * name run started at the quote and matched nothing. The quotes are written back unchanged and the **unquoted** value
  * class excludes them, so a quoted pair keeps both its delimiters (`"key=***"`, not `"key=***`) while a value that
  * opens a quote it never closes is still masked up to it.
+ *
+ * The separator itself is `=` **or** `:` (with optional spaces on either side), and an optional quote may sit between
+ * the name and that separator: `api_key = "..."`, `api_key: "..."` and `{"api_key":"..."}` are all pairs, and all
+ * three were returned verbatim by the `=`-only rule. See `CREDENTIAL_PAIR_RE`.
  * @param {string} text any short value
  * @returns {string} the value with credential pairs masked
  */
+// One copy of the pair rule, named rather than inlined because `maskCredentialPairs()` reads the character in front of
+// the captured value to decide whether the pair was quoted: the rule and its reader have to change together.
+// The value alternation is quoted-first so a quoted value is captured **whole** (a space inside a quoted secret is not
+// where the value ends), and the unquoted alternative excludes the quote characters so the quoted branch is reachable.
+const CREDENTIAL_PAIR_RE =
+    /(^|[,;&#?\s()])(--?)?["']?([A-Za-z][A-Za-z0-9_./-]{0,63})[ \t]*=[ \t]*("[^"]{0,4096}"|'[^']{0,4096}'|[^&;,\s"']{0,4096})|(^|[,;&#?\s(){])"([A-Za-z][A-Za-z0-9_./-]{0,63})"[ \t]*:[ \t]*("[^"]{0,4096}"|'[^']{0,4096}')/g;
+
 export function maskCredentialPairs(text) {
     const value = String(text);
-    // The warm path: nothing to find without an `=`
-    if (!value.includes('=')) return value;
+    // The warm path: a pair is only ever separated by `=` or `:`, so a value carrying neither cannot change. `:` is
+    // part of the test because a JSON/YAML body writes `"api_key": "..."`, which the `=`-only test skipped entirely.
+    if (!value.includes('=') && !value.includes(':')) return value;
     // The **whole** value run is masked, not its first 256 characters: the caller cuts the result at 64, so masking a
     // prefix of a long secret and leaving the rest behind published the tail of the credential in a 415 body. 4096 is
     // far beyond any value that can reach this function (an echoed value is bounded to a 16x window of 64 characters
     // before the mask runs, and a media type or content-part name is shorter still), and it keeps the run bounded the
     // way every other rule here is. `/` is part of a name because a media type is `type/subtype`.
-    return value.replace(
-        /(^|[,;&#?"'\s])(--?)?([A-Za-z][A-Za-z0-9_./-]{0,63})=("[^"]{0,4096}"|'[^']{0,4096}'|[^&;,\s"']{0,4096})/g,
-        (match, separator, flag, name) => (isSensitiveHeader(name) ? `${separator}${flag || ''}${name}=***` : match));
+    //
+    // The separator is `=` **or** `:`, with optional spaces around it, and an optional quote may sit between the name and
+    // the separator. Each of the three shapes is a pair an upstream error body or a wrapper actually quotes:
+    // `api_key = "..."` (hand-written config), `api_key: "..."` (YAML) and `{"api_key":"..."}` (JSON, where the closing
+    // quote of the key precedes the colon). All three used to be returned verbatim, because the rule required a literal
+    // `=` immediately after the name - so a sentence quoting any of them published the credential in the 5xx body and in
+    // `docker logs`, which is the one thing this function exists to prevent. The name test is still what decides, so
+    // prose and non-credential pairs (`the admin: bob@...`, `ratio: 3:4`, `status: ok`) are untouched.
+    //
+    // Writing the pair back keeps the shape it arrived in, and only the shape: the opening quote is re-emitted when the
+    // value carried its closing partner, and the value - quotes included - is replaced by `***`. Reconstructing from the
+    // captures instead of reusing `match` is what stops a `"` from being left behind or duplicated.
+    // Two flat alternatives, so one callback signature reads either match. The groups line up as
+    // (match, eqBoundary, flag, name, eqValue, jsonBoundary, jsonName, jsonValue): the  spelling fills the first
+    // four after the match and the JSON spelling the last three, which is why  decides which branch ran and why
+    // each branch reads its own boundary capture (they are separate groups, not one shared prefix).
+    return value.replace(CREDENTIAL_PAIR_RE, (match, eqBoundary, flag, name, eqValue, jsonBoundary, jsonName, jsonValue) => {
+        if (name === undefined) {
+            if (!isSensitiveHeader(jsonName)) return match;
+            // The JSON spelling `"name": "value"`: the key and its delimiters are written back, the value is not.
+            return `${jsonBoundary}"${jsonName}": "***"`;
+        }
+        if (!isSensitiveHeader(name)) return match;
+        // The separator and any quote in front of the name are read back out of `match`, so a quoted pair keeps its
+        // delimiter (`"key=***"`) while an unquoted one stays unquoted.
+        const beforeName = `${eqBoundary}${flag || ''}`;
+        const nameAt = match.indexOf(name, beforeName.length);
+        const prefix = match.slice(0, nameAt + name.length);
+        const openingQuote = match[match.length - eqValue.length - 1];
+        const quoted = (openingQuote === '"' || openingQuote === "'")
+            && eqValue.length >= 2 && eqValue[eqValue.length - 1] === openingQuote;
+        return quoted ? `${prefix}=${openingQuote}***${openingQuote}` : `${prefix}=***`;
+    });
 }
 
 export function maskUrlQuery(url) {
@@ -325,14 +367,181 @@ export function maskUrlQuery(url) {
  * @param {string} url configured backend URL
  * @returns {string} the URL with userinfo and credential query values masked
  */
-// The length of a leading `scheme://` run, or 0 when the value carries none. `maskBackendUrl()` needs it *before* it
-// reads the last `@` (to tell a hostless authority from a bare trailing `@`), and the scheme run is anchored, so it is
-// linear whatever its length - unlike the bounded `\w[\w+.-]{0,31}` in `maskUrlCredentials()`, which is searched at
-// every offset of a sentence.
-const schemePrefixLength = (text) => {
-    const scheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.exec(text);
-    return scheme ? scheme[0].length : 0;
+/**
+ * Mask the `user:pass@` of every `scheme://` URL in a piece of text, whatever the credential contains.
+ *
+ * The rule both `maskBackendUrl()` and `maskUrlCredentials()` rely on, and the one the smoke suite pins down: the
+ * userinfo of a URL ends at the **last** `@` that lies between its scheme's `://` and the next scheme, and every
+ * character between the two is a credential.
+ *
+ * That "last `@`" is what makes a credential containing a reserved character work. `http://alice:s3#cr3t@host:4097`
+ * and `http://alice:s3/cr3t@host:4097` are both spellings a generated password - or a value decoded once too often -
+ * really produces, and a strict parse reads the `/`, `?` or `#` in them as the end of the authority. A pattern classed
+ * `[^/?#]*@` therefore never reached the `@` at all: it matched nothing and returned the value **unchanged**, so
+ * `/health` (which needs no key) published the operator's intended secret, and so did the startup summary. A masker
+ * fails closed, and the reserved-character spelling is the one that must lose - reading a path `@` as a credential
+ * costs a cosmetic detail in a log line, while reading a credential `@` as a path publishes a secret.
+ *
+ * The one case that is *not* a credential is an `@` with a `/` before it and nothing after it but a path: an `@` in a
+ * path is not userinfo (`http://host:4097/a@b`), and masking it would corrupt a value that never held a credential.
+ * That is what the "next scheme" bound and the `/` test below decide between.
+ *
+ * Only the credential is replaced: scheme, host, port and path stay readable. Every `indexOf()` starts where the
+ * previous one stopped, so the pass is linear on arbitrary text - each character is read a constant number of times,
+ * and no global regex restarts at every offset.
+ * @param {string} text the text to rewrite
+ * @returns {string} the text with every `scheme://userinfo@` reduced to `scheme://**
+ * Mask the `user:pass@` of every `scheme://` URL in a piece of text, whatever the credential contains.
+ *
+ * The rule both `maskBackendUrl()` and `maskUrlCredentials()` rely on, and the one the smoke suite pins down: after a
+ * scheme's `://`, the userinfo ends at the first `@` that has no plain `@` and no `/` before it, and everything from
+ * the scheme to that `@` is a credential.
+ *
+ * - A `/` before it means the `@` sits in a path rather than in userinfo - `http://host:4097/a@b` is a path, and
+ *   masking it would corrupt a value that never held a credential. A plain `@` before it means userinfo already ended
+ *   at that earlier one. In either case the scan moves past this `@` and tries the next.
+ * - Otherwise the pair is userinfo, which is what makes a credential containing a reserved character work:
+ *   `http://alice:s3#cr3t@host:4097` and `http://alice:s3/cr3t@host:4097` are spellings a generated password - or a
+ *   value decoded once too often - really produces, and a strict parse reads the `/`, `?` or `#` in them as the end of
+ *   the authority. A pattern classed `[^/?#]*@` never reached the `@` at all: it matched nothing and returned the
+ *   value **unchanged**, so `/health` (which needs no key) published the operator's intended secret, and so did the
+ *   startup summary.
+ *
+ * A masker fails closed, and the reserved-character spelling is the one that must lose: reading a path `@` as a
+ * credential costs a cosmetic detail in a log line, while reading a credential `@` as a path publishes a secret.
+ *
+ * Only the credential is replaced: scheme, host, port and path stay readable. Every `indexOf()` starts where the
+ * previous one stopped, so the pass is linear on arbitrary text - each character is read a constant number of times,
+ * and no global regex restarts at every offset.
+ * @param {string} text the text to rewrite
+ * @returns {string} the text with every `scheme://userinfo@` reduced to `scheme://**
+ * Mask the `user:pass@` of every `scheme://` URL in a piece of text, whatever the credential contains.
+ *
+ * The rule both `maskBackendUrl()` and `maskUrlCredentials()` rely on, and the one the smoke suite pins down: after a
+ * scheme's `://`, the userinfo ends at the first `@` that no plain `@` and no `/` precedes.
+ *
+ * - A plain `@` before it means userinfo already ended, and a `/` before it means the `@` is in a path rather than in
+ *   userinfo - `http://host:4097/a@b` is a path, and masking it would corrupt a value that never held a credential. In
+ *   both cases the scan moves past that `@` and looks at the next one.
+ * - Otherwise everything from the scheme to that `@` is userinfo, and it is replaced with `***`.
+ *
+ * The non-`/` half is what makes a credential containing a reserved character work. `http://alice:s3#cr3t@host:4097`
+ * and `http://alice:s3/cr3t@host:4097` are spellings a generated password, or a value decoded once too often, really
+ * produces - and a strict parse reads the `/`, `?` or `#` as the end of the authority. A pattern classed `[^/?#]*@`
+ * therefore never reached the `@` at all: it matched nothing and returned the value **unchanged**, so `/health` (which
+ * needs no key) published the operator's intended secret and so did the startup summary. A masker fails closed, and the
+ * reserved-character spelling is the one that must lose: reading a path `@` as a credential costs a cosmetic detail in
+ * a log line, while reading a credential `@` as a path publishes a secret.
+ *
+ * Only the credential is replaced: scheme, host, port and path stay readable. Every `indexOf()` starts where the
+ * previous one stopped, so the pass is linear on arbitrary text - each character is read a constant number of times,
+ * and no global regex restarts at every offset.
+ * @param {string} text the text to rewrite
+ * @returns {string} the text with every `scheme://userinfo@` reduced to `scheme://**
+ * Mask the `user:pass@` of every `scheme://` URL in a piece of text, whatever the credential contains.
+ *
+ * The rule both `maskBackendUrl()` and `maskUrlCredentials()` rely on, and the one the smoke suite pins down: within
+ * one URL (from its scheme's `://` to the next scheme), walk the `@`s and take the first one whose preceding run has
+ * **no `/` and no earlier `@`**. Everything from the scheme to that `@` is the userinfo, and it is replaced with `***`.
+ *
+ * The two halves of that test are each a case the others get wrong:
+ *
+ * - no earlier `@` means userinfo has not already ended at an earlier one, so this `@` is its terminator;
+ * - no `/` means the `@` is userinfo rather than part of a path - `http://host:4097/a@b` is a path, and masking it
+ *   would corrupt a value that never held a credential;
+ * - but a `/` that appears **only after a candidate was rejected** is the one a reserved character produces:
+ *   `http://alice:s3#cr3t@host:4097` and `http://alice:s3/cr3t@host:4097` are spellings a generated password - or a
+ *   value decoded once too often - really produces, and a strict parse reads their `/`, `?` or `#` as the end of the
+ *   authority. A pattern classed `[^/?#]*@` never reached the `@` at all, so it matched nothing and returned the value
+ *   **unchanged**: `/health` (which needs no key) published the operator's intended secret, and so did the startup
+ *   summary. Once the run before a rejected candidate held a `/`, the slash is consumed as part of the credential, and
+ *   the next `@` is judged on its own run.
+ *
+ * A masker fails closed, and the reserved-character spelling is the one that must lose: reading a path `@` as a
+ * credential costs a cosmetic detail in a log line, while reading a credential `@` as a path publishes a secret.
+ *
+ * Only the credential is replaced: scheme, host, port and path stay readable. Every `indexOf()` starts where the
+ * previous one stopped, so the pass is linear on arbitrary text - each character is read a constant number of times,
+ * and no global regex restarts at every offset.
+ * @param {string} text the text to rewrite
+ * @returns {string} the text with every `scheme://userinfo@` reduced to `scheme://**
+ * Mask the `user:pass@` of every `scheme://` URL in a piece of text, whatever the credential contains.
+ *
+ * The rule both `maskBackendUrl()` and `maskUrlCredentials()` rely on, and the one the smoke suite pins down: within
+ * one URL (from its scheme's `://` to the next scheme), an `@` ends the userinfo when
+ *
+ * - no `/` and no earlier `@` lies between the scheme and it, or
+ * - what follows it looks like an authority (`host:port`, or a host followed by `/`, `?` or `#`).
+ *
+ * The second half is what makes a credential containing a reserved character work. `http://alice:s3#cr3t@host:4097`
+ * and `http://alice:s3/cr3t@host:4097` are spellings a generated password - or a value decoded once too often -
+ * really produces, and a strict parse reads their `/`, `?` or `#` as the end of the authority. A pattern classed
+ * `[^/?#]*@` never reached the `@` at all, so it matched nothing and returned the value **unchanged**: `/health`
+ * (which needs no key) published the operator's intended secret, and so did the startup summary.
+ *
+ * The first half is what keeps an `@` **in a path** readable: `http://host:4097/a@b` has a `/` before its `@` and `b`
+ * after it is not a host, so it is a path and masking it would corrupt a value that never held a credential - while
+ * `http://host:4097/a@b:1` still ends in an authority and is masked.
+ *
+ * A masker fails closed, and the reserved-character spelling is the one that must lose: reading a path `@` as a
+ * credential costs a cosmetic detail in a log line, while reading a credential `@` as a path publishes a secret.
+ *
+ * Only the credential is replaced: scheme, host, port and path stay readable. Every `indexOf()` starts where the
+ * previous one stopped, so the pass is linear on arbitrary text - each character is read a constant number of times,
+ * and no global regex restarts at every offset.
+ * @param {string} text the text to rewrite
+ * @returns {string} the text with every `scheme://userinfo@` reduced to `scheme://***@`
+ */
+const maskUserinfoAfterScheme = (text) => {
+    const value = String(text);
+    // A URL with userinfo needs both markers; this runs on every request log line and most carry neither.
+    if (!value.includes('://') || !value.includes('@')) return value;
+    let out = '';
+    let from = 0;
+    let searchAt = 0;
+    for (;;) {
+        const schemeAt = value.indexOf('://', searchAt);
+        if (schemeAt === -1) break;
+        const authorityStart = schemeAt + 3;
+        // One URL runs to the next scheme; nothing may be read past it, or two URLs in a sentence would share one `@`.
+        const nextSchemeAt = value.indexOf('://', authorityStart);
+        const urlEnd = nextSchemeAt === -1 ? value.length : nextSchemeAt;
+        // Walk this URL's `@`s for the one that ends its userinfo.
+        let at = value.indexOf('@', authorityStart);
+        let terminator = -1;
+        while (at !== -1 && at < urlEnd) {
+            const run = value.slice(authorityStart, at);
+            if (!run.includes('@') && !run.includes('/')) {
+                terminator = at;
+                break;
+            }
+            // A `/` or an earlier `@` before this one: it is userinfo only when what follows looks like an authority
+            // (`host`, optionally `:port`, optionally a path/query/fragment) - the reserved-character credential case.
+            if (/^[^\s/?#@]+(?::\d+|[/?#])/.test(value.slice(at + 1, urlEnd))) {
+                terminator = at;
+                break;
+            }
+            at = value.indexOf('@', at + 1);
+        }
+        // Nothing in this URL is userinfo: move to the next scheme, and stop when there is none.
+        if (terminator === -1) {
+            if (nextSchemeAt === -1) break;
+            searchAt = nextSchemeAt;
+            continue;
+        }
+        out += `${value.slice(from, authorityStart)}***@`;
+        if (terminator >= from) from = terminator + 1;
+        // Resume at the next scheme, so a `://` inside the credential that was just masked
+        // (`http://alice:s3/cr3t@host`) is never read as a second URL.
+        const afterSchemeAt = value.indexOf('://', from);
+        if (afterSchemeAt === -1) break;
+        searchAt = afterSchemeAt;
+    }
+    return out + value.slice(from);
 };
+
+
+
 
 export function maskBackendUrl(url) {
     const text = maskUrlQuery(String(url));
@@ -350,27 +559,33 @@ export function maskBackendUrl(url) {
     // returned the value **unchanged**, so `/health` - which needs no key - published the operator's intended secret and
     // so did the startup summary. Failing closed is the only safe direction for a masker: a URL whose *path* contains an
     // `@` is reported as `scheme://***@…`, which costs a cosmetic detail in a log line and never a secret.
-    const at = text.lastIndexOf('@');
-    if (at === -1) return text;
-    const rest = text.slice(at + 1);
-    // What follows the `@` is a path, a query or a fragment rather than a host, so there is no authority left to keep
-    // readable - but the run *before* the `@` is still userinfo, and it is still the operator's credential.
-    //
-    // Returning the value unchanged here was a fail-open: `http://alice:s3cr3t@/v1`, `…@?token=1` and `…@#frag` were
-    // all printed verbatim, and `/health` needs no key, so the password went to every caller that could reach the port as
-    // well as to `docker logs` (the startup summary and every `[Config]` note quote the same value). A hostless spelling
-    // is reachable in the configuration this gateway supports and repairs - `normalizeBackendUrl()` neither rejects nor
-    // rewrites it - so the branch is not hypothetical.
-    //
-    // The condition is therefore "is there anything before the `@` to mask?", not "is there a host after it?". Only a
-    // bare trailing `@` (`http://host@`, with no userinfo in front of it) is left as it arrived.
-    if (rest.search(/[/?#]/) === 0 && at <= schemePrefixLength(text)) return text;
-    // An `@` inside the scheme itself is not userinfo (`scheme` cannot contain one, so this is unreachable in practice).
-    // `schemeText` is also the prefix the masked value keeps, so the run is read once and reused.
-    const schemeText = text.slice(0, schemePrefixLength(text));
-    if (at < schemeText.length) return text;
-    return `${schemeText}***@${rest}`;
+    // The userinfo scan is shared with `maskUrlCredentials()` (`maskUserinfoAfterScheme`). This function used to carry
+    // its own `at`/`rest` split here, and the free-text masker carried a *different* one whose class stopped at the
+    // authority delimiters - so the same URL was masked by one and published by the other. The hostless case is still
+    // the reason this cannot simply be "mask everything before the last `@`": what follows the `@` may be a path, a
+    // query or a fragment rather than a host, so there is no authority left to keep readable, and the run *before* the
+    // `@` is still the operator's credential. Only a bare trailing `@` (`http://host@`, with no userinfo in front of it)
+    // A value with no scheme is masked whole, because every character before its `@` is userinfo.
+    if (looksLikeSchemeLessUrl(text)) {
+        const at = text.lastIndexOf('@');
+        return `***${text.slice(at)}`;
+    }
+    return maskUserinfoAfterScheme(text);
 }
+
+// The length of a leading `scheme://` run, or 0 when the value carries none. `normalizeBackendUrl()` *corrects* a value
+// like `alice:s3cr3t@host:4398` (it adds the scheme) and then quotes the raw value back in its `[Config]` note, so the
+// scheme-less spelling is a credential-bearing URL that reaches the startup log - the one line that publishes a secret
+// to `docker logs`. `maskUrlCredentials()` cannot mask that shape (see its own comment: without a `://` anchor, any
+// colon in prose would start a match), but a configured backend URL is exactly the case where the whole run before the
+// `@` *is* userinfo, so `maskBackendUrl()` masks it whole.
+const looksLikeSchemeLessUrl = (text) => {
+    const at = text.lastIndexOf('@');
+    if (at <= 0) return false;
+    // A leading `scheme://` means the scheme-qualified scan owns the value; a `://` later in the text (a path, a query,
+    // a sentence quoting two URLs) does not make the value a scheme-less URL, so it is read from the start.
+    return !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(text);
+};
 
 /**
  * Mask the userinfo of any URL inside an arbitrary piece of text.
@@ -395,46 +610,20 @@ export function maskUrlCredentials(text) {
     // Masking needs userinfo, which needs an `@`: this runs on every request log line and on every upstream sentence,
     // and the vast majority of both carry none.
     if (!value.includes('@')) return value;
-    // Two cheap necessary conditions, because both rules below are searched at *every* offset of the value and the
-    // request summary line runs before the auth check. The scheme-qualified rule cannot match without a literal
-    // `://`, and the scheme-less one cannot match without a `:` somewhere before the last `@` (its match is
-    // `boundary user ":" secret "@"`, so `indexOf(':') < lastIndexOf('@')` is implied by any match). Neither test can
-    // change the output - they only skip a scan that provably finds nothing - and together they answer the shapes a
-    // client can send for the price of two `indexOf()` calls: `/v1/models?@` + 16 000 `a` carries neither `://` nor
-    // `:` and measured 1.2 ms of blocked serving thread before, ~0 afterwards.
+    // Two cheap necessary conditions. The scan below cannot find userinfo without a literal `://`, and the scheme-less
+    // rule cannot match without a `:` somewhere before the last `@` (its match is `boundary user ":" secret "@"`, so
+    // `indexOf(':') < lastIndexOf('@')` is implied by any match). Neither test can change the output - they only skip a
+    // scan that provably finds nothing - and together they answer the shapes a client can send for the price of two
+    // `indexOf()` calls: `/v1/models?@` + 16 000 `a` carries neither `://` nor `:` and measured 1.2 ms of blocked
+    // serving thread before, ~0 afterwards.
     const lastAt = value.lastIndexOf('@');
     const firstColon = value.indexOf(':');
-    const schemeQualified = value.includes('://');
     const schemeLess = firstColon !== -1 && firstColon < lastAt;
-    // Not anchored: the URL can sit anywhere in the sentence, and a `@` in a path or query is not userinfo (the
-    // authority is everything up to the first `/`, `?` or `#`, which the character class excludes).
-    //
-    // The scheme run is bounded (`{0,31}`): no real scheme is longer, and an unbounded one made this quadratic in the
-    // length of a whitespace-free token. `[\w+.-]*` swallowed the whole token before `://`, then the authority class
-    // scanned it again and failed at every `@`-less offset - 32 000 characters measured 1.9 s on the serving thread,
-    // reachable through the debug dump of a request body (each string up to 32 KiB) and through an upstream error
-    // sentence quoted into a 502. With the bound, a start position can only be a candidate when `://` follows within
-    // 32 characters, so the scan is linear (1 MiB measured ~70 ms).
-    // The userinfo run stops at the authority delimiters only (`/`, `?`, `#`, `@`) and deliberately **not** at
-    // whitespace. A credential containing a space or a tab - a passphrase, or a value copied out of a password manager
-    // - matched neither rule when the class excluded `\s`, so `http://alice:s3 cr3t@127.0.0.1:1/` was returned
-    // unchanged and the operator's password reached the client-facing 502 and the error log: Node's own `fetch` sentence
-    // (`Request cannot be constructed from a URL that includes credentials: …`) reproduces the URL raw, spaces
-    // included, and that sentence is exactly what this masker exists to sanitise. The URL ends at the `@`, so allowing
-    // a space *inside* the run cannot swallow the sentence that follows it: a `user:pass@` shape that ends in an
-    // authority still decides the match, and prose (`alice@example.com`, `mailto:…`) has no `:` before its `@` and is
-    // never reached.
-    // The userinfo run deliberately **does** allow whitespace, unlike the scheme-qualified rule above. A credential
-    // containing a space or a tab - a passphrase, or a value copied out of a password manager - matched neither rule
-    // when both classes excluded `\s`, so `http://alice:s3 cr3t@127.0.0.1:1/` was returned unchanged and the operator's
-    // password reached the client-facing 502 and the error log: Node's own `fetch` sentence
-    // (`Request cannot be constructed from a URL that includes credentials: …`) reproduces the URL raw, spaces
-    // included, and that sentence is exactly what this masker exists to sanitise. A `://` is an unambiguous anchor - the
-    // userinfo of a URL ends at the `@` and never contains one - so allowing a space inside this run cannot swallow the
-    // prose after the URL: the run stops at the first `/`, `?` or `#` whatever it contains.
-    const withScheme = schemeQualified
-        ? value.replace(/(\w[\w+.-]{0,31}:\/\/)[^/?#@]*@/g, '$1***@')
-        : value;
+    // The scheme-qualified pass is `maskUserinfoAfterScheme()`, shared with `maskBackendUrl()`. It replaced a regex whose
+    // userinfo class stopped at `/`, `?` or `#`: that class could never reach the `@` of `http://alice:s3#cr3t@host`, so
+    // the credential came back **unchanged** in a client-facing 502 and in the log line. Its scan is anchored on each
+    // `://` instead of being retried at every offset, which is what keeps it linear on arbitrary text.
+    const scheme = value.includes('://') ? maskUserinfoAfterScheme(value) : value;
     // A URL written **without** a scheme is the form `normalizeBackendUrl()` repairs and then quotes back, and it is the
     // form a hand-written sentence uses (`connect alice:s3cr3t@proxy failed`): requiring `scheme://` left both in clear.
     // The `:` before the `@` is what separates userinfo from an e-mail address, so `alice@example.com` - the shape a
@@ -451,18 +640,18 @@ export function maskUrlCredentials(text) {
     // the `@` to succeed, so a target with one `@` early and no other retried the scan from every `=`, `:`, quote and space
     // after it - `/v1/@x==a:=a:=a:…` measured 1.2 ms at 3 KiB, 16.9 ms at 12 KiB and 126 ms at 32 KiB, quadratic, on
     // the request-summary line that is built before the auth check (the debug body dump hits the same rule with every
-    // string it masks, at 32 KiB each). The scheme-qualified rule above masks a real `scheme://user:pass@` credential
-    // of any length, so this rule only ever sees the scheme-less form a hand-written sentence or `normalizeBackendUrl()`
+    // string it masks, at 32 KiB each). The shared `://` scan above masks a real `scheme://user:pass@` credential of any
+    // length, so this rule only ever sees the scheme-less form a hand-written sentence or `normalizeBackendUrl()`
     // produces, where 256 characters is far beyond any credential: measured 31.1 ms -> 2.3 ms at 16 KiB, byte-identical
     // output on every credential-bearing shape.
     //
-    // The secret class keeps excluding whitespace, for the reason the scheme-qualified run above does *not*: with no
-    // `://` to anchor it, a class that allowed spaces would match from any `:` earlier in the sentence (`the admin:
+    // The secret class keeps excluding whitespace, for the reason a class that allowed it would not be usable here: with
+    // no `://` to anchor it, a class that allowed spaces would match from any `:` earlier in the sentence (`the admin:
     // bob@example.com replied` reads as user `admin`, secret ` bob`) and rewrite ordinary prose. The scheme-less spelling
-    // of a credential containing a space is therefore not covered here; `maskFreeText()` masks it through its
-    // scheme-qualified pass when a `://` is present, and `maskBackendUrl()` covers the configured URL by construction.
-    if (!schemeLess) return withScheme;
-    return withScheme.replace(
+    // of a credential containing a space is therefore not covered here; `maskFreeText()` masks it through the `://` scan
+    // when a scheme is present, and `maskBackendUrl()` covers the configured URL by construction.
+    if (!schemeLess) return scheme;
+    return scheme.replace(
         /(^|[\s="'(<])([^\s/?#@"'()<>=:]+):([^\s/?#@]{0,256})@(?=[^\s/?#@]+)/g,
         (match, boundary, user, secret, offset, whole) => {
             const afterAt = whole.slice(offset + match.length);
@@ -591,7 +780,7 @@ export function maskUrlsInText(text) {
 // never wrote. `maskFreeText()` is the single chain every outbound sentence passes through, so it is the one place that
 // has to apply the same rule. The regex is duplicated here rather than imported from `src/text.js` because that module
 // already imports from this one, and a shared constant would close the cycle into an import error at load time.
-const MASK_CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
+const MASK_CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f]/g;
 
 /**
  * Free text that is about to leave the process - a client-facing 5xx sentence, an error log line, a stack, a string

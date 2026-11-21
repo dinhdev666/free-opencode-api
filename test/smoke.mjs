@@ -467,7 +467,12 @@ async function run() {
     // the value: `isFile(input)` tested the process's cwd by accident, while the child resolved a bare relative path
     // against its own cwd - so a configured `OPENCODE_PATH=src/proxy.js` was warned about as missing and the search
     // fell through to whatever `PATH` held, which is a *different* binary than the operator configured.
-    const relativePathDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-relpath-'));
+    // The assertion below canonicalises the expected directory. `os.tmpdir()` is `/var/folders/...` on macOS while
+    // `/var` is a symlink to `/private/var`, so `chdir` into the fixture makes `process.cwd()` (and therefore the value
+    // `resolveOpencodePath()` resolves against it) the `/private/var/...` spelling. Comparing the two spellings
+    // literally failed on macOS with byte-perfect gateway behaviour, and passed on Linux, where `/tmp` is not a
+    // symlink - the same hazard the `/private` stripping at the end of this file handles for the jail paths.
+    const relativePathDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gw-relpath-')));
     const relativeProbeName = 'opencode-probe.js';
     fs.writeFileSync(path.join(relativePathDir, relativeProbeName), '// probe\n');
     const cwdBeforeProbe = process.cwd();
@@ -2376,6 +2381,13 @@ async function run() {
             allowHeaders: streamed.response.headers.get('access-control-allow-headers'),
             nosniff: streamed.response.headers.get('x-content-type-options')
         }));
+    // `README.md` advertises `X-Accel-Buffering: no` as the reason a stream is not buffered to death behind nginx, and
+    // nothing asserted it: deleting the one line that sets it left the suite fully green while the documented
+    // proxy-friendliness was gone. It rides the hijacked-stream path (`raw.setHeader`), so it is read from the response
+    // that path actually produced.
+    check('a streaming response asks an intermediary not to buffer it',
+        streamed.response.headers.get('x-accel-buffering') === 'no',
+        String(streamed.response.headers.get('x-accel-buffering')));
 
     const subscriptionsAfter = await fetch(`${STUB_URL}/__sessions`).then((r) => r.json()).catch(() => null);
     const priorSubscriptions = Array.isArray(subscriptionsBefore?.eventSubscriptionQueries)
@@ -2909,6 +2921,12 @@ async function run() {
     });
     check('a rejected prompt in streaming mode answers the same 502',
         promptRejectedStream.response.status === 502, `status ${promptRejectedStream.response.status}`);
+    // No SSE frame was ever written, so this is a JSON error body and must carry the documented `no-store` rather than
+    // the `no-cache` the stream path narrows to when it hijacks the response: a shared cache would otherwise be free to
+    // store a completion error keyed on the URL alone, which is the class the header exists to prevent.
+    check('a 502 that arrives before any SSE frame is not cacheable',
+        (promptRejectedStream.response.headers.get('cache-control') || '') === 'no-store',
+        String(promptRejectedStream.response.headers.get('cache-control')));
     const afterRejection = await sessionsAfterCleanup(STUB_URL);
     check('a rejected prompt still deletes its session',
         afterRejection && afterRejection.live === 0, JSON.stringify(afterRejection));
@@ -3041,6 +3059,15 @@ async function run() {
     check('the newest-message poll really ran over a session of many messages',
         manyMessagesStats?.largestSessionMessages >= MANY_MESSAGES_OLDER,
         `largest session ${manyMessagesStats?.largestSessionMessages} messages`);
+    // The query itself, not only its consequence. `order=desc&limit=1&type=assistant` is the shape the documented
+    // behaviour depends on (a stale step in any session larger than one page), and the stub records what each poll
+    // actually asked for. A change to `order=asc` combined with a matching change in the stub's own ordering would
+    // otherwise stay self-consistent and unnoticed.
+    const pollQueries = Array.isArray(manyMessagesStats?.messagePollQueries) ? manyMessagesStats.messagePollQueries : [];
+    check('the message poll asks for the newest assistant message, one page of one',
+        pollQueries.length > 0 && pollQueries.every((q) => q && q.order === 'desc' && q.limit === 1 && q.type === 'assistant'
+            && q.cursor === null),
+        JSON.stringify(pollQueries.slice(0, 3)));
 
     // --- a provider failure that arrives after the text ---------------------------------------------------
     // The event that ends the message carries the error next to `time.completed`. Dropping it served the truncated text
@@ -4501,13 +4528,20 @@ async function run() {
     // startup summary, which is written from the same helper). The stub is not reached by the probe, so the values
     // never have to work as a transport.
     const maskedHealthPort = GATEWAY_PORT + 33;
+    // A port the gateway only ever reflects back through `/health`: it never dials this URL (the check is about the
+    // masking), so it does not have to be a port anything listens on - but it must not be a literal, because under
+    // `SMOKE_STUB_PORT` the suite does not own the default one.
+    const maskedHealthProbePort = GATEWAY_PORT + 61;
     const maskedHealthGateway = spawn(process.execPath, ['index.js'], {
         cwd: ROOT,
         env: {
             ...process.env,
             PORT: String(maskedHealthPort),
             BIND_HOST: '127.0.0.1',
-            OPENCODE_SERVER_URL: 'http://ops:s3cr3t-value@127.0.0.1:4199/proxy?token=abc123',
+            // Interpolated rather than the literal 4199: under `SMOKE_STUB_PORT` the suite does not own 4199, so a
+            // literal made this gateway probe a port the suite never started (passing for whatever else held it, or
+            // failing with a message about masking). This check only round-trips the string, it never calls the URL.
+            OPENCODE_SERVER_URL: `http://ops:s3cr3t-value@127.0.0.1:${maskedHealthProbePort}/proxy?token=abc123`,
             LOG_LEVEL: 'error'
         }
     });
@@ -4519,7 +4553,7 @@ async function run() {
         .then(() => fetch(`${maskedHealthUrl}/health`).then((r) => r.json()))
         .catch(() => null);
     check('GET /health masks a credential in the backend URL',
-        maskedHealth?.status === 'ok' && maskedHealth?.backend === 'http://***@127.0.0.1:4199/proxy?token=***',
+        maskedHealth?.status === 'ok' && maskedHealth?.backend === `http://***@127.0.0.1:${maskedHealthProbePort}/proxy?token=***`,
         JSON.stringify(maskedHealth));
     check('the startup summary masks the backend URL too', !maskedHealthOut.includes('s3cr3t-value'),
         maskedHealthOut.slice(0, 160));
@@ -7358,6 +7392,13 @@ await waitForExit(pipeStub);
             resolve(code);
         });
     });
+    // The `[Fatal]` line and the exit can race: the child writes it, and the `exit` event can be observed before the
+    // pipe has been read, which showed up once as a correct `exit 1` with an output that did not yet contain the line
+    // (and the failure text only printed the first three lines, hiding the cause). Wait for the line, bounded, instead
+    // of reading the buffer once.
+    for (let i = 0; i < 40 && !crashOutput.includes('[Fatal] Uncaught exception'); i += 1) {
+        await new Promise((r) => setTimeout(r, 25));
+    }
     check('an uncaught exception exits with a crash status, not a clean one',
         crashExit === 1 && crashOutput.includes('[Fatal] Uncaught exception'),
         `exit ${crashExit} ${JSON.stringify(crashOutput.split('\n').slice(0, 3).join(' | ').slice(0, 200))}`);

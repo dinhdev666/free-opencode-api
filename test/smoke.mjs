@@ -25,7 +25,8 @@ import {
 } from '../src/logger.js';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { loggableUrl } from '../src/text.js';
+import { echoedValue, loggableUrl } from '../src/text.js';
+import { resolveOpencodePath } from '../src/env.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // This file reads itself for two invariants that live in its own text: the derived ports it must find free before it
@@ -193,15 +194,91 @@ for (const [signal, status] of [['SIGINT', 130], ['SIGTERM', 143]]) {
     });
 }
 
-// A process already listening on the port would answer the checks with someone else's build
+// A process already listening on the port would answer the checks with someone else's build.
+//
+// The message names *what* is listening when it can be told, because "derived port 17242 is already in use" sent the
+// reader looking at their own configuration: the processes behind these are usually this suite's own children. A child
+// is killed with SIGKILL by `stop()` when it does not answer SIGINT, and on Windows a grandchild - the `opencode serve`
+// the gateway spawned - is not killed with its parent, so one abandoned run leaves a real backend holding a derived port
+// for as long as the machine is up. The stub answers a test-only route (`GET /__sessions`) that no other server here
+// has, so a leftover stub or gateway can be named instead of guessed at.
+const listenerHint = async (port) => {
+    const probe = async (route) => {
+        try {
+            const response = await fetch(`http://127.0.0.1:${port}${route}`, { signal: AbortSignal.timeout(1000) });
+            return { status: response.status, body: (await response.text()).slice(0, 200) };
+        } catch {
+            return null;
+        }
+    };
+    const sessions = await probe('/__sessions');
+    if (sessions && sessions.status === 200 && sessions.body.trim().startsWith('{')) {
+        return `it answers the suite's own test route /__sessions, so it is a leftover stub or gateway: ${sessions.body.slice(0, 120)}`;
+    }
+    const root = await probe('/');
+    if (root && /free-opencode-api/.test(root.body)) return 'it identifies itself as free-opencode-api';
+    return null;
+};
+
 async function assertPortFree(port, label) {
     try {
         await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1000) });
     } catch {
         return;
     }
-    throw new Error(`${label} port ${port} is already in use: stop that process or set SMOKE_STUB_PORT / SMOKE_PORT`);
+    const hint = await listenerHint(port);
+    throw new Error(
+        `${label} port ${port} is already in use${hint ? ` (${hint})` : ''}: ` +
+        'stop that process, or set SMOKE_STUB_PORT / SMOKE_PORT to a free range');
 }
+
+// Reap the backends a previous run of *this* suite left behind.
+//
+// `stop()` kills a child with SIGKILL when it does not answer SIGINT, and on Windows a grandchild is not killed with its
+// parent: the `opencode serve` a test gateway spawned survives the gateway, keeps its derived port, and makes every later
+// run abort in the preflight above - with a message about a port rather than about the abandoned process. The suite
+// cannot reach a grandchild by pid, but it knows the ports it owns and Windows can name the listener on one, so the
+// orphans are found by port and killed only when their command line identifies them as this suite's (or as an
+// `opencode serve` started by it). Anything else holding a port is reported and left alone.
+//
+// Windows-only, because that is where the cascade fails; on POSIX a killed gateway's child is in the same group and is
+// taken with it. Best effort throughout: a reap that cannot run must never fail the suite.
+const reapOrphanedBackends = async (ports) => {
+    if (process.platform !== 'win32') return { reaped: [], busy: [] };
+    const run = (file, args) => {
+        try {
+            return execFileSync(file, args, { encoding: 'utf8', timeout: 15000, windowsHide: true });
+        } catch {
+            return '';
+        }
+    };
+    const listeners = run('netstat', ['-ano', '-p', 'tcp']);
+    const reaped = [];
+    const busy = [];
+    for (const port of ports) {
+        const row = listeners.split(/\r?\n/).find((line) => {
+            const columns = line.trim().split(/\s+/);
+            return columns[0] === 'TCP' && columns[1] === `127.0.0.1:${port}` && columns[3] === 'LISTENING';
+        });
+        if (!row) continue;
+        const pid = Number(row.trim().split(/\s+/).pop());
+        if (!Number.isInteger(pid) || pid <= 0) continue;
+        // Only a process this suite can recognise is killed: a pid is reused, and a stranger on a derived port is not
+        // ours to stop.
+        const commandLine = run('powershell', [
+            '-NoProfile', '-NonInteractive', '-Command',
+            `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`
+        ]).trim();
+        const ours = commandLine.includes('opencode') || commandLine.includes(path.join(ROOT, 'test', 'stub-opencode.mjs'));
+        if (!ours) {
+            busy.push({ port, pid, commandLine: commandLine.slice(0, 120) });
+            continue;
+        }
+        if (run('taskkill', ['/F', '/PID', String(pid)]) === '') continue;
+        reaped.push({ port, pid });
+    }
+    return { reaped, busy };
+};
 
 const stopGateway = (child) => {
     if (child && child.exitCode === null) child.kill('SIGINT');
@@ -386,6 +463,30 @@ async function run() {
         removeTempDir(probeDir);
     }
 
+    // `OPENCODE_PATH` may name a relative path, and the existence check has to agree with the `spawn()` that receives
+    // the value: `isFile(input)` tested the process's cwd by accident, while the child resolved a bare relative path
+    // against its own cwd - so a configured `OPENCODE_PATH=src/proxy.js` was warned about as missing and the search
+    // fell through to whatever `PATH` held, which is a *different* binary than the operator configured.
+    const relativePathDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-relpath-'));
+    const relativeProbeName = 'opencode-probe.js';
+    fs.writeFileSync(path.join(relativePathDir, relativeProbeName), '// probe\n');
+    const cwdBeforeProbe = process.cwd();
+    let relativeResolved;
+    let relativeError = null;
+    try {
+        process.chdir(relativePathDir);
+        relativeResolved = resolveOpencodePath(`./${relativeProbeName}`);
+    } catch (e) {
+        relativeError = e;
+    } finally {
+        process.chdir(cwdBeforeProbe);
+        removeTempDir(relativePathDir);
+    }
+    check('a relative OPENCODE_PATH resolves to the file the operator configured',
+        !relativeError && relativeResolved &&
+        relativeResolved.path === path.join(relativePathDir, relativeProbeName) && relativeResolved.source === 'config',
+        relativeError ? String(relativeError && relativeError.message) : JSON.stringify(relativeResolved));
+
     const readmeSource = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
     const undocumented = configKeys.filter((key) => !readmeSource.includes(`| \`${key}\` |`));
     check('every configurable key has a row in the README configuration table',
@@ -441,6 +542,28 @@ async function run() {
     check('the defaults and ranges in the README tuning table are the ones the gateway resolves',
         tuningMismatches.length === 0, tuningMismatches.join('; '));
 
+    // Two bounds that are arithmetic rather than configuration, and are checked here because neither has a number to
+    // compare: both used to be *sums* of values that are each already at a ceiling.
+    //
+    // The upload budget is the stall window plus the request budget, and both addends may sit at `MAX_TIMER_MS`; the
+    // result was compared as a number instead of being handed to `setTimeout`, so nothing warned - every request that
+    // announced a body was answered `408` with a deadline no timer could arm. Every other delay built from the budget
+    // is clamped, and this one is now the same shape.
+    const uploadBudgetLine = /const bodyUploadBudgetMs = ([^;]+);/.exec(proxySource);
+    const uploadBudgetClamped = Boolean(uploadBudgetLine) && uploadBudgetLine[1].includes('Math.min(') &&
+        uploadBudgetLine[1].includes('MAX_TIMER_MS');
+    check('the upload budget is clamped to the largest timer a delay may arm',
+        uploadBudgetClamped, uploadBudgetLine ? uploadBudgetLine[1].trim() : 'no bodyUploadBudgetMs in src/proxy.js');
+
+    // A debug dump of the request body is the one place a 20 MiB body reaches `JSON.parse` on the serving thread. The
+    // bound is the *parse* bound, not the dump bound: above it the value is masked as a string and never parsed, so a
+    // body the gateway would refuse anyway cannot cost a parse per debug line.
+    const bodyDumpGuard = 'if (body.length > MAX_MASKED_BODY_PARSE_CHARS) return maskDetail(body);';
+    check('the debug body dump stops parsing above a bounded size',
+        proxySource.includes(bodyDumpGuard) &&
+        /const MAX_MASKED_BODY_PARSE_CHARS = \d+ \* \d+;/.test(proxySource),
+        proxySource.includes(bodyDumpGuard) ? 'the guard is in place' : 'no parse bound in maskRequestBody()');
+
     // `config.json.example` is not documentation an operator reads, it is configuration they copy: every value in it is
     // written to their `config.json`, which wins over the default. A default changed in `src/proxy.js` while the
     // template keeps the old number does not leave a stale table behind - it pins the old value in every install made
@@ -485,6 +608,14 @@ async function run() {
         ['http://10.0.0.5:4097/v1?token=abc&model=x', 'http://10.0.0.5:4097/v1?token=***&model=x'],
         ['http://user:secret@10.0.0.5:4097/v1?api_key=k', 'http://***@10.0.0.5:4097/v1?api_key=***'],
         ['10.0.0.5:4097', '10.0.0.5:4097'],
+        // A *hostless* authority: the `@` is still the one that ends the userinfo, so the credential is still there.
+        // Reading "is there anything after the `@`?" as "is this a credential at all?" let `http://user:secret@/v1`
+        // through in clear - and `/health` needs no key, so that value was published to every caller.
+        ['http://alice:s3cr3t@/v1', 'http://***@/v1'],
+        ['http://alice:s3cr3t@#fragment', 'http://***@#fragment'],
+        ['http://alice:s3cr3t@?q=1', 'http://***@?q=1'],
+        ['http://host@', 'http://***@'],
+        ['alice:s3cr3t@', '***@'],
         ['', '']
     ];
     const backendUrlResults = backendUrlCases.map(([input, expected]) => [input, maskBackendUrl(input), expected]);
@@ -507,7 +638,15 @@ async function run() {
         // hand-written sentence uses - both used to keep the credential in clear because the pattern wanted `scheme://`
         ['connect alice:s3cr3t@proxy failed', 'connect ***@proxy failed'],
         ['OPENCODE_SERVER_URL=alice:s3cr3t@host:4398 is repaired', 'OPENCODE_SERVER_URL=***@host:4398 is repaired'],
-        ['an @ in a path is not userinfo: http://host:4097/a@b', 'an @ in a path is not userinfo: http://host:4097/a@b']
+        ['an @ in a path is not userinfo: http://host:4097/a@b', 'an @ in a path is not userinfo: http://host:4097/a@b'],
+        // A passphrase is a real credential, and Node's own "URL that includes credentials" sentence quotes it verbatim.
+        // The scheme-qualified rule used to run `[^\s/?#@]*@`, so a credential with a space in it matched nothing and
+        // the whole value was published. Only that rule allows whitespace: without a `://` anchor, a class that did
+        // would match from any earlier colon (`the admin: bob@example.com` is prose).
+        ['Request cannot be constructed from a URL that includes credentials: http://alice:s3 cr3t@127.0.0.1:4097',
+            'Request cannot be constructed from a URL that includes credentials: http://***@127.0.0.1:4097'],
+        ['the admin: bob@example.com', 'the admin: bob@example.com'],
+        ['status=x: connection refused', 'status=x: connection refused']
     ];
     const maskedTextResults = maskedTextCases.map(([input, expected]) => [input, maskUrlCredentials(input), expected]);
     check('a credential inside a message is masked',
@@ -530,6 +669,33 @@ async function run() {
     check('the scheme bound still masks a real credential-bearing URL',
         maskUrlCredentials('see http://user:s3cr3t@host:4097/x') === 'see http://***@host:4097/x',
         maskUrlCredentials('see http://user:s3cr3t@host:4097/x'));
+
+    // A value that is not a URL at all is still echoed into a response body: the `415` names the `Content-Type` the
+    // client sent, and a client that sent `application/json; api_key=SECRET42` read the whole secret back out of the
+    // refusal. `echoedValue()` bounds the value *and* masks it, so the pair form of a credential goes the same way as
+    // the URL form - including the media-type spelling (`application/x-api-key=…`), where `/` is part of the name.
+    const echoedCases = [
+        ['gzip, api_key=SECRET42', 'gzip, api_key=***'],
+        ['application/x-api-key=S3CRET', 'application/x-api-key=***'],
+        ['application/json; token=SECRET42', 'application/json; token=***'],
+        ['application/xml', 'application/xml'],
+        ['text/plain; charset=utf-8', 'text/plain; charset=utf-8'],
+        ['model=gpt-4', 'model=gpt-4']
+    ];
+    const echoedResults = echoedCases.map(([input, expected]) => [input, echoedValue(input), expected]);
+    check('a credential echoed back to the client is masked',
+        echoedResults.every(([, actual, expected]) => actual === expected),
+        JSON.stringify(echoedResults.filter(([, actual, expected]) => actual !== expected)));
+    // The mask must not be a prefix: the value class runs to the end of the pair, so a long secret cannot leave its
+    // tail behind (`api_key=<500 chars>` used to come back as `api_key=***` plus the last 444 characters).
+    const longEchoSecret = 'S'.repeat(500);
+    const longEchoValue = echoedValue(`api_key=${longEchoSecret}`);
+    check('a long echoed credential loses its tail as well as its head',
+        !longEchoValue.includes(longEchoSecret) && longEchoValue.includes('api_key=***'), longEchoValue.slice(0, 60));
+    // Control characters are still replaced, and the bound still applies: masking must not be a way around either.
+    check('the echo bounder still replaces control characters and cuts the value',
+        echoedValue('a\nb') === 'a?b' && echoedValue('x'.repeat(200)).includes('[truncated'),
+        echoedValue('a\nb'));
 
     // A credential containing a reserved character ends the authority a strict parse sees (`http://alice:s3#cr3t@host`
     // is host `alice`, port `s3` - not a number - and the rest), so a masker that walked `[^/?#]*@` matched nothing and
@@ -1331,9 +1497,7 @@ async function run() {
         removeTempDir(configDir);
     }
 
-    await assertPortFree(STUB_PORT, 'stub');
-    await assertPortFree(GATEWAY_PORT, 'gateway');
-    // Every other port the suite uses is derived from GATEWAY_PORT, and only the two above were ever checked: a
+    // Every port the suite uses is GATEWAY_PORT plus a fixed offset, and only the two above were ever checked: a
     // leftover process on a derived one made a section talk to a foreign server instead of its own gateway, which
     // surfaced as an unrelated assertion failing far from the port that caused it (a 1 MB backend error answered `200`
     // by whatever held that port). The offsets are read from this file rather than repeated here, so a section that
@@ -1343,6 +1507,23 @@ async function run() {
     // The one derivation that is not a literal offset (`GATEWAY_PORT + 200 + (process.pid % 20)`), expanded to the
     // twenty ports it can name
     for (let offset = 200; offset < 220; offset += 1) derivedOffsets.add(offset);
+    const suitePorts = [STUB_PORT, GATEWAY_PORT, ...[...derivedOffsets].map((offset) => GATEWAY_PORT + offset)];
+    // A previous run that was SIGKILLed leaves its `opencode serve` grandchildren behind on Windows, and they hold the
+    // ports below. Reaping them **before** the checks below is what keeps one abandoned run from making every later run
+    // abort in the preflight - and the reaping is reported, because a silently killed process is its own surprise.
+    const orphanReap = await reapOrphanedBackends(suitePorts);
+    if (orphanReap.reaped.length) {
+        console.log(`[smoke] reaped ${orphanReap.reaped.length} orphaned backend(s) from an earlier run: ` +
+            orphanReap.reaped.map((entry) => `port ${entry.port} (pid ${entry.pid})`).join(', '));
+    }
+    for (const entry of orphanReap.busy) {
+        console.error(`[smoke] port ${entry.port} is held by pid ${entry.pid} (${entry.commandLine}), which this suite does not own`);
+    }
+    check('a previous run left no backend listening on a suite port', orphanReap.busy.length === 0,
+        orphanReap.busy.map((entry) => `${entry.port}: pid ${entry.pid}`).join(', '));
+
+    await assertPortFree(STUB_PORT, 'stub');
+    await assertPortFree(GATEWAY_PORT, 'gateway');
     for (const offset of [...derivedOffsets].sort((a, b) => a - b)) {
         await assertPortFree(GATEWAY_PORT + offset, 'derived');
     }

@@ -7,7 +7,7 @@
  * read as a *second* one (a forged request summary, a fake `[Security]` line), an ANSI escape would reach the operator's
  * terminal, and an unbounded value would turn one request body into an arbitrarily large record.
  */
-import { MASK_TEXT_WINDOW_FACTOR, maskUrlCredentials, maskUrlQuery } from './logger.js';
+import { MASK_TEXT_WINDOW_FACTOR, maskCredentialPairs, maskUrlCredentials, maskUrlQuery } from './logger.js';
 
 /**
  * Control characters, including the DEL and the C1 range: replaced wherever a value that did not come from this process
@@ -49,6 +49,12 @@ const boundedForLog = (raw, maxLen, counted = true, mask = null) => {
 // The credential rules `loggableUrl()` needs, in the order `maskFreeText()` applies them: a query value first, then the
 // userinfo of any URL in what is left.
 const maskUrlText = (text) => maskUrlCredentials(maskUrlQuery(text));
+
+// The rules a value echoed into a **response body** needs. They are the two URL rules plus one more: the values on
+// these paths are single tokens with no query string (a `Content-Encoding` header, a media type with parameters, the
+// `type` of a content part), so a `name=value` pair is masked on the name alone (`maskCredentialPairs()`). Bounding and
+// masking both run on the same 16x window, so a caller cannot turn a 415 into a scan of the whole request.
+const maskEchoText = (text) => maskCredentialPairs(maskUrlText(text));
 
 // Two completions that reach this counter in the same millisecond used to receive the same `chatcmpl-<epoch>` id (a
 // client that keys its messages by id merged two answers); the counter keeps ids distinct without a random source, and
@@ -108,11 +114,18 @@ export const MAX_ECHOED_VALUE_LENGTH = 64;
 export const loggableModelId = (id) => boundedForLog(id, MAX_LOGGED_MODEL_LENGTH, false);
 
 /**
- * A client-supplied value on its way into a response body: bounded, with its control characters replaced.
+ * A client-supplied value on its way into a response body: bounded, with its control characters replaced **and** its
+ * credentials masked.
+ *
+ * Bounding alone was not enough: this helper is what the gateway echoes a rejected request header or content-part type
+ * back through (`unsupported content type "…"`, `Content-Encoding: … are not supported`, `… uses an unsupported
+ * content part type "…"`), and a client that builds one of those from its own configuration put a credential into a
+ * response body that SDK error logs, proxy logs and bug reports all quote. The caller learns nothing - it sent the
+ * value - but the third party reading the body does.
  * @param {unknown} value
  * @returns {string}
  */
-export const echoedValue = (value) => boundedForLog(value, MAX_ECHOED_VALUE_LENGTH);
+export const echoedValue = (value) => boundedForLog(value, MAX_ECHOED_VALUE_LENGTH, true, maskEchoText);
 
 /**
  * An operator-supplied value on its way into a log line, under the rule client input follows: `config.json` and the

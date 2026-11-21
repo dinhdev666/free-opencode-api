@@ -86,10 +86,16 @@ const SYMLINK_TYPE = 'a symbolic link';
 function describeFileType(stat) {
     if (stat.isDirectory()) return 'a directory';
     if (stat.isSymbolicLink()) return SYMLINK_TYPE;
-    if (stat.isFIFO()) return 'a FIFO';
-    if (stat.isSocket()) return 'a socket';
-    if (stat.isCharacterDevice()) return 'a character device';
-    if (stat.isBlockDevice()) return 'a block device';
+    // The POSIX-only predicates, each called defensively: `isFIFO`/`isSocket`/`isCharacterDevice`/`isBlockDevice` are
+    // documented as always present on a `Stats` object, but if one is ever missing the call throws *inside* the `try`
+    // below, and the `finally` that closes the descriptor was itself unguarded - so a `config.json` that is none of the
+    // known types took the startup down with a `TypeError` and leaked the descriptor instead of answering
+    // "must be a regular file".
+    const kind = (name, label) => (typeof stat[name] === 'function' && stat[name]());
+    if (kind('isFIFO')) return 'a FIFO';
+    if (kind('isSocket')) return 'a socket';
+    if (kind('isCharacterDevice')) return 'a character device';
+    if (kind('isBlockDevice')) return 'a block device';
     return 'not a regular file';
 }
 
@@ -151,8 +157,14 @@ export function readConfigFile(configPath) {
         if (e.code === 'ENOENT') return { config: {}, error: null };
         return { config: {}, error: `cannot be read: ${e.message}` };
     } finally {
-        // Every return above leaves through here, so no error path leaks the descriptor.
-        fs.closeSync(fd);
+        // Every return above leaves through here, so no error path leaks the descriptor - and the close is guarded:
+        // an unguarded `closeSync()` in a `finally` replaces the real failure (a bad descriptor, an already-closed one)
+        // with its own, which is the error the operator would be left reading.
+        try {
+            fs.closeSync(fd);
+        } catch (e) {
+            // The descriptor is closed by the process exit this leads to; the config error is the useful one
+        }
     }
 
     // A UTF-8 BOM is what a Windows editor or PowerShell 5.1 writes: JSON.parse rejects the first character of a file

@@ -259,6 +259,40 @@ const decodeQueryName = (name) => {
     return name.replace(/%([0-9A-Fa-f]{2})/g, (match, hex) => String.fromCharCode(parseInt(hex, 16)));
 };
 
+/**
+ * Mask a `name=value` pair whose **name** looks like a credential, wherever the pair sits in a short value.
+ *
+ * `maskUrlQuery()` is written for a URL: it requires a `?`, `&`, `#` or `;` in front of the name, which is exactly
+ * right for a request target and not enough for the other client-controlled values the gateway echoes into a response
+ * body - a `Content-Encoding` header (`api_key=…`), a media type with parameters (`application/x-api-key=…`) and the
+ * `type` of an unsupported content part. Those are single tokens with no query string, so a credential a client
+ * copied into one was returned verbatim to the caller and into any log that quotes the body.
+ *
+ * The *name* test is the same one `maskUrlQuery()` uses (`isSensitiveHeader()`), so the two rules cannot disagree
+ * about what counts as a credential: `token`, `api_key`, `accessToken`, `password`, `authorization` and friends are
+ * masked, and an ordinary pair (`status=ok`, `model=gpt-4`) is left alone. That reuse is also why the rule is narrow
+ * enough for prose: a sentence has to contain a credential *name* followed by `=` to be rewritten at all.
+ *
+ * Not anchored at the end of the value, and bounded on both runs: a pair is a name of at most 64 characters and a
+ * value of at most 256, which is far beyond any real token, and the bound is what keeps the scan linear on a value
+ * that carries no pair at all.
+ * @param {string} text any short value
+ * @returns {string} the value with credential pairs masked
+ */
+export function maskCredentialPairs(text) {
+    const value = String(text);
+    // The warm path: nothing to find without an `=`
+    if (!value.includes('=')) return value;
+    // The **whole** value run is masked, not its first 256 characters: the caller cuts the result at 64, so masking a
+    // prefix of a long secret and leaving the rest behind published the tail of the credential in a 415 body. 4096 is
+    // far beyond any value that can reach this function (an echoed value is bounded to a 16x window of 64 characters
+    // before the mask runs, and a media type or content-part name is shorter still), and it keeps the run bounded the
+    // way every other rule here is. `/` is part of a name because a media type is `type/subtype`.
+    return value.replace(
+        /(^|[,;&#?\s])([A-Za-z][A-Za-z0-9_./-]{0,63})=("[^"]{0,4096}"|'[^']{0,4096}'|[^&;,\s]{0,4096})/g,
+        (match, separator, name) => (isSensitiveHeader(name) ? `${separator}${name}=***` : match));
+}
+
 export function maskUrlQuery(url) {
     const text = String(url);
     // A masked credential is always a `name=value` pair, so a text carrying no `=` cannot change: this is the warm path
@@ -278,6 +312,15 @@ export function maskUrlQuery(url) {
  * @param {string} url configured backend URL
  * @returns {string} the URL with userinfo and credential query values masked
  */
+// The length of a leading `scheme://` run, or 0 when the value carries none. `maskBackendUrl()` needs it *before* it
+// reads the last `@` (to tell a hostless authority from a bare trailing `@`), and the scheme run is anchored, so it is
+// linear whatever its length - unlike the bounded `\w[\w+.-]{0,31}` in `maskUrlCredentials()`, which is searched at
+// every offset of a sentence.
+const schemePrefixLength = (text) => {
+    const scheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.exec(text);
+    return scheme ? scheme[0].length : 0;
+};
+
 export function maskBackendUrl(url) {
     const text = maskUrlQuery(String(url));
     // Everything between the scheme and the **last** `@` is userinfo (`user:pass`), and the last `@` is the one that
@@ -297,15 +340,21 @@ export function maskBackendUrl(url) {
     const at = text.lastIndexOf('@');
     if (at === -1) return text;
     const rest = text.slice(at + 1);
-    const authorityEnd = rest.search(/[/?#]/);
-    // A trailing `@` with nothing after it is not a credential, and there is no host left to keep readable
-    if (authorityEnd === 0) return text;
-    // The scheme run is anchored, so it is linear whatever its length (the bounded `\w[\w+.-]{0,31}` in
-    // `maskUrlCredentials()` exists because *that* pattern is searched at every offset of a sentence; this one only
-    // ever runs once, at position 0). It is read for the prefix it keeps, not as a validity check.
-    const scheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.exec(text);
-    const schemeText = scheme ? scheme[0] : '';
-    // An `@` inside the scheme itself is not userinfo (`scheme` cannot contain one, so this is unreachable in practice)
+    // What follows the `@` is a path, a query or a fragment rather than a host, so there is no authority left to keep
+    // readable - but the run *before* the `@` is still userinfo, and it is still the operator's credential.
+    //
+    // Returning the value unchanged here was a fail-open: `http://alice:s3cr3t@/v1`, `…@?token=1` and `…@#frag` were
+    // all printed verbatim, and `/health` needs no key, so the password went to every caller that could reach the port as
+    // well as to `docker logs` (the startup summary and every `[Config]` note quote the same value). A hostless spelling
+    // is reachable in the configuration this gateway supports and repairs - `normalizeBackendUrl()` neither rejects nor
+    // rewrites it - so the branch is not hypothetical.
+    //
+    // The condition is therefore "is there anything before the `@` to mask?", not "is there a host after it?". Only a
+    // bare trailing `@` (`http://host@`, with no userinfo in front of it) is left as it arrived.
+    if (rest.search(/[/?#]/) === 0 && at <= schemePrefixLength(text)) return text;
+    // An `@` inside the scheme itself is not userinfo (`scheme` cannot contain one, so this is unreachable in practice).
+    // `schemeText` is also the prefix the masked value keeps, so the run is read once and reused.
+    const schemeText = text.slice(0, schemePrefixLength(text));
     if (at < schemeText.length) return text;
     return `${schemeText}***@${rest}`;
 }
@@ -353,8 +402,25 @@ export function maskUrlCredentials(text) {
     // reachable through the debug dump of a request body (each string up to 32 KiB) and through an upstream error
     // sentence quoted into a 502. With the bound, a start position can only be a candidate when `://` follows within
     // 32 characters, so the scan is linear (1 MiB measured ~70 ms).
+    // The userinfo run stops at the authority delimiters only (`/`, `?`, `#`, `@`) and deliberately **not** at
+    // whitespace. A credential containing a space or a tab - a passphrase, or a value copied out of a password manager
+    // - matched neither rule when the class excluded `\s`, so `http://alice:s3 cr3t@127.0.0.1:1/` was returned
+    // unchanged and the operator's password reached the client-facing 502 and the error log: Node's own `fetch` sentence
+    // (`Request cannot be constructed from a URL that includes credentials: …`) reproduces the URL raw, spaces
+    // included, and that sentence is exactly what this masker exists to sanitise. The URL ends at the `@`, so allowing
+    // a space *inside* the run cannot swallow the sentence that follows it: a `user:pass@` shape that ends in an
+    // authority still decides the match, and prose (`alice@example.com`, `mailto:…`) has no `:` before its `@` and is
+    // never reached.
+    // The userinfo run deliberately **does** allow whitespace, unlike the scheme-qualified rule above. A credential
+    // containing a space or a tab - a passphrase, or a value copied out of a password manager - matched neither rule
+    // when both classes excluded `\s`, so `http://alice:s3 cr3t@127.0.0.1:1/` was returned unchanged and the operator's
+    // password reached the client-facing 502 and the error log: Node's own `fetch` sentence
+    // (`Request cannot be constructed from a URL that includes credentials: …`) reproduces the URL raw, spaces
+    // included, and that sentence is exactly what this masker exists to sanitise. A `://` is an unambiguous anchor - the
+    // userinfo of a URL ends at the `@` and never contains one - so allowing a space inside this run cannot swallow the
+    // prose after the URL: the run stops at the first `/`, `?` or `#` whatever it contains.
     const withScheme = schemeQualified
-        ? value.replace(/(\w[\w+.-]{0,31}:\/\/)[^\s/?#@]*@/g, '$1***@')
+        ? value.replace(/(\w[\w+.-]{0,31}:\/\/)[^/?#@]*@/g, '$1***@')
         : value;
     // A URL written **without** a scheme is the form `normalizeBackendUrl()` repairs and then quotes back, and it is the
     // form a hand-written sentence uses (`connect alice:s3cr3t@proxy failed`): requiring `scheme://` left both in clear.
@@ -368,14 +434,20 @@ export function maskUrlCredentials(text) {
     // does too unless the leading word is a URI scheme the login and address forms use.
     // The name class cannot cross a separator, `:`, `=` or a quote: `KEY=user:pass@host` is a note naming the value, and
     // starting at the `=` keeps the key readable while the credential goes.
-    // The secret run is bounded (`{0,256}`) for the same reason the scheme run above is: `[^…]*` had to reach the `@`
-    // to succeed, so a target with one `@` early and no other retried the scan from every `=`, `:`, quote and space
+    // The scheme-less secret run is bounded (`{0,256}`) for the same reason the scheme run above is: `[^…]*` had to reach
+    // the `@` to succeed, so a target with one `@` early and no other retried the scan from every `=`, `:`, quote and space
     // after it - `/v1/@x==a:=a:=a:…` measured 1.2 ms at 3 KiB, 16.9 ms at 12 KiB and 126 ms at 32 KiB, quadratic, on
     // the request-summary line that is built before the auth check (the debug body dump hits the same rule with every
     // string it masks, at 32 KiB each). The scheme-qualified rule above masks a real `scheme://user:pass@` credential
     // of any length, so this rule only ever sees the scheme-less form a hand-written sentence or `normalizeBackendUrl()`
     // produces, where 256 characters is far beyond any credential: measured 31.1 ms -> 2.3 ms at 16 KiB, byte-identical
     // output on every credential-bearing shape.
+    //
+    // The secret class keeps excluding whitespace, for the reason the scheme-qualified run above does *not*: with no
+    // `://` to anchor it, a class that allowed spaces would match from any `:` earlier in the sentence (`the admin:
+    // bob@example.com replied` reads as user `admin`, secret ` bob`) and rewrite ordinary prose. The scheme-less spelling
+    // of a credential containing a space is therefore not covered here; `maskFreeText()` masks it through its
+    // scheme-qualified pass when a `://` is present, and `maskBackendUrl()` covers the configured URL by construction.
     if (!schemeLess) return withScheme;
     return withScheme.replace(
         /(^|[\s="'(<])([^\s/?#@"'()<>=:]+):([^\s/?#@]{0,256})@(?=[^\s/?#@]+)/g,
@@ -464,14 +536,28 @@ export const MASK_TEXT_WINDOW_FACTOR = 16;
 // endpoint has no host): requiring `://` skipped the query masking as well, so the value went out in clear although the
 // rule ("a URL is masked") already promised it. A token needs nothing but a `=` to be a candidate for that; the
 // per-token `maskUrlQuery()` call decides, and it cannot mask ordinary prose (`x=1:` carries no pair separator).
+//
+// One pass over the whole string handles a credential whose userinfo contains a **space** (`http://alice:s3 cr3t@host`):
+// splitting into whitespace-delimited tokens first cut that credential in half, and the tail then read as ordinary prose,
+// so the password survived while the rule appeared to have run. The split is kept for the query rule (it must not see a
+// sentence as one URL), but the credential rule runs on the unsplit text first - a bounded, anchored scan that is
+// skipped entirely when the text carries no `://` or no `user:pass@` shape at all.
+//
+// That pass covers the **scheme-qualified** form. A credential written without a scheme (`connect alice:s3 cr3t@proxy
+// failed` - the shape `normalizeBackendUrl()` repairs and then quotes back, and the shape a hand-written sentence uses)
+// still needs a token boundary to be recognised, so it is masked per token in the loop below. Its secret class cannot
+// cross whitespace on purpose: without the `://` anchor, a class that allowed spaces would match `the admin: bob@…`
+// from any colon earlier in the sentence.
 export function maskUrlsInText(text) {
     const value = String(text);
     if (!value.includes('://') && !value.includes('=')) return value;
-    return value
+    const withSchemeCredentials = value.includes('://') ? maskUrlCredentials(value) : value;
+    if (!withSchemeCredentials.includes('=')) return withSchemeCredentials;
+    return withSchemeCredentials
         .split(/(\s+)/)
         .map((token) => {
-            const url = token.includes('://') ? maskUrlCredentials(token) : token;
-            return url.includes('=') ? maskUrlQuery(url) : url;
+            const withCredentials = token.includes('://') ? maskUrlCredentials(token) : token;
+            return withCredentials.includes('=') ? maskUrlQuery(withCredentials) : withCredentials;
         })
         .join('');
 }

@@ -90,7 +90,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `src/socket.js` | `closeSocketAfterFlush()`: `end()` then a 250 ms `destroy()` fallback, for the paths that answer outside Fastify's reply lifecycle (`clientErrorHandler`, `badUrlHandler`, a hijacked stream). `destroy()` alone discards buffered writes, so a client under backpressure got a reset instead of its envelope. |
 | `src/api-key.js` | The built-in key `sk-dummy-123` and `resolveApiKey()` (a blank or missing `API_KEY` falls back to it). Never add a "disable auth" switch. |
 | `src/backend-auth.js` | The `Authorization` header for the **backend**: `backendAuthorizationHeader()` (Basic, user `opencode`), `resolveBackendAuth()` (splits userinfo out of a credential-bearing `OPENCODE_SERVER_URL` and registers it as sensitive) and `resolveBackendPassword()` (an explicit password, or a generated one — there is no variable that switches generation off: `options.generate === false` suppresses it for a caller that needs to match a spawned child, and no production caller passes it). |
-| `src/env.js` | Resolving the two configured environment values: `resolveOpencodePath()` (memoised per requested value for a minute; PATH, then the package/version-manager install locations — a candidate that exists but is not a regular file, a directory being the realistic case, is skipped rather than handed to `spawn()`, which fails with `EACCES`/`EISDIR` on every start) and `normalizeBackendUrl()` / `normalizeBindHost()` (trim, add a missing scheme, drop a trailing slash — each with a `[Config]` note naming the value that was corrected, and `normalizeBackendUrl()` also notes that a URL without an explicit port resolves to the scheme default), plus `isLoopbackHost()`, and `isUsableBindHost()` - the check `OPENCODE_BIND_HOST` gets before it becomes an
+| `src/env.js` | Resolving the two configured environment values: `resolveOpencodePath()` (memoised per requested value for a minute; a **relative** configured path is resolved against the working directory before it is tested, because the existence check and the `spawn()` that later receives the value do not agree on a relative one: the check saw a file in `cwd` while the child got a bare relative path and resolved it against its own cwd, so a configured `OPENCODE_PATH=src/proxy.js` was warned about as missing and then fell through to whatever `PATH` held; PATH, then the package/version-manager install locations — a candidate that exists but is not a regular file, a directory being the realistic case, is skipped rather than handed to `spawn()`, which fails with `EACCES`/`EISDIR` on every start) and `normalizeBackendUrl()` / `normalizeBindHost()` (trim, add a missing scheme, drop a trailing slash — each with a `[Config]` note naming the value that was corrected, and `normalizeBackendUrl()` also notes that a URL without an explicit port resolves to the scheme default), plus `isLoopbackHost()`, and `isUsableBindHost()` - the check `OPENCODE_BIND_HOST` gets before it becomes an
   argument of the child: the child may be started through a shell, so a value outside `[A-Za-z0-9.\-:\[\]%]` falls
   back to loopback with a `[Config]` note instead of being concatenated into a command line.
   `isShellUnsafePath()` is the same rule for `OPENCODE_PATH`, and it is **platform-aware**: the characters that break
@@ -101,14 +101,20 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `src/options.js` | `parseBoolean()` and `readFlag()`, the **single** boolean parser for `index.js`, `startProxy()` and request bodies. Two implementations of that rule drifted once (`-e DISABLE_TOOLS=yes` meant "off" in the container); do not add a third. |
 | `src/settings.js` | The tuning keys' readers: `readLimit()`, `readMilliseconds()` (returns `{value, note}`, with the precedence inside it so the note names the value that actually took effect), `resolveRequestTimeoutMs()`, `backendDeadline()`, and the named defaults they quote (`DEFAULT_REQUEST_TIMEOUT_MS`, `MAX_TIMER_MS`, `METADATA_TIMEOUT_CAP_MS`). The resolved values are held by their consumers in `src/proxy.js`. |
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. The file is opened **once** with `O_NOFOLLOW` (when the platform has it) and `O_NONBLOCK`, then described with `fstat()` on that descriptor: a `config.json` that is a **symbolic link** or a **FIFO** is refused by name, because following it would read a target the operator did not configure and a FIFO would block the startup on a writer that never comes. A BOM is tolerated. |
-| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses), and `maskFreeText()` (control characters - newline, tab, DEL - replaced
+| `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskCredentialPairs()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses), and `maskFreeText()` (control characters - newline, tab, DEL - replaced
 *before* the mask chain runs, so a secret cannot be split across a line break into a shape no pattern matches) for debug
 logging. Every masker **fails closed**: a shape it does not recognise is returned unchanged rather than partly rewritten,
 because a half-masked value is what leaks - `maskBackendUrl()` splits on the **last** `@` (the one that ends the
-userinfo) and leaves the text alone when there is none, when nothing precedes it, or when it sits inside what looks like
-another scheme's run, and `maskUrlCredentials()` only applies its second (scheme-less `user:pass@`) rule when the value
-carries no `://` or the colon is inside the userinfo rather than in the host:port that follows it. `MASK_TEXT_WINDOW_FACTOR`
-is exported from here because `src/text.js` bounds by the same rule. |
+userinfo) and leaves the text alone only when there is none or when nothing precedes it (a bare trailing `@`, which
+carries no credential), so a *hostless* authority (`http://user:secret@/v1`) is masked like any other: `/health` needs
+no key, so an unmasked one published the operator's password to every caller. `maskUrlCredentials()` only applies its
+second (scheme-less `user:pass@`) rule when the value carries no `://` or the colon is inside the userinfo rather than
+in the host:port that follows it, and its first (scheme-qualified) rule allows whitespace inside the userinfo - a
+passphrase is a real credential, and Node's own "URL that includes credentials" sentence quotes one verbatim. The
+scheme-less rule keeps excluding whitespace on purpose: without a `://` anchor, a class that allowed spaces would match
+from any earlier colon (`the admin: bob@example.com`). `maskCredentialPairs()` masks a bare `name=value` pair whose name
+is a credential, for the values that are not URLs at all (an echoed `Content-Encoding` header, a media type, a
+content-part type). `MASK_TEXT_WINDOW_FACTOR` is exported from here because `src/text.js` bounds by the same rule. |
 | `src/polyfills.js` | Node 20 shims, imported for its side effect first thing in `src/proxy.js`: `Promise.withResolvers()` is Node 22+, and `@opencode/client`'s SSE subscription calls it unconditionally, so without it every stream silently fell back to polling (one delta per answer). A no-op on a runtime that has the API. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README (`docker/README.md`, kept under 25 000 characters). |
@@ -133,13 +139,18 @@ pnpm install --frozen-lockfile   # install dependencies
 pnpm start                       # run the gateway (needs the opencode CLI on PATH)
 pnpm run check                   # node --check every JavaScript source file
 pnpm run check:commits           # commit subjects against CONTRIBUTING.md
-pnpm test                        # smoke suite: stub backend + gateway (533 contract assertions on Linux; fewer on Windows, where the POSIX-only checks are skipped)
+pnpm test                        # smoke suite: stub backend + gateway (the run prints the exact number of checks it executed; the count is higher on Linux, where the POSIX-only checks are not skipped)
 sh -n docker/docker-entrypoint.sh
 ```
 
 `pnpm test` needs no OpenCode CLI and no network: it starts `test/stub-opencode.mjs` on port 4199 and the gateway on
 port 8199 (override with `SMOKE_STUB_PORT` / `SMOKE_PORT`). The run prints the exact number of checks it executed, so
-quote that number rather than this line. `SMOKE_SLOW=1 pnpm test` adds the checks that are slow by nature (the SSE
+quote that number rather than this line. Before it starts anything, the suite requires every port it will use to be
+free and refuses with a hint naming what is holding one; on **Windows**, where a killed run leaves the backend
+children it spawned behind (`opencode.exe serve …`), it first reaps exactly those - a listener whose command line names
+`opencode` or `test/stub-opencode.mjs` - and never touches a listener it cannot attribute, because a run that aborted at
+its second check is indistinguishable from a failing one. The POSIX path needs none of this: killing the run's process
+group takes its children with it. `SMOKE_SLOW=1 pnpm test` adds the checks that are slow by nature (the SSE
 keep-alive line, written only after 15 s of silence); they are skipped otherwise. CI runs `pnpm run check` and
 `pnpm test` on Node 20, 22
 and 24, plus `test/check-commit-messages.mjs` over the added commits. No linter or formatter exists: style is a review
@@ -338,7 +349,10 @@ One-off stub scripts stay in `/tmp`; anything worth keeping goes into `test/stub
   **no progress**, answering the `408` envelope when nothing has been sent, in the gateway's voice and with the deadline
   in force (`request body was not received within …ms; send the declared body or close the connection`). The window
   re-arms while the socket is reading more bytes (`req.socket.bytesRead` moved since the last arming) and the upload is
-  given a total budget of that window plus `REQUEST_TIMEOUT_MS`: a deadline that never renewed cut off a slow client
+  given a total budget of that window plus `REQUEST_TIMEOUT_MS`, **clamped to `MAX_TIMER_MS`** like every other delay
+  built from the budget: the two addends can each sit at that ceiling, and the sum is compared as a number rather than
+  handed to `setTimeout`, so an over-large one produced no warning at all - every request announcing a body was refused
+  `408`, and the sentence named a budget no timer could arm. A deadline that never renewed cut off a slow client
   mid-body and told it to send the body it was sending, while the stall it exists for is a body that *stops*. When the
   budget runs out on an upload that was still progressing, the message says so instead of blaming a stall. It closes the
   **request's** socket, not `reply.raw`: a keep-alive response is detached from the connection once it ends, so destroying it
@@ -362,7 +376,9 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   The status and the code stay; the message becomes `unsupported content type "application/xml"; send
   Content-Type: application/json`, or `the request has a body but no Content-Type header; send Content-Type:
   application/json` when the header is missing (the value is client input echoed into a response body, so
-  `echoedValue()` replaces control characters and cuts it at 64). Recognised types are unchanged:
+  `echoedValue()` replaces control characters, **masks a credential it can recognise** (`maskCredentialPairs()`: a
+  `name=value` pair whose name is one, so a client that put `api_key=…` in its `Content-Type` does not read the whole
+  value back out of the `415`) and cuts it at 64). Recognised types are unchanged:
   `application/json`, `application/x-www-form-urlencoded` and `text/plain` (handed to the handler as text).
 - A body carrying a **forbidden property name** (`__proto__`, `constructor`) is refused by Fastify's
   prototype-poisoning guard before any handler runs, and that refusal arrives as the same

@@ -170,12 +170,18 @@ function searchOpencodePath(input) {
     if (input) {
         const looksLikePath = path.isAbsolute(input) || input.includes('/') || input.includes('\\');
         if (looksLikePath) {
+            // The configured value is **resolved** against this process's working directory before it is handed back,
+            // and the resolution is what is returned - never the raw value. `spawn()` looks the executable up relative to
+            // the child's own `cwd`, which is the 0700 workspace jail (`spawnBackend()`), so a relative
+            // `OPENCODE_PATH: "./bin/opencode"` that exists and was announced at startup as resolved failed one layer
+            // later as a backend that "exited during startup" - the same hazard already recorded for a relative `PATH`
+            // entry, where the configured branch was the one that was missed. The value is a process we start as this
+            // uid, so an absolute path is also what the operator's configuration is read as.
             // A *file*, not merely something that exists: a configured directory (`OPENCODE_PATH=/opt/opencode`)
             // passed `existsSync()` and was reported at startup as the resolved binary, so the failure surfaced one
             // layer later as `spawn /opt/opencode EACCES` inside a `502 backend_unreachable` - about a path the
             // operator had just been told was correct. `findExecutableInDirs()` has always required a regular file
             // for the PATH search; the configured branch is the one that did not.
-            if (isFile(input)) return { path: input, source: 'config' };
             const resolved = path.resolve(process.cwd(), input);
             if (isFile(resolved)) return { path: resolved, source: 'config' };
             // A configured path that does not exist is almost always a typo or a moved installation. Say so: the

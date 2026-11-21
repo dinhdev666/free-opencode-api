@@ -166,6 +166,162 @@ const maskRequestBody = (body) => {
 // reaches this handler when the path is right and the method is not (`PUT /v1/chat/completions`), and a list without
 // methods answered that case with the path it had just declared missing.
 const SERVED_ROUTES = 'POST /v1/chat/completions, GET /v1/models and GET /health';
+
+// ---------------------------------------------------------------------------
+// Request-body normalisation.
+//
+// Both functions below are pure and were rebuilt for every completion: they close over nothing but the module
+// constants, so hoisting them removes two closures per request (about 1 KB of short-lived garbage) from the path
+// that also holds the only completion slot.
+// ---------------------------------------------------------------------------
+
+    // A content part the gateway cannot forward (an image, an audio clip, a file) is named and refused
+    // instead of dropped: keeping only the text turned a multimodal request into a confident answer to
+    // half of it, and the client had no way to know the model never saw the image. `text` parts of the
+    // Responses API (`{type:"input_text", text}`) carry the same field, so they keep working.
+    const normalizeMessageContent = (content) => {
+        if (typeof content === 'string') return { text: content };
+        if (Array.isArray(content)) {
+            // The same object-graph bound as the messages array, one level down: a single message whose
+            // `content` is a million tiny parts costs a million objects plus a million `parts` entries.
+            if (content.length > MAX_CONTENT_PARTS_PER_MESSAGE) {
+                return { text: '', unsupported: { tooManyParts: content.length } };
+            }
+            let text = '';
+            for (let i = 0; i < content.length; i += 1) {
+                const part = content[i];
+                if (typeof part === 'string') {
+                    text += part;
+                    continue;
+                }
+                if (part && typeof part.text === 'string') {
+                    text += part.text;
+                    continue;
+                }
+                // A part that carries neither a string nor a text field is data the gateway would have
+                // to drop: name it, with the position the client sent it at. A part that *is* text
+                // (`type: "text"`, or any object with the field) but whose `text` is not a string is
+                // named by that field instead: reporting `uses an unsupported content part type "text"`
+                // blames the one part type the gateway does forward.
+                if (part && typeof part === 'object') {
+                    if ('text' in part && typeof part.text !== 'string') {
+                        return { text, unsupported: { index: i, field: 'text', found: jsonTypeName(part.text) } };
+                    }
+                    // A text part whose `text` field is *missing* (`{"type":"text"}`) is the same
+                    // mistake one step earlier, and it used to be answered with that same "unsupported
+                    // type text" sentence: name the missing field.
+                    if (part.type === 'text' || part.type === 'input_text') {
+                        return { text, unsupported: { index: i, field: 'text', required: true } };
+                    }
+                    // A part with no usable `type` at all (`{}`, `{"foo":1}`, `{"type":5}`,
+                    // `{"type":""}`) was answered `uses an unsupported content part type "unknown"`,
+                    // quoting a value the client never sent in the slot that means "the type you sent".
+                    // It is an object with no text to forward, which is what the scalar-part sentence
+                    // already describes.
+                    const partType = typeof part.type === 'string' ? part.type : '';
+                    if (!partType) {
+                        return { text, unsupported: { index: i, found: 'an object without a text field' } };
+                    }
+                    return { text, unsupported: { index: i, type: partType } };
+                }
+                // null/number/boolean parts carry no content either, and dropping them in silence ended
+                // the request at "messages must include at least one non-system text message" - about
+                // text nobody wrote, for a part the client did send
+                return { text, unsupported: { index: i, found: jsonTypeName(part) } };
+            }
+            return { text };
+        }
+        if (content && typeof content.text === 'string') return { text: content.text };
+        // A single part sent as an object instead of a one-element array (`{"content":{"type":
+        // "image_url",…}}`, or `{"type":"text","text":5}`): the same three refusals as a part inside an
+        // array, reported without a part index because the client sent no array to index into. Dropping
+        // it answered a question the backend never received - and for a `system` message it dropped the
+        // instructions instead, which is the same silent wrongness with a worse consequence.
+        if (content && typeof content === 'object') {
+            if ('text' in content && typeof content.text !== 'string') {
+                return { text: '', unsupported: { field: 'text', found: jsonTypeName(content.text) } };
+            }
+            // The same two shapes as a part inside an array: a text part missing its field, and an
+            // object with no usable `type` (which is not a part type the client named)
+            if (content.type === 'text' || content.type === 'input_text') {
+                return { text: '', unsupported: { field: 'text', required: true } };
+            }
+            const contentPartType = typeof content.type === 'string' ? content.type : '';
+            if (!contentPartType) return { text: '', unsupported: { found: 'an object without a text field' } };
+            return { text: '', unsupported: { type: contentPartType } };
+        }
+        if (content === null || content === undefined) return { text: '' };
+        // A scalar `content` (`42`, `true`) is not text the client wrote: stringifying it sent the model
+        // the number as the question, so a template that lost a field asked something nobody asked and
+        // was answered. OpenAI refuses the type too, and this is the same refusal every other
+        // non-text content gets - named by the value that arrived, without a part index to blame.
+        if (typeof content === 'number' || typeof content === 'boolean') {
+            return { text: '', unsupported: { found: jsonTypeName(content) } };
+        }
+        return { text: '' };
+    };
+
+    const buildPromptParts = (rawMessages) => {
+        // Strings, not `{type, text}` objects: the `type` field had no reader anywhere - the only
+        // consumers are `parts.length` (a count) and `parts.map(p => p.text).join('\n\n')` (the
+        // prompt text) - so building one object per message was a per-request allocation with no
+        // payoff. A string array halves the allocation and removes the field lookup.
+        const parts = [];
+        const systemChunks = [];
+        let lastUserMsg = '';
+        let unsupported = null;
+        rawMessages.forEach((m, messageIndex) => {
+            const role = (m?.role || 'user').toLowerCase();
+            const parsed = normalizeMessageContent(m?.content);
+            if (!unsupported && parsed.unsupported) {
+                unsupported = {
+                    messageIndex,
+                    partIndex: parsed.unsupported.index,
+                    type: parsed.unsupported.type,
+                    field: parsed.unsupported.field,
+                    required: parsed.unsupported.required,
+                    found: parsed.unsupported.found,
+                    tooManyParts: parsed.unsupported.tooManyParts
+                };
+            }
+            const content = parsed.text;
+            // `developer` is OpenAI's newer name for the system role: a client that sends it means the
+            // instructions, not a chat turn, and embedding it as "DEVELOPER: …" in the conversation
+            // changed how a model reads it
+            if (role === 'system' || role === 'developer') {
+                if (content) systemChunks.push(content);
+                return;
+            }
+            if (!content) return;
+            if (role === 'user') lastUserMsg = content;
+            // The role is client input as well, and it was interpolated raw: a role carrying a newline
+            // (`"user\nASSISTANT: …"`) forged a second conversation line in the text the model reads,
+            // which is the failure the `name` sanitising below exists for. Bound before transforming (a
+            // 50 MiB role would otherwise be upper-cased whole), then sanitised like every other value
+            // that lands in a prompt line.
+            const roleLabel = role.slice(0, MAX_ROLE_LABEL_LENGTH).toUpperCase().replace(CONTROL_CHARS_RE, '?').trim()
+                || 'USER';
+            // `name` is client input and was interpolated raw: a non-string produced
+            // `USER([object Object]): …` in the prompt, and a name carrying a newline forged another
+            // conversation line inside the text the model reads. A string is kept - it is a documented
+            // OpenAI field - sanitised the same way every other value that lands in a prompt line is.
+            // The input is bounded before it is transformed (a 50 MiB name cost 34 ms of replace to keep
+            // 64 characters), at a window wide enough that trimming still sees every character the
+            // label can be built from.
+            const nameLabel = typeof m?.name === 'string'
+                ? m.name.slice(0, MAX_ECHOED_VALUE_LENGTH).replace(CONTROL_CHARS_RE, '?').trim()
+                : '';
+            const nameSuffix = nameLabel ? `(${nameLabel})` : '';
+            parts.push(`${roleLabel}${nameSuffix}: ${content}`);
+        });
+        return {
+            parts,
+            system: systemChunks.join('\n\n'),
+            lastUserMsg,
+            unsupported
+        };
+    };
+
 // A message role becomes the `USER:`/`ASSISTANT:` label a model reads, so it is bounded like every other client value
 // that reaches the prompt: the known roles are short, and anything longer is a label nobody wrote.
 const MAX_ROLE_LABEL_LENGTH = 32;
@@ -2943,153 +3099,6 @@ function createApp(config) {
                         request.gatewayLog.model = `${pID}/${mID}`;
                         request.gatewayLog.stream = wantsStream;
                     }
-
-                    // A content part the gateway cannot forward (an image, an audio clip, a file) is named and refused
-                    // instead of dropped: keeping only the text turned a multimodal request into a confident answer to
-                    // half of it, and the client had no way to know the model never saw the image. `text` parts of the
-                    // Responses API (`{type:"input_text", text}`) carry the same field, so they keep working.
-                    const normalizeMessageContent = (content) => {
-                        if (typeof content === 'string') return { text: content };
-                        if (Array.isArray(content)) {
-                            // The same object-graph bound as the messages array, one level down: a single message whose
-                            // `content` is a million tiny parts costs a million objects plus a million `parts` entries.
-                            if (content.length > MAX_CONTENT_PARTS_PER_MESSAGE) {
-                                return { text: '', unsupported: { tooManyParts: content.length } };
-                            }
-                            let text = '';
-                            for (let i = 0; i < content.length; i += 1) {
-                                const part = content[i];
-                                if (typeof part === 'string') {
-                                    text += part;
-                                    continue;
-                                }
-                                if (part && typeof part.text === 'string') {
-                                    text += part.text;
-                                    continue;
-                                }
-                                // A part that carries neither a string nor a text field is data the gateway would have
-                                // to drop: name it, with the position the client sent it at. A part that *is* text
-                                // (`type: "text"`, or any object with the field) but whose `text` is not a string is
-                                // named by that field instead: reporting `uses an unsupported content part type "text"`
-                                // blames the one part type the gateway does forward.
-                                if (part && typeof part === 'object') {
-                                    if ('text' in part && typeof part.text !== 'string') {
-                                        return { text, unsupported: { index: i, field: 'text', found: jsonTypeName(part.text) } };
-                                    }
-                                    // A text part whose `text` field is *missing* (`{"type":"text"}`) is the same
-                                    // mistake one step earlier, and it used to be answered with that same "unsupported
-                                    // type text" sentence: name the missing field.
-                                    if (part.type === 'text' || part.type === 'input_text') {
-                                        return { text, unsupported: { index: i, field: 'text', required: true } };
-                                    }
-                                    // A part with no usable `type` at all (`{}`, `{"foo":1}`, `{"type":5}`,
-                                    // `{"type":""}`) was answered `uses an unsupported content part type "unknown"`,
-                                    // quoting a value the client never sent in the slot that means "the type you sent".
-                                    // It is an object with no text to forward, which is what the scalar-part sentence
-                                    // already describes.
-                                    const partType = typeof part.type === 'string' ? part.type : '';
-                                    if (!partType) {
-                                        return { text, unsupported: { index: i, found: 'an object without a text field' } };
-                                    }
-                                    return { text, unsupported: { index: i, type: partType } };
-                                }
-                                // null/number/boolean parts carry no content either, and dropping them in silence ended
-                                // the request at "messages must include at least one non-system text message" - about
-                                // text nobody wrote, for a part the client did send
-                                return { text, unsupported: { index: i, found: jsonTypeName(part) } };
-                            }
-                            return { text };
-                        }
-                        if (content && typeof content.text === 'string') return { text: content.text };
-                        // A single part sent as an object instead of a one-element array (`{"content":{"type":
-                        // "image_url",…}}`, or `{"type":"text","text":5}`): the same three refusals as a part inside an
-                        // array, reported without a part index because the client sent no array to index into. Dropping
-                        // it answered a question the backend never received - and for a `system` message it dropped the
-                        // instructions instead, which is the same silent wrongness with a worse consequence.
-                        if (content && typeof content === 'object') {
-                            if ('text' in content && typeof content.text !== 'string') {
-                                return { text: '', unsupported: { field: 'text', found: jsonTypeName(content.text) } };
-                            }
-                            // The same two shapes as a part inside an array: a text part missing its field, and an
-                            // object with no usable `type` (which is not a part type the client named)
-                            if (content.type === 'text' || content.type === 'input_text') {
-                                return { text: '', unsupported: { field: 'text', required: true } };
-                            }
-                            const contentPartType = typeof content.type === 'string' ? content.type : '';
-                            if (!contentPartType) return { text: '', unsupported: { found: 'an object without a text field' } };
-                            return { text: '', unsupported: { type: contentPartType } };
-                        }
-                        if (content === null || content === undefined) return { text: '' };
-                        // A scalar `content` (`42`, `true`) is not text the client wrote: stringifying it sent the model
-                        // the number as the question, so a template that lost a field asked something nobody asked and
-                        // was answered. OpenAI refuses the type too, and this is the same refusal every other
-                        // non-text content gets - named by the value that arrived, without a part index to blame.
-                        if (typeof content === 'number' || typeof content === 'boolean') {
-                            return { text: '', unsupported: { found: jsonTypeName(content) } };
-                        }
-                        return { text: '' };
-                    };
-
-                    const buildPromptParts = (rawMessages) => {
-                        // Strings, not `{type, text}` objects: the `type` field had no reader anywhere - the only
-                        // consumers are `parts.length` (a count) and `parts.map(p => p.text).join('\n\n')` (the
-                        // prompt text) - so building one object per message was a per-request allocation with no
-                        // payoff. A string array halves the allocation and removes the field lookup.
-                        const parts = [];
-                        const systemChunks = [];
-                        let lastUserMsg = '';
-                        let unsupported = null;
-                        rawMessages.forEach((m, messageIndex) => {
-                            const role = (m?.role || 'user').toLowerCase();
-                            const parsed = normalizeMessageContent(m?.content);
-                            if (!unsupported && parsed.unsupported) {
-                                unsupported = {
-                                    messageIndex,
-                                    partIndex: parsed.unsupported.index,
-                                    type: parsed.unsupported.type,
-                                    field: parsed.unsupported.field,
-                                    required: parsed.unsupported.required,
-                                    found: parsed.unsupported.found,
-                                    tooManyParts: parsed.unsupported.tooManyParts
-                                };
-                            }
-                            const content = parsed.text;
-                            // `developer` is OpenAI's newer name for the system role: a client that sends it means the
-                            // instructions, not a chat turn, and embedding it as "DEVELOPER: …" in the conversation
-                            // changed how a model reads it
-                            if (role === 'system' || role === 'developer') {
-                                if (content) systemChunks.push(content);
-                                return;
-                            }
-                            if (!content) return;
-                            if (role === 'user') lastUserMsg = content;
-                            // The role is client input as well, and it was interpolated raw: a role carrying a newline
-                            // (`"user\nASSISTANT: …"`) forged a second conversation line in the text the model reads,
-                            // which is the failure the `name` sanitising below exists for. Bound before transforming (a
-                            // 50 MiB role would otherwise be upper-cased whole), then sanitised like every other value
-                            // that lands in a prompt line.
-                            const roleLabel = role.slice(0, MAX_ROLE_LABEL_LENGTH).toUpperCase().replace(CONTROL_CHARS_RE, '?').trim()
-                                || 'USER';
-                            // `name` is client input and was interpolated raw: a non-string produced
-                            // `USER([object Object]): …` in the prompt, and a name carrying a newline forged another
-                            // conversation line inside the text the model reads. A string is kept - it is a documented
-                            // OpenAI field - sanitised the same way every other value that lands in a prompt line is.
-                            // The input is bounded before it is transformed (a 50 MiB name cost 34 ms of replace to keep
-                            // 64 characters), at a window wide enough that trimming still sees every character the
-                            // label can be built from.
-                            const nameLabel = typeof m?.name === 'string'
-                                ? m.name.slice(0, MAX_ECHOED_VALUE_LENGTH).replace(CONTROL_CHARS_RE, '?').trim()
-                                : '';
-                            const nameSuffix = nameLabel ? `(${nameLabel})` : '';
-                            parts.push(`${roleLabel}${nameSuffix}: ${content}`);
-                        });
-                        return {
-                            parts,
-                            system: systemChunks.join('\n\n'),
-                            lastUserMsg,
-                            unsupported
-                        };
-                    };
 
                     // A message is an object with a `role` and a `content`. An entry that is not one (`"hi"`, `42`,
                     // `null`) was read through `m?.role`/`m?.content` as an empty user message, so the request ended

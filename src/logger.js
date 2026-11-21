@@ -280,13 +280,34 @@ export function maskUrlQuery(url) {
  */
 export function maskBackendUrl(url) {
     const text = maskUrlQuery(String(url));
-    // Everything between the scheme and the last `@` before the path is userinfo (`user:pass`); a host cannot contain `@`
+    // Everything between the scheme and the **last** `@` is userinfo (`user:pass`), and the last `@` is the one that
+    // separates it from the host in every spelling an operator writes.
     //
     // The scheme is optional, because the value `normalizeBackendUrl()` is about to *correct* is the one it also quotes:
     // `OPENCODE_SERVER_URL='alice:s3cr3t@host:4398' has no scheme, assuming http://` was built from the raw value before
     // the scheme was added, and a pattern anchored on `scheme://` left that credential in the startup log - the one line
     // that publishes a secret to `docker logs`, in a configuration the gateway supports and repairs.
-    return text.replace(/^(\w[\w+.-]{0,31}:\/\/)?[^/?#]*@/, (match, scheme = '') => `${scheme}***@`);
+    //
+    // The userinfo run deliberately does **not** stop at `/`, `?` or `#`. A credential containing one of them is written
+    // `http://alice:s3#cr3t@host:4097` (a generated password, a URL-encoded value that was decoded once too often), and
+    // a pattern that ended the authority at the reserved character never reached the `@` at all: it matched nothing and
+    // returned the value **unchanged**, so `/health` - which needs no key - published the operator's intended secret and
+    // so did the startup summary. Failing closed is the only safe direction for a masker: a URL whose *path* contains an
+    // `@` is reported as `scheme://***@…`, which costs a cosmetic detail in a log line and never a secret.
+    const at = text.lastIndexOf('@');
+    if (at === -1) return text;
+    const rest = text.slice(at + 1);
+    const authorityEnd = rest.search(/[/?#]/);
+    // A trailing `@` with nothing after it is not a credential, and there is no host left to keep readable
+    if (authorityEnd === 0) return text;
+    // The scheme run is anchored, so it is linear whatever its length (the bounded `\w[\w+.-]{0,31}` in
+    // `maskUrlCredentials()` exists because *that* pattern is searched at every offset of a sentence; this one only
+    // ever runs once, at position 0). It is read for the prefix it keeps, not as a validity check.
+    const scheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.exec(text);
+    const schemeText = scheme ? scheme[0] : '';
+    // An `@` inside the scheme itself is not userinfo (`scheme` cannot contain one, so this is unreachable in practice)
+    if (at < schemeText.length) return text;
+    return `${schemeText}***@${rest}`;
 }
 
 /**
@@ -312,6 +333,17 @@ export function maskUrlCredentials(text) {
     // Masking needs userinfo, which needs an `@`: this runs on every request log line and on every upstream sentence,
     // and the vast majority of both carry none.
     if (!value.includes('@')) return value;
+    // Two cheap necessary conditions, because both rules below are searched at *every* offset of the value and the
+    // request summary line runs before the auth check. The scheme-qualified rule cannot match without a literal
+    // `://`, and the scheme-less one cannot match without a `:` somewhere before the last `@` (its match is
+    // `boundary user ":" secret "@"`, so `indexOf(':') < lastIndexOf('@')` is implied by any match). Neither test can
+    // change the output - they only skip a scan that provably finds nothing - and together they answer the shapes a
+    // client can send for the price of two `indexOf()` calls: `/v1/models?@` + 16 000 `a` carries neither `://` nor
+    // `:` and measured 1.2 ms of blocked serving thread before, ~0 afterwards.
+    const lastAt = value.lastIndexOf('@');
+    const firstColon = value.indexOf(':');
+    const schemeQualified = value.includes('://');
+    const schemeLess = firstColon !== -1 && firstColon < lastAt;
     // Not anchored: the URL can sit anywhere in the sentence, and a `@` in a path or query is not userinfo (the
     // authority is everything up to the first `/`, `?` or `#`, which the character class excludes).
     //
@@ -321,7 +353,9 @@ export function maskUrlCredentials(text) {
     // reachable through the debug dump of a request body (each string up to 32 KiB) and through an upstream error
     // sentence quoted into a 502. With the bound, a start position can only be a candidate when `://` follows within
     // 32 characters, so the scan is linear (1 MiB measured ~70 ms).
-    const withScheme = value.replace(/(\w[\w+.-]{0,31}:\/\/)[^\s/?#@]*@/g, '$1***@');
+    const withScheme = schemeQualified
+        ? value.replace(/(\w[\w+.-]{0,31}:\/\/)[^\s/?#@]*@/g, '$1***@')
+        : value;
     // A URL written **without** a scheme is the form `normalizeBackendUrl()` repairs and then quotes back, and it is the
     // form a hand-written sentence uses (`connect alice:s3cr3t@proxy failed`): requiring `scheme://` left both in clear.
     // The `:` before the `@` is what separates userinfo from an e-mail address, so `alice@example.com` - the shape a
@@ -342,6 +376,7 @@ export function maskUrlCredentials(text) {
     // of any length, so this rule only ever sees the scheme-less form a hand-written sentence or `normalizeBackendUrl()`
     // produces, where 256 characters is far beyond any credential: measured 31.1 ms -> 2.3 ms at 16 KiB, byte-identical
     // output on every credential-bearing shape.
+    if (!schemeLess) return withScheme;
     return withScheme.replace(
         /(^|[\s="'(<])([^\s/?#@"'()<>=:]+):([^\s/?#@]{0,256})@(?=[^\s/?#@]+)/g,
         (match, boundary, user, secret, offset, whole) => {
@@ -412,7 +447,10 @@ const MAX_UPSTREAM_TEXT_CHARS = 512;
 // (the same limit `safeClone()` applies to an `Error` it copies).
 export const MAX_LOGGED_STACK_CHARS = 1000;
 // How much of a sentence `maskFreeText()` masks before it truncates (a multiple of the retained length, see there).
-const MASK_TEXT_WINDOW_FACTOR = 16;
+// Exported because `src/text.js` bounds a value before it masks one for the same reason (see `boundedForLog()`), and
+// the two must not disagree about how much of a value is worth transforming: a value longer than this window can only
+// contribute its first `maxChars` characters to the output, because every masking rule shortens what it matches.
+export const MASK_TEXT_WINDOW_FACTOR = 16;
 
 // Only the URL-shaped words of the text are masked. `maskUrlQuery()` is written for a URL: given a sentence it
 // read everything after the first `?` as that parameter's value, so `…?x=1: connection refused` answered

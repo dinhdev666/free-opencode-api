@@ -124,6 +124,32 @@ const IDLE_RECOVERY_STALL_POLLS = Math.max(3, Math.ceil(DEFAULT_EVENT_IDLE_TIMEO
 const FORBIDDEN_BODY_MESSAGE = 'request body is not valid JSON, or it carries a forbidden property name '
     + '(__proto__, constructor); send Content-Type: application/json';
 const FORBIDDEN_BODY_KEYS = new Set(['__proto__', 'constructor']);
+
+/**
+ * A request body on its way into the debug dump: masked by key, whatever content type it arrived under.
+ *
+ * `maskDetail()` walks a *parsed* object and masks the values whose key looks like a credential, so the dump answered
+ * `{"api_key":"SECR***(22 chars)"}` for an `application/json` request. A body handed over as text - `text/plain`,
+ * `application/x-www-form-urlencoded`, `curl -d` without the header - reached the same line as the raw string, and the
+ * string branch of `maskDetail()` is `maskFreeText()`, which only knows URL and `Basic|Bearer` shapes: the identical
+ * bytes were logged as `"{\"api_key\":\"SECRET-LEAK-TEST-12345\"…}"`, so a client chose the content type that wrote its
+ * credential into `docker logs` in clear. The content type must not decide whether a body is masked any more than it
+ * decides whether a body is *safe* (the `FORBIDDEN_BODY_KEYS` guard above), so a string that parses as a JSON object is
+ * masked by key. It is parsed here and again below when the handler reads it: this path only runs at `LOG_LEVEL=debug`.
+ * @param {*} body the body Fastify handed the handler
+ * @returns {*} the masked body, in the same shape it arrived
+ */
+const maskRequestBody = (body) => {
+    if (typeof body !== 'string') return maskDetail(body);
+    // Only an object can carry a keyed credential; a JSON scalar is masked by `maskDetail()`'s string branch
+    if (!body.trimStart().startsWith('{')) return maskDetail(body);
+    try {
+        return maskDetail(JSON.parse(body));
+    } catch (e) {
+        // Not JSON after all (a truncated upload, a hand-written body): the text branch is all there is
+        return maskDetail(body);
+    }
+};
 // The endpoints a client that hit the wrong path is looking for, in one place: the 404 message names them and the
 // smoke suite asserts the message carries this exact list. Each entry carries its method, because the same request
 // reaches this handler when the path is right and the method is not (`PUT /v1/chat/completions`), and a list without
@@ -196,9 +222,20 @@ function runQueuedTask() {
     // already had its response, so an immediate follow-up request was refused with 503 queue_full on a gateway whose
     // queue is 0. Idempotent, because .finally() below stays the safety net for every path.
     let released = false;
+    // The watchdog armed by the timeout below, kept here so `release()` can disarm it. The slot is normally freed by
+    // the handler as soon as the response is written, which for a timed-out completion is moments after the timeout
+    // callback ran - and the watchdog armed there was then left standing for `SLOT_WATCHDOG_GRACE_MS`, to wake up and
+    // find `released` already true. It logged nothing in that case, so this is not a log-noise fix: the cost was a
+    // timer and a wake-up per timed-out completion, and the context the callback closes over keeps the queued `entry`
+    // reachable for those five seconds - the task and the request body it holds (up to the 50 MB body limit) included.
+    let watchdog = null;
     const release = () => {
         if (released) return;
         released = true;
+        if (watchdog) {
+            clearTimeout(watchdog);
+            watchdog = null;
+        }
         activeTasks -= 1;
         // Drain the queue on the next tick instead of waiting a fixed 100 ms between requests
         setImmediate(processQueue);
@@ -215,7 +252,10 @@ function runQueuedTask() {
         // later completion queued, the queue filled, and a gateway that still answered /health 200 refused all traffic
         // with 503. The grace gives the handler's own finishing path (which releases on response completion) time to
         // run first; `release()` is idempotent, so the two cannot double-count.
-        const watchdog = setTimeout(() => {
+        // A slot the handler already freed needs no watchdog at all, so none is armed for it.
+        if (released) return;
+        watchdog = setTimeout(() => {
+            watchdog = null;
             if (released) return;
             logger.warn(
                 `[Proxy] A completion outlived its ${timeoutMs}ms budget by ${SLOT_WATCHDOG_GRACE_MS}ms; releasing its slot`
@@ -884,6 +924,9 @@ function createApp(config) {
                 'Content-Type: application/json; charset=utf-8\r\n' +
                 `Content-Length: ${Buffer.byteLength(body)}\r\n` +
                 'X-Content-Type-Options: nosniff\r\n' +
+                // The same header the `onRequest` hook sets on every other response (see "Responses are not
+                // cacheable by default"): a rejection is a response too, and this path writes it by hand
+                'Cache-Control: no-store\r\n' +
                 'Access-Control-Allow-Origin: *\r\n' +
                 'Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n' +
                 `Access-Control-Allow-Headers: ${CORS_ALLOW_HEADERS}\r\n` +
@@ -922,6 +965,8 @@ function createApp(config) {
             'Content-Type': 'application/json; charset=utf-8',
             'Content-Length': Buffer.byteLength(body),
             'X-Content-Type-Options': NO_SNIFF,
+            // The same header the `onRequest` hook sets on every other response: a 400 is a response too
+            'Cache-Control': 'no-store',
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
             'Access-Control-Allow-Headers': CORS_ALLOW_HEADERS,
@@ -1655,7 +1700,12 @@ function createApp(config) {
                         // may turn out never to close). Only a fragment that could still become a tag is held back, so
                         // a closing tag split across two deltas is still recognised by the next call.
                         const [emit, tail] = splitAtPossibleTag(buffer);
-                        pending += emit;
+                        // Prefix-capped like every other answer buffer: `pending` is only ever read by `flush()`, to
+                        // release the text after an opening tag that never closed, so a capped copy answers it the same
+                        // way. Without the cap an answer that opens `<function_calls>` and never closes it grew this
+                        // string without any bound at all, which is the case `MAX_ANSWER_CHARS` exists to prevent - the
+                        // visible buffers stopped at 16 M characters while this one held the whole answer.
+                        pending = appendCapped(pending, emit);
                         held = tail;
                         return output;
                     }
@@ -2675,7 +2725,7 @@ function createApp(config) {
                             // The body is as client-chosen as the headers: a wrapper that forwards
                             // `{"api_key": …}` or `{"metadata":{"authorization":…}}` wrote a credential into
                             // `docker logs`, and bounding the dump never addressed that
-                            body: maskDetail(request.body)
+                            body: maskRequestBody(request.body)
                         });
                     }
                     // A body like `null` or `"text"` is valid JSON but not a completion request: answer 400 instead of
@@ -4367,12 +4417,19 @@ async function ensureBackend(config, options = {}) {
             }
 
             let port = '4097';
-            let portParsed = false;
             try {
                 port = new URL(OPENCODE_SERVER_URL).port;
-                portParsed = true;
             } catch (e) {
-                logger.warn(`[Proxy] Could not parse OPENCODE_SERVER_URL '${maskBackendUrl(OPENCODE_SERVER_URL)}', assuming port 4097`);
+                // Refused rather than warned about: the port is only half of what this parse answers. `configuredHost`
+                // above comes from the same call and stays `null` for exactly this value, so the "not on this machine"
+                // check is skipped too, and the spawn below started a **local** child on port 4097 for a URL no probe
+                // can ever reach - a real backend process, as this uid, with model-directed tools enabled by default,
+                // answering 502 on every completion until the operator noticed. A malformed value is an operator's
+                // configuration error, and the sentence names the value and the shape it must have.
+                throw backendUnavailable(
+                    `OPENCODE_SERVER_URL '${maskBackendUrl(OPENCODE_SERVER_URL)}' cannot be parsed as a URL; ` +
+                    'it must be http(s)://host:port, for example http://127.0.0.1:4097'
+                );
             }
             // A URL with no port and a child that can only listen on one: the child was started on 4097 while every
             // readiness probe used the configured URL verbatim (port 80 for `http://127.0.0.1`), so all 60 probes
@@ -4380,7 +4437,7 @@ async function ensureBackend(config, options = {}) {
             // and the child - which was listening, just not where anything looked - was left holding 4097 until the
             // next attempt killed it. Refuse before `spawn()`: no child, no cooldown, and a sentence that names the
             // port the gateway would have chosen.
-            if (portParsed && port === '') {
+            if (port === '') {
                 throw backendUnavailable(
                     'OPENCODE_SERVER_URL must name the backend port (http://127.0.0.1:4097): ' +
                     'a URL without one points at port 80, while opencode serve can only be started on a numbered port'

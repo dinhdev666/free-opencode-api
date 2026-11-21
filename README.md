@@ -478,7 +478,9 @@ gateway cannot read, `502` for an upstream/provider failure (streaming requests 
 provider failure that arrives before the first token is an HTTP error, not an empty answer, and a backend that dies
 mid-request is an upstream failure rather than a `500` — the next request starts it again, a backend that refuses
 to create a session reports its status and reason in the message instead of a bare `500`, a backend the gateway cannot
-start at all (a missing CLI, a 1.x release, a port already taken, a restart cooldown after a failed attempt) is the
+start at all (a missing CLI, a 1.x release, a port already taken, a restart cooldown after a failed attempt, an
+`OPENCODE_SERVER_URL` that names no port or that the URL parser rejects — the child can only listen on a numbered
+port, so the gateway refuses the value before it spawns anything) is the
 same upstream failure, and a backend that keeps failing while the answer is polled gives up after 5 consecutive
 failures instead of waiting out the whole request budget), `503` in two cases — the completion queue is full
 (`type: "queue_full"`) or the gateway is shutting down (`code: "gateway_shutting_down"`), both with a `Retry-After: 1`

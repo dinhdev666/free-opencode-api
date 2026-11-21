@@ -84,7 +84,7 @@ These are product decisions, not implementation details. Do not "improve" them w
 | --- | --- |
 | `index.js` | Entry point. Loads `config.json`, merges **env > file > default**, prints the startup summary (including the resolved queue limits, via `getQueueLimits()`), calls `startProxy()` and awaits its `ready` promise (a listen failure is reported and exits there, not inside the proxy), wires `SIGINT`/`SIGTERM` shutdown. |
 | `src/proxy.js` | The Fastify app: hooks (request id/logging, CORS, auth), the routes `/`, `/v1/models`, `/v1/models/:modelId`, `/v1/chat/completions`, `/health`, error/404 envelopes, the completion queue, SSE collection, polling, the backend lifecycle (`ensureBackend`, spawn, health probe against `/api/info`), and the `@opencode/client` calls every completion is built from (`session.create` / `prompt` / `message.list` / `remove`, `model.list`, `event.subscribe`). It is also the **public surface**: the entry point, the smoke suite and an embedder import `startProxy()`, `beginShutdown()`, `getQueueLimits()`, `resolveApiKey()` and the helper names from here, so a helper that moved into its own module is re-exported here rather than moved for its callers. |
-| `src/text.js` | Text and value handling shared by the request path: request/completion ids (`requestId()`, `generatedRequestId()`, `newCompletionId()`), the log-safety bounders (`echoedValue()`, `loggableModelId()`, `loggableConfigValue()`, `loggableUpstreamText()`, `loggableUrl()`, `urlPath()`), `jsonTypeName()` and `timeoutMessage()`. Every bounder **bounds, then masks** and marks a cut value with an ellipsis plus a `…[truncated N chars]` counter, so two log lines never disagree about how much was dropped. |
+| `src/text.js` | Text and value handling shared by the request path: request/completion ids (`requestId()`, `generatedRequestId()`, `newCompletionId()`), the log-safety bounders (`echoedValue()`, `loggableModelId()`, `loggableConfigValue()`, `loggableUpstreamText()`, `loggableUrl()`, `urlPath()`), `jsonTypeName()` and `timeoutMessage()`. Every bounder **bounds, then masks** and marks a cut value with an ellipsis plus a `…[truncated N chars]` counter, so two log lines never disagree about how much was dropped. Two details of that rule are load-bearing: the bound is applied to the *work* before the mask runs (a masker scans what it is given, and a 16 KiB request target is not made cheaper by needing only 512 of its characters), while the counter is computed from the **original** length - the number of characters the client's value lost, which is what the marker is read for; and the masking window is `16x` the retained length (`MASK_TEXT_WINDOW_FACTOR`, the rule `maskFreeText()` follows), because every masking rule only *shortens* what it matches, so characters past that window can never reach the output. |
 | `src/errors.js` | The sentences an upstream throw turns into: `clientFacingText()` (masked, URL/credential-safe, cut at 512) for a 5xx body and `handlerFailureMessage()` for the route handler's own catch. |
 | `src/upstream.js` | Classifying what the backend threw: `isTimeoutError()`, `isConnectionError()`, `isConnectionRefused()` (walks the `cause` chain, because `fetch` nests `ECONNREFUSED`), `errorCauseChain()`, `upstreamErrorStatus()` over `V2_ERROR_TAG_STATUS`, `upstreamFailureReason()` and the tagged `backendUnavailable()`. |
 | `src/socket.js` | `closeSocketAfterFlush()`: `end()` then a 250 ms `destroy()` fallback, for the paths that answer outside Fastify's reply lifecycle (`clientErrorHandler`, `badUrlHandler`, a hijacked stream). `destroy()` alone discards buffered writes, so a client under backpressure got a reset instead of its envelope. |
@@ -103,7 +103,12 @@ These are product decisions, not implementation details. Do not "improve" them w
 | `src/config.js` | Reads `config.json` for the entry point. A missing file is fine; one that exists and cannot be used (invalid JSON, not an object, a known key of the wrong type, not a regular file, over 1 MiB) stops the gateway, because continuing would run with the built-in key. The file is opened **once** with `O_NOFOLLOW` (when the platform has it) and `O_NONBLOCK`, then described with `fstat()` on that descriptor: a `config.json` that is a **symbolic link** or a **FIFO** is refused by name, because following it would read a target the operator did not configure and a FIFO would block the startup on a writer that never comes. A BOM is tolerated. |
 | `src/logger.js` | Zero-dependency logger with `error`/`warn`/`info`/`debug` levels, `[gateway]` prefix, and the masking helpers (`maskHeaders()`, `maskSecret()`, `maskUrlQuery()`, `maskBackendUrl()`, `maskUrlCredentials()`, `maskQuotedCredentials()`) plus `serializeDetail()` (truncate before stringify; the `preBounded` flag skips the clone for a detail `maskDetail()` already built, which is what `logger.debugBounded()` uses), and `maskFreeText()` (control characters - newline, tab, DEL - replaced
 *before* the mask chain runs, so a secret cannot be split across a line break into a shape no pattern matches) for debug
-logging. |
+logging. Every masker **fails closed**: a shape it does not recognise is returned unchanged rather than partly rewritten,
+because a half-masked value is what leaks - `maskBackendUrl()` splits on the **last** `@` (the one that ends the
+userinfo) and leaves the text alone when there is none, when nothing precedes it, or when it sits inside what looks like
+another scheme's run, and `maskUrlCredentials()` only applies its second (scheme-less `user:pass@`) rule when the value
+carries no `://` or the colon is inside the userinfo rather than in the host:port that follows it. `MASK_TEXT_WINDOW_FACTOR`
+is exported from here because `src/text.js` bounds by the same rule. |
 | `src/polyfills.js` | Node 20 shims, imported for its side effect first thing in `src/proxy.js`: `Promise.withResolvers()` is Node 22+, and `@opencode/client`'s SSE subscription calls it unconditionally, so without it every stream silently fell back to polling (one delta per answer). A no-op on a runtime that has the API. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README (`docker/README.md`, kept under 25 000 characters). |
@@ -384,10 +389,14 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   the sentence is one shared `queueFullMessage()` - the `OPENCODE_PROXY_MAX_QUEUE=0` spelling of "waiting is disabled"
   included - so the two paths cannot describe the same refusal differently) or `type: "server_error"` with `code: "gateway_shutting_down"` (also with `Retry-After: 1`, when
   `SIGINT`/`SIGTERM` arrived and the request is not one of the responses being finished), `504` (timeout), `500`
-  (anything else). A backend the gateway cannot start (a missing CLI, a 1.x release, a taken port, a start cooldown, or
-  an `OPENCODE_SERVER_URL` naming **no port** - the child can only listen on a numbered one, so the gateway probed the
-  URL as written, port 80/443, while the child held 4097: every completion answered 502 after the whole startup budget
-  and the child was left behind. It is refused before the spawn, with a sentence naming the port) is
+  (anything else). A backend the gateway cannot start (a missing CLI, a 1.x release, a taken port, a start cooldown, an
+  `OPENCODE_SERVER_URL` naming **no port**, or one the URL parser **rejects** - the child can only listen on a numbered
+  one, so the gateway probed the URL as written, port 80/443, while the child held 4097: every completion answered 502
+  after the whole startup budget and the child was left behind. Both are refused before the spawn, with a sentence
+  naming the port or the shape the value must have. A rejected URL is the more dangerous half: the "is this on this
+  machine?" check and the port check both read the same `new URL()` that had just failed, so both were skipped, the
+  port fell back to 4097, and the gateway started a **local** child - a real backend process, as this uid, with
+  model-directed tools enabled by default - for a URL no probe could ever reach) is
   the same `502 backend_unreachable` as a backend that died mid-request: the tagged `backendUnavailable()` error is
   what tells the two paths apart, and the message names the start failure. Every error body carries a
   `type`; `500`, `502` and `504` use `type: "server_error"` and never an internal exception class name, and its message is
@@ -511,7 +520,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   and SSE, which a browser must not re-read as something else.
 - **Responses are not cacheable by default.** The `onRequest` hook sets `Cache-Control: no-store` on the raw response
   for every request, and the SSE path narrows it to `no-cache` when it hijacks the stream (a revalidated stream is the
-  right answer for a long-lived response; a stored one is not). The gateway writes no `ETag`, `Last-Modified` or
+  right answer for a long-lived response; a stored one is not). The two responders that write **outside** the hook -
+  `clientErrorHandler` (a request the HTTP parser rejected) and `badUrlHandler` (a URL the router could not decode) -
+  set the same header on their own envelopes: the header was added to the hook and not to them, so those two 400/408/431
+  replies were the only responses a shared cache was free to store. The gateway writes no `ETag`, `Last-Modified` or
   `Vary`, so without this a shared cache was free to key a completion on the URL alone - and every completion POSTs to
   the same `/v1/chat/completions`, so the only thing separating two users' answers was that nothing had told the cache
   not to reuse them. `no-store` is the header OpenAI's own API sends.
@@ -560,7 +572,10 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   The `model` value and the URL are client-controlled, so both are normalised before they are logged
   (`loggableModelId()`: control characters replaced, 128 characters max; a URL goes through `maskUrlQuery()` *and*
   `maskUrlCredentials()`, so a `user:pass@` in a request target is masked the way `maskBackendUrl()` masks it, and one
-  over 512 characters is cut with a `…[truncated N chars]` marker): one log line is one record, and a newline in a model id used to start a second,
+  over 512 characters is cut with a `…[truncated N chars]` marker counting what the **original** target lost - the
+  maskers only shorten, so both run inside a 16x window of the retained length instead of over the whole 16 KiB Node
+  allows a request line, which is what kept a `?@` + `a`×16000 target from costing 1.2 ms of the serving thread on a
+  line built for every response, the `401` ones included): one log line is one record, and a newline in a model id used to start a second,
   attacker-written line while a 2 MB id produced a 2 MB line. The backend still receives the id
   verbatim - the contract does not restrict model ids, only what is logged is normalised, and an **operator** value
   quoted in a startup line goes through `loggableConfigValue()` for the same reason: `config.json` and the environment
@@ -623,7 +638,11 @@ error. An absent or blank `model` means `DEFAULT_MODEL`.
   `#`-separated pairs); the smoke suite asserts the entrypoint calls the helper rather than re-implementing it.
   A request body reaches the debug dump through `maskDetail()` (the same name list on a bounded copy, each string cut
   at `MAX_SERIALIZED_LENGTH` before it is masked: the line is cut to that length too, so a body at the 50 MiB limit no
-  longer costs 688 ms per debug line), and the model-fetch error line uses the same helpers. A detail object handed to a
+  longer costs 688 ms per debug line). That only covers a body the gateway **parsed**: a `text/plain` or
+  `application/x-www-form-urlencoded` body is handed to the handler as a string and used to be dumped verbatim, so
+  `curl -d 'api_key=sk-…'` put the client's key in the log while the same body under `application/json` was masked -
+  `maskRequestBody()` parses it first when it looks like JSON and falls back to `maskDetail()` over the text, so the
+  content type cannot decide whether a credential is masked. A detail object handed to a
   debug line is **truncated before it is cloned** (`serializeDetail()`): a 50 MB body used to be cloned and
   re-stringified into a 32 KB line (43 ms and +100 MB of heap per line).
   Masking replaces a value and never drops the key: the copy these helpers build is assigned to with

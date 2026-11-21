@@ -335,7 +335,10 @@ export function normalizeBackendUrl(raw) {
             notes.push(`OPENCODE_SERVER_URL='${maskBackendUrl(url)}' names no port: the backend is started on 4097 but this URL is probed as-is (port 80), so completions cannot succeed`);
         }
     } catch (e) {
-        // Unparseable: `spawnBackend()` reports it and falls back to port 4097
+        // Unparseable: `spawnBackend()` refuses it before the spawn, with a sentence naming the value and the shape it
+        // must have. Said here too, because this is the line an operator reads at startup - the 502 of the first
+        // completion is a worse place to learn that the configured URL is not a URL.
+        notes.push(`OPENCODE_SERVER_URL='${maskBackendUrl(url)}' cannot be parsed as a URL: it must be http(s)://host:port, for example http://127.0.0.1:4097`);
     }
     return { url, notes };
 }

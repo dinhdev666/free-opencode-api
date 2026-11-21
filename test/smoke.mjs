@@ -25,6 +25,7 @@ import {
 } from '../src/logger.js';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loggableUrl } from '../src/text.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // This file reads itself for two invariants that live in its own text: the derived ports it must find free before it
@@ -529,6 +530,57 @@ async function run() {
     check('the scheme bound still masks a real credential-bearing URL',
         maskUrlCredentials('see http://user:s3cr3t@host:4097/x') === 'see http://***@host:4097/x',
         maskUrlCredentials('see http://user:s3cr3t@host:4097/x'));
+
+    // A credential containing a reserved character ends the authority a strict parse sees (`http://alice:s3#cr3t@host`
+    // is host `alice`, port `s3` - not a number - and the rest), so a masker that walked `[^/?#]*@` matched nothing and
+    // returned the value **unchanged**: `/health`, which needs no key, published the operator's intended secret, and so
+    // did the startup summary. A masker fails closed - the last `@` separates userinfo from host in every spelling - so
+    // these are masked, and a scheme longer than the 32-character bound is masked too.
+    const failOpenCases = [
+        ['http://alice:s3#cr3t@127.0.0.1:4097', 'http://***@127.0.0.1:4097'],
+        ['http://alice:s3?cr3t@127.0.0.1:4097', 'http://***@127.0.0.1:4097'],
+        ['http://alice:s3/cr3t@127.0.0.1:4097', 'http://***@127.0.0.1:4097'],
+        [`http://${'a'.repeat(40)}:s3cr3t@127.0.0.1:4097`, 'http://***@127.0.0.1:4097'],
+        ['alice:s3cr3t@host:4398', '***@host:4398']
+    ];
+    const failOpenResults = failOpenCases.map(([input, expected]) => [input, maskBackendUrl(input), expected]);
+    check('a credential holding a reserved character is still masked in the backend URL',
+        failOpenResults.every(([, actual, expected]) => actual === expected),
+        JSON.stringify(failOpenResults.filter(([, actual, expected]) => actual !== expected)));
+    // The cost side of the same function: it runs on the startup summary, on `/health` and on every 502, and a masker
+    // that returns the value unchanged for a credential it did not recognise is also the shape that costs the most.
+    const reservedStartedAt = process.hrtime.bigint();
+    const reservedMasked = maskBackendUrl(`http://${'u'.repeat(8000)}:${'p'.repeat(8000)}@host:4097`);
+    const reservedMs = Number(process.hrtime.bigint() - reservedStartedAt) / 1e6;
+    check('masking a long credential-bearing backend URL stays cheap',
+        reservedMs < 100 && !reservedMasked.includes('pppppppp') && reservedMasked.startsWith('http://***@'),
+        `${reservedMs.toFixed(1)} ms ${reservedMasked.slice(0, 40)}`);
+
+    // The request summary line is built for every `/v1/*` response - the `401` an unauthenticated caller receives
+    // included - and it ran both URL maskers over the whole request target, which Node bounds only by its 16 KiB header
+    // limit, to keep 512 characters of it. Both patterns are searched at every offset, and the scheme-less credential
+    // rule retries a 256-character run, so a target shaped `/v1/models?@` + 16 000 `a` cost 1.2 ms of blocked serving
+    // thread per request and `@` + `=a:`×5333 cost 2.2 ms: a client with one keep-alive connection could spend the
+    // single core. The value is now masked inside a 16x window, which is the same rule `maskFreeText()` follows.
+    const maskCostShapes = [
+        ['@ + a-run', `/v1/models?@${'a'.repeat(16000)}`],
+        ['@ + =a: run', `/v1/models?@${'=a:'.repeat(5333)}`],
+        ['&x= run', `/v1/models?${'&x='.repeat(5333)}`]
+    ];
+    const maskCostResults = maskCostShapes.map(([label, target]) => {
+        const startedAt = process.hrtime.bigint();
+        const masked = loggableUrl(target);
+        return [label, Number(process.hrtime.bigint() - startedAt) / 1e6, masked];
+    });
+    check('a maximum-length request target is masked without stalling the serving thread',
+        maskCostResults.every(([, ms]) => ms < 20),
+        JSON.stringify(maskCostResults.map(([label, ms]) => `${label}: ${ms.toFixed(2)} ms`)));
+    check('the masked form of those targets is unchanged by the window',
+        maskCostResults.every(([label, , masked]) => {
+            if (label === '&x= run') return masked.startsWith('/v1/models?') && masked.includes('…[truncated');
+            return masked.startsWith('/v1/models?@');
+        }),
+        JSON.stringify(maskCostResults.map(([label, , masked]) => `${label}: ${masked.slice(0, 40)}`)));
 
     // The credential-name list has to carry the spellings clients use. `passw` was a *prefix*, and the anchors around
     // the alternation require a whole name segment, so it matched nothing but the literal `passw`: `?password=…` and an
@@ -1384,7 +1436,15 @@ async function run() {
     check('a listing served past its TTL is the cached body, answered without waiting for the refresh',
         staleListing.response.status === 200 && staleListing.text === cachedSecond.text && staleMs < 1500,
         `status ${staleListing.response.status}, ${staleMs} ms`);
-    const staleAfter = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
+    // The refresh is started behind the response, so the provider count read straight after it is a race: the reply
+    // can win by a few milliseconds and the check reported `provider calls: 0` for a refresh that was on its way.
+    // Poll for it instead - the assertion is still "exactly one refresh", it is just made once it has had the chance
+    // to arrive (2 s ceiling, well inside the rate-limit window the next check depends on).
+    let staleAfter = staleBefore;
+    for (let attempt = 0; staleAfter === staleBefore && attempt < 80; attempt += 1) {
+        await sleep(25);
+        staleAfter = (await (await fetch(`${STUB_URL}/__sessions`)).json()).providerCalls;
+    }
     check('the stale listing triggers exactly one background refresh',
         staleAfter - staleBefore === 1, `provider calls: ${staleAfter - staleBefore}`);
     // ...and the refresh rate-limits itself: past the TTL but inside the same refresh window a failing provider must not
@@ -1584,6 +1644,12 @@ async function run() {
         badUrl.headers.get('access-control-allow-origin') === '*' &&
         /^gw-[a-z0-9]+$/.test(badUrl.headers.get('x-request-id') || ''),
         `${badUrl.headers.get('access-control-allow-origin')} ${badUrl.headers.get('x-request-id')}`);
+    // The `onRequest` hook sets `Cache-Control: no-store` on every response, and this path writes its envelope by hand
+    // (the router never decoded the URL, so no hook ran): the header was added to the hook and not to the two
+    // hand-written responders, so these responses were the only ones a shared cache was free to store.
+    check('an undecodable URL is not cacheable, like every other response',
+        badUrl.headers.get('cache-control') === 'no-store',
+        String(badUrl.headers.get('cache-control')));
     // ...and that id is in the log line for the same request: a client report quotes the id, so an id no log entry
     // carries is the one thing the header cannot do. The client's own trace id is echoed on this path too - it is the
     // path that answers before any hook, so it is where the echo was missing.
@@ -4195,6 +4261,47 @@ async function run() {
     stopGateway(noPortGateway);
     await waitForExit(noPortGateway);
 
+    // A URL the parser rejects is the same class of configuration error, and it used to reach the spawn: both the
+    // "is this on this machine?" check and the port check read the same `new URL()` that had just failed, so both were
+    // skipped, the port fell back to 4097, and the gateway started a **local** child - a real backend process, as this
+    // uid, with model-directed tools enabled by default - for a URL no probe could ever reach. Every completion then
+    // answered 502 until the operator noticed. Refused before the spawn, with a sentence naming the value.
+    const badUrlPort = GATEWAY_PORT + 80;
+    const badUrlGateway = spawn(process.execPath, ['index.js'], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            PORT: String(badUrlPort),
+            BIND_HOST: '127.0.0.1',
+            OPENCODE_SERVER_URL: 'http://user:s3cr3t@127.0.0.1:not-a-port',
+            OPENCODE_PATH: deadBackendScript,
+            LOG_LEVEL: 'error'
+        }
+    });
+    children.push(badUrlGateway);
+    badUrlGateway.stdout.on('data', () => {});
+    badUrlGateway.stderr.on('data', () => {});
+    await waitForOk(`http://127.0.0.1:${badUrlPort}/health`);
+    const unparseableAnswer = await fetch(`http://127.0.0.1:${badUrlPort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(15000)
+    }).then(async (response) => ({ status: response.status, json: await response.json().catch(() => null) }))
+        .catch((error) => ({ status: 0, json: null, error: error.message }));
+    const unparseableMessage = unparseableAnswer.json?.error?.message || unparseableAnswer.error || '';
+    check('a backend URL the parser rejects is refused before a local child is spawned',
+        unparseableAnswer.status === 502 && /cannot be parsed as a URL/.test(unparseableMessage) &&
+        /must be http\(s\):\/\/host:port/.test(unparseableMessage),
+        `status ${unparseableAnswer.status} ${unparseableMessage.slice(0, 200)}`);
+    check('the refused backend URL is masked in the sentence that names it',
+        unparseableAnswer.json?.error?.code === 'backend_unreachable' &&
+        unparseableMessage.includes('http://***@127.0.0.1:not-a-port') &&
+        !unparseableMessage.includes('s3cr3t'),
+        unparseableMessage.slice(0, 200));
+    stopGateway(badUrlGateway);
+    await waitForExit(badUrlGateway);
+
     stopGateway(deadBackendGateway);
     await waitForExit(deadBackendGateway);
     try { fs.unlinkSync(deadBackendScript); } catch { /* best effort */ }
@@ -4745,6 +4852,45 @@ async function run() {
         /http:\/\/\*\*\*@127\.0\.0\.1:4097\/session\?token=\*\*\*/.test(upstreamDump) &&
         upstreamDump.includes('and store it'),
         upstreamDump.slice(-400));
+
+    // Masking by key only helps when the body *is* an object, and whether it is one is decided by the content type: a
+    // `text/plain`, `application/x-www-form-urlencoded` or header-less body reaches the handler as the raw string, and
+    // the string branch of `maskDetail()` is `maskFreeText()` - it knows `user:pass@` and `Bearer …`, not
+    // `"api_key":"…"`. The same bytes were therefore masked under `application/json` and printed in clear under
+    // `text/plain`, so a client chose the content type that published its credential. The dump masks a string that
+    // parses as a JSON object by key, exactly as it masks a parsed one.
+    const TEXT_CREDENTIAL = 'sk-must-not-appear-either-4242';
+    const textBodyAnswer = await fetch(`${debugUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'text/plain' },
+        body: JSON.stringify({
+            messages: [{ role: 'user', content: 'hi' }],
+            api_key: TEXT_CREDENTIAL,
+            metadata: { authorization: `Bearer ${TEXT_CREDENTIAL}` }
+        }),
+        signal: AbortSignal.timeout(15000)
+    }).then((r) => r.text()).catch(() => '');
+    const formBodyAnswer = await fetch(`${debugUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/x-www-form-urlencoded' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], api_key: TEXT_CREDENTIAL }),
+        signal: AbortSignal.timeout(15000)
+    }).then((r) => r.text()).catch(() => '');
+    await sleep(200);
+    let textDumps = [];
+    for (let i = 0; i < 40 && textDumps.length < 2; i += 1) {
+        textDumps = debugOutput.split('\n').filter((line) => line.includes('Incoming OpenAI request'));
+        if (textDumps.length < 2) await sleep(50);
+    }
+    check('the debug dump masks a credential sent under a text content type',
+        textDumps.length >= 2 && !debugOutput.includes(TEXT_CREDENTIAL),
+        `${textDumps.length} dumps; the secret ${debugOutput.includes(TEXT_CREDENTIAL) ? 'appeared' : 'did not appear'}`);
+    check('a text body is dumped by key, the same way a JSON one is',
+        textDumps.length >= 2 && textDumps.every((line) => /"api_key":"sk-[^"]*\*\*\*\(\d+ chars\)"/.test(line)),
+        textDumps.map((line) => line.slice(0, 200)).join(' | '));
+    check('the text-body requests are still served',
+        /"object":"chat\.completion"/.test(textBodyAnswer) && /"object":"chat\.completion"/.test(formBodyAnswer),
+        `${textBodyAnswer.slice(0, 100)} / ${formBodyAnswer.slice(0, 100)}`);
 
     stopGateway(debugGateway);
     await waitForExit(debugGateway);
@@ -5684,6 +5830,11 @@ async function run() {
     // ...and `nosniff` on that same path, which is where a browser would otherwise re-read the envelope as HTML
     check('a parser-level rejection forbids content sniffing',
         /x-content-type-options: nosniff/i.test(rawHeaderBlock),
+        rawHeaderBlock.slice(0, 240));
+    // ...and it is not cacheable either: this handler writes its response by hand too, so it needs the same
+    // `Cache-Control` the `onRequest` hook sets on everything else
+    check('a parser-level rejection is not cacheable',
+        /cache-control: no-store/i.test(rawHeaderBlock),
         rawHeaderBlock.slice(0, 240));
     // ...and the envelope has to arrive whole: the handler wrote it and called socket.destroy() on the next line, which
     // discards buffered writes, so under backpressure the client saw a reset instead of the error it was promised

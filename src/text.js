@@ -7,7 +7,7 @@
  * read as a *second* one (a forged request summary, a fake `[Security]` line), an ANSI escape would reach the operator's
  * terminal, and an unbounded value would turn one request body into an arbitrarily large record.
  */
-import { maskUrlCredentials, maskUrlQuery } from './logger.js';
+import { MASK_TEXT_WINDOW_FACTOR, maskUrlCredentials, maskUrlQuery } from './logger.js';
 
 /**
  * Control characters, including the DEL and the C1 range: replaced wherever a value that did not come from this process
@@ -22,17 +22,33 @@ export const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
  * The bound is applied *before* the replace, because the regex is per character: a client value at the 50 MiB body limit
  * is then not transformed in full just to keep a couple of hundred characters of it (measured 3.9 ms for 5 MiB). The
  * output is the same either way - the replace is one character for one character.
+ *
+ * `mask` runs on the same prefix, for the same reason and with the same bound. It used to run on the whole value: the
+ * caller masked first and this function cut afterwards, so `loggableUrl()` handed both URL maskers a request target of
+ * up to Node's 16 KiB header limit to keep 512 characters of it. Both are searched at every offset and the scheme-less
+ * credential rule retries a 256-character run, so a target shaped `/v1/models?@` + `a`×16000 cost 1.2 ms of the serving
+ * thread per request - unauthenticated, because the summary line is also written for a `401`. The window is the same
+ * 16x rule `maskFreeText()` follows: every masking rule *shortens* what it matches, so characters past 16x the retained
+ * length can never reach the output, and the marker below still counts what the **original** value lost.
  * @param {unknown} raw
  * @param {number} maxLen
  * @param {boolean} [counted] name how much was cut, instead of a bare ellipsis
+ * @param {(text: string) => string} [mask] applied to the retained window before the cut
  * @returns {string}
  */
-const boundedForLog = (raw, maxLen, counted = true) => {
+const boundedForLog = (raw, maxLen, counted = true, mask = null) => {
     const value = String(raw);
-    const clean = (value.length > maxLen ? value.slice(0, maxLen) : value).replace(CONTROL_CHARS_RE, '?');
+    const window = maxLen * MASK_TEXT_WINDOW_FACTOR;
+    const head = value.length > window ? value.slice(0, window) : value;
+    const masked = mask ? mask(head) : head;
+    const clean = (masked.length > maxLen ? masked.slice(0, maxLen) : masked).replace(CONTROL_CHARS_RE, '?');
     if (value.length <= maxLen) return clean;
     return counted ? `${clean}…[truncated ${value.length - maxLen} chars]` : `${clean}…`;
 };
+
+// The credential rules `loggableUrl()` needs, in the order `maskFreeText()` applies them: a query value first, then the
+// userinfo of any URL in what is left.
+const maskUrlText = (text) => maskUrlCredentials(maskUrlQuery(text));
 
 // Two completions that reach this counter in the same millisecond used to receive the same `chatcmpl-<epoch>` id (a
 // client that keys its messages by id merged two answers); the counter keeps ids distinct without a random source, and
@@ -126,7 +142,7 @@ export const loggableUpstreamText = (value) => boundedForLog(value, MAX_LOGGED_U
  * @param {string} url raw request URL
  * @returns {string}
  */
-export const loggableUrl = (url) => boundedForLog(maskUrlCredentials(maskUrlQuery(url)), MAX_LOGGED_URL_LENGTH);
+export const loggableUrl = (url) => boundedForLog(url, MAX_LOGGED_URL_LENGTH, true, maskUrlText);
 
 /**
  * The request target without its query string, which the access log and the 404 body want.

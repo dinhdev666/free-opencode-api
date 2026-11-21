@@ -109,8 +109,12 @@ jobs:
           for file in $files; do
             [ -f "$file" ] || continue
             # A comment that explains the rule must not be read as a use of an action (`:[[:space:]]*#` is a line
-            # whose content starts with `#`, which no step does)
-            hits=$(grep -nE 'us[e]s:[[:space:]]*[^[:space:]#},]+' "$file" | grep -vE ':[[:space:]]*#' || true)
+            # whose content starts with `#`, which no step does), and neither must prose that merely mentions the key.
+            # The match is anchored to a mapping entry - an optional `{` and the comma that precedes the key inside a
+            # flow-style step are allowed - so `echo "pin every uses: to a SHA"` in a `run:` block is not a reference,
+            # while `- { name: X, uses: actions/x@v4 }` still is. The unanchored form flagged the prose line, which was
+            # one documentation `echo` away from failing the build for no reason.
+            hits=$(grep -nE '^[[:space:]]*-?[[:space:]]*(\{[^}]*[,-][[:space:]]*)?us[e]s:[[:space:]]*[^[:space:]#},]+' "$file" | grep -vE ':[[:space:]]*#' || true)
             [ -n "$hits" ] || continue
             # A reference with no `@` is not pinned either: `docker://alpine:3` moves on every pull, and a local action
             # (`./.github/actions/x`) is only as frozen as the checkout it comes from. A bare SHA is not enough on its
@@ -128,6 +132,14 @@ jobs:
 
       - name: Smoke test (OpenAI contract)
         run: pnpm test
+
+      # The slow checks are skipped by `pnpm test` (they wait out the 15 s keep-alive interval), and nothing ran them:
+      # `SMOKE_SLOW` appeared nowhere in this workflow or the README, so the documented `: keep-alive` line could be
+      # deleted with every other job still green. This line runs exactly one more pass with them enabled - ~16 s, once,
+      # not on all three matrix entries, because the check is about behaviour and not about the runtime version.
+      - name: Smoke test including the slow SSE keep-alive checks
+        if: matrix.node == '24'
+        run: SMOKE_SLOW=1 pnpm test
 
   # Its own job rather than one step inside the matrix above, where it was gated on `if: matrix.node == '24'`: a gate
   # keyed to a matrix value disappears with the value, so dropping or renaming that Node line silently stopped checking

@@ -121,7 +121,12 @@ type), and it reads a pair wherever the name starts a run: a **prefixed** name (
 command line) and a **quoted** one (`"key=value"`, the shape a config parser echoes) are both pairs, because the
 free-text chain runs this rule over sentences that carry no `;`, `,` or `&` before the name at all - the separator class
 is what starts a name run, so it also accepts a quote and a flag prefix (written back unchanged; only the value is
-replaced). `MASK_TEXT_WINDOW_FACTOR` is exported from here because `src/text.js` bounds by the same rule. |
+replaced). The separator is `=`, with optional spaces on either side, and the **JSON** spelling
+(`{"api_key":"..."}`) is a second alternative that keys off the quoted name; the two are **flat** alternatives at the
+top level, because nesting them made the JSON one unreachable. A `name: value` pair whose name is *not* quoted
+(`api_key: "alpha beta gamma"`) is deliberately left to `maskQuotedCredentials()`, which keeps its length floor so an
+address (`mailto:someone@example.com`) is not rewritten as a credential. `MASK_TEXT_WINDOW_FACTOR` is exported from
+here because `src/text.js` bounds by the same rule. |
 | `src/polyfills.js` | Node 20 shims, imported for its side effect first thing in `src/proxy.js`: `Promise.withResolvers()` is Node 22+, and `@opencode/client`'s SSE subscription calls it unconditionally, so without it every stream silently fell back to polling (one delta per answer). A no-op on a runtime that has the API. |
 | `config.json.example` | Template for `config.json` (not committed). |
 | `docker/` | `Dockerfile`, `docker-entrypoint.sh` (writes `config.json` from env), container README (`docker/README.md`, kept under 25 000 characters). |
@@ -158,7 +163,9 @@ children it spawned behind (`opencode.exe serve …`), it first reaps exactly th
 `opencode` or `test/stub-opencode.mjs` - and never touches a listener it cannot attribute, because a run that aborted at
 its second check is indistinguishable from a failing one. The POSIX path needs none of this: killing the run's process
 group takes its children with it. `SMOKE_SLOW=1 pnpm test` adds the checks that are slow by nature (the SSE
-keep-alive line, written only after 15 s of silence); they are skipped otherwise. CI runs `pnpm run check` and
+keep-alive line, written only after 15 s of silence); they are skipped otherwise, and the Node 24 entry of CI runs
+exactly that invocation so the documented keep-alive line is covered by a build rather than by a human's memory. CI also
+runs `pnpm run check` and
 `pnpm test` on Node 20, 22
 and 24, plus `test/check-commit-messages.mjs` over the added commits. No linter or formatter exists: style is a review
 concern. Do not claim checks passed if they were not run.

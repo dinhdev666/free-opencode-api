@@ -276,6 +276,19 @@ const decodeQueryName = (name) => {
  * Not anchored at the end of the value, and bounded on both runs: a pair is a name of at most 64 characters and a
  * value of at most 256, which is far beyond any real token, and the bound is what keeps the scan linear on a value
  * that carries no pair at all.
+ *
+ * A **flag** spelling is a pair too. The separator class already accepts whitespace, so `opencode --api-key=…` reached
+ * this rule with `opencode` as the name run and `--api-key` as ordinary prose: the name had to start with a letter,
+ * and both characters in front of `api-key` are dashes. That is the spelling a CLI wrapper uses (`opencode serve
+ * --api-key=…`, `--token=…`, `--password=…`), and a wrapper's own error sentence is exactly the client text
+ * `maskFreeText()` exists to sanitise, so the flag run is consumed separately and the credential *name* is what the
+ * sensitive-name test sees. `-x-api-key=…` and `--x-api-key=…` now read as the header name they spell.
+ *
+ * A quote is a separator too (`yaml: "password=…"`, `syntax error near "token=…"`): a pair quoted inside a sentence
+ * is the shape a configuration parser and a wrapper both produce, and without the quote in the separator class the
+ * name run started at the quote and matched nothing. The quotes are written back unchanged and the **unquoted** value
+ * class excludes them, so a quoted pair keeps both its delimiters (`"key=***"`, not `"key=***`) while a value that
+ * opens a quote it never closes is still masked up to it.
  * @param {string} text any short value
  * @returns {string} the value with credential pairs masked
  */
@@ -289,8 +302,8 @@ export function maskCredentialPairs(text) {
     // before the mask runs, and a media type or content-part name is shorter still), and it keeps the run bounded the
     // way every other rule here is. `/` is part of a name because a media type is `type/subtype`.
     return value.replace(
-        /(^|[,;&#?\s])([A-Za-z][A-Za-z0-9_./-]{0,63})=("[^"]{0,4096}"|'[^']{0,4096}'|[^&;,\s]{0,4096})/g,
-        (match, separator, name) => (isSensitiveHeader(name) ? `${separator}${name}=***` : match));
+        /(^|[,;&#?"'\s])(--?)?([A-Za-z][A-Za-z0-9_./-]{0,63})=("[^"]{0,4096}"|'[^']{0,4096}'|[^&;,\s"']{0,4096})/g,
+        (match, separator, flag, name) => (isSensitiveHeader(name) ? `${separator}${flag || ''}${name}=***` : match));
 }
 
 export function maskUrlQuery(url) {
@@ -543,15 +556,25 @@ export const MASK_TEXT_WINDOW_FACTOR = 16;
 // sentence as one URL), but the credential rule runs on the unsplit text first - a bounded, anchored scan that is
 // skipped entirely when the text carries no `://` or no `user:pass@` shape at all.
 //
-// That pass covers the **scheme-qualified** form. A credential written without a scheme (`connect alice:s3 cr3t@proxy
-// failed` - the shape `normalizeBackendUrl()` repairs and then quotes back, and the shape a hand-written sentence uses)
-// still needs a token boundary to be recognised, so it is masked per token in the loop below. Its secret class cannot
-// cross whitespace on purpose: without the `://` anchor, a class that allowed spaces would match `the admin: bob@…`
-// from any colon earlier in the sentence.
+// That pass covers **both** spellings. `maskUrlCredentials()` masks a scheme-qualified userinfo
+// (`http://user:secret@host:4097`) and, when the text carries no `://`, a scheme-less `user:secret@host` as well
+// (`connect alice:s3cr3t@proxy failed` - the shape `normalizeBackendUrl()` repairs and then quotes back, and the shape
+// a hand-written sentence uses). Its scheme-less secret class cannot cross whitespace on purpose: without the `://`
+// anchor, a class that allowed spaces would match `the admin: bob@example.com` from any colon earlier in the sentence.
+// A scheme-less credential **containing a space** is therefore the one shape this rule leaves alone, and it is not
+// reachable from anything the gateway composes: `normalizeBackendUrl()` adds the scheme before a value is quoted into
+// a `[Config]` note, and `maskBackendUrl()` masks the userinfo whatever it contains. The residual case is a
+// third-party sentence quoting such a URL verbatim.
 export function maskUrlsInText(text) {
     const value = String(text);
-    if (!value.includes('://') && !value.includes('=')) return value;
-    const withSchemeCredentials = value.includes('://') ? maskUrlCredentials(value) : value;
+    // `@` is a candidate on its own: a credential written **without** a scheme (`connect alice:s3cr3t@proxy failed`,
+    // the form `normalizeBackendUrl()` repairs and a hand-written sentence uses) carries neither `://` nor `=`, so the
+    // early return below skipped the one rule that recognises it and the sentence was published verbatim although
+    // `maskUrlCredentials()` documents that form as covered. `maskUrlCredentials()` itself needs no `://` and no `=`
+    // to decide - it looks for a `:` before the last `@` - and a text with no `@` at all leaves it at its own warm
+    // exit, so the extra call costs one `lastIndexOf()` on the sentences that carry an address at all.
+    if (!value.includes('://') && !value.includes('=') && !value.includes('@')) return value;
+    const withSchemeCredentials = value.includes('://') || value.includes('@') ? maskUrlCredentials(value) : value;
     if (!withSchemeCredentials.includes('=')) return withSchemeCredentials;
     return withSchemeCredentials
         .split(/(\s+)/)
@@ -574,10 +597,12 @@ const MASK_CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
  * Free text that is about to leave the process - a client-facing 5xx sentence, an error log line, a stack, a string
  * inside a debug dump - masked and bounded in one place.
  *
- * Two credentials can hide in a sentence and neither is the sentence's own: a URL carrying userinfo or a query value
- * (`http://user:secret@host:4097/session?token=…`, which Node's `fetch` refuses out loud) and an authorization header
- * value a proxy echoed back (`Authorization: Basic b3BzOnMzY3I…`). Both used to reach a client body and `docker logs`
- * verbatim; masking one and not the other is why the chain lives here rather than at each call site.
+ * Three credentials can hide in a sentence and none of them is the sentence's own: a URL carrying userinfo or a query
+ * value (`http://user:secret@host:4097/session?token=…`, which Node's `fetch` refuses out loud), an authorization
+ * header value a proxy echoed back (`Authorization: Basic b3BzOnMzY3I…`), and a bare `name=value` pair or CLI flag
+ * (`opencode --api-key=…`, `x-api-key=…`) copied out of a wrapper's command line. All three used to reach a client
+ * body and `docker logs` verbatim; masking one and not the others is why the chain lives here rather than at each
+ * call site.
  * @param {*} value any text (non-strings are stringified the way `maskUrlQuery` does it)
  * @param {number} [maxChars] length bound; 512 by default, and the marker matches `loggableUrl()`
  * @returns {string} the masked, bounded text
@@ -592,7 +617,11 @@ export function maskFreeText(value, maxChars = MAX_UPSTREAM_TEXT_CHARS) {
     // characters left into the retained window - and the final truncation below still applies unchanged.
     const window = Number.isFinite(maxChars) && maxChars > 0 ? maxChars * MASK_TEXT_WINDOW_FACTOR : 0;
     const bounded = window && text.length > window ? text.slice(0, window) : text;
-    const masked = redactRegisteredValues(maskQuotedCredentials(maskUrlsInText(bounded)))
+    // `maskCredentialPairs()` runs before the URL rules for the same reason it runs inside `loggableUrl()`: a
+    // `name=value` pair is not a URL, and the URL rule only ever looks at a `?`, `&`, `#` or `;` in front of a name.
+    // Without it a sentence that quotes a CLI flag (`opencode --api-key=…`) or a bare pair (`x-api-key=…`) was
+    // published verbatim, because the separator the URL rule needs is a query separator and a flag has a space.
+    const masked = redactRegisteredValues(maskQuotedCredentials(maskCredentialPairs(maskUrlsInText(bounded))))
         .replace(MASK_CONTROL_CHARS_RE, '?');
     if (!Number.isFinite(maxChars) || masked.length <= maxChars) return masked;
     return `${masked.slice(0, maxChars)}…[truncated ${text.length - maxChars} chars]`;

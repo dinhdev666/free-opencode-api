@@ -308,8 +308,10 @@ action when the session is created, and as soon as either `read` or `glob` is de
 gateway never returns content. The fix denies the whole action set first (`edit`, `shell`, `write`, `grep`, `webfetch`,
 `websearch`, `subagent`, `external_directory`, `question`, `skill`, `task`, `todowrite`, `todoread`, `lsp`, `browser`,
 `patch`, `multiedit`, `invalid`), then `deny *` so an action a newer server grows is covered too, and re-allows exactly
-`read` and `glob` **last**. Both are read-only with no write or execution capability; `stripFunctionCalls` output
-filtering plus the `TOOL_GUARD_MESSAGE` prompt text are a second line of defense.
+`read` and `glob` **last**. Both are read-only with no write or execution capability; `stripFunctionCalls()` output
+filtering plus the `TOOL_GUARD_MESSAGE` prompt text are further defences under the **same** switch, not independent
+ones — the guard sentence is prepended only when `DISABLE_TOOLS` is on, so a container that turns tools back on loses
+all three.
 
 **Fix 2 — streaming SSE compatibility.** In 2.x the stream names the kind in `type` (dot-separated: `session.text.delta`,
 `session.reasoning.delta`, `session.text.ended`, `session.step.ended`, …) and the payload in `data`. A `*.delta` event

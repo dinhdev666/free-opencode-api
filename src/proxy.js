@@ -1110,7 +1110,13 @@ function createApp(config) {
     // 50 MiB default limit) was cut off mid-body and told to send the body it was already sending. The deadline is
     // renewed while bytes arrive, and the arrival phase gets its own window before the completion budget starts (it is
     // spent before anything is queued), so a client that drizzles forever still cannot hold the socket.
-    const bodyUploadBudgetMs = bodyReceiveDeadlineMs + REQUEST_TIMEOUT_MS;
+    //
+    // Clamped to `MAX_TIMER_MS`, the way `REQUEST_TIMEOUT_MS` is: the sum of two values that are each at most that
+    // ceiling can exceed it, and the budget is compared as a number (below) rather than handed to `setTimeout`, so an
+    // over-large one produced no warning anywhere. With the documented maximum request timeout the sum was 30 s past
+    // `2**31 - 1`: the first re-arm check `Date.now() - armedAt < bodyUploadBudgetMs` was already false, so every
+    // request that announced a body was answered `408` - and its sentence named a budget no timer can arm.
+    const bodyUploadBudgetMs = Math.min(bodyReceiveDeadlineMs + REQUEST_TIMEOUT_MS, MAX_TIMER_MS);
     const armBodyDeadline = (request, reply, meta) => {
         const raw = request.raw;
         // Only an announced body is waited for, so every bodyless request keeps the hook's current cost

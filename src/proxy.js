@@ -40,7 +40,7 @@ import { parseBoolean, readFlag } from './options.js';
 // from here, so a helper moving into its own module does not move for a caller.
 export { DEFAULT_API_KEY, resolveApiKey } from './api-key.js';
 export { backendAuthorizationHeader, resolveBackendAuth, resolveBackendPassword } from './backend-auth.js';
-export { clientFacingText, handlerFailureMessage } from './errors.js';
+export { clientFacingText, handlerFailureMessage, HANDLER_FAILURE_FALLBACK } from './errors.js';
 export { normalizeBackendUrl, normalizeBindHost, isUsableBindHost, resolveOpencodePath, isShellUnsafePath } from './env.js';
 export { parseBoolean, readFlag } from './options.js';
 export { DEFAULT_REQUEST_TIMEOUT_MS, resolveRequestTimeoutMs } from './settings.js';
@@ -357,6 +357,20 @@ const MAX_CONTENT_PARTS_PER_MESSAGE = 10000;
 // a capped copy is still a prefix of the same answer and the remainder is still the text the client is missing. Only
 // the non-streaming answer is cut, and only past 16 M characters - roughly four million tokens.
 const MAX_ANSWER_CHARS = 16 * 1024 * 1024;
+
+// How much of each end of a polled answer identifies it. The stability window only asks whether the text changed
+// between two polls, and the previous poll's *text* is what it used to keep to answer that - a second full copy of the
+// answer (and of the reasoning) alive across the sleep between polls. Length plus this many characters at each end is
+// enough: an answer grows by appending, so a change moves the length or one of the two edges. A change confined to the
+// middle of an answer longer than twice this window is not seen, which is the same bounded comparison the streaming
+// collector makes with `SNAPSHOT_EDGE_CHARS`.
+const ANSWER_FINGERPRINT_CHARS = 64;
+const answerFingerprint = (content, reasoning) => {
+    const part = (text) => (text.length <= ANSWER_FINGERPRINT_CHARS * 2
+        ? `${text.length}:${text}`
+        : `${text.length}:${text.slice(0, ANSWER_FINGERPRINT_CHARS)}|${text.slice(-ANSWER_FINGERPRINT_CHARS)}`);
+    return `${part(content)}#${part(reasoning)}`;
+};
 
 // Appends `chunk` to a growing answer without passing MAX_ANSWER_CHARS. The result is always a *prefix* of the full
 // answer, which is the only property the streaming code relies on: every comparison against these buffers is a
@@ -2227,8 +2241,16 @@ function createApp(config) {
         // carry reasoning and no text at all. Watching `content` alone left `stableFor` at 0 for a reasoning-only
         // message, so a provider that never sets `finish` could not be accepted and the completion ended in `504` on
         // its whole budget (measured 4.4 s of a 4 s budget) for an answer the first poll already held.
-        let lastAnswerContent = '';
-        let lastAnswerReasoning = '';
+        //
+        // The previous poll is kept as a **fingerprint**, not as its text. Holding `lastAnswerContent` /
+        // `lastAnswerReasoning` retained a second full copy of each across the sleep between polls, so a completion at
+        // `MAX_ANSWER_CHARS` held twice the answer (and twice the reasoning) for as long as it ran - the exact cost
+        // that constant's comment says it exists to bound. Length plus the first and last
+        // `ANSWER_FINGERPRINT_CHARS` characters answer the only question the stability window asks ("did anything
+        // change?"), and two polls that differ only inside the middle of an answer longer than twice that window are
+        // indistinguishable - a shape no backend produces, because an answer grows by appending. `snapshotDelta()` in
+        // the streaming collector makes the same bounded comparison for the same reason.
+        let lastAnswerPrint = null;
         let lastAnswerAt = 0;
         let pollIndex = 0;
         // One failed poll used to end the whole completion: a single 5xx or a reset connection while the backend was
@@ -2343,11 +2365,10 @@ function createApp(config) {
                     let stableFor = 0;
                     // `content || reasoning` keeps the guard the single-field version had: an empty poll is a normal
                     // "not written yet" answer, never a finished one, so it may only restart the window.
-                    if ((content || reasoning) && content === lastAnswerContent && reasoning === lastAnswerReasoning) {
+                    if ((content || reasoning) && answerFingerprint(content, reasoning) === lastAnswerPrint) {
                         stableFor = Date.now() - lastAnswerAt;
                     } else {
-                        lastAnswerContent = content;
-                        lastAnswerReasoning = reasoning;
+                        lastAnswerPrint = answerFingerprint(content, reasoning);
                         lastAnswerAt = Date.now();
                     }
                     if (done || stableFor >= stableWindowMs || (!requireDone && (content || reasoning))) {
@@ -2478,6 +2499,12 @@ function createApp(config) {
             // Both maps are keyed by this string, so both are bounded here: `partTotals` used to grow one permanent
             // entry per delta for a backend that varies the part id (`assistantMessageID` is backend-controlled text),
             // 200 000 deltas measured 200 000 entries and +44.6 MB of heap against a `partTexts` stuck at 64.
+            //
+            // The comparison is `>` and it runs *after* the caller inserted `key`, which is what makes the bound
+            // exactly `MAX_PART_KEYS` rather than one short of it: the new entry is the 65th only for the length of this
+            // call, and the eviction below brings the map back to 64 before it returns. Checking `>=` here instead
+            // evicted at 64 and left the map holding 63 - the sibling bound in `partSnapshotKey()` is a `>=` because it
+            // runs *before* its insert, so the two are consistent at the same limit rather than written the same way.
             if (partTexts.size > MAX_PART_KEYS) {
                 const oldest = partKeyOrder.shift();
                 if (oldest !== undefined && oldest !== key) {
@@ -2641,9 +2668,12 @@ function createApp(config) {
                         // provider refresh) must not move this completion.
                         if (data.sessionID !== sessionId) continue;
                         // A part ordinal identifies one text or reasoning part of the assistant message, so the
-                        // cumulative snapshots of two kinds never collide even though both count from zero.
-                        const partKey = `${data.assistantMessageID || ''}:${data.ordinal || 0}`;
+                        // cumulative snapshots of two kinds never collide even though both count from zero. Built inside
+                        // the two branches that read it: every other event type (`session.step.ended`, `session.idle`,
+                        // `session.execution.*`, `session.step.failed`) paid for a template string it never used, on the
+                        // hottest loop in the gateway.
                         if (event.type === 'session.text.delta' || event.type === 'session.reasoning.delta') {
+                            const partKey = `${data.assistantMessageID || ''}:${data.ordinal || 0}`;
                             // 2.x sends real increments here, so the delta itself is what the client gets. The running
                             // total is still fed to `recordPartSnapshot()` on every delta, because `session.text.ended`
                             // closes the part with its **whole** text: without a base to diff against, that closing event
@@ -2720,6 +2750,7 @@ function createApp(config) {
                             // an empty increment here, and one that streamed nothing gets the whole part.
                             if (typeof data.text !== 'string' || data.text === '') continue;
                             const isReasoning = event.type === 'session.reasoning.ended';
+                            const partKey = `${data.assistantMessageID || ''}:${data.ordinal || 0}`;
                             const delta = recordPartSnapshot(`${isReasoning ? 'r' : 't'}${partKey}`, appendCapped('', data.text));
                             // An empty increment means the deltas already delivered this text: the closing event is
                             // bookkeeping, and treating it as output is what duplicated the answer.

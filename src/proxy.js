@@ -125,6 +125,14 @@ const FORBIDDEN_BODY_MESSAGE = 'request body is not valid JSON, or it carries a 
     + '(__proto__, constructor); send Content-Type: application/json';
 const FORBIDDEN_BODY_KEYS = new Set(['__proto__', 'constructor']);
 
+// A parsed body larger than this is not parsed for the debug dump. `maskDetail()` renders at most 100 top-level keys and
+// `serializeDetail()` cuts the line at 32 KB, so the object graph a whole-body `JSON.parse()` builds is walked to
+// produce a fraction of a percent of itself: a 2.2 MiB text body with 200 000 keys measured 39.7 ms to parse and
+// 23.5 ms to mask, for 101 keys rendered (about 63 ms on the one thread that also serves `/health` and holds the
+// completion slot, and linear in the body - seconds at the 50 MiB limit). The bound is well above any real prompt, and
+// a body over it takes the text branch below, which is already the right answer: bounded and fail-closed.
+const MAX_MASKED_BODY_PARSE_CHARS = 256 * 1024;
+
 /**
  * A request body on its way into the debug dump: masked by key, whatever content type it arrived under.
  *
@@ -143,6 +151,9 @@ const maskRequestBody = (body) => {
     if (typeof body !== 'string') return maskDetail(body);
     // Only an object can carry a keyed credential; a JSON scalar is masked by `maskDetail()`'s string branch
     if (!body.trimStart().startsWith('{')) return maskDetail(body);
+    // Bounded before the parse, the way `boundedForLog()` bounds before it masks: a large body is masked as the text it
+    // is rather than parsed into an object graph nobody will ever see
+    if (body.length > MAX_MASKED_BODY_PARSE_CHARS) return maskDetail(body);
     try {
         return maskDetail(JSON.parse(body));
     } catch (e) {

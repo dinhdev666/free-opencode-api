@@ -117,9 +117,11 @@ if [ ! -f "$CONFIG" ]; then
                     + " can use the gateway. Set API_KEY to a private value, and publish the port only on a trusted network.");
             } else {
                 // A private key closes the built-in-key hole, and it also silenced the only line that said the gateway is
-                // reachable on every interface - which is this image's default bind, and the half an operator decides with
-                // `-p`. index.js prints nothing for this combination either, so without this a first boot with a private
-                // key said nothing at all about what it published.
+                // reachable on every interface - which is the default bind of this image, and the half an operator
+                // decides with `-p`. index.js prints nothing for this combination either, so without this a first boot
+                // with a private key said nothing at all about what it published. No apostrophe in this block: it is a
+                // single-quoted shell string, so one would end the Node script mid-comment (dash reported it as
+                // `Syntax error: word unexpected` at this line, which points at the comment, not at the code).
                 console.log("[entrypoint] NOTE: BIND_HOST is " + usable(cfg.BIND_HOST)
                     + " (every interface), so the gateway is reachable on port " + usable(cfg.PORT)
                     + " from outside the container; API_KEY is the only thing guarding it, so publish the port only on a"

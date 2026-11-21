@@ -11,7 +11,7 @@
 #             docker/README.md.
 # =====================================================================
 
-# Base image: node 22 + debian bookworm slim
+# Base image: node 22 + debian bookworm slim (the runtime the image ships; the gateway itself supports 20/22/24)
 # slim instead of alpine: a glibc environment is more reliable for node native dependencies and the opencode binary,
 # avoiding musl pitfalls
 # If Docker Hub pulls are slow on your host, configure a registry mirror on the builder beforehand

@@ -25,7 +25,8 @@ import {
 } from '../src/logger.js';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { loggableUrl } from '../src/text.js';
+import { echoedValue, loggableUrl } from '../src/text.js';
+import { resolveOpencodePath } from '../src/env.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // This file reads itself for two invariants that live in its own text: the derived ports it must find free before it
@@ -462,6 +463,30 @@ async function run() {
         removeTempDir(probeDir);
     }
 
+    // `OPENCODE_PATH` may name a relative path, and the existence check has to agree with the `spawn()` that receives
+    // the value: `isFile(input)` tested the process's cwd by accident, while the child resolved a bare relative path
+    // against its own cwd - so a configured `OPENCODE_PATH=src/proxy.js` was warned about as missing and the search
+    // fell through to whatever `PATH` held, which is a *different* binary than the operator configured.
+    const relativePathDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-relpath-'));
+    const relativeProbeName = 'opencode-probe.js';
+    fs.writeFileSync(path.join(relativePathDir, relativeProbeName), '// probe\n');
+    const cwdBeforeProbe = process.cwd();
+    let relativeResolved;
+    let relativeError = null;
+    try {
+        process.chdir(relativePathDir);
+        relativeResolved = resolveOpencodePath(`./${relativeProbeName}`);
+    } catch (e) {
+        relativeError = e;
+    } finally {
+        process.chdir(cwdBeforeProbe);
+        removeTempDir(relativePathDir);
+    }
+    check('a relative OPENCODE_PATH resolves to the file the operator configured',
+        !relativeError && relativeResolved &&
+        relativeResolved.path === path.join(relativePathDir, relativeProbeName) && relativeResolved.source === 'config',
+        relativeError ? String(relativeError && relativeError.message) : JSON.stringify(relativeResolved));
+
     const readmeSource = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
     const undocumented = configKeys.filter((key) => !readmeSource.includes(`| \`${key}\` |`));
     check('every configurable key has a row in the README configuration table',
@@ -517,6 +542,28 @@ async function run() {
     check('the defaults and ranges in the README tuning table are the ones the gateway resolves',
         tuningMismatches.length === 0, tuningMismatches.join('; '));
 
+    // Two bounds that are arithmetic rather than configuration, and are checked here because neither has a number to
+    // compare: both used to be *sums* of values that are each already at a ceiling.
+    //
+    // The upload budget is the stall window plus the request budget, and both addends may sit at `MAX_TIMER_MS`; the
+    // result was compared as a number instead of being handed to `setTimeout`, so nothing warned - every request that
+    // announced a body was answered `408` with a deadline no timer could arm. Every other delay built from the budget
+    // is clamped, and this one is now the same shape.
+    const uploadBudgetLine = /const bodyUploadBudgetMs = ([^;]+);/.exec(proxySource);
+    const uploadBudgetClamped = Boolean(uploadBudgetLine) && uploadBudgetLine[1].includes('Math.min(') &&
+        uploadBudgetLine[1].includes('MAX_TIMER_MS');
+    check('the upload budget is clamped to the largest timer a delay may arm',
+        uploadBudgetClamped, uploadBudgetLine ? uploadBudgetLine[1].trim() : 'no bodyUploadBudgetMs in src/proxy.js');
+
+    // A debug dump of the request body is the one place a 20 MiB body reaches `JSON.parse` on the serving thread. The
+    // bound is the *parse* bound, not the dump bound: above it the value is masked as a string and never parsed, so a
+    // body the gateway would refuse anyway cannot cost a parse per debug line.
+    const bodyDumpGuard = 'if (body.length > MAX_MASKED_BODY_PARSE_CHARS) return maskDetail(body);';
+    check('the debug body dump stops parsing above a bounded size',
+        proxySource.includes(bodyDumpGuard) &&
+        /const MAX_MASKED_BODY_PARSE_CHARS = \d+ \* \d+;/.test(proxySource),
+        proxySource.includes(bodyDumpGuard) ? 'the guard is in place' : 'no parse bound in maskRequestBody()');
+
     // `config.json.example` is not documentation an operator reads, it is configuration they copy: every value in it is
     // written to their `config.json`, which wins over the default. A default changed in `src/proxy.js` while the
     // template keeps the old number does not leave a stale table behind - it pins the old value in every install made
@@ -561,6 +608,14 @@ async function run() {
         ['http://10.0.0.5:4097/v1?token=abc&model=x', 'http://10.0.0.5:4097/v1?token=***&model=x'],
         ['http://user:secret@10.0.0.5:4097/v1?api_key=k', 'http://***@10.0.0.5:4097/v1?api_key=***'],
         ['10.0.0.5:4097', '10.0.0.5:4097'],
+        // A *hostless* authority: the `@` is still the one that ends the userinfo, so the credential is still there.
+        // Reading "is there anything after the `@`?" as "is this a credential at all?" let `http://user:secret@/v1`
+        // through in clear - and `/health` needs no key, so that value was published to every caller.
+        ['http://alice:s3cr3t@/v1', 'http://***@/v1'],
+        ['http://alice:s3cr3t@#fragment', 'http://***@#fragment'],
+        ['http://alice:s3cr3t@?q=1', 'http://***@?q=1'],
+        ['http://host@', 'http://***@'],
+        ['alice:s3cr3t@', '***@'],
         ['', '']
     ];
     const backendUrlResults = backendUrlCases.map(([input, expected]) => [input, maskBackendUrl(input), expected]);
@@ -583,7 +638,15 @@ async function run() {
         // hand-written sentence uses - both used to keep the credential in clear because the pattern wanted `scheme://`
         ['connect alice:s3cr3t@proxy failed', 'connect ***@proxy failed'],
         ['OPENCODE_SERVER_URL=alice:s3cr3t@host:4398 is repaired', 'OPENCODE_SERVER_URL=***@host:4398 is repaired'],
-        ['an @ in a path is not userinfo: http://host:4097/a@b', 'an @ in a path is not userinfo: http://host:4097/a@b']
+        ['an @ in a path is not userinfo: http://host:4097/a@b', 'an @ in a path is not userinfo: http://host:4097/a@b'],
+        // A passphrase is a real credential, and Node's own "URL that includes credentials" sentence quotes it verbatim.
+        // The scheme-qualified rule used to run `[^\s/?#@]*@`, so a credential with a space in it matched nothing and
+        // the whole value was published. Only that rule allows whitespace: without a `://` anchor, a class that did
+        // would match from any earlier colon (`the admin: bob@example.com` is prose).
+        ['Request cannot be constructed from a URL that includes credentials: http://alice:s3 cr3t@127.0.0.1:4097',
+            'Request cannot be constructed from a URL that includes credentials: http://***@127.0.0.1:4097'],
+        ['the admin: bob@example.com', 'the admin: bob@example.com'],
+        ['status=x: connection refused', 'status=x: connection refused']
     ];
     const maskedTextResults = maskedTextCases.map(([input, expected]) => [input, maskUrlCredentials(input), expected]);
     check('a credential inside a message is masked',
@@ -606,6 +669,33 @@ async function run() {
     check('the scheme bound still masks a real credential-bearing URL',
         maskUrlCredentials('see http://user:s3cr3t@host:4097/x') === 'see http://***@host:4097/x',
         maskUrlCredentials('see http://user:s3cr3t@host:4097/x'));
+
+    // A value that is not a URL at all is still echoed into a response body: the `415` names the `Content-Type` the
+    // client sent, and a client that sent `application/json; api_key=SECRET42` read the whole secret back out of the
+    // refusal. `echoedValue()` bounds the value *and* masks it, so the pair form of a credential goes the same way as
+    // the URL form - including the media-type spelling (`application/x-api-key=…`), where `/` is part of the name.
+    const echoedCases = [
+        ['gzip, api_key=SECRET42', 'gzip, api_key=***'],
+        ['application/x-api-key=S3CRET', 'application/x-api-key=***'],
+        ['application/json; token=SECRET42', 'application/json; token=***'],
+        ['application/xml', 'application/xml'],
+        ['text/plain; charset=utf-8', 'text/plain; charset=utf-8'],
+        ['model=gpt-4', 'model=gpt-4']
+    ];
+    const echoedResults = echoedCases.map(([input, expected]) => [input, echoedValue(input), expected]);
+    check('a credential echoed back to the client is masked',
+        echoedResults.every(([, actual, expected]) => actual === expected),
+        JSON.stringify(echoedResults.filter(([, actual, expected]) => actual !== expected)));
+    // The mask must not be a prefix: the value class runs to the end of the pair, so a long secret cannot leave its
+    // tail behind (`api_key=<500 chars>` used to come back as `api_key=***` plus the last 444 characters).
+    const longEchoSecret = 'S'.repeat(500);
+    const longEchoValue = echoedValue(`api_key=${longEchoSecret}`);
+    check('a long echoed credential loses its tail as well as its head',
+        !longEchoValue.includes(longEchoSecret) && longEchoValue.includes('api_key=***'), longEchoValue.slice(0, 60));
+    // Control characters are still replaced, and the bound still applies: masking must not be a way around either.
+    check('the echo bounder still replaces control characters and cuts the value',
+        echoedValue('a\nb') === 'a?b' && echoedValue('x'.repeat(200)).includes('[truncated'),
+        echoedValue('a\nb'));
 
     // A credential containing a reserved character ends the authority a strict parse sees (`http://alice:s3#cr3t@host`
     // is host `alice`, port `s3` - not a number - and the rest), so a masker that walked `[^/?#]*@` matched nothing and

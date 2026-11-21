@@ -1550,9 +1550,16 @@ function createApp(config) {
         const now = Date.now();
         if (now - modelsRefreshAt < MODELS_CACHE_TTL_MS) return;
         modelsRefreshAt = now;
-        modelsInFlight = fetchModels();
-        // `fetchModels()` answers its own failures (fallback plus a log line), so this only frees the dedupe slot
-        modelsInFlight.then(() => { modelsInFlight = null; }, () => { modelsInFlight = null; });
+        const pending = fetchModels();
+        modelsInFlight = pending;
+        // `fetchModels()` answers its own failures (fallback plus a log line), so this only frees the dedupe slot.
+        // Only the caller that installed the promise clears it: a caller in `loadModels()` awaiting the same refresh
+        // ran the same `modelsInFlight = null` in its `finally`, so a third request that arrived in the same few
+        // microtasks saw a free slot and started a second provider round trip for one expired cache.
+        const release = () => {
+            if (modelsInFlight === pending) modelsInFlight = null;
+        };
+        pending.then(release, release);
     };
     // "Usable now, and does it need a refresh?" lives in one place because the listing route and the by-id route have
     // to agree on the bound, and a second copy of these two comparisons is how they stop agreeing.
@@ -1571,11 +1578,14 @@ function createApp(config) {
         // await the same promise
         if (modelsFallbackAt && now - modelsFallbackAt < FALLBACK_HOLD_MS) return STATIC_FALLBACK_MODELS;
         if (modelsInFlight) return modelsInFlight;
-        modelsInFlight = fetchModels();
+        const pending = fetchModels();
+        modelsInFlight = pending;
         try {
-            return await modelsInFlight;
+            return await pending;
         } finally {
-            modelsInFlight = null;
+            // Only the caller that installed the promise frees the slot, so a request that joined a refresh already in
+            // flight (the background one included) cannot clear it out from under the caller still awaiting it
+            if (modelsInFlight === pending) modelsInFlight = null;
         }
     };
 
